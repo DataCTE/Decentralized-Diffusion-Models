@@ -51,7 +51,7 @@ Configure the Script:
 
 ## Run Training
 ```python
-python train_model.py
+torchrun --nproc-per-node=8 --nnodes=1 train_model.py
 ```
 ## The script will:
 Cluster the dataset using DINOv2 features and MiniBatchKMeans.
