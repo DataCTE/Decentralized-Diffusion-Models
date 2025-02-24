@@ -67,27 +67,27 @@ trainer.generate("a photo of a mountain", size=(256, 256), num_steps=50)
 Outputs are generated using the trained ensemble with top-1 expert selection.
 
 ## Key Parameters
-NUM_EXPERTS: Number of expert models (default: 8, based on paper's findings).
-BATCH_SIZE: Per-expert batch size (default: 1, adjust based on GPU memory).
-NUM_STEPS: Total training steps (default: 1,000,000).
-buckets: Image resolution buckets for multi-resolution training (default matches paper).
+  - NUM_EXPERTS: Number of expert models (default: 8, based on paper's findings).
+  - BATCH_SIZE: Per-expert batch size (default: 1, adjust based on GPU memory).
+  - NUM_STEPS: Total training steps (default: 1,000,000).
+  - buckets: Image resolution buckets for multi-resolution training (default matches paper).
 
 ## Implementation Details
-Model Architecture: Uses a simplified DiT with adaLN-Zero conditioning, MoE-inspired expert layers, and sinusoidal timestep embeddings.
-Clustering: Employs DINOv2 for feature extraction and MiniBatchKMeans for efficient data partitioning (1024 fine clusters consolidated to NUM_EXPERTS coarse clusters).
-Training Objective: Implements Decentralized Flow Matching (DFM) with a cosine noise schedule.
-Router: A smaller DiT model predicts expert weights via cross-entropy loss over cluster labels.
-Inference: Supports top-1 expert selection for efficiency, with optional full ensembling.
+  - Model Architecture: Uses a simplified DiT with adaLN-Zero conditioning, MoE-inspired expert layers, and sinusoidal timestep embeddings.
+  - Clustering: Employs DINOv2 for feature extraction and MiniBatchKMeans for efficient data partitioning (1024 fine clusters consolidated to NUM_EXPERTS coarse clusters).
+  - Training Objective: Implements Decentralized Flow Matching (DFM) with a cosine noise schedule.
+  - Router: A smaller DiT model predicts expert weights via cross-entropy loss over cluster labels.
+  - Inference: Supports top-1 expert selection for efficiency, with optional full ensembling.
 
 ## Limitations
-Simplified Scope: This replication omits some advanced features from the original code (e.g., FSDP, distributed sampling) for simplicity.
-Hardware Constraints: Tested on limited resources; scaling to billions of parameters (e.g., 24B as in the paper) requires significant compute not replicated here.
-Text Conditioning: Basic CLIP integration is included but not fully optimized for large-scale text-to-image tasks.
+  - Simplified Scope: This replication omits some advanced features from the original code (e.g., FSDP, distributed sampling) for simplicity.
+  - Hardware Constraints: Tested on limited resources; scaling to billions of parameters (e.g., 24B as in the paper) requires significant compute not replicated here.
+  - Text Conditioning: Basic CLIP integration is included but not fully optimized for large-scale text-to-image tasks.
 
 ## Acknowledgments
-Inspired by "Decentralized Diffusion Models" by McAllister et al. (2025).
-Builds on the DiT implementation from Peebles and Xie (2023).
-Thanks to the PyTorch and Hugging Face communities for open-source tools.
+  - Inspired by "Decentralized Diffusion Models" by McAllister et al. (2025).
+  - Builds on the DiT implementation from Peebles and Xie (2023).
+  - Thanks to the PyTorch and Hugging Face communities for open-source tools.
 
 ## License
 This project is licensed under the MIT License. See the LICENSE file for details.
