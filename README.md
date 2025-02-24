@@ -1,6 +1,6 @@
 # Decentralized Diffusion Model (DDM) DiT Training Replication
 
-**Author:** Datacte (GitHub: [Datavoid](https://github.com/Datavoid))  
+**Author:** Datacte (GitHub: [Datavoid](https://github.com/Datacte))  
 **Date:** February 24, 2025  
 **License:** MIT License  
 
