@@ -373,7 +373,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             expert_bucket_indices[bucket].append(i)
         
         # Create bucket batch sampler with appropriate batch size
-        batch_size = max(1, min(config.batch_size // config.num_experts, len(indices) // 2))
+        batch_size = config.expert_batch_size
         sampler = BucketBatchSampler(
             expert_bucket_indices,
             batch_size=batch_size,

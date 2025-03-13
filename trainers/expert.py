@@ -55,7 +55,10 @@ class ExpertTrainer:
         """
         images = batch["image"].to(self.device)
         
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
+        # Use mixed precision training if configured
+        scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
+        
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             # VAE encoding (paper section 4.1)
             # The paper uses a VAE to encode images into latent space
             latents = self.vae.encode(images)
@@ -86,17 +89,25 @@ class ExpertTrainer:
             # The expert predicts the flow field at the current timestep
             pred_flow = self.expert(latent_t, t_indices, text_embeds)
             
-            # Flow matching loss (Equation 6 from paper)
-            # L(θ) = E_{t,x_0,ε}[||u_θ(x_t, t) - u_t(x_t|x_0)||²]
-            # This computes the MSE between predicted flow and target flow
-            loss = self.flow_matcher.expert_loss(pred_flow, latents, t, noise)
-
-        # Optimization following paper training details (Section 4.1)
-        # The paper uses AdamW with weight decay and gradient clipping
+            # The target flow field v_t(x_t) (Equation 4)
+            # This is the ground truth for flow matching objective
+            target_flow = self.flow_matcher.compute_flow_matching_target(
+                latents, latent_t, t
+            )
+            
+            # Flow matching loss (Equation 7)
+            # L_flow = E_{x_0,t}[|| u_t(x_t) - v_t(x_t) ||^2]
+            loss = self.flow_matcher.compute_flow_matching_loss(
+                pred_flow, target_flow
+            )
+        
+        # Optimize using mixed precision
         self.optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(self.optimizer)  # Unscale gradients for clipping
         torch.nn.utils.clip_grad_norm_(self.expert.parameters(), self.config.max_grad_norm)
-        self.optimizer.step()
+        scaler.step(self.optimizer)
+        scaler.update()
         
         return loss.item()
     

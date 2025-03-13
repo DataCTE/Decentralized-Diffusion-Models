@@ -134,6 +134,9 @@ class ExpertDiT(nn.Module):
         # Initialize weights
         self.initialize_weights()
         
+        # Enable gradient checkpointing for memory efficiency
+        self.use_gradient_checkpointing = getattr(config, 'use_gradient_checkpointing', True)
+        
     def initialize_weights(self):
         # Initialize patch embedding
         nn.init.xavier_uniform_(self.x_embedder.weight)
@@ -229,8 +232,12 @@ class ExpertDiT(nn.Module):
             x = x + x_out
         
         # Process through transformer blocks
-        for block in self.blocks:
-            x = block(x, t_emb)
+        if self.use_gradient_checkpointing and self.training:
+            for block in self.blocks:
+                x = torch.utils.checkpoint.checkpoint(block, x, t_emb)
+        else:
+            for block in self.blocks:
+                x = block(x, t_emb)
             
         # Final layer and unpatchify with correct dimensions
         x = self.final_layer(x, t_emb)

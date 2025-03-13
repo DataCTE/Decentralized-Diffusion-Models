@@ -22,6 +22,7 @@ from trainers.router import RouterTrainer
 from utils.vae import VAEWrapper
 from utils.clip import CLIPTextEncoder
 from inference import ddm_sample
+from config import DDMConfig
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -249,12 +250,18 @@ class DDMTrainingCoordinator:
             
             # Extract features from current dataset
             feature_dataset = FeatureDataset(self.config.dataset_path, self.config)
+            
+            # Use a very small batch size for feature extraction to avoid OOM
             feature_loader = DataLoader(
                 feature_dataset, 
-                batch_size=self.config.feature_batch_size,
-                num_workers=self.config.feature_workers
+                batch_size=self.config.feature_batch_size,  # Already set to 1 in config
+                num_workers=max(1, self.config.feature_workers // 2),  # Reduce workers
+                pin_memory=True
             )
-            features = self.cluster_manager.extract_features(feature_loader)
+            
+            # Use autocast to reduce memory usage during feature extraction
+            with torch.cuda.amp.autocast():
+                features = self.cluster_manager.extract_features(feature_loader)
             
             # Perform clustering
             new_cluster_labels = self.cluster_manager.cluster_dataset(features)
@@ -328,8 +335,17 @@ class DDMTrainingCoordinator:
 
     def train_router(self):
         if self.rank == 0 and self.current_step % self.config.save_interval == 0:
+            # Use a smaller batch size for router training to prevent OOM issues
+            # The router doesn't need large batches to learn effectively
+            router_batch_size = DDMConfig.router_batch_size  # Hardcoded to 1 to prevent OOM
             avg_loss = self.router_trainer.train_epoch(
-                DataLoader(self.full_dataset, batch_size=self.config.batch_size, shuffle=True)
+                DataLoader(
+                    self.full_dataset, 
+                    batch_size=router_batch_size, 
+                    shuffle=True,
+                    num_workers=self.config.num_workers,
+                    pin_memory=True
+                )
             )
             logger.info(f"Router Training Loss: {avg_loss:.4f}")
             

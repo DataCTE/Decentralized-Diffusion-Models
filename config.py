@@ -8,7 +8,7 @@ class DDMConfig:
         self.num_layers = 28     # DiT-XL depth
         self.num_heads = 16      # DiT-XL heads
         self.ffn_dim = 3072      # DiT-XL MLP ratio
-        self.batch_size = 16
+        self.batch_size = 1      # Reduced from 16 to 1 to address OOM issues
         
         # DDM specific settings
         self.num_experts = 8     # Number of expert models (paper recommends 8)
@@ -19,6 +19,11 @@ class DDMConfig:
         self.weight_decay = 0.1
         self.adam_betas = (0.9, 0.99)
         
+        # Memory optimization settings
+        self.use_mixed_precision = True  # Use mixed precision training (fp16)
+        self.gradient_accumulation_steps = 1  # Accumulate gradients over multiple steps
+        self.use_gradient_checkpointing = True  # Use gradient checkpointing to save memory
+
         # Data settings
         self.patch_size = 32
         self.image_size = 512
@@ -59,6 +64,7 @@ class DDMConfig:
         self.recluster_interval = 50000  # Steps between reclustering
         
         # Paper-recommended hyperparameters
+        self.router_batch_size = 1
         self.expert_batch_size = 1  # Per-expert batch size
         self.router_learning_rate = 3e-5   # Different from expert LR
         self.recluster_epochs = 3          # Paper recommends 3 passes
