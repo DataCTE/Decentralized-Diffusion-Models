@@ -58,20 +58,29 @@ class DDMTrainingCoordinator:
         self.previous_clusters = None
 
     def init_data_loaders(self):
-        """Initialize distributed data loaders following paper Appendix A.1"""
-        # Only rank 0 handles dataset initialization
-        if self.rank == 0:
-            self.full_dataset = DDMDataset(self.config.dataset_path)
-            self.cluster_labels = self.perform_initial_clustering()
-        else:
-            self.full_dataset = DDMDataset(self.config.dataset_path)
-            self.cluster_labels = np.zeros(len(self.full_dataset), dtype=np.int32)
-            
-        # Sync cluster labels across all nodes
-        self.sync_cluster_labels()
-        
-        # Create expert-specific loaders (paper Section 3.3)
-        self.expert_loaders = self.create_expert_loaders()
+        """Initialize distributed data loaders with sharded validation"""
+        # Shared dataset for all processes
+        dataset = DDMDataset(
+            self.config.dataset_path,
+            cluster_labels=self.cluster_manager.get_clusters()
+        )
+
+        # Distributed sampler for sharding
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True
+        )
+
+        self.train_loader = DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            sampler=sampler,
+            num_workers=2,
+            pin_memory=True,
+            persistent_workers=True
+        )
         
     def perform_initial_clustering(self):
         """Paper Algorithm 1: Initial dataset clustering"""

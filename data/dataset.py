@@ -10,6 +10,7 @@ from tqdm import tqdm
 from collections import defaultdict
 from sklearn.cluster import MiniBatchKMeans
 import logging
+import torch.distributed as dist
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -26,29 +27,51 @@ class DDMDataset(Dataset):
         self.include_metadata = include_metadata
         
         # Validate and filter image files
-        logger.info("Initializing DDMDataset and validating images...")
-        self.image_files = self._validate_files()
-        logger.info(f"DDMDataset initialized with {len(self.image_files)} valid images")
+        if dist.get_rank() == 0:  # Only validate on main process
+            logger.info("Initializing DDMDataset and validating images...")
+            self.image_files = self._validate_files()
+            logger.info(f"DDMDataset initialized with {len(self.image_files)} valid images")
+            
+            # Broadcast validated files to all processes
+            files_tensor = torch.tensor(len(self.image_files), device='cuda')
+            dist.broadcast(files_tensor, 0)
+        else:
+            files_tensor = torch.tensor(0, device='cuda')
+            dist.broadcast(files_tensor, 0)
+            self.image_files = [None] * files_tensor.item()
+
+        # Distributed synchronization point
+        dist.barrier()
+
+        # Only main process needs to extract captions and sizes
+        if dist.get_rank() == 0:
+            self.captions = self._extract_captions()
+            self.actual_sizes = self._collect_image_sizes()
+            self.buckets = self._generate_dynamic_buckets()
+        else:
+            self.captions = {}
+            self.actual_sizes = []
+            self.buckets = []
+
+        # Initialize cluster labels from shared memory
+        self.cluster_labels = self._init_shared_clusters(cluster_labels)
+        self._init_bucket_assignments()
+
+    def _init_shared_clusters(self, cluster_labels):
+        """Initialize cluster labels using shared memory"""
+        if cluster_labels is None:
+            return torch.zeros(len(self), dtype=torch.long)
+        return cluster_labels
+
+    def _init_bucket_assignments(self):
+        """Distribute bucket assignments across processes"""
+        if dist.get_rank() == 0:
+            bucket_tensor = torch.tensor(self.image_buckets)
+        else:
+            bucket_tensor = torch.empty(len(self), dtype=torch.long)
         
-        # Extract captions from filenames
-        self.captions = {}
-        for img_file in self.image_files:
-            # Extract caption from filename (assuming format: caption_hash.ext)
-            base_name = os.path.splitext(img_file)[0]
-            caption = base_name.split('_')[0].replace('-', ' ')
-            self.captions[img_file] = caption
-        
-        # Collect actual image dimensions
-        self.actual_sizes = self._collect_image_sizes()
-        
-        # Dynamic bucket generation
-        self.buckets = self._generate_dynamic_buckets()
-        
-        # Initialize cluster labels
-        self.cluster_labels = np.array(cluster_labels) if cluster_labels is not None else np.zeros(len(self))
-        self.image_buckets = [None] * len(self)
-        self.bucket_indices = defaultdict(list)
-        self.assign_buckets()
+        dist.broadcast(bucket_tensor, 0)
+        self.image_buckets = bucket_tensor.tolist()
 
     def _validate_files(self):
         """Validate all image files and return only the valid ones"""
@@ -190,10 +213,20 @@ class FeatureDataset(Dataset):
         from config import DDMConfig
         
         self.root = root_dir
-        self.config = config or DDMConfig()  # Use provided config or default
+        self.config = config or DDMConfig()
         
-        # Include webp files in feature extraction but validate them first
-        self.image_files = self._validate_files()
+        # Sharded validation across processes
+        if dist.get_rank() == 0:
+            self.image_files = self._validate_files()
+            files_tensor = torch.tensor(len(self.image_files), device='cuda')
+            dist.broadcast(files_tensor, 0)
+        else:
+            files_tensor = torch.tensor(0, device='cuda')
+            dist.broadcast(files_tensor, 0)
+            self.image_files = [None] * files_tensor.item()
+
+        dist.barrier()
+
         self.dino_size = self.config.dino_size
         self.transform = T.Compose([
             T.Resize(self.dino_size, interpolation=T.InterpolationMode.BILINEAR),
