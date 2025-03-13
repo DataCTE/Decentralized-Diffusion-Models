@@ -53,18 +53,34 @@ class DDMTrainingCoordinator:
         self.expert_loading_count = 0
         
     def init_cluster_manager(self):
-        """Initialize clustering components as per paper Section 3.2"""
+        """Initialize clustering components with distributed synchronization"""
         self.cluster_manager = ClusterManager()
-        self.previous_clusters = None
         
-        # Perform initial clustering if not already done
-        if self.cluster_manager.get_clusters() is None:
+        # Only perform clustering on main process
+        if self.rank == 0:
             feature_loader = DataLoader(
                 FeatureDataset(self.config.dataset_path, self.config),
                 batch_size=self.config.feature_batch_size,
                 num_workers=self.config.feature_workers
             )
             self.cluster_manager.perform_clustering(feature_loader)
+        
+        # Synchronize cluster labels across nodes
+        cluster_labels = self.cluster_manager.get_clusters() if self.rank == 0 else None
+        cluster_labels = self._broadcast_clusters(cluster_labels)
+        self.cluster_manager.cluster_labels = cluster_labels
+
+    def _broadcast_clusters(self, clusters):
+        """Distributed broadcast of cluster assignments"""
+        if self.rank == 0:
+            clusters_tensor = torch.tensor(clusters, dtype=torch.long, device=self.device)
+            dist.broadcast(clusters_tensor, src=0)
+        else:
+            clusters_tensor = torch.empty(self.config.dataset_size, 
+                                        dtype=torch.long, device=self.device)
+            dist.broadcast(clusters_tensor, src=0)
+        
+        return clusters_tensor.cpu().numpy()
 
     def init_data_loaders(self):
         """Initialize distributed data loaders with sharded validation"""
