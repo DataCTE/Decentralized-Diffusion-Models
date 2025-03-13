@@ -1,0 +1,2067 @@
+Decentralized Diffusion Models
+David McAllister1 * Matthew Tancik2
+
+arXiv:2501.05450v2 [cs.CV] 10 Jan 2025
+
+1
+
+Jiaming Song2
+
+University of California, Berkeley
+
+2
+
+Angjoo Kanazawa1†
+Luma AI
+
+Abstract
+Dataset
+
+Large-scale AI model training divides work across thousands of GPUs, then synchronizes gradients across them
+at each step. This incurs a significant network burden that
+only centralized, monolithic clusters can support, driving up
+infrastructure costs and straining power systems. We propose Decentralized Diffusion Models, a scalable framework
+for distributing diffusion model training across independent
+clusters or datacenters by eliminating the dependence on a
+centralized, high-bandwidth networking fabric. Our method
+trains a set of expert diffusion models over partitions of the
+dataset, each in full isolation from one another. At inference
+time, the experts ensemble through a lightweight router. We
+show that the ensemble collectively optimizes the same objective as a single model trained over the whole dataset. This
+means we can divide the training burden among a number
+of “compute islands,” lowering infrastructure costs and improving resilience to localized GPU failures. Decentralized
+diffusion models empower researchers to take advantage
+of smaller, more cost-effective and more readily available
+compute like on-demand GPU nodes rather than central
+integrated systems. We conduct extensive experiments on
+ImageNet and LAION Aesthetics, showing that decentralized
+diffusion models FLOP-for-FLOP outperform standard diffusion models. We finally scale our approach to 24 billion
+parameters, demonstrating that high-quality diffusion models can now be trained with just eight individual GPU nodes
+in less than a week.
+
+Monolithic Diffusion Training
+
+Decentralized Diffusion Training
+
+Figure 1. Decentralized Diffusion Models (DDM). Left: Existing
+diffusion models (monolithic) require synchronized, centralized
+training across thousands of GPUs, making high-quality training
+systems expensive and inaccessible. Right: DDM divides a diffusion model into an ensemble of expert models, each trained on its
+own data cluster in complete isolation. This ensemble collectively
+optimizes the same diffusion objective as a single model trained on
+all the data. This enables flexible training across diverse cloud or
+academic compute facilities. At inference, the ensemble delivers
+improved performance at the same FLOP-cost, making high-quality
+diffusion model training more efficient and accessible. See Figure 2
+for large-scale DDM model samples.
+
+Video diffusion models demand a step-function increase in
+these resources. For instance, Meta’s Movie Gen trains on
+up to 6,114 H100 GPUs [35]—nearly GPT-3 scale [6]. As
+these models continue to grow in size and capability, they
+encounter significant systems-level challenges that mirror
+those faced in LLM training. High-bandwidth interconnect
+becomes a critical bottleneck, storage systems must handle
+massive streaming datasets and persistent hardware failures
+can crash or silently slow the training process [1, 14]. The
+result is a fragile integrated system where performance and
+reliability depend on complex interactions between arrays of
+accelerators and networking hardware. This is challenging
+and costly for large industry labs—untenable for academics.
+We present Decentralized Diffusion Models, a scalable
+method for distributing the modeling burdening of diffusion across independent expert models, each trained on its
+own “compute island” with no cross-communication. This
+enables training with scattered resources, leveraging costeffective cloud compute or combining resources across mul-
+
+1. Introduction
+Diffusion models achieve breakthrough results in image
+generation [39, 40], video modeling [4], and robotic control through diffusion policies [10]. However, these models
+continue to demand greater and greater training compute.
+Even early successes in image diffusion underscored the
+immense computational requirements, with Stable Diffusion
+1.5’s training consuming over 6,000 A100 GPU days [7, 34].
+* Work partially done when author was an intern at Luma AI
+† Author is an advisor to Luma AI
+
+1
+
+Figure 2. Decentralized diffusion models train on readily-available hardware and generate high quality, diverse images. We present
+selected samples from our 8x3B parameter model.
+
+2
+
+tiple clusters. Decentralization is also helpful for training
+“foundation”-scale models [3], where it is increasingly difficult to build datacenters with enough power capacity for
+the scale of modern training runs [31]. Independent training
+provides additional benefits, such as the ability to execute
+across heterogeneous hardware, making it possible to reuse
+existing training clusters alongside newer infrastructure.
+Decentralized diffusion models employ a new training
+objective, Decentralized Flow Matching (DFM), which partitions the training data into K groups and trains a dedicated
+diffusion model over each. We refer to these specialized
+models as experts, inspired by the Mixture of Experts (MoE)
+literature [16]. An independently trained router model orchestrates these experts, determining which are most appropriate at test-time. We show that this ensemble of expert
+models collectively optimizes the same global objective as a
+single model trained on the entire dataset.
+During each inference step, the router predicts each expert’s relevance to the input noise and condition. The expert
+predictions are then linearly combined, weighed by their
+associated relevance scores. Experts learn to specialize, so
+many are irrelevant to a given input, and it is more efficient
+to use a subset of them. If not all experts are selected, it
+serves as a sparse model, leveraging selective computation
+similar to MoE. Sparse inference is compute-efficient but
+remains memory-intensive. We demonstrate that we can distill experts into a single dense model, achieving convenient
+inference while preserving sample quality.
+We evaluate our approach on ImageNet and a filtered
+subset of LAION-Aesthetics, where we compare DDMs
+against existing monolithic diffusion model training. We
+systematically vary the number of experts to analyze its impact on downstream generation tasks, where we find that
+DDMs with eight experts consistently achieve the best performance, even outperforming a single model trained with
+the same compute. This is made possible by the additional
+parametrization provided by multiple specialized experts to
+outperform a generalist model. Finally, we demonstrate the
+scaling ability of DDMs by training a large decentralized
+model with eight 3-billion parameter experts, resulting in
+high definition image generation, as shown in Figure 2.
+Decentralized Diffusion Models also integrate easily into
+existing diffusion training environments. In practice, DDMs
+involve clustering a dataset then training a standard diffusion
+model on each cluster. This means nearly everything from existing diffusion infrastructure can be reused—training code,
+dataloading, systems optimizations, noise schedules and architectures. See our blog post for a visual walkthrough and
+pseudocode.
+
+tractable large-scale training of continuous normalizing
+flows (CNFs) [8]. Diffusion and flow matching models produce state of the art generations in high dimensional continuous spaces but are typically expensive to train to high quality.
+Recent works propose token masking [43] and aligning internal states with pretrained image representation models
+[52] to accelerate the model learning process. PixArt-α [7]
+shows that curated datasets with synthetic captions reduce
+training costs. We explore a complementary direction that
+decentralizes the training of the model across multiple GPU
+clusters without cross-communication, thereby increasing
+the robustness and efficiency of training.
+Existing approaches all use data parallel training, which
+distributes batches across GPUs and synchronizes gradients
+to produce larger effective batch sizes. Our work introduces
+an orthogonal form of parallelism that partitions the model’s
+training across isolated compute centers with no gradient synchronization. Our approach is complementary with existing
+techniques—in fact, we employ Fully Sharded Data Parallel
+(FSDP) [53] training within each cluster while maintaining
+isolation between them in our experiments.
+Mixture of Experts Mixture of Experts (MoE) is a popular and powerful approach to increase model capacity without a proportional increase in computational cost. This is
+achieved through sparse parameter activation: MoE replaces
+each dense feed forward network (FFN) layer of a transformer with a lightweight router that selects k of N learned
+FFN layers per token. The approach gained prominence
+with Switch Transformers [16], followed by works that refined MoE via various routing strategies [54] and systems
+improvements [17].
+These advances have led to notable successes in language modeling, exemplified by models like Mixtral [24]
+and DeepSeek-V3 [11], which achieve strong performance
+while maintaining computational efficiency. While our work
+focuses on decentralized training, we draw inspiration from
+MoE techniques at test-time, adapting the principle of increasing parametrization through sparsely-activated experts
+to the diffusion domain. Both MoE and DDMs increase total
+model capacity without increasing computational costs, but
+we achieve this by routing inputs to different data experts
+rather than routing tokens to different FFNs.
+MoE architectures introduce significant systems challenges, particularly the problems of expert load balancing,
+managing capacity factors, and the challenge of holding
+many times more parameters in memory during training and
+inference. Conversely, DDMs alleviate systems constraints
+by training experts and routers individually, extending diffusion training to readily available hardware configurations.
+
+2. Related Works
+Accelerating Diffusion Models Flow matching [27,
+28] generalizes diffusion models [21, 44–46] and makes
+
+Low Communication Learning Federated learning [30]
+establishes foundational techniques for communication3
+
+Cluster Assignment
+
+Inference
+
+Training
+
+xt
+ut(xt | x0)
+
+x0
+
+vθ,t(xt)
+
+vθ,t(xt)
+
+x̂0
+
+x̂0
+
+xt
+
+xt
+Ensemble Flow
+
+ut(xt | x0)
+
+vθ,t(xt)
+
+xt
+
+vθ,t(xt)
+
+x0
+
+Router
+
+Figure 3. Decentralized Diffusion Model (DDM) Training Overview. DDMs follow a three-step training process. We first cluster the
+dataset using off-the-shelf representation extraction models. We train a diffusion model over each of these clusters and a router that associates
+any input xt with its most likely clusters. At test-time, given a noisy sample, each expert (in red and green) predict their own flows, which
+combine linearly via the weights predicted by the router. The combined flow samples the entire distribution and is illustrated on the right.
+
+process with timesteps t interpolating the data distribution
+at t = 0 and the per-pixel Gaussian distribution at t = 1.
+Concretely, xt = αt x0 + σt ϵ, where the scaling coefficients
+αt and σt are chosen ahead of time, typically to preserve
+variance across timesteps [46]. The learned model, vθ,t (xt ),
+reverses this corruption process to transport from the noise
+distribution to the data distribution. These transport paths
+collectively represent the marginal flow, ut (xt ), which is a
+vector field at each timestep that can be regressed in a model
+to interpolate the data distribution or computed analytically
+over a dataset, which will reproduce training samples.
+Flow transports a latent variable, xt , to the data distribution through a multi-step sampling process. At each step,
+the model predicts the flow from xt toward a weighted average of the data distribution. In its continuous definition, we
+express this as an integral:
+
+constrained training, originally motivated by data privacy
+concerns. Follow-up works including Federated Averaging
+[48], Adaptive Federated Optimization [38] and DiLoCo
+[13], adapt these ideas to address large-scale training challenges. DiLoCo, uses an inner and outer optimization loop to
+balance local training with periodic global synchronization.
+This parallels developments in large model training, where
+methods like Branch-Train-Merge [26] and Diffusion Soup
+[2, 50] have explored training and combining data-specialist
+models. While our approach shares technical insights with
+these methods, we focus on leveraging distributed computation for robustness and flexibility rather than data sovereignty
+or training on mobile devices. In fact, our method should
+complement these approaches for further decentralization,
+which we hope to see in future work.
+
+3. Decentralized Flow Matching
+Z
+
+We introduce Decentralized Flow Matching (DFM), the training objective for DDMs, to distribute the diffusion modeling
+burden across an ensemble of expert denoisers, each trained
+individually without cross-communication. We show that
+the flow matching objective divides naturally into this distributed arrangement. Since diffusion models and rectified
+flows can be seen as special cases of flow matching, DFM
+applies directly across these popular algorithms. This generalizes a previous derivation for privacy-preserving diffusion
+models [18]. Specifically, we train each expert over a predetermined subset of the data distribution. Each expert’s
+predicted flow is combined at test-time using a router trained
+with a simple classification objective. The resulting ensemble samples the entire data distribution.
+
+ut (xt |x0 )
+
+ut (xt ) =
+x0
+
+pt (xt |x0 )q(x0 )
+dx0
+pt (xt )
+
+(1)
+
+Where ut (xt ) is the marginal flow, xt is our noisy latent, x0
+is a data sample, pt (xt |x0 ) is Gaussian and ut (xt |x0 ) is the
+conditional flow from x0 to xt . Flow matching regresses this
+analytical form of ut through a parametric model. Since we
+train over a discrete dataset, the integral becomes a summation,
+ut (xt ) =
+
+1 X
+ut (xt |x0 )pt (xt |x0 )q(x0 ).
+pt (xt ) x
+
+(2)
+
+0
+
+3.2. Decentralized Flow Matching Objective
+DFM decomposes the marginal flow into a series of expert flows. We partition the data into K disjoint clusters
+{S1 , S2 , . . . , SK }, and each expert trains on an assigned
+subset (x0 ∈ Si ). This is a natural choice, since empirical
+
+3.1. Preliminary: Flow Matching Objective
+Flow matching [27] defines a fixed forward corruption process and a learned reverse denoising process. We index this
+4
+
+Algorithm 1 Flow Router Training
+
+results suggest that image data lies on a disjoint union of
+manifolds [5, 25] and this may be one reason diffusion models are effective in the image domain [49]. Splitting across
+these subsets yields marginal flow of the form:
+ut (xt ) =
+
+K
+X
+k=1
+
+Require: Training data {x0 , k}, schedule {αt , σt }Tt=1
+1: while not converged do
+2:
+x0 , k ∼ D
+3:
+t ∼ {1, . . . , T }
+4:
+ϵ ∼ N (0, I)
+5:
+xt = αt x0 + σt ϵ
+6:
+z = rθ (xt , t) ∈ R|K|
+7:
+Update θ using ∇θ LCE (z, OneHot(k))
+8: end while
+
+X
+1
+ut (xt |x0 )pt (xt |x0 )q(x0 ). (3)
+pt (xt )
+x0 ∈Sk
+
+Finally, we find that marginal flow can be written as a linear
+combination of expert flows,
+ut (xt ) =
+
+K
+X
+pt,Sk (xt ) X ut (xt |x0 )pt (xt |x0 )q(x0 )
+, (4)
+pt (xt ) x ∈S
+pt,Sk (xt )
+k=1
+0
+k
+|
+{z
+}|
+{z
+}
+
+Router
+
+3.4. Expert Training
+The DFM objective divides the training task into learning
+a series of expert denoisers. Conveniently, these experts
+employ the same objective as standard flow matching:
+
+Data-Expert Flow
+
+where the outer sum results in a categorical probability distribution over all experts that we refer to as a ‘router’, and
+the inner sum is the marginal flow over each subset that we
+refer to as a data-expert flow. Please see the supplement for
+an alternative derivation based on score matching.
+This division is highly convenient for large-scale training.
+Instead of one monolith training run, we can train a number
+of independent expert denoisers. We train each with the
+standard flow-matching objective and zero cross-model communication. Separately, we train a router that predicts the
+probability that xt is drawn from each data subset, which can
+be formulated as the classification task we describe below.
+Similar to MoE, this learned router delegates computation
+to different parameters during inference. A key difference is
+that our router can be explicitly trained in isolation, instead
+of being trained end-to-end with gradients flowing through
+the entire model. At inference time, the experts combine in
+an ensemble that, as we show above, collectively optimize
+the same global objective as a monolithic training.
+
+2
+
+LCFM (θ) = Et,q(x0 ),pt (xt |x0 ) ∥vθ,t (xt ) − ut (xt |x0 )∥ .
+(6)
+We parameterize each expert as its own DiT, though it is
+important to note that our method is architecture-agnostic.
+We can even assign each denoiser a different architecture as
+long as it optimizes the above objective.
+
+3.5. Inference Strategy
+At test-time, we merge the predictions of our experts following the weights predicted by the router:
+ut (xt ) =
+
+k=1
+
+The router predicts the probability of a given xt being drawn
+from each of the data partitions.
+pt,Sk (xt )
+,
+pt (xt )
+
+k ∈ [K]
+
+rθ (xt , t) vθ,t (xt ) .
+| {z } | {z }
+Router
+
+(7)
+
+Expert
+
+While the full ensemble is necessary to exactly match the
+global flow matching objective, it is much less expensive
+to use a subset of experts or even only one expert for each
+test-time prediction. The model’s FLOP cost scales linearly
+with the number of active experts in each forward pass. This
+introduces a trade-off between theoretical correctness and
+computational efficiency. We can interpret this selection as
+instantiating model sparsity, where the model activates only
+a subset of its parameters in each forward pass. In MoE,
+this is demonstrated to improve performance with the same
+computational budget [16]. We compare different inference
+strategies empirically to outline this efficiency-correctness
+tradeoff, where we find selecting only the top expert is the
+most efficient approach and does not sacrifice quality.
+
+3.3. Router Training
+
+p(k|xt , t) =
+
+K
+X
+
+(5)
+
+To learn this, we sample input xt then supervise with a crossentropy loss over the cluster labels associated to each data
+sample. This loss is minimized when the model, rθ (xt , t),
+exactly predicts p(k|xt , t). See Algorithm 1 for details. Note
+that router trains independently of the denoisers.
+We parameterize rθ (xt , t) with a small diffusion transformer (DiT) [33] and use the same conditioning mechanisms as a DiT denoiser. We append a learned classification
+token [12] that we decode to cluster logits through a linear
+head following usual conventions.
+
+3.6. Distillation
+In production systems, it is difficult to deploy models with
+extremely high parameter counts. A DDM model with singleexpert selection at test-time achieves nearly the same FLOPs
+per forward pass as a monolithic model, even though it has
+5
+
+|K| times more parameters. Still, it requires |K| times more
+memory than the monolithic model to load in the first place.
+As model sizes scale past the memory budget of today’s
+accelerators, this becomes a challenging distributed systems
+problem. While this is achievable in many cases, we present
+a distillation approach as a convenient alternative.
+Specifically, the sparse DDM model can be distilled into a
+dense model. After the distillation, inference can be done just
+like any other diffusion model trained in a non-decentralized
+manner. Note that the goal of distillation here is to reduce
+K experts into a single model, not to reduce the number of
+denoising steps, as done in other diffusion distillation works
+[41, 47, 51]. We follow a teacher-student training procedure
+[19]. Specifically, we replace the conditional flow ut (xt |x0 )
+supervision target with a prediction from the teacher model:
+2
+
+Ldistill (θ) = Et,q(x0 ),pt (xt |x0 ) ∥vθ,t (xt ) − vteacher,t (xt )∥ .
+
+Inference Strategy
+
+GFLOPs ↓
+
+FID ↓
+
+CLIP FID ↓
+
+Monolith
+Oracle
+Full
+Top-1
+Top-2
+Top-3
+Sample-1
+Sample-2
+Sample-3
+Threshold-0.01
+Threshold-0.05
+Threshold-0.1
+Nucleus (T = 0.5)
+Nucleus (T = 1.0)
+Nucleus (T = 2.0)
+
+308
+308
+2490
+334
+642
+950
+334
+642
+950
+334
+334
+334
+
+12.81
+10.46
+10.52
+9.84
+10.31
+10.37
+157.05
+10.27
+10.44
+10.46
+10.37
+10.15
+188.66
+152.16
+33.9
+
+5.58
+5.83
+5.83
+5.48
+5.74
+5.77
+51.17
+5.73
+5.78
+5.81
+5.75
+5.72
+60.09
+48.37
+14
+
+Table 1. Test-Time Combination Strategies. We ablate strategies
+to sample from the ensemble at test-time and find that simply
+selecting the top expert outperforms more sophisticated alternatives.
+
+In our case, we use the cluster label assigned to each data
+point to select a single teacher expert per training example.
+
+and evaluating all models. Our FID figures align well with
+published results and our consistent implementation provides
+precise relative comparisons between different approaches.
+This standardization eliminates confounding variables that
+often complicate comparisons of generative models.
+
+4. Experiments
+We evaluate the effectiveness of decentralized diffusion models on the academic ImageNet dataset and a subset of the
+LAION [42] dataset filtered for aesthetic scores of 5 or
+higher, which more closely resembles real-world training
+scenarios. Our goal is to analyze the design space of decentralized diffusion models applied to widely-adopted settings
+so that practitioners can confidently adapt the method to
+their needs. For this reason, we use standard architectures,
+hyperparameters and data when possible.
+
+Training Details For ImageNet experiments, we adopt the
+hyperparameters and architecture from diffusion transformers [33], using a batch size of 256, EMA decay rate of
+0.9999, and learning rate of 1e-4 without warmup or decay.
+We aim to replicate plausible real-world training runs with
+our LAION experiments, so we scale the batch size to 1024.
+
+4.1. Implementation Details
+
+We reimplement the DiT XL/2 architecture for our denoising models, with each containing 895M parameters. In
+decentralized diffusion models, the total parameter count
+scales linearly with the number of experts. However, the
+computational cost remains constant during inference when
+using single expert selection.
+
+Dataset Partitioning We partition the dataset in an efficient
+manner that facilitates learning the decentralized flow matching objective. Naive k-means scales quadratically with input
+data size, which is a non-starter for massive Internet datasets.
+Ma et al. [29] propose a multi-stage algorithm that efficiently
+consolidates a large number of fine-grained clusters into a
+small number of partitions. We adopt this approach to focus
+our efforts on generative modeling.
+Following [29], we compute image features for the images in the dataset by pooling the output from DINOv2 [32]
+to incorporate both pixel features and semantics, cluster these
+features to 1024 fine-grained centroids, and then further consolidate to k coarse centroids. We assign each data point to
+the nearest of the coarse centroids to produce the final set
+of partitions. This partitioning process is computationally
+negligible compared to training.
+
+For LAION experiments, we implement text conditioning
+following the Pix-Art Alpha [7] architecture, using SDXL’s
+CLIP [9, 36] model to incorporate text via cross-attention.
+The router uses the smaller DiT B/2 architecture (158M parameters) augmented with a learned CLS token that decodes
+linearly to a probability distribution over the clusters.
+We ensure fair comparison by maintaining consistent total computation across decentralized diffusion models and
+baseline monolith models. We achieve this simply by dividing total batch size evenly among experts. For example, with
+eight experts, a 256 monolith batch size corresponds to eight
+expert batches of size 32. This equalizes the total training
+FLOPs between DDMs and baselines. The router introduces
+an additional 4% measured training FLOPs overhead, which
+we also incorporate in our comparisons.
+
+Evaluations We control for known sensitivities in FID calculations that arise from different implementations and evaluation splits. We designate a fixed evaluation set of 50,000
+samples from each training dataset for computing features
+6
+
+10
+
+Train Steps
+200k
+300k
+400k
+
+LAION Cluster Count Ablation
+Train Steps
+200k
+300k
+400k
+
+FID-50K
+
+9
+8
+7
+6
+
+Monolith
+
+4
+
+8
+
+# Clusters in Ensemble
+(a)
+
+5 Monolith
+
+16
+
+4
+
+8
+
+# Clusters in Ensemble
+(b)
+
+ImageNet FID Comparison
+Monolith
+Decentralized
+
+30
+
+FID-50K
+
+20
+15
+
+5e+19
+
+1e+20
+
+2e+20
+
+Training FLOPs
+
+Random Clusters
+DINOv2 Clusters
+
+100k
+
+10
+
+(d)
+
+300k
+
+400k
+
+(c)
+
+8
+6
+
+4
+0e+00
+
+2e+20
+
+200k
+
+Optimization Steps
+
+Monolith
+Decentralized
+
+12
+
+10
+5
+0e+00
+
+Clustering FID Comparison
+
+LAION Aes. FID Comparison
+
+FID-50K
+
+25
+
+16
+
+70
+60
+50
+40
+30
+20
+10
+
+FID-50K
+
+ImageNet Cluster Count Ablation
+
+FID-50K
+
+40
+35
+30
+25
+20
+15
+10
+5
+
+2e+20
+
+4e+20
+
+6e+20
+
+Training FLOPs
+
+8e+20
+
+(e)
+
+Figure 4. Ablations at the DiT XL model scale. Eight-expert DDMs display the best consistent performance on ImageNet (a) and LAION
+Aesthetics (b). We show the importance of image-based clustering on ImageNet compared to random clustering (c). Finally, FLOP-for-FLOP,
+decentralized diffusion models outperform monolith diffusion models on both datasets (d, e).
+
+4.2. Ensembling at Test-Time
+We first compare different strategies to combine expert predictions at test-time. A full estimate of the marginal flow
+involves linearly combining all expert predictions:
+
+ut (xt ) =
+
+K
+X
+k=1
+
+rθ (xt , t) vθ,t (xt ) .
+| {z } | {z }
+Router
+
+(8)
+
+Figure 5. DDMs optimize the global diffusion objective. We
+average samples from the monolithic and DDM ImageNet models
+using a deterministic sampler with matching random seeds (left)
+and compare them to outputs generated with random noise samples
+(right). The left samples are highly correlated, appearing less blurry.
+
+Expert
+
+In practice, selecting only important experts saves on computation. We evaluate the following strategies:
+• Full. Compute the weighted combination of all expert
+predictions. This strategy’s FLOP cost scales linearly with
+the number of experts.
+• Sample. Sample from the router’s predicted softmax distribution to select a single expert. This is an unbiased
+Monte-Carlo estimate of the marginal flow.
+• Top-k. Simply use the k experts with the maximum predicted router probability. Top-1 selection is the most efficient option at test-time.
+• Nucleus. Sample one expert according to the nucleus
+(top-p) sampling strategy [22] commonly used in large
+language models. We use p = 0.9 and ablate softmax
+temperature in Table 1.
+• Oracle. Select one expert according to the cluster label
+associated with an evaluation image. Used only to evaluate
+the effectiveness of the learned router.
+
+In Table 1, we evaluate these inference strategies on ImageNet. We find that top-1 selection outperforms all other
+alternatives, while also incurring the lowest FLOP cost. For
+all other comparisons in Figures 4 and 6, we use top-1 selection because it nearly matches the computational cost of a
+dense model.
+
+4.3. Selecting the Right Number of Experts
+The DFM objective theoretically supports any number of
+experts, but practically we find this is an important hyperparameter for DDMs. This choice determines both the degree
+of decentralization and the total parameter count of the system. In the theoretical limit, where the number of experts approaches the number of training samples, the system would
+reduce to a nearest neighbor lookup that can only reproduce
+7
+
+Scaling Study
+
+form standard diffusion models on a FLOP-for-FLOP basis.
+In Figure 4d, we compare FID on ImageNet up to 800k training steps. The decentralized diffusion model achieves a 28%
+lower FID at 800k steps (6.081 vs. 8.494). Note that we plot
+FID as a function of training FLOPs to account for the 4%
+additional training cost of the router.
+We find that the performance uplift is also significant on
+captioned internet data with LAION in Figure 4e. In fact, it
+achieves a lower FID of 6.48 at 200k optimization steps than
+the monolith’s 6.52 FID at 800k steps. This represents a 4x
+training speedup as well as a lower convergence FID.
+We also visually verify the correctness of the DFM objective. The standard diffusion objective predictably pairs noise
+samples and data samples, so a well-trained DDM should
+sample a similar image as a monolith for the same input
+noise. We verify this in Figure 5. Please see more samples
+and analysis of DDM in the supplemental.
+
+FID-50K
+
+DiT_B (160M)
+DiT_XL (900M)
+MMDiT (3B)
+
+101
+1019
+
+1020
+
+1021
+
+Training FLOPs
+
+1022
+
+1023
+
+Figure 6. Decentralized diffusion models scale gracefully to
+billions of parameters. Throughout training, we plot the FID over
+LAION Aesthetics as a function of training compute. We find that
+increasing expert model capacity and training compute predictably
+improves performance.
+
+LAION 8 Cluster Distillation
+
+20
+Monolith
+18
+Distilled
+16
+14
+12
+10
+8
+6
+4 50K 100K 150K 200K 250K 300K 350K 400K
+
+4.5. Data Clustering Ablation
+
+FID-50K
+
+DFM imposes no explicit constraints on cluster size or composition, so we ablate two clustering strategies. We find
+that the chosen strategy significantly impacts model performance. Comparing feature-based clustering using DINO
+against random cluster assignments, which would maintain
+i.i.d. properties across partitions, reveals that feature-based
+clustering improves results significantly. We hypothesize
+that there is more mutual information within feature clusters than random clusters, meaning expert models can more
+efficiently compress and specialize in their assigned subdistributions. When data possesses semantic or low-level
+feature similarities, experts are free to learn more focused
+representations.
+
+Optimization Steps
+
+Figure 7. Distilling a DDM into a dense model. Dense models are
+often more convenient than sparse models to serve in production
+settings. Distilling a decentralized diffusion model into a dense
+model matches the performance of training a monolith from scratch
+at one third of the FLOP-cost (1/4 batch size).
+
+4.6. Distillation
+While our method achieves computational efficiency through
+top-1 expert selection at inference time, the total memory
+footprint of many expert models can be substantial. We
+address this limitation through knowledge distillation, compressing the ensemble’s capabilities into a dense model. Our
+approach supervises a student model with predictions from
+the expert ensemble, selecting the appropriate expert for
+each training example based on its cluster label. This can be
+seen as distilling the top-1 sparse model and incurs the same
+cost as standard teacher-student distillation.
+Our distilled model matches the performance of directly
+training on the dataset, despite using only one quarter of the
+batch size and, consequently, one third the training FLOPs
+(assuming a backward pass costs double a forward pass).
+After 400k training steps, the distilled model achieves an
+FID of 7.76, comparable to the baseline model’s FID of
+7.82 (Figure 7). Many diffusion distillation works focus on
+reducing the number of sampling steps, whereas we just aim
+to replicate the ensemble in a dense model. We leave the
+
+training examples—equivalent to the analytical form of flow
+matching. We also find that individual experts train poorly
+as the global batch size is divided too aggressively, as in the
+16 expert (batch size 16 per expert) experiment in Figure 4a.
+We compare DDMs with 4, 8 and 16 experts in Figures
+4a and 4b, and we find that eight experts achieves the best
+performance consistently on ImageNet and LAION. This
+configuration enables strong decentralization while maintaining reasonable test-time memory requirements. The eight
+experts appear to specialize meaningfully while preserving
+coherent coverage of the data distribution. Empirically, we
+find this is a sweet spot for the competing factors of model
+capacity, decentralization, and practical deployment.
+
+4.4. DDMs vs. Monoliths
+We compare decentralized diffusion models against a fair
+monolithic baseline on both datasets. We find that decentralized diffusion models with eight experts consistently outper8
+
+References
+
+exploration of combining our method with sampling-focused
+distillation techniques as promising future work.
+
+[1] Wei An, Xiao Bi, Guanting Chen, Shanhuang Chen, Chengqi
+Deng, Honghui Ding, Kai Dong, Qiushi Du, Wenjun Gao,
+Kang Guan, et al. Fire-flyer ai-hpc: A cost-effective
+software-hardware co-design for deep learning. arXiv preprint
+arXiv:2408.14158, 2024. 1
+[2] Benjamin Biggs, Arjun Seshadri, Yang Zou, Achin Jain,
+Aditya Golatkar, Yusheng Xie, Alessandro Achille, Ashwin
+Swaminathan, and Stefano Soatto. Diffusion soup: Model
+merging for text-to-image diffusion models. arXiv preprint
+arXiv:2406.08431, 2024. 4
+[3] Rishi Bommasani, Drew A Hudson, Ehsan Adeli, Russ Altman, Simran Arora, Sydney von Arx, Michael S Bernstein,
+Jeannette Bohg, Antoine Bosselut, Emma Brunskill, et al.
+On the opportunities and risks of foundation models. arXiv
+preprint arXiv:2108.07258, 2021. 3
+[4] Tim Brooks, Bill Peebles, Connor Holmes, Will DePue, Yufei
+Guo, Li Jing, David Schnurr, Joe Taylor, Troy Luhman, Eric
+Luhman, et al. Video generation models as world simulators.
+2024. URL https://openai. com/research/video-generationmodels-as-world-simulators, 3, 2024. 1
+[5] Bradley CA Brown, Anthony L Caterini, Brendan Leigh Ross,
+Jesse C Cresswell, and Gabriel Loaiza-Ganem. Verifying the
+union of manifolds hypothesis for image data. arXiv preprint
+arXiv:2207.02862, 2022. 5
+[6] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan,
+Pranav Shyam, Girish Sastry, Amanda Askell, and Sandhini Agarwal et al. Language models are few-shot learners,
+2020. 1
+[7] Junsong Chen, Jincheng Yu, Chongjian Ge, Lewei Yao, Enze
+Xie, Yue Wu, Zhongdao Wang, James Kwok, Ping Luo,
+Huchuan Lu, and Zhenguo Li. Pixart-α: Fast training of
+diffusion transformer for photorealistic text-to-image synthesis, 2023. 1, 3, 6
+[8] Ricky TQ Chen, Yulia Rubanova, Jesse Bettencourt, and
+David K Duvenaud. Neural ordinary differential equations.
+Advances in neural information processing systems, 31, 2018.
+3
+[9] Mehdi Cherti, Romain Beaumont, Ross Wightman, Mitchell
+Wortsman, Gabriel Ilharco, Cade Gordon, Christoph Schuhmann, Ludwig Schmidt, and Jenia Jitsev. Reproducible scaling laws for contrastive language-image learning. In Proceedings of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition, pages 2818–2829, 2023. 6
+[10] Cheng Chi, Zhenjia Xu, Siyuan Feng, Eric Cousineau, Yilun
+Du, Benjamin Burchfiel, Russ Tedrake, and Shuran Song.
+Diffusion policy: Visuomotor policy learning via action diffusion. The International Journal of Robotics Research, page
+02783649241273668, 2023. 1
+[11] DeepSeek-AI, Aixin Liu, Bei Feng, Bing Xue, Bingxuan
+Wang, Bochao Wu, Chengda Lu, Chenggang Zhao, Chengqi
+Deng, Chenyu Zhang, Chong Ruan, Damai Dai, Daya Guo,
+Dejian Yang, Deli Chen, Dongjie Ji, Erhang Li, Fangyun
+Lin, Fucong Dai, Fuli Luo, Guangbo Hao, Guanting Chen,
+Guowei Li, H. Zhang, Han Bao, Hanwei Xu, Haocheng Wang,
+Haowei Zhang, Honghui Ding, Huajian Xin, Huazuo Gao,
+
+4.7. Scaling Experiment
+We perform a scaling study of decentralized diffusion models.
+At each scale, we follow best practices gleaned from our
+ablations and train a system of eight expert models, each
+based on the FLUX MMDiT architecture [15]. We use a
+hidden dimension of 2560, depth of 30, and separate text and
+visual token streams, which total 3B parameters per expert.
+We encode text prompts using a single T5 XL model [37] and
+mix their features with image features through self attention.
+Crucially, each expert can be trained independently on
+readily available hardware. With 16 GPUs per expert, we
+train at 0.28 seconds per iteration for 1M pretraining steps.
+Using gradient accumulation, this is equivalent to training
+each expert on a single on-demand cloud GPU node for six
+and a half days. This demonstrates that our method enables
+training large-scale diffusion models without specialized
+infrastructure or large integrated compute clusters.
+We evaluate our large-scale ensemble against smaller DiT
+B and XL [33] ensembles in Figure 6. DDM performance
+improves as a function of expert parametrization and does
+not saturate at any scale we tried. We finally finetune our
+largest ensemble for 60k steps on high-resolution data and
+display some selected samples in Figure 2.
+
+5. Discussion
+Decentralized diffusion models enable high-quality generative model training across isolated compute clusters, greatly
+broadening the possible hardware configurations for diffusion model training. While we focus on distributing computational resources, DFM theoretically permits decentralizing
+data as well—a property with potential privacy implications
+for domains like medical imaging. Experts can train locally where sensitive data resides, and a router can train on
+samples from these experts rather than the raw data. These
+ideas allow DDM to preserve data privacy and sovereignty,
+as private data never leaves its original location. Furthermore, combining DDMs with low-bandwidth training methods could push the boundaries of decentralization—perhaps
+enabling large-scale model training on true commodity hardware. While we experiment on image modeling, the principles proposed by DDM may be applied to other domains,
+such as medical imaging, robotic policies and video modeling. We look forward to future works in these directions.
+Acknowledgements. We would like to thank Alex Yu for
+his guidance throughout the project and his score matching
+derivation. We would also like to thank Daniel Mendelevitch,
+Songwei Ge, Dan Kondratyuk, Haiwen Feng, Terrance DeVries, Chung Min Kim, Hang Gao, Justin Kerr and the Luma
+AI research team for helpful discussions.
+9
+
+Hui Li, Hui Qu, J. L. Cai, Jian Liang, Jianzhong Guo, Jiaqi Ni,
+Jiashi Li, Jiawei Wang, Jin Chen, Jingchang Chen, Jingyang
+Yuan, Junjie Qiu, Junlong Li, Junxiao Song, Kai Dong, Kai
+Hu, Kaige Gao, Kang Guan, Kexin Huang, Kuai Yu, Lean
+Wang, Lecong Zhang, Lei Xu, Leyi Xia, Liang Zhao, Litong
+Wang, Liyue Zhang, Meng Li, Miaojun Wang, Mingchuan
+Zhang, Minghua Zhang, Minghui Tang, Mingming Li, Ning
+Tian, Panpan Huang, Peiyi Wang, Peng Zhang, Qiancheng
+Wang, Qihao Zhu, Qinyu Chen, Qiushi Du, R. J. Chen, R. L.
+Jin, Ruiqi Ge, Ruisong Zhang, Ruizhe Pan, Runji Wang,
+Runxin Xu, Ruoyu Zhang, Ruyi Chen, S. S. Li, Shanghao Lu,
+Shangyan Zhou, Shanhuang Chen, Shaoqing Wu, Shengfeng
+Ye, Shengfeng Ye, Shirong Ma, Shiyu Wang, Shuang Zhou,
+Shuiping Yu, Shunfeng Zhou, Shuting Pan, T. Wang, Tao
+Yun, Tian Pei, Tianyu Sun, W. L. Xiao, Wangding Zeng,
+Wanjia Zhao, Wei An, Wen Liu, Wenfeng Liang, Wenjun Gao,
+Wenqin Yu, Wentao Zhang, X. Q. Li, Xiangyue Jin, Xianzu
+Wang, Xiao Bi, Xiaodong Liu, Xiaohan Wang, Xiaojin Shen,
+Xiaokang Chen, Xiaokang Zhang, Xiaosha Chen, Xiaotao
+Nie, Xiaowen Sun, Xiaoxiang Wang, Xin Cheng, Xin Liu,
+Xin Xie, Xingchao Liu, Xingkai Yu, Xinnan Song, Xinxia
+Shan, Xinyi Zhou, Xinyu Yang, Xinyuan Li, Xuecheng Su,
+Xuheng Lin, Y. K. Li, Y. Q. Wang, Y. X. Wei, Y. X. Zhu,
+Yang Zhang, Yanhong Xu, Yanhong Xu, Yanping Huang,
+Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Li, Yaohui Wang,
+Yi Yu, Yi Zheng, Yichao Zhang, Yifan Shi, Yiliang Xiong,
+Ying He, Ying Tang, Yishi Piao, Yisong Wang, Yixuan Tan,
+Yiyang Ma, Yiyuan Liu, Yongqiang Guo, Yu Wu, Yuan Ou,
+Yuchen Zhu, Yuduan Wang, Yue Gong, Yuheng Zou, Yujia He,
+Yukun Zha, Yunfan Xiong, Yunxian Ma, Yuting Yan, Yuxiang
+Luo, Yuxiang You, Yuxuan Liu, Yuyang Zhou, Z. F. Wu,
+Z. Z. Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhean Xu, Zhen
+Huang, Zhen Zhang, Zhenda Xie, Zhengyan Zhang, Zhewen
+Hao, Zhibin Gou, Zhicheng Ma, Zhigang Yan, Zhihong Shao,
+Zhipeng Xu, Zhiyu Wu, Zhongyu Zhang, Zhuoshu Li, Zihui
+Gu, Zijia Zhu, Zijun Liu, Zilin Li, Ziwei Xie, Ziyang Song,
+Ziyi Gao, and Zizheng Pan. Deepseek-v3 technical report,
+2024. 3
+[12] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina
+Toutanova.
+Bert: Pre-training of deep bidirectional
+transformers for language understanding. arXiv preprint
+arXiv:1810.04805, 2018. 5
+[13] Arthur Douillard, Qixuan Feng, Andrei A Rusu, Rachita
+Chhaparia, Yani Donchev, Adhiguna Kuncoro, Marc’Aurelio
+Ranzato, Arthur Szlam, and Jiajun Shen. Diloco: Distributed
+low-communication training of language models. arXiv
+preprint arXiv:2311.08105, 2023. 4
+[14] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil
+Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The
+llama 3 herd of models. arXiv preprint arXiv:2407.21783,
+2024. 1
+[15] Patrick Esser, Sumith Kulal, Andreas Blattmann, Rahim Entezari, Jonas Müller, Harry Saini, Yam Levi, Dominik Lorenz,
+Axel Sauer, Frederic Boesel, et al. Scaling rectified flow transformers for high-resolution image synthesis. In Forty-first
+International Conference on Machine Learning, 2024. 9, 12
+[16] William Fedus, Barret Zoph, and Noam Shazeer. Switch
+
+transformers: Scaling to trillion parameter models with simple
+and efficient sparsity. Journal of Machine Learning Research,
+23(120):1–39, 2022. 3, 5
+[17] Trevor Gale, Deepak Narayanan, Cliff Young, and Matei
+Zaharia. Megablocks: Efficient sparse training with mixtureof-experts. Proceedings of Machine Learning and Systems, 5:
+288–304, 2023. 3
+[18] Aditya Golatkar, Alessandro Achille, Ashwin Swaminathan,
+and Stefano Soatto. Training data protection with compositional diffusion models, 2024. 4
+[19] Geoffrey Hinton. Distilling the knowledge in a neural network.
+arXiv preprint arXiv:1503.02531, 2015. 6
+[20] Jonathan Ho and Tim Salimans. Classifier-free diffusion
+guidance, 2022. 12
+[21] Jonathan Ho, Ajay Jain, and Pieter Abbeel. Denoising diffusion probabilistic models. Advances in neural information
+processing systems, 33:6840–6851, 2020. 3
+[22] Ari Holtzman, Jan Buys, Li Du, Maxwell Forbes, and Yejin
+Choi. The curious case of neural text degeneration, 2020. 7
+[23] Emiel Hoogeboom, Jonathan Heek, and Tim Salimans. Simple diffusion: End-to-end diffusion for high resolution images,
+2023. 12
+[24] Albert Q Jiang, Alexandre Sablayrolles, Antoine Roux,
+Arthur Mensch, Blanche Savary, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna,
+Florian Bressand, et al. Mixtral of experts. arXiv preprint
+arXiv:2401.04088, 2024. 3
+[25] Hamidreza Kamkari, Brendan Leigh Ross, Rasa Hosseinzadeh, Jesse C Cresswell, and Gabriel Loaiza-Ganem. A
+geometric view of data complexity: Efficient local intrinsic
+dimension estimation with diffusion models. arXiv preprint
+arXiv:2406.03537, 2024. 5
+[26] Margaret Li, Suchin Gururangan, Tim Dettmers, Mike Lewis,
+Tim Althoff, Noah A Smith, and Luke Zettlemoyer. Branchtrain-merge: Embarrassingly parallel training of expert language models. arXiv preprint arXiv:2208.03306, 2022. 4
+[27] Yaron Lipman, Ricky TQ Chen, Heli Ben-Hamu, Maximilian
+Nickel, and Matt Le. Flow matching for generative modeling.
+arXiv preprint arXiv:2210.02747, 2022. 3, 4, 12
+[28] Xingchao Liu, Chengyue Gong, and Qiang Liu. Flow straight
+and fast: Learning to generate and transfer data with rectified
+flow. arXiv preprint arXiv:2209.03003, 2022. 3
+[29] Jiawei Ma, Po-Yao Huang, Saining Xie, Shang-Wen Li, Luke
+Zettlemoyer, Shih-Fu Chang, Wen-Tau Yih, and Hu Xu.
+Mode: Clip data experts via clustering. In Proceedings of
+the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 26354–26363, 2024. 6
+[30] Brendan McMahan, Eider Moore, Daniel Ramage, Seth
+Hampson, and Blaise Aguera y Arcas. Communicationefficient learning of deep networks from decentralized data. In
+Artificial intelligence and statistics, pages 1273–1282. PMLR,
+2017. 3
+[31] Mark Morey. Data center owners turn to nuclear as potential
+electricity source - u.s. energy information administration
+(eia), 2024. 3
+[32] Maxime Oquab, Timothée Darcet, Théo Moutakanni, Huy Vo,
+Marc Szafraniec, Vasil Khalidov, Pierre Fernandez, Daniel
+
+10
+
+Haziza, Francisco Massa, Alaaeldin El-Nouby, et al. Dinov2:
+Learning robust visual features without supervision. arXiv
+preprint arXiv:2304.07193, 2023. 6
+[33] William Peebles and Saining Xie. Scalable diffusion models
+with transformers. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 4195–4205,
+2023. 5, 6, 9
+[34] Dustin Podell, Zion English, Kyle Lacey, Andreas Blattmann,
+Tim Dockhorn, Jonas Müller, Joe Penna, and Robin Rombach.
+Sdxl: Improving latent diffusion models for high-resolution
+image synthesis. arXiv preprint arXiv:2307.01952, 2023. 1
+[35] Adam Polyak, Amit Zohar, Andrew Brown, Andros Tjandra,
+Animesh Sinha, Ann Lee, Apoorv Vyas, Bowen Shi, ChihYao Ma, Ching-Yao Chuang, et al. Movie gen: A cast of
+media foundation models. arXiv preprint arXiv:2410.13720,
+2024. 1
+[36] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya
+Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,
+Amanda Askell, Pamela Mishkin, Jack Clark, et al. Learning
+transferable visual models from natural language supervision. In International conference on machine learning, pages
+8748–8763. PMLR, 2021. 6
+[37] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee,
+Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, and
+Peter J Liu. Exploring the limits of transfer learning with a
+unified text-to-text transformer. Journal of machine learning
+research, 21(140):1–67, 2020. 9
+[38] Sashank Reddi, Zachary Charles, Manzil Zaheer, Zachary
+Garrett, Keith Rush, Jakub Konečnỳ, Sanjiv Kumar, and
+H Brendan McMahan. Adaptive federated optimization. arXiv
+preprint arXiv:2003.00295, 2020. 4
+[39] Robin Rombach, Andreas Blattmann, Dominik Lorenz,
+Patrick Esser, and Björn Ommer. High-resolution image
+synthesis with latent diffusion models. In Proceedings of
+the IEEE/CVF conference on computer vision and pattern
+recognition, pages 10684–10695, 2022. 1
+[40] Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li,
+Jay Whang, Emily L Denton, Kamyar Ghasemipour, Raphael
+Gontijo Lopes, Burcu Karagol Ayan, Tim Salimans, et al. Photorealistic text-to-image diffusion models with deep language
+understanding. Advances in neural information processing
+systems, 35:36479–36494, 2022. 1
+[41] Tim Salimans and Jonathan Ho. Progressive distillation
+for fast sampling of diffusion models. arXiv preprint
+arXiv:2202.00512, 2022. 6
+[42] Christoph Schuhmann, Romain Beaumont, Richard Vencu,
+Cade Gordon, Ross Wightman, Mehdi Cherti, Theo Coombes,
+Aarush Katta, Clayton Mullis, Mitchell Wortsman, et al.
+Laion-5b: An open large-scale dataset for training next generation image-text models. Advances in Neural Information
+Processing Systems, 35:25278–25294, 2022. 6
+[43] Vikash Sehwag, Xianghao Kong, Jingtao Li, Michael
+Spranger, and Lingjuan Lyu. Stretching each dollar: Diffusion training from scratch on a micro-budget. arXiv preprint
+arXiv:2407.15811, 2024. 3
+[44] Jascha Sohl-Dickstein, Eric Weiss, Niru Maheswaranathan,
+and Surya Ganguli. Deep unsupervised learning using
+
+nonequilibrium thermodynamics. In International conference on machine learning, pages 2256–2265. PMLR, 2015.
+3
+[45] Yang Song and Stefano Ermon. Generative modeling by
+estimating gradients of the data distribution. Advances in
+neural information processing systems, 32, 2019.
+[46] Yang Song, Jascha Sohl-Dickstein, Diederik P Kingma, Abhishek Kumar, Stefano Ermon, and Ben Poole. Score-based
+generative modeling through stochastic differential equations.
+arXiv preprint arXiv:2011.13456, 2020. 3, 4, 12
+[47] Yang Song, Prafulla Dhariwal, Mark Chen, and Ilya Sutskever.
+Consistency models. arXiv preprint arXiv:2303.01469, 2023.
+6
+[48] Tao Sun, Dongsheng Li, and Bao Wang. Decentralized federated averaging. IEEE Transactions on Pattern Analysis and
+Machine Intelligence, 45(4):4289–4301, 2022. 4
+[49] Peng Wang, Huijie Zhang, Zekai Zhang, Siyi Chen, Yi
+Ma, and Qing Qu. Diffusion models learn low-dimensional
+distributions via subspace clustering.
+arXiv preprint
+arXiv:2409.02426, 2024. 5
+[50] Mitchell Wortsman, Gabriel Ilharco, Samir Ya Gadre, Rebecca Roelofs, Raphael Gontijo-Lopes, Ari S Morcos,
+Hongseok Namkoong, Ali Farhadi, Yair Carmon, Simon Kornblith, et al. Model soups: averaging weights of multiple
+fine-tuned models improves accuracy without increasing inference time. In International conference on machine learning,
+pages 23965–23998. PMLR, 2022. 4
+[51] Tianwei Yin, Michaël Gharbi, Richard Zhang, Eli Shechtman, Fredo Durand, William T Freeman, and Taesung Park.
+One-step diffusion with distribution matching distillation. In
+Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages 6613–6623, 2024. 6
+[52] Sihyun Yu, Sangkyung Kwak, Huiwon Jang, Jongheon Jeong,
+Jonathan Huang, Jinwoo Shin, and Saining Xie. Representation alignment for generation: Training diffusion transformers
+is easier than you think. arXiv preprint arXiv:2410.06940,
+2024. 3
+[53] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, ChienChin Huang, Min Xu, Less Wright, Hamid Shojanazeri, Myle
+Ott, Sam Shleifer, et al. Pytorch fsdp: experiences on scaling
+fully sharded data parallel. arXiv preprint arXiv:2304.11277,
+2023. 3
+[54] Yanqi Zhou, Tao Lei, Hanxiao Liu, Nan Du, Yanping Huang,
+Vincent Zhao, Andrew M Dai, Quoc V Le, James Laudon,
+et al. Mixture-of-experts with expert choice routing. Advances
+in Neural Information Processing Systems, 35:7103–7114,
+2022. 3
+
+11
+
+A. Score Matching Derivation
+
+employs an 8× spatial downsampling factor. Throughout
+training, we maintain a patch size of 2 for best quality, resulting in a pretraining context length of 256.
+For high-resolution finetuning, we choose five aspect
+ratio buckets to handle varying image dimensions while
+maintaining consistent tokenized sequence length (3600).
+The bucket are as follows:
+• 1280 × 720 (16:9 landscape)
+• 1200 × 768 ( 3:2 landscape)
+• 960 × 960 (square)
+• 768 × 1200 ( 2:3 portrait)
+• 720 × 1280 (9:16 portrait)
+Images are mapped to their nearest matching bucket by
+aspect ratio. Following best practices from Stable Diffusion
+3 [15], we adjust the timestep schedule for high-resolution
+training and inference by applying a log-SNR shift of 3 [23].
+We also modify the Rotary Positional Embedding (RoPE) in
+the MMDiT architecture by interpolating RoPE inputs within
+the central square region and extrapolating for peripheral
+areas.
+For evaluation, we use standard classifier-free guidance
+scales: 7.5 for LAION text-conditional generation and 3 for
+ImageNet class-conditional generation. All evaluations use
+50 sampling steps to ensure consistent comparisons. We
+compute FID, CLIP-FID and DINO-FID metrics on fixed
+evaluation splits to standardize evaluations.
+
+We provide an alternative derivation of Decentralized Flow
+Matching based on score matching [46] rather than flow
+matching [27]. We begin with the score, which is the gradient
+of the log likelihood, pt (xt ).
+∇xt log pt (xt )
+
+(9)
+
+By applying the chain rule, this can be expressed in terms of
+the derivative of the likelihood itself:
+∇xt log pt (xt ) =
+
+1
+· ∇xt pt (xt ).
+pt (xt )
+
+(10)
+
+Let us assume our data, x0 , is generated in a bi-level fashion:
+x0 ∼ p0 (x0 |v),
+
+v ∼ pv (v),
+
+(11)
+
+where v is the cluster label discussed in the DDM method
+and pv (v) follows a distribution defined by the clustering
+procedure. The marginal likelihood pt (xt ) can then be expressed by integrating over v:
+∇xt log pt (xt ) =
+
+X
+1
+· ∇ xt
+p(v) · pt (xt |v). (12)
+pt (xt )
+v
+
+By linearity of differentiation, we distribute the gradient over
+the summation:
+X
+1
+·
+=
+p(v) · ∇xt pt (xt |v).
+(13)
+pt (xt ) v
+
+C. Additional Quantitative Analysis
+Our additional quantitative analysis explores key test-time
+DDM hyperparameters. We test various ensemble combinations in Table 2, including nucleus sampling which is
+common in LLM decoding. Top-1 sampling consistently
+delivers the best performance while being the most computationally efficient. This finding holds across different expert
+counts, router temperatures, and threshold probabilities.
+Our classifier-free guidance (CFG) [20] scale experiments
+(Figure 8) show that DDMs respond similarly to monolith
+models, suggesting that standard CFG scales can be directly
+applied to DDMs. Additionally, our training efficiency analysis (Figures 8e and 8f) confirms that distillation achieves
+comparable generation quality (FID) with only one-quarter
+of the monolith’s batch size (256 vs 1024).
+
+Since the gradient of a log probability can be expressed as
+the probability multiplied by the gradient of its log,
+=
+
+X
+1
+·
+p(v)pt (xt |v) · ∇xt log pt (xt |v).
+pt (xt ) v
+
+Finally, we invoke Bayes’ Theorem:
+X
+=
+pt (v|xt ) · ∇xt log pt (xt |v)
+
+(14)
+
+(15)
+
+v
+
+This result mirrors the flow matching derivation, showing
+that the score prediction for the overall data distribution
+can be recast as a linear combination of score predictions
+for each data cluster. Each learned expert predicts its own
+conditional score, which ensemble according to the posterior
+probability of the expert label given the latent xt .
+
+D. Additional Qualitative Results
+We provide additional selected samples from our largest
+DDM ensemble in Figure 9 as well as random samples for
+different text prompts in Figures 10 through 17.
+
+B. Additional Training and Evaluation Details
+Our split of LAION Aesthetics contains 153.6 million imagecaption pairs. We pretrain all diffusion models on 256x256
+square crop images encoded through Huggingface’s finetuned Stable Diffusion VAE (sd-vae-ft-mse). This encoder
+12
+
+Expert Count vs. CFG Scale
+
+8
+
+# Experts
+4
+8
+16
+
+6
+5
+4
+3
+
+2.5
+
+5.0
+
+7.5
+
+10.0
+
+CFG Scale
+
+12.5
+
+15.0
+
+2
+
+17.5
+
+5.0
+
+7.5
+
+10.0
+
+CFG Scale
+
+12.5
+
+15.0
+
+17.5
+
+DDM vs. Monolith Across CFG Scales (CLIP)
+# Experts
+8
+Monolith
+
+7
+
+CLIP FID-50K
+
+FID-50K
+
+8
+
+# Experts
+8
+Monolith
+
+10
+
+2.5
+
+(b)
+
+DDM vs. Monolith Across CFG Scales
+
+12
+
+6
+5
+
+8
+
+4
+
+6
+4
+
+# Experts
+4
+8
+16
+
+7
+
+(a)
+
+14
+
+Expert Count vs. CFG Scale (CLIP)
+
+CLIP FID-50K
+
+FID-50K
+
+12
+11
+10
+9
+8
+7
+6
+5
+4
+
+3
+2.5
+
+5.0
+
+7.5
+
+10.0
+
+CFG Scale
+
+12.5
+
+15.0
+
+2
+
+17.5
+
+(c)
+
+2.5
+
+5.0
+
+7.5
+
+10.0
+
+CFG Scale
+
+12.5
+
+15.0
+
+17.5
+
+(d)
+
+LAION 8 Cluster Distillation
+
+LAION 8 Cluster Distillation (CLIP)
+
+20
+Monolith
+18
+Distilled
+16
+14
+12
+10
+8
+6
+4 50K 100K 150K 200K 250K 300K 350K 400K
+
+FID-50K
+
+CLIP FID-50K
+
+16
+Monolith
+14
+Distilled
+12
+10
+8
+6
+4
+2 50K 100K 150K 200K 250K 300K 350K 400K
+
+Optimization Steps
+
+Optimization Steps
+
+(e)
+
+(f)
+
+Figure 8. Additional Quantitative Analysis. We sweep CFG scales across decentralized and monolith diffusion models trained on LAION
+Aesthetics (a, b, c, d), finding that optimal CFG scales are consistent across models. Distillation matches the performance of training a
+monolith from raw data at a fraction of the FLOP-cost (e, f).
+
+13
+
+Active
+Experts
+
+p
+
+GFLOPs ↓
+
+FID ↓
+
+CLIP FID ↓
+
+DINO FID ↓
+
+-
+
+1
+
+0.00
+
+308
+
+12.81
+
+5.58
+
+343.96
+
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+
+0.5
+1.0
+2.0
+0.5
+1.0
+2.0
+0.5
+1.0
+2.0
+0.5
+1.0
+2.0
+1.0
+1.0
+1.0
+
+4
+1
+2
+3
+1
+1
+1
+2
+2
+2
+3
+3
+3
+1
+1
+1
+-
+
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.90
+0.90
+0.90
+0.01
+0.05
+0.10
+
+1245
+334
+642
+950
+334
+334
+334
+642
+642
+642
+950
+950
+950
+334
+334
+334
+-
+
+12.75
+12.54
+12.76
+12.88
+117.02
+89.14
+15.08
+12.67
+12.67
+13.51
+12.57
+12.84
+13.59
+15.74
+15.72
+17.35
+12.82
+12.67
+12.63
+
+6.82
+6.72
+6.75
+6.8
+36.25
+28.01
+7.53
+6.71
+6.73
+7.05
+6.76
+6.81
+7.08
+9.99
+10.04
+10.31
+6.81
+6.73
+6.76
+
+386.3
+378.4
+384.12
+385.79
+1321.17
+1042.09
+425.29
+380.85
+382.93
+400.08
+381.44
+385.18
+400.23
+412.49
+411.31
+432.46
+385.44
+382.54
+382.86
+
+Full
+Top-1
+Top-2
+Top-3
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Nucleus
+Nucleus
+Nucleus
+Threshold
+Threshold
+Threshold
+
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+8
+
+1.0
+2.0
+0.5
+1.0
+2.0
+0.5
+1.0
+2.0
+0.5
+1.0
+2.0
+1.0
+1.0
+1.0
+
+4
+1
+2
+3
+1
+1
+2
+2
+2
+3
+3
+3
+1
+1
+1
+-
+
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.90
+0.90
+0.90
+0.01
+0.05
+0.10
+
+2490
+334
+642
+950
+334
+334
+642
+642
+642
+950
+950
+950
+334
+334
+334
+-
+
+10.52
+9.85
+10.33
+10.45
+190.95
+184.06
+9.93
+10.28
+17.11
+10.04
+10.42
+12.06
+188.66
+152.16
+33.9
+10.51
+10.32
+10.18
+
+5.85
+5.54
+5.73
+5.77
+59.03
+50.55
+5.57
+5.72
+8.09
+5.62
+5.78
+6.38
+60.09
+48.37
+14
+5.82
+5.73
+5.7
+
+354.15
+339.56
+349.28
+351.91
+2105.79
+1790.24
+343.51
+348.39
+471.18
+342.86
+350.91
+380.54
+2110.22
+1609.23
+682.31
+351.17
+349.86
+346.9
+
+Full
+Top-1
+Top-2
+Top-3
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Threshold
+Threshold
+Threshold
+
+16
+16
+16
+16
+16
+16
+16
+16
+16
+16
+16
+16
+16
+16
+
+1.0
+2.0
+0.5
+1.0
+0.5
+1.0
+2.0
+1.0
+1.0
+1.0
+
+4
+1
+2
+3
+1
+1
+2
+2
+3
+3
+3
+-
+
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.00
+0.01
+0.05
+0.10
+
+4980
+334
+642
+950
+334
+334
+642
+642
+950
+950
+950
+-
+
+15.43
+12.51
+148.26
+91.76
+232.1
+259
+161.29
+174.23
+119.84
+44.62
+26.01
+14.92
+12.62
+12.69
+
+7.57
+6.6
+41.13
+29.53
+71.88
+81.49
+47.76
+54.41
+40.18
+20.04
+10.92
+7.44
+6.61
+6.61
+
+440.54
+397.99
+1535.85
+1105.92
+2557.41
+2797.76
+1732.88
+1941.49
+1510.78
+772.02
+603.31
+431.89
+399.09
+398.33
+
+Inference
+Strategy
+
+Expert
+Count
+
+Monolith
+
+1
+
+Full
+Top-1
+Top-2
+Top-3
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Sample
+Nucleus
+Nucleus
+Nucleus
+Threshold
+Threshold
+Threshold
+
+Temp.
+
+Table 2. Test-Time Combination Strategies. We ablate strategies and relevant hyperparameters for sampling from our ImageNet DDM
+ensemble at test-time. Across many experiments, we find that simply selecting the top expert outperforms more sophisticated alternatives.
+
+14
+
+Figure 9. Additional Selected Samples.
+
+15
+
+Figure 10. Random Samples, Fixed Prompt. a photo of the dolomites
+
+16
+
+Figure 11. Random Samples, Fixed Prompt. 1969 Polaris Colt, restored to showroom, static display in snow, winter sunrise
+
+17
+
+Figure 12. Random Samples, Fixed Prompt. weather research station in extreme conditions, monitoring equipment, natural elements
+
+18
+
+Figure 13. Random Samples, Fixed Prompt. ancient bristlecone pine forest, twisted trees, high-altitude light, rugged mountain backdrop
+
+19
+
+Figure 14. Random Samples, Fixed Prompt. deep desert slot canyon, sandstone textures, shaft of light, natural color gradients
+
+20
+
+Figure 15. Random Samples, Fixed Prompt. gothic cathedral spires piercing morning mist, ancient European city roofscape
+
+21
+
+Figure 16. Random Samples, Fixed Prompt. historic textile mill interior, preserved machinery, sunbeams through industrial windows
+
+22
+
+Figure 17. Random Samples, Fixed Prompt. symphony orchestra during rehearsal, conductor’s perspective, historic concert hall
+
+23
+
+
