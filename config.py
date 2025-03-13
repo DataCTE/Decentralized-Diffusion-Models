@@ -59,7 +59,7 @@ class DDMConfig:
         self.recluster_interval = 50000  # Steps between reclustering
         
         # Paper-recommended hyperparameters
-        self.expert_batch_size = 4  # Per-expert batch size
+        self.expert_batch_size = 32  # Per-expert batch size
         self.router_learning_rate = 3e-5   # Different from expert LR
         self.recluster_epochs = 3          # Paper recommends 3 passes
         self.ema_decay = 0.9999            # For model stability
@@ -69,12 +69,12 @@ class DDMConfig:
         self.diversity_threshold = 0.75    # Novelty measurement
         
         # Feature extraction settings
-        self.feature_batch_size = 64
+        self.feature_batch_size = 32
         self.feature_workers = 4
         self.dino_size = 518  # Size for DINO feature extraction
         
         # Distillation settings
         self.distill_lr = 1e-5
-        self.distill_batch_size = 4
+        self.distill_batch_size = 32
         self.distill_epochs = 10
         self.distill_samples = 10000  # Number of samples for distillation 
