@@ -49,8 +49,7 @@ class DDMTrainingCoordinator:
         # Initialize step counter
         self.current_step = 0
         
-        # Initialize dataset
-        self.full_dataset = DDMDataset(config.dataset_path)
+        # Don't initialize dataset here - moved to init_data_loaders()
         
         # Initialize router trainer
         self.router_trainer = RouterTrainer(config, self.device, self.rank)
@@ -62,7 +61,8 @@ class DDMTrainingCoordinator:
         ]
         
         # Initialize previous clusters for tracking reassignments
-        self.previous_clusters = np.zeros(len(self.full_dataset), dtype=np.int32)
+        # We'll set this after dataset initialization
+        self.previous_clusters = None
         
         # Create checkpoint directory
         os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -73,14 +73,26 @@ class DDMTrainingCoordinator:
         self.init_metrics()
 
     def init_data_loaders(self):
+        # Only rank 0 validates the dataset, others wait
         if self.rank == 0:
+            logger.info("Rank 0 validating dataset for all processes")
             self.full_dataset = DDMDataset(self.config.dataset_path)
             self.cluster_manager = self.perform_initial_clustering()
         else:
-            self.full_dataset = DDMDataset(self.config.dataset_path)
+            # Wait for rank 0 to finish validation
+            torch.distributed.barrier()
+            logger.info(f"Rank {self.rank} loading pre-validated dataset")
+            self.full_dataset = DDMDataset(self.config.dataset_path, validate=False)
             self.full_dataset.cluster_labels = np.zeros(1, dtype=np.int64)
 
+        # Make sure all ranks are ready before proceeding
+        torch.distributed.barrier()
+        
         self.sync_cluster_labels()
+        
+        # Now initialize previous_clusters with correct size
+        self.previous_clusters = np.zeros(len(self.full_dataset), dtype=np.int32)
+        
         self.expert_loaders = create_expert_bucket_loaders(
             self.full_dataset, self.config, self.world_size, self.rank
         )
