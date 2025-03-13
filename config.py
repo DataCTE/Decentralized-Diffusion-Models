@@ -1,5 +1,7 @@
 """Configuration for Decentralized Diffusion Models."""
 
+import os
+
 class DDMConfig:
     """Configuration for Decentralized Diffusion Models"""
     def __init__(self):
@@ -40,6 +42,7 @@ class DDMConfig:
         self.patch_size = 32
         self.image_size = 512
         self.dataset_path = "/home/alex/workspace/datasets/danbooru2025"  # Path to training dataset
+        self.dataset_size = self._calculate_dataset_size()  # Add this line
         self.num_workers = 2     # DataLoader workers
         self.pin_memory = True   # Pin memory for faster data transfer
         
@@ -108,3 +111,13 @@ class DDMConfig:
         self.calibration_interval = 1000  # Calibrate every 1000 steps
         self.router_confidence_threshold = 0.7  # 0.7 recommended by paper
         self.fallback_expert_idx = 0  # Default fallback expert
+
+    def _calculate_dataset_size(self):
+        """Calculate dataset size from directory (only called on rank 0)"""
+        if not os.path.exists(self.dataset_path):
+            return 0
+            
+        return len([
+            f for f in os.listdir(self.dataset_path) 
+            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))
+        ])
