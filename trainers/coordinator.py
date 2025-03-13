@@ -1,6 +1,6 @@
 """Training coordinator for Decentralized Diffusion Models (Paper implementation)"""
 
-import os
+
 import math
 import logging
 import torch
@@ -11,16 +11,15 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
 import numpy as np
 import wandb
-from sklearn.cluster import MiniBatchKMeans
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
 
 from models.dit import ExpertDiT
 from models.router import RouterModel
-from utils.dataset import DDMDataset, FeatureDataset
+from data.dataset import DDMDataset, FeatureDataset
 from utils.diffusion import DecentralizedFlowMatcher
-from utils.feature_extractor import DINOv2FeatureExtractor
 from utils.fsdp import create_fsdp_config
+from data.clustering import ClusterManager
 
 logger = logging.getLogger(__name__)
 
@@ -89,38 +88,46 @@ class DDMTrainingCoordinator:
         self.cluster_labels = cluster_tensor.cpu().numpy()
         
     def init_models(self):
-        """Initialize models with FSDP using centralized config"""
-        # Expert models
-        self.experts = [
-            FSDP(
-                ExpertDiT(self.config),
-                **create_fsdp_config(self.config, sharding_strategy="FULL_SHARD")
-            ) for _ in range(self.config.num_experts)
+        """Initialize models using dedicated trainer classes"""
+        from trainers.expert import ExpertTrainer
+        from trainers.router import RouterTrainer
+        
+        # Initialize expert trainers
+        self.expert_trainers = [
+            ExpertTrainer(
+                expert_idx=i,
+                config=self.config,
+                device=self.device,
+                rank=self.rank,
+                world_size=self.world_size
+            ) for i in range(self.config.num_experts)
         ]
         
-        # Router model
-        self.router = FSDP(
-            RouterModel(self.config),
-            **create_fsdp_config(self.config, sharding_strategy="SHARD_GRAD_OP")
+        # Initialize router trainer
+        self.router_trainer = RouterTrainer(
+            config=self.config,
+            device=self.device,
+            rank=self.rank,
+            world_size=self.world_size
         )
         
         if self.rank == 0:
-            logger.info(f"Initialized {len(self.experts)} experts and router with FSDP")
+            logger.info(f"Initialized {len(self.expert_trainers)} experts and router with dedicated trainers")
         
     def init_optimizers(self):
         """Initialize optimizers following paper Section 4.1"""
-        self.expert_optims = [torch.optim.AdamW(expert.parameters(), 
+        self.expert_optims = [torch.optim.AdamW8bit(expert.parameters(), 
                                               lr=self.config.learning_rate,
                                               weight_decay=self.config.weight_decay)
-                            for expert in self.experts]
+                            for expert in self.expert_trainers]
         
-        self.router_optim = torch.optim.AdamW(self.router.parameters(),
+        self.router_optim = torch.optim.AdamW8bit(self.router_trainer.router.parameters(),
                                             lr=self.config.router_learning_rate,
                                             weight_decay=self.config.weight_decay)
         
     def run_training_cycle(self):
         """Paper Algorithm 2: Main training loop with full sharding"""
-        logger.info("Starting DDM training with FSDP sharding...")
+        logger.info("Starting DDM training with dedicated trainers...")
         
         # Paper-recommended training schedule
         for step in range(self.config.num_steps):
@@ -135,74 +142,20 @@ class DDMTrainingCoordinator:
                 self.perform_reclustering()
                 self.run_validation(step)
                 
-            # Sharded checkpointing
-            if step % self.config.save_interval == 0:
-                self.save_sharded_checkpoints(step)
-                
             # Distributed metric logging
             self.log_sharded_metrics(step, expert_losses, router_loss)
 
     def train_experts(self, step):
-        """Paper Section 3.2: Expert training with FSDP sharding"""
-        losses = []
-        for expert_idx, expert in enumerate(self.experts):
-            expert.train()
-            for batch in self.expert_loaders[expert_idx]:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                
-                # FSDP-compatible forward/backward
-                loss = self.flow_matching_loss(expert, batch)
-                
-                # Sharded optimizer step
-                self.expert_optims[expert_idx].zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    expert.parameters(), 
-                    self.config.max_grad_norm
-                )
-                self.expert_optims[expert_idx].step()
-                
-                losses.append(loss.item())
-                
-        return torch.tensor(losses).mean().item()
+        """Delegate expert training to ExpertTrainer instances"""
+        return np.mean([
+            trainer.train_step(batch)
+            for trainer, loader in zip(self.expert_trainers, self.expert_loaders)
+            for batch in loader
+        ])
     
     def train_router(self, step):
-        """Paper Section 3.3: Router training"""
-        losses = []
-        for batch in self.router_loader:
-            # Get router predictions
-            logits = self.router(batch['latent'], batch['t'])
-            
-            # Compute cross-entropy loss
-            loss = torch.nn.functional.cross_entropy(logits, batch['cluster'])
-            
-            # Optimization
-            self.router_optim.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.router.parameters(),
-                                         self.config.max_grad_norm)
-            self.router_optim.step()
-            
-            losses.append(loss.item())
-            
-        return np.mean(losses)
-    
-    def flow_matching_loss(self, expert, batch):
-        """Paper Equation 6: Flow matching objective"""
-        # Forward process
-        t = torch.rand(batch['image'].size(0), device=self.device)
-        noise = torch.randn_like(batch['latent'])
-        alpha_t = torch.cos(t * math.pi/2)[:, None, None, None]
-        sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
-        x_t = alpha_t * batch['latent'] + sigma_t * noise
-        
-        # Expert prediction
-        pred_flow = expert(x_t, t, batch['text_embeds'])
-        
-        # Target flow
-        target_flow = (batch['latent'] - x_t) / sigma_t
-        
-        return torch.nn.functional.mse_loss(pred_flow, target_flow)
+        """Delegate router training to RouterTrainer"""
+        return self.router_trainer.train_epoch(self.router_loader)
     
     def perform_reclustering(self):
         """Paper Section 3.3: Dynamic reclustering"""
@@ -225,14 +178,14 @@ class DDMTrainingCoordinator:
         
         # Gather sharded model states
         expert_models = []
-        with FSDP.summon_full_params(self.experts):
-            for expert in self.experts:
-                expert_models.append(expert.clone().to("cpu"))
+        with FSDP.summon_full_params(self.expert_trainers[0].expert):
+            for trainer in self.expert_trainers:
+                expert_models.append(trainer.expert.clone().to("cpu"))
         
         # Generate samples using paper's algorithm
         samples = DecentralizedFlowMatcher.sample(
             self.config,
-            self.router,
+            self.router_trainer.router,
             expert_models,
             num_samples=4,
             device="cpu"
@@ -243,24 +196,18 @@ class DDMTrainingCoordinator:
         self.log_to_wandb(step, fid, samples)
         
     def save_sharded_checkpoints(self, step):
-        """Paper Appendix A.2: Sharded checkpoint saving"""
+        """Save checkpoints through trainer classes"""
         if self.rank == 0:
             logger.info(f"Saving sharded checkpoint at step {step}")
         
         checkpoint = {
-            'experts': [expert.state_dict() for expert in self.experts],
-            'router': self.router.state_dict(),
+            'experts': [trainer.expert.state_dict() for trainer in self.expert_trainers],
+            'router': self.router_trainer.router.state_dict(),
             'config': self.config,
             'step': step
         }
         
-        # FSDP-aware saving
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.experts[0], StateDictType.FULL, save_policy):
-            expert_states = [expert.state_dict() for expert in self.experts]
-        
-        if self.rank == 0:
-            torch.save(checkpoint, f"{self.config.save_dir}/ddm_step{step}.pt")
+        torch.save(checkpoint, f"{self.config.save_dir}/ddm_step{step}.pt")
             
     def log_sharded_metrics(self, step, expert_loss, router_loss):
         """Log training metrics to WandB"""
@@ -332,32 +279,6 @@ class DDMTrainingCoordinator:
             if fid < self.best_fid:
                 self.best_fid = fid
                 torch.save({
-                    'experts': [e.state_dict() for e in self.experts],
-                    'router': self.router.state_dict()
+                    'experts': [trainer.expert.state_dict() for trainer in self.expert_trainers],
+                    'router': self.router_trainer.router.state_dict()
                 }, f"{self.config.save_dir}/best_fid.pt")
-
-class ClusterManager:
-    """Implements paper's clustering strategy from Section 3.2"""
-    def __init__(self):
-        self.feature_extractor = DINOv2FeatureExtractor()
-        self.kmeans = MiniBatchKMeans(n_clusters=1024)
-        
-    def extract_features(self, dataloader):
-        """Extract DINOv2 features from dataset"""
-        features = []
-        for batch in dataloader:
-            features.append(self.feature_extractor(batch))
-        return torch.cat(features).cpu().numpy()
-    
-    def cluster_dataset(self, features):
-        """Two-stage clustering from paper Appendix A.1"""
-        # Stage 1: Fine-grained clustering
-        self.kmeans.fit(features)
-        fine_labels = self.kmeans.labels_
-        
-        # Stage 2: Coarse clustering
-        centroids = self.kmeans.cluster_centers_
-        coarse_kmeans = MiniBatchKMeans(n_clusters=self.config.num_experts)
-        coarse_kmeans.fit(centroids)
-        
-        return coarse_kmeans.labels_[fine_labels]

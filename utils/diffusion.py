@@ -1,47 +1,114 @@
-"""Diffusion process utilities for Decentralized Diffusion Models."""
+"""Diffusion utilities implementing paper's equations"""
 
-import torch
 import math
+import torch
 
 def get_alphas_and_betas(num_timesteps=1000, schedule_type='cosine'):
-    """Compute noise schedule coefficients for diffusion"""
+    """Paper's noise schedules from Section 3.2 and Appendix B.1"""
     if schedule_type == 'cosine':
-        # Improved DDPM cosine schedule
-        max_beta = 0.999
-        ts = torch.arange(num_timesteps + 1, dtype=torch.float64)
-        alpha_bar = torch.cos((ts / num_timesteps + 0.008) / 1.008 * math.pi * 0.5) ** 2
-        alpha_bar = alpha_bar / alpha_bar[0]
-        betas = torch.minimum(1 - alpha_bar[1:] / alpha_bar[:-1], torch.tensor(max_beta))
-    else:  # linear schedule
+        # Equation 4: Cosine schedule
+        ts = torch.linspace(0, 1, num_timesteps + 1)
+        alphas = torch.cos(ts * math.pi/2)
+        alphas = alphas / alphas[0]  # Ensure alpha_0 = 1
+        betas = 1 - (alphas[1:] / alphas[:-1])
+    else:  # Linear schedule (paper baseline comparison)
         beta_start = 0.0001
         beta_end = 0.02
-        betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float64)
+        betas = torch.linspace(beta_start, beta_end, num_timesteps)
     
-    alphas = 1. - betas
+    alphas = 1 - betas
     alpha_bar = torch.cumprod(alphas, dim=0)
     return alphas, alpha_bar, betas
 
-def forward_diffuse(x0, t, noise, alpha_bar=None):
-    """
-    Forward diffusion process - adds noise to images
-    
-    Args:
-        x0: Original images [B, C, H, W]
-        t: Timestep indices [B,]
-        noise: Noise to add [B, C, H, W]
-        alpha_bar: Precomputed cumulative product of alphas [T,]
-    """
-    if alpha_bar is None:
-        _, alpha_bar, _ = get_alphas_and_betas()
+def forward_diffuse(x0, t, alpha_bar, noise=None):
+    """Paper Equation 4: Forward diffusion process"""
+    if noise is None:
+        noise = torch.randn_like(x0)
         
-    alpha_bar = alpha_bar.to(device=x0.device, dtype=x0.dtype)
-    
-    # Extract alpha_bar for the specific timesteps
     sqrt_alpha_bar = torch.sqrt(alpha_bar[t])[:, None, None, None]
     sqrt_one_minus = torch.sqrt(1. - alpha_bar[t])[:, None, None, None]
-    
-    # Apply forward diffusion: x_t = sqrt(α_t)·x_0 + sqrt(1-α_t)·ε
     return sqrt_alpha_bar * x0 + sqrt_one_minus * noise
+
+class DecentralizedFlowMatcher:
+    """Implements paper's Equations 6-8 for DFM"""
+    
+    def __init__(self, sigma=0.8, loss_type='l2'):
+        """
+        Args:
+            sigma: Noise scale (paper Appendix B.1)
+            loss_type: 'l2' or 'huber' (paper Section 4.1)
+        """
+        self.sigma = sigma
+        self.loss_fn = {
+            'l2': torch.nn.functional.mse_loss,
+            'huber': torch.nn.functional.smooth_l1_loss
+        }[loss_type]
+
+    def compute_loss(self, pred_flows, router_probs, x0, t, alpha_bar):
+        """
+        Paper Equation 7: Decentralized flow matching loss
+        Args:
+            pred_flows: List of expert predictions [E][B, C, H, W]
+            router_probs: Router probabilities [B, E]
+            x0: Clean samples [B, C, H, W]
+            t: Timesteps [B,]
+            alpha_bar: Precomputed alpha_bar schedule
+        """
+        # Sample noise and create x_t
+        noise = torch.randn_like(x0)
+        x_t = forward_diffuse(x0, t, alpha_bar, noise)
+        
+        # Compute target flow (Equation 4 derivative)
+        sigma_t = torch.sqrt(1. - alpha_bar[t])[:, None, None, None]
+        target_flow = (x0 - x_t) / sigma_t
+        
+        # Calculate per-expert losses
+        expert_losses = torch.stack([
+            self.loss_fn(pred, target_flow, reduction='none')
+            for pred in pred_flows
+        ], dim=1)  # [B, E, ...]
+        
+        # Apply router weights and reduce
+        weighted_losses = router_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * expert_losses
+        return weighted_losses.sum(dim=1).mean()
+
+    def sample(self, router, experts, shape, alpha_bar, steps=50, top_k=1):
+        """
+        Paper Algorithm 2: Decentralized sampling
+        Args:
+            shape: Output shape [B, C, H, W]
+            alpha_bar: Precomputed schedule
+            steps: Number of sampling steps
+            top_k: Experts to use per step
+        """
+        device = next(router.parameters()).device
+        x = torch.randn(shape, device=device)
+        dt = 1.0 / steps
+        
+        for step in reversed(range(steps)):
+            t = torch.full((shape[0],), step/steps, device=device)
+            
+            # Get router probabilities
+            with torch.no_grad():
+                logits = router(x, t)
+                probs = torch.softmax(logits, dim=-1)
+            
+            # Select top-k experts
+            top_probs, top_indices = torch.topk(probs, top_k, dim=-1)
+            top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
+            
+            # Compute and combine expert predictions
+            combined = torch.zeros_like(x)
+            for expert_idx, expert in enumerate(experts):
+                mask = (top_indices == expert_idx).any(dim=-1)
+                if mask.any():
+                    pred = expert(x[mask], t[mask])
+                    combined[mask] += pred * top_probs[mask][..., None, None, None]
+            
+            # Update sample (Equation 8 Euler step)
+            x = x + combined * dt
+            
+        return x
 
 def update_sample(x_t, pred_noise, t, alphas=None, alpha_bar=None, betas=None, steps=1000):
     """
@@ -96,90 +163,9 @@ def update_sample(x_t, pred_noise, t, alphas=None, alpha_bar=None, betas=None, s
     # Return properly thresholded results
     return x_prev.clamp(-1., 1.)
 
-class DecentralizedFlowMatcher:
-    """Implements DFM objective from Paper Equation 6 & 7"""
-    
-    def __init__(self, sigma=0.8, loss_type='l2'):
-        """
-        Args:
-            sigma: Noise scale from paper Appendix B.1
-            loss_type: 'l2' or 'huber' as per paper recommendations
-        """
-        self.sigma = sigma
-        self.loss_type = loss_type
-        self._loss_fn = {
-            'l2': torch.nn.functional.mse_loss,
-            'huber': torch.nn.functional.smooth_l1_loss
-        }[loss_type]
-
-    def compute_loss(self, pred_flows, router_probs, x0, t):
-        """
-        Paper Eq. 7: Decentralized flow matching loss
-        Args:
-            pred_flows: List of expert flow predictions [E][B, C, H, W]
-            router_probs: Router probability distribution [B, E]
-            x0: Clean samples [B, C, H, W]
-            t: Timesteps [B,]
-        """
-        # Paper's noise schedule (Eq. 4)
-        alpha_t = torch.cos(t * math.pi/2)[:, None, None, None]
-        sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
-        
-        # Target flow calculation (Eq. 4)
-        noise = torch.randn_like(x0)
-        xt = alpha_t * x0 + sigma_t * noise
-        target_flow = (x0 - xt) / sigma_t
-        
-        # Compute expert losses (Eq. 6)
-        expert_losses = torch.stack([
-            self._loss_fn(pred, target_flow, reduction='none')
-            for pred in pred_flows
-        ], dim=1)  # [B, E, ...]
-        
-        # Apply router weights and reduce (Eq. 7)
-        weighted_losses = router_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * expert_losses
-        return weighted_losses.sum(dim=1).mean()
-
-    def sample(self, router, experts, shape, num_steps=50, top_k=1):
-        """
-        Paper Algorithm 2: Decentralized sampling
-        Args:
-            router: Trained router model
-            experts: List of expert models
-            shape: Output shape [B, C, H, W]
-            num_steps: Number of sampling steps
-            top_k: Number of experts to use per step
-        """
-        device = next(router.parameters()).device
-        x = torch.randn(shape, device=device)
-        
-        for step in reversed(range(num_steps)):
-            t = torch.ones(shape[0], device=device) * step / num_steps
-            
-            # Get router probabilities
-            with torch.no_grad():
-                logits = router(x, t)
-                probs = torch.softmax(logits, dim=-1)
-            
-            # Select top-k experts
-            top_probs, top_indices = torch.topk(probs, top_k, dim=-1)
-            top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
-            
-            # Compute expert predictions
-            preds = []
-            for expert_idx in range(len(experts)):
-                mask = (top_indices == expert_idx).any(dim=-1)
-                if mask.any():
-                    expert_pred = experts[expert_idx](x[mask], t[mask])
-                    preds.append((mask, expert_pred))
-            
-            # Combine predictions
-            combined = torch.zeros_like(x)
-            for mask, pred in preds:
-                combined[mask] += pred * top_probs[mask][..., None, None, None]
-            
-            # Update sample (Eq. 8)
-            dt = 1.0 / num_steps
-            x = x + combined * dt
-            
-        return x 
+def get_schedule(timesteps, schedule_type='cosine'):
+    """Paper's noise schedules from Section 3.2"""
+    if schedule_type == 'cosine':
+        return torch.cos(timesteps * math.pi/2)
+    else:
+        return 1 - timesteps 

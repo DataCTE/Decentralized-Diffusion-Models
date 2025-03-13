@@ -9,14 +9,17 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import default_auto_wrap_policy, size_based_auto_wrap_policy
 from torch.distributed.fsdp import StateDictType
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
 from models.dit import ExpertDiT
 from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from utils.vae import VAEWrapper
 from utils.clip import CLIPTextEncoder
+from utils.fsdp import get_fsdp_defaults
+from utils.checkpoint import save_sharded
+from utils.metrics import MetricCalculator
+from utils.base import BaseTrainer
 
-class ExpertTrainer:
+class ExpertTrainer(BaseTrainer):
     """Trainer for expert DiT models in DDM"""
     def __init__(self, expert_idx, config, device, rank, world_size):
         # Paper-recommended initialization (section 4.1)
@@ -69,7 +72,7 @@ class ExpertTrainer:
         )
         
         # Paper-specified optimizer settings - use Adam with FSDP
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = AdamW8bit(
             self.expert.parameters(),
             lr=config.learning_rate,
             betas=config.adam_betas,
@@ -90,6 +93,13 @@ class ExpertTrainer:
         # Log initialization of this expert
         if rank == 0:
             print(f"Initialized SHARDED Expert {expert_idx} across {world_size} GPUs")
+
+    def compute_loss(self, batch):
+        return self.flow_matcher.compute_loss(
+            self.expert(batch['x_t'], batch['t']),
+            batch['x0'],
+            batch['t']
+        )
 
     def train_step(self, batch):
         """
