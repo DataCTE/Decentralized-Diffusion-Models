@@ -37,6 +37,7 @@ class DDMConfig:
         self.save_dir = "checkpoints/ddm"
         self.checkpoint_dir = "checkpoints/ddm"  # Added to match save_dir
         self.sample_dir = "samples/ddm"  # Directory to save generated samples
+        self.expert_steps_per_router = 1000  # Number of expert steps between router training
         
         # Inference settings
         self.use_top_k = 1  # Number of experts to use at inference time
@@ -62,9 +63,10 @@ class DDMConfig:
         self.validation_interval = 1000  # Steps between validation
         self.save_interval = 5000  # Steps between saving checkpoints
         self.recluster_interval = 50000  # Steps between reclustering
+        self.distill_interval = 100000  # Steps between distillation
         
         # Paper-recommended hyperparameters
-        self.router_batch_size = 1
+        self.router_batch_size = 1  # Batch size for router training
         self.expert_batch_size = 1  # Per-expert batch size
         self.router_learning_rate = 3e-5   # Different from expert LR
         self.recluster_epochs = 3          # Paper recommends 3 passes

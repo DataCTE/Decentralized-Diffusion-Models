@@ -251,16 +251,16 @@ class DDMTrainingCoordinator:
             # Extract features from current dataset
             feature_dataset = FeatureDataset(self.config.dataset_path, self.config)
             
-            # Use a very small batch size for feature extraction to avoid OOM
+            # Use centralized config parameters for feature extraction
             feature_loader = DataLoader(
                 feature_dataset, 
-                batch_size=self.config.feature_batch_size,  # Already set to 1 in config
-                num_workers=max(1, self.config.feature_workers // 2),  # Reduce workers
-                pin_memory=True
+                batch_size=self.config.feature_batch_size,
+                num_workers=self.config.feature_workers,
+                pin_memory=self.config.pin_memory
             )
             
             # Use autocast to reduce memory usage during feature extraction
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
                 features = self.cluster_manager.extract_features(feature_loader)
             
             # Perform clustering
@@ -335,9 +335,8 @@ class DDMTrainingCoordinator:
 
     def train_router(self):
         if self.rank == 0 and self.current_step % self.config.save_interval == 0:
-            # Use a smaller batch size for router training to prevent OOM issues
-            # The router doesn't need large batches to learn effectively
-            router_batch_size = DDMConfig.router_batch_size  # Hardcoded to 1 to prevent OOM
+            # Use the router batch size from config to ensure centralized configuration
+            router_batch_size = self.config.router_batch_size
             avg_loss = self.router_trainer.train_epoch(
                 DataLoader(
                     self.full_dataset, 
@@ -402,10 +401,10 @@ class DDMTrainingCoordinator:
                     [trainer.expert for trainer in self.expert_trainers],
                     vae_wrapper,
                     text_embeddings,
-                    num_steps=50,
+                    num_steps=self.config.inference_steps,
                     batch_size=len(validation_prompts),
                     device=self.device,
-                    guidance_scale=7.5,
+                    guidance_scale=self.config.cfg_scale,
                     uncond_embeddings=uncond_embeddings,
                     log_to_wandb=True
                 )
@@ -474,7 +473,13 @@ class DDMTrainingCoordinator:
         
         # Initialize latent with paper-specified noise scale (Section 3.4)
         # The paper initializes with Gaussian noise scaled by sigma
-        latent = torch.randn(batch_size, self.config.latent_channels, *self.config.image_size, device=device) * self.config.sigma
+        latent = torch.randn(
+            batch_size, 
+            self.config.latent_channels, 
+            self.config.image_size // self.config.patch_size, 
+            self.config.image_size // self.config.patch_size, 
+            device=device
+        ) * self.config.sigma
         
         # Text conditioning
         if text_embeddings is not None:
@@ -570,7 +575,7 @@ class DDMTrainingCoordinator:
         # Initialize student model with same architecture as experts
         student = ExpertDiT(self.config).to(self.device)
         
-        # Paper-recommended optimizer settings for distillation
+        # Paper-recommended optimizer settings for distillation from config
         optimizer = AdamW8bit(
             student.parameters(), 
             lr=self.config.distill_lr,
@@ -583,11 +588,13 @@ class DDMTrainingCoordinator:
             indices=range(min(self.config.distill_samples, len(self.full_dataset)))
         )
         
-        # Create dataloader for distillation
+        # Create dataloader for distillation using config parameters
         distill_loader = DataLoader(
             distill_dataset, 
             batch_size=self.config.distill_batch_size, 
-            shuffle=True
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory
         )
         
         # Create a mapping from cluster ID to expert trainer for efficient lookup
@@ -601,7 +608,10 @@ class DDMTrainingCoordinator:
             for batch in tqdm(distill_loader, desc=f"Distillation Epoch {epoch}"):
                 images = batch["image"].to(self.device)
                 
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                # Use mixed precision from config for consistency
+                scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
+                
+                with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
                     # VAE encoding
                     vae = VAEWrapper(self.device, self.config)
                     latents = vae.encode(images)
@@ -647,11 +657,13 @@ class DDMTrainingCoordinator:
                     # Ldistill(θ) = E_{t,x_0,ε}[||vθ,t(xt) - vteacher,t(xt)||²]
                     loss = torch.nn.functional.mse_loss(student_flow, teacher_flow)
                 
-                # Optimization
+                # Optimization with mixed precision
                 optimizer.zero_grad()
-                loss.backward()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(student.parameters(), self.config.max_grad_norm)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 
                 total_loss += loss.item()
             

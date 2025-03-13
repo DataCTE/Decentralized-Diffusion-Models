@@ -134,8 +134,8 @@ class ExpertDiT(nn.Module):
         # Initialize weights
         self.initialize_weights()
         
-        # Enable gradient checkpointing for memory efficiency
-        self.use_gradient_checkpointing = getattr(config, 'use_gradient_checkpointing', True)
+        # Enable gradient checkpointing for memory efficiency from config
+        self.use_gradient_checkpointing = config.use_gradient_checkpointing
         
     def initialize_weights(self):
         # Initialize patch embedding
