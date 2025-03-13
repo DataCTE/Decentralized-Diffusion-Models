@@ -23,6 +23,13 @@ class DDMConfig:
         self.use_mixed_precision = True  # Use mixed precision training (fp16)
         self.gradient_accumulation_steps = 1  # Accumulate gradients over multiple steps
         self.use_gradient_checkpointing = True  # Use gradient checkpointing to save memory
+        
+        # FSDP (Fully Sharded Data Parallel) settings
+        self.fsdp_sharding_strategy = "FULL_SHARD"  # Fully shard parameters, gradients, and optimizer states
+        self.fsdp_cpu_offload = False  # Whether to offload parameters to CPU
+        self.fsdp_min_num_params = 1e6  # Minimum number of parameters for a layer to be wrapped (1M)
+        self.fsdp_auto_wrap_policy = "DEFAULT"  # Default auto wrap policy
+        self.fsdp_backward_prefetch = "BACKWARD_PRE"  # Prefetch parameters before backward pass
 
         # Data settings
         self.patch_size = 32

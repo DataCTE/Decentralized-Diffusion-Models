@@ -5,6 +5,11 @@ from torch.distributed.optim import ZeroRedundancyOptimizer
 from bitsandbytes.optim import AdamW8bit
 import math
 import os
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import default_auto_wrap_policy, size_based_auto_wrap_policy
+from torch.distributed.fsdp import StateDictType
+from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
 from models.dit import ExpertDiT
 from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
@@ -13,19 +18,59 @@ from utils.clip import CLIPTextEncoder
 
 class ExpertTrainer:
     """Trainer for expert DiT models in DDM"""
-    def __init__(self, expert_idx, config, device, rank):
+    def __init__(self, expert_idx, config, device, rank, world_size):
         # Paper-recommended initialization (section 4.1)
         self.expert_idx = expert_idx  # Store the expert index for identification
-        self.expert = ExpertDiT(config).to(device)
         self.config = config
         self.device = device
         self.rank = rank
+        self.world_size = world_size
         
-        # Paper-specified optimizer settings
-        self.optimizer = ZeroRedundancyOptimizer(
+        # Create base model
+        base_expert = ExpertDiT(config).to(device)
+        
+        # Configure FSDP settings based on config
+        # Sharding strategy
+        if config.fsdp_sharding_strategy == "FULL_SHARD":
+            sharding_strategy = ShardingStrategy.FULL_SHARD
+        elif config.fsdp_sharding_strategy == "SHARD_GRAD_OP":
+            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
+        else:
+            sharding_strategy = ShardingStrategy.FULL_SHARD
+            
+        # CPU offload
+        cpu_offload = CPUOffload(offload_params=config.fsdp_cpu_offload)
+        
+        # Backward prefetch
+        if config.fsdp_backward_prefetch == "BACKWARD_PRE":
+            backward_prefetch = BackwardPrefetch.BACKWARD_PRE
+        elif config.fsdp_backward_prefetch == "BACKWARD_POST":
+            backward_prefetch = BackwardPrefetch.BACKWARD_POST
+        else:
+            backward_prefetch = BackwardPrefetch.BACKWARD_PRE
+            
+        # Auto wrap policy
+        if config.fsdp_auto_wrap_policy == "DEFAULT":
+            auto_wrap_policy = default_auto_wrap_policy
+        elif config.fsdp_auto_wrap_policy == "SIZE_BASED":
+            auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=config.fsdp_min_num_params)
+        else:
+            auto_wrap_policy = default_auto_wrap_policy
+            
+        # Apply FSDP to shard model across all GPUs
+        self.expert = FSDP(
+            base_expert,
+            device_id=torch.cuda.current_device(),
+            sharding_strategy=sharding_strategy,
+            cpu_offload=cpu_offload,
+            backward_prefetch=backward_prefetch,
+            auto_wrap_policy=auto_wrap_policy,
+            use_orig_params=True  # Allow easier parameter access
+        )
+        
+        # Paper-specified optimizer settings - use Adam with FSDP
+        self.optimizer = torch.optim.AdamW(
             self.expert.parameters(),
-            optimizer_class=AdamW8bit,
-            parameters_as_bucket_view=True,
             lr=config.learning_rate,
             betas=config.adam_betas,
             weight_decay=config.weight_decay
@@ -44,7 +89,7 @@ class ExpertTrainer:
         
         # Log initialization of this expert
         if rank == 0:
-            print(f"Initialized Expert {expert_idx} on device {device}")
+            print(f"Initialized SHARDED Expert {expert_idx} across {world_size} GPUs")
 
     def train_step(self, batch):
         """
@@ -112,11 +157,22 @@ class ExpertTrainer:
         return loss.item()
     
     def save_checkpoint(self, save_dir, step):
-        """Save a checkpoint for this expert"""
+        """Save a checkpoint for the expert model using FSDP state dict utilities"""
         if self.rank == 0:
             os.makedirs(save_dir, exist_ok=True)
             checkpoint_path = f"{save_dir}/expert_{self.expert_idx}_step{step}.pt"
-            torch.save(self.expert.state_dict(), checkpoint_path)
+            
+            # Check if model is wrapped with FSDP
+            if isinstance(self.expert, FSDP):
+                # Get consolidated state dict using FSDP
+                with FSDP.state_dict_type(self.expert, StateDictType.FULL_STATE_DICT):
+                    state_dict = self.expert.state_dict()
+            else:
+                # Regular state dict
+                state_dict = self.expert.state_dict()
+            
+            # Only rank 0 saves the model
+            torch.save(state_dict, checkpoint_path)
             return checkpoint_path
         return None
     
