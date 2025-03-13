@@ -11,6 +11,7 @@ from collections import defaultdict
 from sklearn.cluster import MiniBatchKMeans
 import logging
 import torch.distributed as dist
+import time
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class DDMDataset(Dataset):
 
         # Distributed synchronization point
         dist.barrier()
+        logger.info(f"Rank {dist.get_rank()} synchronized at {time.asctime()}")
 
         # Only main process needs to extract captions and sizes
         if dist.get_rank() == 0:
@@ -76,16 +78,28 @@ class DDMDataset(Dataset):
     def _validate_files(self):
         """Validate all image files and return only the valid ones"""
         valid_files = []
-        invalid_count = 0
+        invalid_files = []
+        start_time = time.time()
         
-        for fname in tqdm(os.listdir(self.root), desc="Validating images"):
-            if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                if self._is_valid_image(os.path.join(self.root, fname)):
+        all_files = [f for f in os.listdir(self.root) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+        logger.info(f"Starting validation of {len(all_files):,} candidate images")
+
+        with tqdm(total=len(all_files), desc="Validating images", unit="img") as pbar:
+            for idx, fname in enumerate(all_files):
+                full_path = os.path.join(self.root, fname)
+                if self._is_valid_image(full_path):
                     valid_files.append(fname)
                 else:
-                    invalid_count += 1
-                    
-        logger.info(f"Found {invalid_count} invalid images that will be excluded")
+                    invalid_files.append(full_path)
+                    if len(invalid_files) <= 5:  # Log first few examples
+                        logger.debug(f"Invalid file: {full_path}")
+                
+                pbar.update(1)
+                if idx % 10000 == 0:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Validated {idx:,}/{len(all_files):,} - "
+                               f"{len(valid_files):,} valid ({len(valid_files)/max(1,idx)*100:.1f}%) - "
+                               f"Elapsed: {elapsed:.1f}s")
         return valid_files
 
     def _is_valid_image(self, path):
@@ -102,16 +116,23 @@ class DDMDataset(Dataset):
     def _collect_image_sizes(self):
         """Collect all image dimensions in the dataset"""
         sizes = []
-        for img_file in tqdm(self.image_files, desc="Collecting sizes"):
-            try:
-                with Image.open(os.path.join(self.root, img_file)) as img:
-                    w, h = img.size
-                    sizes.append([w, h])
-            except Exception as e:
-                # This shouldn't happen since we've already validated the files,
-                # but just in case, log it and continue
-                logger.warning(f"Error getting size for {img_file}: {e}")
-                continue
+        logger.info("Starting image size collection")
+        
+        with tqdm(total=len(self.image_files), desc="Collecting sizes", unit="img") as pbar:
+            for idx, img_file in enumerate(self.image_files):
+                if idx % 10000 == 0:
+                    logger.info(f"Processing sizes: {idx}/{len(self.image_files)} - "
+                               f"Current dimensions: {sizes[-1] if sizes else 'N/A'}")
+                try:
+                    with Image.open(os.path.join(self.root, img_file)) as img:
+                        w, h = img.size
+                        sizes.append([w, h])
+                except Exception as e:
+                    # This shouldn't happen since we've already validated the files,
+                    # but just in case, log it and continue
+                    logger.warning(f"Error getting size for {img_file}: {e}")
+                    continue
+                pbar.update(1)
         return np.array(sizes)
 
     def _generate_dynamic_buckets(self, num_buckets=20):
@@ -156,24 +177,33 @@ class DDMDataset(Dataset):
 
     def assign_buckets(self):
         """Assign each image to its closest resolution bucket"""
-        for idx, img_file in enumerate(tqdm(self.image_files, desc="Assigning buckets")):
-            img_path = os.path.join(self.root, img_file)
-            try:
-                # Get image size
-                with Image.open(img_path) as img:
-                    w, h = img.size
-                
-                # Find closest bucket
-                closest_bucket = self.find_closest_bucket(w, h)
-                
-                # Assign bucket
-                self.image_buckets[idx] = closest_bucket
-                self.bucket_indices[closest_bucket].append(idx)
-            except Exception as e:
-                print(f"Error processing {img_file}: {e}")
-                # Assign a default bucket
-                self.image_buckets[idx] = self.buckets[0]
-                self.bucket_indices[self.buckets[0]].append(idx)
+        logger.info(f"Starting bucket assignment for {len(self.image_files)} images")
+        start_time = time.time()
+        
+        with tqdm(total=len(self.image_files), desc="Assigning buckets", unit="img") as pbar:
+            for idx, img_file in enumerate(self.image_files):
+                if idx % 5000 == 0:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Assigned {idx:,} buckets - "
+                               f"Current rate: {idx/max(1,elapsed):.1f} img/s")
+                img_path = os.path.join(self.root, img_file)
+                try:
+                    # Get image size
+                    with Image.open(img_path) as img:
+                        w, h = img.size
+                    
+                    # Find closest bucket
+                    closest_bucket = self.find_closest_bucket(w, h)
+                    
+                    # Assign bucket
+                    self.image_buckets[idx] = closest_bucket
+                    self.bucket_indices[closest_bucket].append(idx)
+                except Exception as e:
+                    print(f"Error processing {img_file}: {e}")
+                    # Assign a default bucket
+                    self.image_buckets[idx] = self.buckets[0]
+                    self.bucket_indices[self.buckets[0]].append(idx)
+                pbar.update(1)
     
     def __len__(self):
         return len(self.image_files)
