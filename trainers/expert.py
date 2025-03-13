@@ -132,7 +132,7 @@ class ExpertTrainer(BaseTrainer):
             # x_t = alpha_t * x_0 + sigma_t * noise
             # This follows the cosine schedule in the paper:
             # alpha_t = cos(t * pi/2), sigma_t = sin(t * pi/2)
-            alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
+            alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * noise
             
@@ -160,7 +160,7 @@ class ExpertTrainer(BaseTrainer):
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(self.optimizer)  # Unscale gradients for clipping
-        torch.nn.utils.clip_grad_norm_(self.expert.parameters(), self.config.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.expert.parameters(), 1.0, norm_type=2.0)
         scaler.step(self.optimizer)
         scaler.update()
         

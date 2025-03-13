@@ -8,8 +8,8 @@ def get_alphas_and_betas(num_timesteps=1000, schedule_type='cosine'):
     if schedule_type == 'cosine':
         # Equation 4: Cosine schedule
         ts = torch.linspace(0, 1, num_timesteps + 1)
-        alphas = torch.cos(ts * math.pi/2)
-        alphas = alphas / alphas[0]  # Ensure alpha_0 = 1
+        alphas = torch.cos((ts + 0.008) / 1.008 * math.pi / 2).pow(2)  # Paper Eq.4
+        alphas = alphas / alphas[0]  # Ensure alpha_0 = 1 (Paper Eq.4)
         betas = 1 - (alphas[1:] / alphas[:-1])
     else:  # Linear schedule (paper baseline comparison)
         beta_start = 0.0001

@@ -4,22 +4,20 @@
 import math
 import logging
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from tqdm import tqdm
 import numpy as np
 import wandb
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 
 
 from models.dit import ExpertDiT
-from models.router import RouterModel
 from data.dataset import DDMDataset, FeatureDataset
 from utils.diffusion import DecentralizedFlowMatcher
-from utils.fsdp import create_fsdp_config
 from data.clustering import ClusterManager
+from trainers.Distillation import DiffusionDistiller
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +71,19 @@ class DDMTrainingCoordinator:
         
     def perform_initial_clustering(self):
         """Paper Algorithm 1: Initial dataset clustering"""
+        # First stage: 1024 fine-grained clusters
         feature_dataset = FeatureDataset(self.config.dataset_path, self.config)
         feature_loader = DataLoader(feature_dataset, 
                                   batch_size=self.config.feature_batch_size,
                                   num_workers=self.config.feature_workers)
-        
-        features = self.cluster_manager.extract_features(feature_loader)
-        return self.cluster_manager.cluster_dataset(features)
+        fine_features = self.cluster_manager.extract_features(feature_loader)
+        fine_clusters = self.cluster_manager.cluster_dataset(fine_features, n_clusters=1024)
+
+        # Second stage: Consolidate to coarse clusters
+        coarse_clusters = self.cluster_manager.consolidate_clusters(
+            fine_clusters, target_clusters=self.config.num_experts
+        )
+        return coarse_clusters
     
     def sync_cluster_labels(self):
         """Synchronize cluster labels across all processes"""
@@ -125,26 +129,6 @@ class DDMTrainingCoordinator:
                                             lr=self.config.router_learning_rate,
                                             weight_decay=self.config.weight_decay)
         
-    def run_training_cycle(self):
-        """Paper Algorithm 2: Main training loop with full sharding"""
-        logger.info("Starting DDM training with dedicated trainers...")
-        
-        # Paper-recommended training schedule
-        for step in range(self.config.num_steps):
-            # Expert training phase (Section 3.2)
-            expert_losses = self.train_experts(step)
-            
-            # Router training phase (Section 3.3)
-            router_loss = self.train_router(step)
-            
-            # Paper-mandated synchronization points
-            if self.needs_reclustering(step):
-                self.perform_reclustering()
-                self.run_validation(step)
-                
-            # Distributed metric logging
-            self.log_sharded_metrics(step, expert_losses, router_loss)
-
     def train_experts(self, step):
         """Delegate expert training to ExpertTrainer instances"""
         return np.mean([
@@ -172,23 +156,13 @@ class DDMTrainingCoordinator:
         self.update_cluster_assignments(new_clusters)
         
     def run_validation(self, step):
-        """Paper-aligned validation with sharded models"""
-        if self.rank != 0: 
-            return
-        
-        # Gather sharded model states
-        expert_models = []
-        with FSDP.summon_full_params(self.expert_trainers[0].expert):
-            for trainer in self.expert_trainers:
-                expert_models.append(trainer.expert.clone().to("cpu"))
-        
-        # Generate samples using paper's algorithm
+        """Paper-aligned validation with top-1 expert selection"""
         samples = DecentralizedFlowMatcher.sample(
             self.config,
             self.router_trainer.router,
-            expert_models,
+            [trainer.expert for trainer in self.expert_trainers],
             num_samples=4,
-            device="cpu"
+            top_k=1  # Enforce paper's recommendation
         )
         
         # Calculate metrics
@@ -282,3 +256,28 @@ class DDMTrainingCoordinator:
                     'experts': [trainer.expert.state_dict() for trainer in self.expert_trainers],
                     'router': self.router_trainer.router.state_dict()
                 }, f"{self.config.save_dir}/best_fid.pt")
+
+    def train_distilled_model(self):
+        """Paper Section 3.6: Knowledge Distillation"""
+        teacher = DecentralizedFlowMatcher(
+            self.config, self.router_trainer.router, self.expert_trainers
+        )
+        student = ExpertDiT(self.config).to(self.device)
+        
+        distiller = DiffusionDistiller(
+            teacher=teacher,
+            student=student,
+            num_train_timesteps=self.config.num_timesteps,
+            loss_fn=nn.MSELoss(),
+            lr=self.config.distill_lr,
+            warmup_ratio=0.05
+        )
+        
+        # Train and save distilled model
+        distiller.train(self.distill_loader)
+        if self.rank == 0:
+            torch.save(student.state_dict(), f"{self.config.save_dir}/distilled_model.pt")
+
+    def needs_reclustering(self, step):
+        """Paper's dynamic reclustering schedule"""
+        return step % self.config.recluster_interval == 0

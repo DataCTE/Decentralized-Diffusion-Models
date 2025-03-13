@@ -126,6 +126,10 @@ class ExpertDiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         
+        # Initialize modulation layers to zero
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+        
     def get_position_embeddings(self, h, w, device):
         """Generate position embeddings for arbitrary grid sizes"""
         grid_indices = torch.stack(torch.meshgrid(

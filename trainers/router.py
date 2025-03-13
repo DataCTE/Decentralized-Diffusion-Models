@@ -6,9 +6,7 @@ import math
 from bitsandbytes.optim import AdamW8bit
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import default_auto_wrap_policy, size_based_auto_wrap_policy
-from torch.distributed.fsdp import StateDictType
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
-import os
 
 from models.router import RouterModel
 
@@ -72,12 +70,20 @@ class RouterTrainer:
             self.router = base_router
             
         # Paper-recommended optimizer settings
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = AdamW8bit(
             self.router.parameters(),
             lr=config.router_learning_rate,
             weight_decay=config.weight_decay
         )
         self.criterion = nn.CrossEntropyLoss()
+
+        # Paper-recommended learning schedule
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: min(step/self.config.warmup_steps, 1.0) 
+            if step < self.config.warmup_steps 
+            else 0.5*(1 + math.cos(math.pi*(step - self.config.warmup_steps)/self.config.total_steps))
+        )
 
     def train_epoch(self, loader):
         """
@@ -125,8 +131,14 @@ class RouterTrainer:
             # The paper uses AdamW with weight decay
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.max_grad_norm)
+            # Paper-recommended gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                self.router.parameters(), 
+                max_norm=self.config.max_grad_norm,  # Should be 1.0 in config
+                norm_type=2.0
+            )
             self.optimizer.step()
+            self.lr_scheduler.step()  # Update learning rate
             
             total_loss += loss.item()
             num_batches += 1
