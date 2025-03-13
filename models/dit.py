@@ -1,7 +1,7 @@
-"""DiT model implementation for Decentralized Diffusion Models."""
+"""DiT implementation for Decentralized Diffusion Models (Paper Section 3.2)"""
 
 import torch
-from torch import nn
+import torch.nn as nn
 import math
 
 from models.embeddings import TimestepEmbedder
@@ -11,58 +11,38 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 class DiTBlock(nn.Module):
-    """DiT Transformer Block with AdaLN-Zero conditioning"""
+    """Implements transformer block with adaLN-zero conditioning (Paper Eq. 4)"""
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        
-        # Layer norms
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        
-        # Attention
-        self.attn = nn.MultiheadAttention(
-            hidden_size, 
-            num_heads, 
-            dropout=0.0, 
-            batch_first=True
-        )
-        
-        # MLP
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False)
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False)
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_dim),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(mlp_hidden_dim, hidden_size)
+            nn.Linear(hidden_size, int(hidden_size * mlp_ratio)),
+            nn.GELU(),
+            nn.Linear(int(hidden_size * mlp_ratio), hidden_size)
         )
-        
-        # AdaLN-Zero modulation parameters
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 6 * hidden_size)
         )
-        
-        # Initialize to zero
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
     def forward(self, x, c):
-        # Get AdaLN modulation parameters
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
-        # Self-attention with modulation
-        x_norm = self.norm1(x)
-        x_norm = modulate(x_norm, shift_msa, scale_msa)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + gate_msa.unsqueeze(1) * attn_out
+        # Modulated attention
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            modulate(self.norm1(x), shift_msa, scale_msa)
+        )[0]
         
-        # MLP with modulation
-        x_norm = self.norm2(x)
-        x_norm = modulate(x_norm, shift_mlp, scale_mlp)
-        mlp_out = self.mlp(x_norm)
-        x = x + gate_mlp.unsqueeze(1) * mlp_out
-        
+        # Modulated MLP
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), shift_mlp, scale_mlp)
+        )
         return x
 
 class FinalLayer(nn.Module):
@@ -93,7 +73,7 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 class ExpertDiT(nn.Module):
-    """Expert DiT model for DDM - implements DiT architecture for latent diffusion"""
+    """Implements expert model from Paper Section 3.2"""
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -183,64 +163,24 @@ class ExpertDiT(nn.Module):
                      h * self.patch_size, w * self.patch_size)
         return x
     
-    def forward(self, x, t, text_embeddings=None, cfg_scale=7.5):
-        """
-        Forward pass through the DiT model with proper type handling
-        
-        Args:
-            x: Input noisy latent [B, C, H, W]
-            t: Timestep [B,]
-            text_embeddings: CLIP text embeddings [B, L, D] (optional)
-        """
-        # Ensure consistent dtype
-        dtype = x.dtype
-        
-        # Patchify input
+    def forward(self, x, t, text_embeds=None):
+        # FSDP-compatible forward pass
         x = self.x_embedder(x)  # [B, C, H, W] -> [B, D, H/P, W/P]
+        x = x.flatten(2).permute(0, 2, 1)  # [B, D, N] -> [B, N, D]
         
-        # Get actual grid dimensions
-        batch_size, _, h_patches, w_patches = x.shape
+        # Generate dynamic position embeddings
+        h, w = x.shape[2] // self.patch_size, x.shape[3] // self.patch_size
+        self.pos_embed = self.get_position_embeddings(h, w, x.device)
         
-        # Flatten patches
-        x = x.flatten(2).permute(0, 2, 1)  # [B, D, H/P, W/P] -> [B, (H/P*W/P), D]
-        
-        # Add position embeddings
-        pos_embed = self.get_position_embeddings(h_patches, w_patches, x.device).to(dtype=dtype)
-        x = x + pos_embed
-        
-        # Get timestep embeddings
-        t_emb = self.t_embedder(t).to(dtype=dtype)
-        
-        # Modified text conditioning with classifier-free guidance
-        if text_embeddings is not None:
-            # Ensure text embeddings have the same dtype as the model
-            text_embeddings = text_embeddings.to(dtype=dtype)
-            
-            # Project text embeddings
-            projected_text = self.text_projection(text_embeddings)
-            
-            # Classifier-free guidance implementation
-            uncond_proj = self.text_projection(torch.zeros_like(text_embeddings))
-            cond_emb = uncond_proj + cfg_scale * (projected_text - uncond_proj)
-            
-            # Apply cross-attention with guidance
-            x_out, _ = self.text_cross_attention(
-                query=x,
-                key=cond_emb,
-                value=cond_emb
-            )
-            x = x + x_out
+        # Add position embeddings with sharding awareness
+        x += self.pos_embed.to(x.dtype)  # FSDP handles sharded parameters
         
         # Process through transformer blocks
-        if self.use_gradient_checkpointing and self.training:
-            for block in self.blocks:
-                x = torch.utils.checkpoint.checkpoint(block, x, t_emb)
-        else:
-            for block in self.blocks:
-                x = block(x, t_emb)
-            
-        # Final layer and unpatchify with correct dimensions
-        x = self.final_layer(x, t_emb)
-        x = self.unpatchify(x, h_patches, w_patches)
+        for block in self.blocks:
+            if self.use_gradient_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(block, x, t)
+            else:
+                x = block(x, t)
         
-        return x 
+        # Final projection
+        return self.final_layer(x, t) 

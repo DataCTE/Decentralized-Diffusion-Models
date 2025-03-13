@@ -26,7 +26,12 @@ class DDMConfig:
         
         # FSDP (Fully Sharded Data Parallel) settings
         self.fsdp_sharding_strategy = "FULL_SHARD"  # Fully shard parameters, gradients, and optimizer states
-        self.fsdp_cpu_offload = False  # Whether to offload parameters to CPU
+        self.fsdp_cpu_offload = True
+        self.fsdp_activation_checkpointing = True
+        self.fsdp_sync_module_states = True
+        self.fsdp_use_orig_params = True
+        self.fsdp_limit_all_gathers = True
+        self.fsdp_forward_prefetch = True
         self.fsdp_min_num_params = 1e6  # Minimum number of parameters for a layer to be wrapped (1M)
         self.fsdp_auto_wrap_policy = "DEFAULT"  # Default auto wrap policy
         self.fsdp_backward_prefetch = "BACKWARD_PRE"  # Prefetch parameters before backward pass
@@ -39,7 +44,7 @@ class DDMConfig:
         self.pin_memory = True   # Pin memory for faster data transfer
         
         # Training settings
-        self.num_steps = 400_000  
+        self.num_steps = 400000  
         self.log_dir = "runs/ddm"
         self.save_dir = "checkpoints/ddm"
         self.checkpoint_dir = "checkpoints/ddm"  # Added to match save_dir

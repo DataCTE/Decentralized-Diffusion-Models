@@ -182,7 +182,6 @@ class DDMDataset(Dataset):
             
         except Exception as e:
             logger.error(f"Error loading {self.image_files[idx]}: {e}")
-            # Instead of returning a placeholder, raise the exception to be handled properly
             raise
 
 class FeatureDataset(Dataset):

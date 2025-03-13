@@ -78,5 +78,17 @@ def train_ddm():
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
+def main():
+    # Initialize distributed training
+    torch.distributed.init_process_group(backend='nccl')
+    rank = torch.distributed.get_rank()
+    
+    # Load config and create coordinator
+    config = DDMConfig()
+    coordinator = DDMTrainingCoordinator(config, rank, torch.distributed.get_world_size())
+    
+    # Run training cycle
+    coordinator.run_training_cycle()
+
 if __name__ == "__main__":
-    train_ddm() 
+    main() 

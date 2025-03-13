@@ -97,72 +97,89 @@ def update_sample(x_t, pred_noise, t, alphas=None, alpha_bar=None, betas=None, s
     return x_prev.clamp(-1., 1.)
 
 class DecentralizedFlowMatcher:
-    """Implements DFM objective from paper section 3.2"""
+    """Implements DFM objective from Paper Equation 6 & 7"""
+    
     def __init__(self, sigma=0.8, loss_type='l2'):
         """
-        Initialize the Decentralized Flow Matcher
-        
         Args:
-            sigma: Flow matching noise scale (paper section 3.2)
-            loss_type: Loss type for flow matching ('l2' or 'huber')
+            sigma: Noise scale from paper Appendix B.1
+            loss_type: 'l2' or 'huber' as per paper recommendations
         """
         self.sigma = sigma
         self.loss_type = loss_type
-        
-    def compute_conditional_flow(self, x0, t, noise):
-        """
-        Implements Equation 3 from paper - computes the conditional flow field
-        
-        Args:
-            x0: Original clean data [B, C, H, W]
-            t: Normalized timesteps in [0, 1] [B,]
-            noise: Random noise [B, C, H, W]
-        """
-        # Compute alpha_t and sigma_t using cosine schedule as in paper Section 3.2
-        # alpha_t = cos(t * pi/2), sigma_t = sin(t * pi/2)
-        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
-        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
-        
-        # Compute noisy sample x_t = alpha_t * x_0 + sigma_t * noise (Forward process)
-        x_t = alpha_t * x0 + sigma_t * noise
-        
-        # Compute conditional flow field (Equation 3 from paper)
-        # u_t(x_t|x_0) = (x_0 - x_t) / sigma_t
-        # This represents the direction from x_t toward x_0, scaled by 1/sigma_t
-        return (x0 - x_t) / sigma_t
-    
-    def expert_loss(self, pred_flow, x0, t, noise):
-        """
-        Equation 6 from paper - computes the expert loss
-        
-        Args:
-            pred_flow: Predicted flow from expert [B, C, H, W]
-            x0: Original clean data [B, C, H, W]
-            t: Normalized timesteps in [0, 1] [B,]
-            noise: Random noise [B, C, H, W]
-        """
-        # Compute target flow field
-        target_flow = self.compute_conditional_flow(x0, t, noise)
-        
-        # Apply loss function (L2 or Huber as specified in paper)
-        if self.loss_type == 'l2':
-            return torch.nn.functional.mse_loss(pred_flow, target_flow)
-        elif self.loss_type == 'huber':
-            return torch.nn.functional.smooth_l1_loss(pred_flow, target_flow)
-        else:
-            return torch.nn.functional.mse_loss(pred_flow, target_flow)
+        self._loss_fn = {
+            'l2': torch.nn.functional.mse_loss,
+            'huber': torch.nn.functional.smooth_l1_loss
+        }[loss_type]
 
-    def ensemble_flows(self, router_probs, expert_flows):
+    def compute_loss(self, pred_flows, router_probs, x0, t):
         """
-        Implements Equation 4 from paper - combines expert flows using router probabilities
-        
+        Paper Eq. 7: Decentralized flow matching loss
         Args:
-            router_probs: Router probabilities [B, num_experts]
-            expert_flows: List of expert flow predictions [num_experts, B, C, H, W]
+            pred_flows: List of expert flow predictions [E][B, C, H, W]
+            router_probs: Router probability distribution [B, E]
+            x0: Clean samples [B, C, H, W]
+            t: Timesteps [B,]
         """
-        # Stack flows [B, num_experts, C, H, W]
-        stacked = torch.stack(expert_flows, dim=1)
+        # Paper's noise schedule (Eq. 4)
+        alpha_t = torch.cos(t * math.pi/2)[:, None, None, None]
+        sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
         
-        # Weighted sum using router probabilities (Equation 4)
-        # u_t(x_t) = sum_k p_k(x_t, t) * u_t^k(x_t)
-        return (router_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * stacked).sum(dim=1) 
+        # Target flow calculation (Eq. 4)
+        noise = torch.randn_like(x0)
+        xt = alpha_t * x0 + sigma_t * noise
+        target_flow = (x0 - xt) / sigma_t
+        
+        # Compute expert losses (Eq. 6)
+        expert_losses = torch.stack([
+            self._loss_fn(pred, target_flow, reduction='none')
+            for pred in pred_flows
+        ], dim=1)  # [B, E, ...]
+        
+        # Apply router weights and reduce (Eq. 7)
+        weighted_losses = router_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * expert_losses
+        return weighted_losses.sum(dim=1).mean()
+
+    def sample(self, router, experts, shape, num_steps=50, top_k=1):
+        """
+        Paper Algorithm 2: Decentralized sampling
+        Args:
+            router: Trained router model
+            experts: List of expert models
+            shape: Output shape [B, C, H, W]
+            num_steps: Number of sampling steps
+            top_k: Number of experts to use per step
+        """
+        device = next(router.parameters()).device
+        x = torch.randn(shape, device=device)
+        
+        for step in reversed(range(num_steps)):
+            t = torch.ones(shape[0], device=device) * step / num_steps
+            
+            # Get router probabilities
+            with torch.no_grad():
+                logits = router(x, t)
+                probs = torch.softmax(logits, dim=-1)
+            
+            # Select top-k experts
+            top_probs, top_indices = torch.topk(probs, top_k, dim=-1)
+            top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
+            
+            # Compute expert predictions
+            preds = []
+            for expert_idx in range(len(experts)):
+                mask = (top_indices == expert_idx).any(dim=-1)
+                if mask.any():
+                    expert_pred = experts[expert_idx](x[mask], t[mask])
+                    preds.append((mask, expert_pred))
+            
+            # Combine predictions
+            combined = torch.zeros_like(x)
+            for mask, pred in preds:
+                combined[mask] += pred * top_probs[mask][..., None, None, None]
+            
+            # Update sample (Eq. 8)
+            dt = 1.0 / num_steps
+            x = x + combined * dt
+            
+        return x 
