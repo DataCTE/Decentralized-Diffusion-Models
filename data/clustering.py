@@ -4,6 +4,9 @@ import torch
 import numpy as np
 from sklearn.cluster import MiniBatchKMeans
 from tqdm import tqdm
+import logging
+
+logger = logging.getLogger(__name__)
 
 class ClusterManager:
     """Handles dataset clustering following the paper's approach"""
@@ -81,28 +84,49 @@ class ClusterManager:
     def perform_clustering(self, dataloader):
         """Paper's two-stage clustering procedure from Section 3.2"""
         # Stage 1: Extract features and create fine clusters
+        if self.local_rank == 0:
+            logger.info("Starting DINOv2 feature extraction")
         features = self.extract_features(dataloader)
         
         # Paper's dynamic cluster count based on dataset size
         n_samples = features.shape[0]
-        n_fine_clusters = min(1024, n_samples // 100)  # 1 cluster per 100 samples
-        n_coarse_clusters = 8  # Paper-mandated expert count
-        
+        n_fine_clusters = min(1024, n_samples // 100)
+        n_coarse_clusters = 8
+
         # Initialize fresh clusterers
         self.fine_clusterer = MiniBatchKMeans(n_clusters=n_fine_clusters)
         self.coarse_clusterer = MiniBatchKMeans(n_clusters=n_coarse_clusters)
-        
-        # Fit fine clusters and get centroids (no label storage)
-        print("Creating fine-grained centroids...")
-        self.fine_clusterer.fit(features)
-        fine_centroids = self.fine_clusterer.cluster_centers_
+
+        # Fit fine clusters with progress
+        if self.local_rank == 0:
+            logger.info(f"Clustering {n_samples:,} samples into {n_fine_clusters} fine clusters")
+            with tqdm(total=100, desc="Fine clustering", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
+                self.fine_clusterer.fit(features)
+                pbar.update(100)
         
         # Stage 2: Cluster fine centroids into coarse groups
-        print("Consolidating into coarse clusters...")
-        self.coarse_clusterer.fit(fine_centroids)
-        
-        # Directly map samples to coarse clusters via fine centroids
-        fine_labels = self.fine_clusterer.predict(features)
-        self.cluster_labels = self.coarse_clusterer.labels_[fine_labels]
+        fine_centroids = self.fine_clusterer.cluster_centers_
+        if self.local_rank == 0:
+            logger.info(f"Grouping {len(fine_centroids)} centroids into {n_coarse_clusters} coarse clusters")
+            with tqdm(total=100, desc="Coarse clustering", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
+                self.coarse_clusterer.fit(fine_centroids)
+                pbar.update(100)
+
+        # Map samples to coarse clusters with progress
+        if self.local_rank == 0:
+            logger.info("Assigning final cluster labels")
+            fine_labels = []
+            with tqdm(total=len(features), desc="Cluster assignment", unit="img") as pbar:
+                for i in range(0, len(features), 10000):
+                    batch = features[i:i+10000]
+                    fine_labels.extend(self.fine_clusterer.predict(batch))
+                    pbar.update(len(batch))
+            
+            self.cluster_labels = self.coarse_clusterer.labels_[fine_labels]
+        else:
+            self.cluster_labels = None
+            
+        # Broadcast labels to all processes
+        self.cluster_labels = self._broadcast_labels(self.cluster_labels)
         
         return self.cluster_labels 
