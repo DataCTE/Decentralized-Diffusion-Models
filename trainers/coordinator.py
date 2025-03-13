@@ -56,6 +56,15 @@ class DDMTrainingCoordinator:
         """Initialize clustering components as per paper Section 3.2"""
         self.cluster_manager = ClusterManager()
         self.previous_clusters = None
+        
+        # Perform initial clustering if not already done
+        if self.cluster_manager.get_clusters() is None:
+            feature_loader = DataLoader(
+                FeatureDataset(self.config.dataset_path, self.config),
+                batch_size=self.config.feature_batch_size,
+                num_workers=self.config.feature_workers
+            )
+            self.cluster_manager.perform_clustering(feature_loader)
 
     def init_data_loaders(self):
         """Initialize distributed data loaders with sharded validation"""
