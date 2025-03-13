@@ -59,7 +59,7 @@ class DDMConfig:
         self.recluster_interval = 50000  # Steps between reclustering
         
         # Paper-recommended hyperparameters
-        self.expert_batch_size = 32  # Per-expert batch size
+        self.expert_batch_size = 16  # Per-expert batch size
         self.router_learning_rate = 3e-5   # Different from expert LR
         self.recluster_epochs = 3          # Paper recommends 3 passes
         self.ema_decay = 0.9999            # For model stability
@@ -75,6 +75,6 @@ class DDMConfig:
         
         # Distillation settings
         self.distill_lr = 1e-5
-        self.distill_batch_size = 32
+        self.distill_batch_size = 16
         self.distill_epochs = 10
         self.distill_samples = 10000  # Number of samples for distillation 
