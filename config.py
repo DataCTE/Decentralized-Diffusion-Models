@@ -103,3 +103,8 @@ class DDMConfig:
         self.max_loaded_experts = 3  # Paper recommends 2-3 for 8 experts
         self.validation_topk = 1     # Paper Section 4.3 recommendation
         self.validation_samples = 4  # Default from code 
+        
+        # Add calibration parameters
+        self.calibration_interval = 1000  # Calibrate every 1000 steps
+        self.router_confidence_threshold = 0.7  # 0.7 recommended by paper
+        self.fallback_expert_idx = 0  # Default fallback expert

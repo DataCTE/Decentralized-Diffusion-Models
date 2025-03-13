@@ -7,6 +7,7 @@ from bitsandbytes.optim import AdamW8bit
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import default_auto_wrap_policy, size_based_auto_wrap_policy
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
+from torch.nn import functional as F
 
 from models.router import RouterModel
 
@@ -161,3 +162,32 @@ class RouterTrainer:
         
         # Return average loss over the epoch
         return total_loss / num_batches
+
+    def calibrate_confidence(self, val_loader):
+        """Paper-recommended temperature scaling (Section 3.3)"""
+        # Freeze all parameters except temperature
+        for param in self.router.parameters():
+            param.requires_grad = False
+        self.router.temperature.requires_grad = True
+        
+        optimizer = torch.optim.LBFGS([self.router.temperature], lr=0.01)
+        
+        def eval_fn():
+            optimizer.zero_grad()
+            loss = 0
+            for batch in val_loader:
+                images = batch["image"].to(self.device)
+                clusters = batch["cluster"].to(self.device)
+                t = torch.rand(images.size(0), device=self.device)
+                noise = torch.randn_like(images)
+                xt = torch.cos(t * math.pi/2)[:,None,None,None] * images + \
+                     torch.sin(t * math.pi/2)[:,None,None,None] * noise
+                    
+                logits = self.router(xt, t)
+                loss += F.cross_entropy(logits, clusters)
+            loss.backward()
+            return loss
+        
+        # Run L-BFGS optimization
+        for _ in range(100):
+            optimizer.step(eval_fn)

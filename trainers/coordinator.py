@@ -18,6 +18,7 @@ from data.dataset import DDMDataset, FeatureDataset
 from utils.diffusion import DecentralizedFlowMatcher
 from data.clustering import ClusterManager
 from trainers.Distillation import DiffusionDistiller
+from utils.clip import CLIPTextEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -170,18 +171,51 @@ class DDMTrainingCoordinator:
         
         # Update clusters
         new_clusters = self.cluster_manager.cluster_dataset(features)
-        self.update_cluster_assignments(new_clusters)
+        
+        # New expert data migration
+        cluster_mapping = self.cluster_manager.get_cluster_mapping(
+            self.previous_clusters, new_clusters
+        )
+        
+        # Migrate expert parameters
+        for old_idx, new_idx in cluster_mapping.items():
+            if old_idx != new_idx:
+                self.migrate_expert_data(old_idx, new_idx)
+        
+        # Update validation dataset assignments
+        self.val_dataset.update_clusters(new_clusters)
+        
+        # Paper-recommended expert reset for empty clusters
+        for new_idx in range(self.config.num_experts):
+            if new_idx not in cluster_mapping.values():
+                self.expert_trainers[new_idx].reset_parameters()
+        
+        # Update previous clusters
+        self.previous_clusters = new_clusters
         
     def run_validation(self, step):
-        """Optimized validation with on-demand expert loading"""
+        """Modified validation with confidence checks"""
+        fallback_count = 0
+        total_samples = 0
+        
         samples = []
         for _ in range(self.config.validation_samples):
-            # Generate sample using only needed experts
             with torch.no_grad():
                 latent = torch.randn(...)
                 for t in reversed(range(0, 1000)):
-                    # Get router predictions
                     probs = self.router_trainer.router(latent, t)
+                    max_prob = probs.max(dim=-1)[0]
+                    
+                    # Apply confidence threshold
+                    if self.config.router_confidence_threshold > 0:
+                        low_conf = max_prob < self.config.router_confidence_threshold
+                        if low_conf.any():
+                            # Use fallback expert for low confidence samples
+                            probs[low_conf] = 0
+                            probs[low_conf, 0] = 1.0  # Assign to expert 0
+                            fallback_count += low_conf.sum().item()
+                            total_samples += low_conf.size(0)
+                    
                     top_k = torch.topk(probs, self.config.validation_topk)
                     
                     # Aggregate only needed experts
@@ -200,6 +234,27 @@ class DDMTrainingCoordinator:
         fid = self.calculate_fid(samples, self.val_dataset)
         self.log_to_wandb(step, fid, samples)
         
+        # Calibrate router after validation
+        if step % self.config.calibration_interval == 0:
+            self.router_trainer.calibrate_confidence(self.val_loader)
+        
+        # Log fallback usage
+        metrics = {
+            'fallback_rate': fallback_count / total_samples if total_samples > 0 else 0,
+            'fid': fid,
+            'best_fid': min(fid, self.best_fid),
+            'samples': [wandb.Image(sample) for sample in samples]
+        }
+        wandb.log(metrics, step=step)
+        
+        # Update best FID
+        if fid < self.best_fid:
+            self.best_fid = fid
+            torch.save({
+                'experts': [trainer.expert.state_dict() for trainer in self.expert_trainers],
+                'router': self.router_trainer.router.state_dict()
+            }, f"{self.config.save_dir}/best_fid.pt")
+
     def save_sharded_checkpoints(self, step):
         """Paper-recommended sharded checkpoint format"""
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -213,7 +268,7 @@ class DDMTrainingCoordinator:
         expert_paths = []
         for idx, trainer in enumerate(self.expert_trainers):
             expert_state = FSDP.state_dict(trainer.expert)
-            path = f"{self.config.save_dir}/expert_{idx}_step{step}.pt"
+            path = f"{self.config.save_dir}/expert_{idx}_step{step}_v{self.config.version}.pt"
             if self.rank == 0:
                 torch.save(expert_state, path)
             expert_paths.append(path)
@@ -265,7 +320,43 @@ class DDMTrainingCoordinator:
         diff = mu_real - mu_gen
         cov_mean = (sigma_real @ sigma_gen).sqrt()
         fid = diff.dot(diff) + torch.trace(sigma_real + sigma_gen - 2*cov_mean)
-        return fid.item()
+        fid_inception = fid.item()
+        
+        # New CLIP-FID calculation
+        clip_model = CLIPTextEncoder(self.device, self.config).model.visual
+        clip_model.eval()
+        
+        def clip_features(images):
+            with torch.no_grad():
+                return clip_model(images)
+        
+        # DINOv2-FID calculation
+        dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+        dino_model.eval().to(self.device)
+        
+        def dino_features(images):
+            with torch.no_grad():
+                return dino_model(images)
+        
+        # Compute all metrics
+        return {
+            'inception_fid': fid_inception,
+            'clip_fid': self._compute_fid_pair(clip_features, real_loader, gen_loader),
+            'dino_fid': self._compute_fid_pair(dino_features, real_loader, gen_loader)
+        }
+
+    def _compute_fid_pair(self, feature_fn, real_loader, gen_loader):
+        """Helper to compute FID for different feature extractors"""
+        real_feats = torch.cat([feature_fn(batch['image'].to(self.device)) 
+                              for batch in real_loader])
+        gen_feats = torch.cat([feature_fn(batch.to(self.device)) 
+                             for batch in gen_loader])
+        
+        mu_real, sigma_real = torch.mean(real_feats, 0), torch.cov(real_feats.T)
+        mu_gen, sigma_gen = torch.mean(gen_feats, 0), torch.cov(gen_feats.T)
+        
+        return ((mu_real - mu_gen).pow(2).sum() + 
+                torch.trace(sigma_real + sigma_gen - 2*(sigma_real@sigma_gen).sqrt())).item()
 
     def get_current_lr(self):
         """Paper-recommended learning rate schedule"""
@@ -323,17 +414,27 @@ class DDMTrainingCoordinator:
         return step % self.config.recluster_interval == 0
 
     def get_expert(self, idx):
-        """Lazy-load experts with memory management"""
-        if idx not in self.loaded_experts:
-            # Load expert with FSDP sharding
-            expert = self._load_expert_sharded(idx)
-            
-            # Manage memory if over limit
-            if len(self.loaded_experts) >= self.config.max_loaded_experts:
-                # Evict least recently used expert
-                lru_key = min(self.loaded_experts, key=lambda k: self.loaded_experts[k][1])
-                del self.loaded_experts[lru_key]
-            
-            self.loaded_experts[idx] = (expert, self.expert_loading_count)
-            self.expert_loading_count += 1
-        return self.loaded_experts[idx][0]
+        """Lazy-load experts with fallback mechanism"""
+        try:
+            return super().get_expert(idx)
+        except KeyError:
+            if self.config.router_confidence_threshold > 0:
+                logger.warning(f"Using fallback expert for {idx}")
+                return self.expert_trainers[0]
+            raise
+
+    def migrate_expert_data(self, old_idx, new_idx):
+        """Transfer expert parameters and training data"""
+        # Parameter transfer
+        self.expert_trainers[new_idx].load_state_dict(
+            self.expert_trainers[old_idx].state_dict()
+        )
+        
+        # Data migration
+        old_mask = (self.cluster_labels == old_idx)
+        self.cluster_labels[old_mask] = new_idx
+        
+        # Update data loaders
+        self.expert_loaders[new_idx].dataset.add_samples(
+            self.expert_loaders[old_idx].dataset.remove_samples(old_mask)
+        )
