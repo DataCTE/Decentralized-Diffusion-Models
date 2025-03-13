@@ -22,7 +22,7 @@ class DDMConfig:
         # Data settings
         self.patch_size = 32
         self.image_size = 512
-        self.dataset_path = "./datasets/danbooru2025"  # Path to training dataset
+        self.dataset_path = "/home/alex/workspace/datasets/danbooru2025"  # Path to training dataset
         self.num_workers = 2     # DataLoader workers
         self.pin_memory = True   # Pin memory for faster data transfer
         
@@ -30,6 +30,7 @@ class DDMConfig:
         self.num_steps = 400_000  
         self.log_dir = "runs/ddm"
         self.save_dir = "checkpoints/ddm"
+        self.checkpoint_dir = "checkpoints/ddm"  # Added to match save_dir
         self.sample_dir = "samples/ddm"  # Directory to save generated samples
         
         # Inference settings

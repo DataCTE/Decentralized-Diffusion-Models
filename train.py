@@ -59,7 +59,7 @@ def train_ddm():
         
         # Initialize training coordinator with paper-recommended settings
         coordinator = DDMTrainingCoordinator(
-            DDMConfig(), device, rank, world_size
+            DDMConfig(), rank, world_size
         )
         
         # Run training cycle (Algorithm 1 in the paper)

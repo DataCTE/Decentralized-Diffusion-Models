@@ -7,7 +7,7 @@ import logging
 import math
 from tqdm import tqdm
 import wandb
-from adamw_bf16 import AdamW8bit
+from bitsandbytes.optim import AdamW8bit
 import numpy as np
 from torch.utils.data import DataLoader, Subset
 from torchvision.utils import make_grid
@@ -50,14 +50,14 @@ class DDMTrainingCoordinator:
         self.current_step = 0
         
         # Initialize dataset
-        self.full_dataset = DDMDataset(config)
+        self.full_dataset = DDMDataset(config.dataset_path)
         
         # Initialize router trainer
-        self.router_trainer = RouterTrainer(config, self.device)
+        self.router_trainer = RouterTrainer(config, self.device, self.rank)
         
         # Initialize expert trainers
         self.expert_trainers = [
-            ExpertTrainer(config, self.device, expert_idx=i)
+            ExpertTrainer(i, config, self.device, self.rank)
             for i in range(config.num_experts)
         ]
         
