@@ -97,4 +97,9 @@ class DDMConfig:
         self.distill_lr = 1e-5
         self.distill_batch_size = 1
         self.distill_epochs = 10
-        self.distill_samples = 10000  # Number of samples for distillation 
+        self.distill_samples = 10000  # Number of samples for distillation
+        
+        # Add these new params
+        self.max_loaded_experts = 3  # Paper recommends 2-3 for 8 experts
+        self.validation_topk = 1     # Paper Section 4.3 recommendation
+        self.validation_samples = 4  # Default from code 

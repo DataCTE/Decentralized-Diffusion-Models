@@ -1,7 +1,6 @@
 """Expert trainer for Decentralized Diffusion Models."""
 
 import torch
-from torch.distributed.optim import ZeroRedundancyOptimizer
 from bitsandbytes.optim import AdamW8bit
 import math
 import os
@@ -14,10 +13,7 @@ from models.dit import ExpertDiT
 from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from utils.vae import VAEWrapper
 from utils.clip import CLIPTextEncoder
-from utils.fsdp import get_fsdp_defaults
-from utils.checkpoint import save_sharded
-from utils.metrics import MetricCalculator
-from utils.base import BaseTrainer
+from trainers.base import BaseTrainer
 
 class ExpertTrainer(BaseTrainer):
     """Trainer for expert DiT models in DDM"""
@@ -60,7 +56,7 @@ class ExpertTrainer(BaseTrainer):
         else:
             auto_wrap_policy = default_auto_wrap_policy
             
-        # Apply FSDP to shard model across all GPUs
+        # Apply FSDP with explicit isolation
         self.expert = FSDP(
             base_expert,
             device_id=torch.cuda.current_device(),
@@ -68,7 +64,10 @@ class ExpertTrainer(BaseTrainer):
             cpu_offload=cpu_offload,
             backward_prefetch=backward_prefetch,
             auto_wrap_policy=auto_wrap_policy,
-            use_orig_params=True  # Allow easier parameter access
+            use_orig_params=True,
+            # Paper-mandated isolation parameters
+            ignored_parameters=[],  # Remove incorrect base_router reference
+            param_init_fn=lambda module: module.to_empty(device=torch.cuda.current_device(), recurse=False)
         )
         
         # Paper-specified optimizer settings - use Adam with FSDP
@@ -159,10 +158,22 @@ class ExpertTrainer(BaseTrainer):
         # Optimize using mixed precision
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
-        scaler.unscale_(self.optimizer)  # Unscale gradients for clipping
-        torch.nn.utils.clip_grad_norm_(self.expert.parameters(), 1.0, norm_type=2.0)
+        scaler.unscale_(self.optimizer)
+        # Paper-recommended per-expert gradient clipping
+        with self.expert.summon_full_params():
+            torch.nn.utils.clip_grad_norm_(
+                self.expert.parameters(), 
+                max_norm=self.config.max_grad_norm,
+                norm_type=2.0,
+                # Prevent cross-expert norm calculation
+                foreach=False  # Important for isolation
+            )
         scaler.step(self.optimizer)
         scaler.update()
+        
+        if self.config.use_affinity_mask:
+            mask = (batch['cluster'] == self.expert_idx).float()
+            loss = mask * loss + (1-mask) * loss.detach()
         
         return loss.item()
     

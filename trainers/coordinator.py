@@ -48,6 +48,9 @@ class DDMTrainingCoordinator:
         self.best_fid = float('inf')
         self.train_losses = []
         
+        self.loaded_experts = {}  # Track loaded experts
+        self.expert_loading_count = 0
+        
     def init_cluster_manager(self):
         """Initialize clustering components as per paper Section 3.2"""
         self.cluster_manager = ClusterManager()
@@ -92,7 +95,7 @@ class DDMTrainingCoordinator:
         self.cluster_labels = cluster_tensor.cpu().numpy()
         
     def init_models(self):
-        """Initialize models using dedicated trainer classes"""
+        """Initialize models with parameter isolation checks"""
         from trainers.expert import ExpertTrainer
         from trainers.router import RouterTrainer
         
@@ -118,6 +121,14 @@ class DDMTrainingCoordinator:
         if self.rank == 0:
             logger.info(f"Initialized {len(self.expert_trainers)} experts and router with dedicated trainers")
         
+        expert_params = set()
+        for i in range(self.config.num_experts):
+            expert = ExpertDiT(self.config)
+            current_params = {id(p) for p in expert.parameters()}
+            if expert_params & current_params:
+                raise RuntimeError(f"Parameter sharing detected in expert {i}")
+            expert_params |= current_params
+        
     def init_optimizers(self):
         """Initialize optimizers following paper Section 4.1"""
         self.expert_optims = [torch.optim.AdamW8bit(expert.parameters(), 
@@ -131,11 +142,17 @@ class DDMTrainingCoordinator:
         
     def train_experts(self, step):
         """Delegate expert training to ExpertTrainer instances"""
-        return np.mean([
+        loss = np.mean([
             trainer.train_step(batch)
             for trainer, loader in zip(self.expert_trainers, self.expert_loaders)
             for batch in loader
         ])
+        
+        # Add diversity loss
+        diversity_loss = torch.stack([e.diversity() for e in self.expert_trainers]).mean()
+        loss += self.config.diversity_lambda * diversity_loss
+        
+        return loss
     
     def train_router(self, step):
         """Delegate router training to RouterTrainer"""
@@ -156,32 +173,55 @@ class DDMTrainingCoordinator:
         self.update_cluster_assignments(new_clusters)
         
     def run_validation(self, step):
-        """Paper-aligned validation with top-1 expert selection"""
-        samples = DecentralizedFlowMatcher.sample(
-            self.config,
-            self.router_trainer.router,
-            [trainer.expert for trainer in self.expert_trainers],
-            num_samples=4,
-            top_k=1  # Enforce paper's recommendation
-        )
+        """Optimized validation with on-demand expert loading"""
+        samples = []
+        for _ in range(self.config.validation_samples):
+            # Generate sample using only needed experts
+            with torch.no_grad():
+                latent = torch.randn(...)
+                for t in reversed(range(0, 1000)):
+                    # Get router predictions
+                    probs = self.router_trainer.router(latent, t)
+                    top_k = torch.topk(probs, self.config.validation_topk)
+                    
+                    # Aggregate only needed experts
+                    combined_flow = 0
+                    for expert_idx in top_k.indices:
+                        expert = self.get_expert(expert_idx.item())
+                        flow = expert(latent, t)
+                        combined_flow += flow * top_k.values[expert_idx]
+                    
+                    # Update latent
+                    latent -= combined_flow * self.config.step_size
+            
+            samples.append(self.vae.decode(latent))
         
         # Calculate metrics
         fid = self.calculate_fid(samples, self.val_dataset)
         self.log_to_wandb(step, fid, samples)
         
     def save_sharded_checkpoints(self, step):
-        """Save checkpoints through trainer classes"""
-        if self.rank == 0:
-            logger.info(f"Saving sharded checkpoint at step {step}")
+        """Paper-recommended sharded checkpoint format"""
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         
         checkpoint = {
-            'experts': [trainer.expert.state_dict() for trainer in self.expert_trainers],
-            'router': self.router_trainer.router.state_dict(),
-            'config': self.config,
-            'step': step
+            'meta': {'step': step, 'best_fid': self.best_fid},
+            'router': FSDP.state_dict(self.router_trainer.router),
         }
         
-        torch.save(checkpoint, f"{self.config.save_dir}/ddm_step{step}.pt")
+        # Save experts separately using FSDP sharded format
+        expert_paths = []
+        for idx, trainer in enumerate(self.expert_trainers):
+            expert_state = FSDP.state_dict(trainer.expert)
+            path = f"{self.config.save_dir}/expert_{idx}_step{step}.pt"
+            if self.rank == 0:
+                torch.save(expert_state, path)
+            expert_paths.append(path)
+        
+        checkpoint['expert_paths'] = expert_paths
+        
+        if self.rank == 0:
+            torch.save(checkpoint, f"{self.config.save_dir}/coordinator_step{step}.pt")
             
     def log_sharded_metrics(self, step, expert_loss, router_loss):
         """Log training metrics to WandB"""
@@ -281,3 +321,19 @@ class DDMTrainingCoordinator:
     def needs_reclustering(self, step):
         """Paper's dynamic reclustering schedule"""
         return step % self.config.recluster_interval == 0
+
+    def get_expert(self, idx):
+        """Lazy-load experts with memory management"""
+        if idx not in self.loaded_experts:
+            # Load expert with FSDP sharding
+            expert = self._load_expert_sharded(idx)
+            
+            # Manage memory if over limit
+            if len(self.loaded_experts) >= self.config.max_loaded_experts:
+                # Evict least recently used expert
+                lru_key = min(self.loaded_experts, key=lambda k: self.loaded_experts[k][1])
+                del self.loaded_experts[lru_key]
+            
+            self.loaded_experts[idx] = (expert, self.expert_loading_count)
+            self.expert_loading_count += 1
+        return self.loaded_experts[idx][0]

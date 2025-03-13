@@ -92,6 +92,15 @@ class RouterTrainer:
         This trains the router model to predict which expert should handle
         each sample, as described in Section 3.3 of the paper.
         """
+        # Add gradient isolation
+        for param in self.router.parameters():
+            param.requires_grad_(False)  # Freeze first
+        
+        # Only unfreeze router-specific params
+        for name, param in self.router.named_parameters():
+            if "classifier" in name or "cls_token" in name:
+                param.requires_grad_(True)
+        
         total_loss = 0
         num_batches = 0
         
@@ -126,6 +135,13 @@ class RouterTrainer:
             # where k* is the cluster assignment for x_0
             # This is implemented as cross-entropy between logits and cluster labels
             loss = self.criterion(logits, clusters)
+            
+            # Add confidence thresholding
+            if self.config.router_confidence_threshold > 0:
+                probs = torch.softmax(logits, dim=1)
+                max_prob = probs.max(dim=1)[0]
+                mask = (max_prob > self.config.router_confidence_threshold).float()
+                loss = (loss * mask).mean()
             
             # Optimization (Section 4.1)
             # The paper uses AdamW with weight decay
