@@ -7,6 +7,7 @@ import datetime
 import torch.nn.functional as F
 import time
 import sys
+import numpy as np
 
 from data.dataset import DDMDataset
 from data.clustering import ClusterManager
@@ -57,9 +58,30 @@ class DDMTrainingCoordinator:
         self.config = config
         self.rank = rank
         self.world_size = world_size
-        self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
         self.cache_manager = cache_manager
         self.progress_callback = progress_callback
+        
+        # Set device
+        if torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{rank}")
+        else:
+            self.device = torch.device("cpu")
+        
+        # Initialize components
+        self.vae = None
+        self.clip = None
+        self.router = None
+        self.experts = {}
+        
+        # Data components
+        self.cluster_manager = None
+        self.dataset = None
+        self.expert_loaders = {}
+        self.router_loader = None
+        
+        # Initialize learning rate scheduler
+        self.scheduler_fn = None
+        self.create_lr_scheduler()
         
         debug_print(f"Initializing with device: {self.device}", rank)
         
@@ -274,63 +296,133 @@ class DDMTrainingCoordinator:
             return False
 
     def init_cluster_manager(self):
-        """Initialize cluster manager for expert assignment"""
-        debug_print(f"Creating ClusterManager for rank {self.rank}", self.rank)
+        """Initialize data clustering manager (Section 4.1)"""
+        from data.clustering import ClusterManager
         
-        try:
-            # Report progress
-            if self.progress_callback and self.rank == 0:
-                self.progress_callback("Extracting dataset features for clustering", 5)
-                
-            # Create cluster manager
-            self.cluster_manager = ClusterManager(
-                local_rank=self.rank,
-                dataset_path=self.config.dataset_path,
-                config=self.config
-            )
+        # Create feature extractor based on config
+        logger.info(f"Initializing clustering manager with {self.config.num_experts} experts")
+        init_start_time = time.time()
+        
+        # Log progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Starting cluster manager initialization", 5)
             
-            # Report progress
-            if self.progress_callback and self.rank == 0:
-                self.progress_callback("Performing initial data clustering", 15)
-                
-            # Use synchronization to ensure all processes have initialized
-            debug_print(f"Waiting for cluster manager sync on rank {self.rank}", self.rank)
-            sync_start = time.time()
-            self.safe_synchronize(timeout_seconds=300, name="cluster_manager_init")
-            debug_print(f"Cluster manager sync completed in {time.time() - sync_start:.2f}s", self.rank)
+        # Create dataset for feature extraction
+        logger.info(f"Creating feature extraction dataset from {self.config.dataset_path}")
+        dataset_start_time = time.time()
+        
+        from data.dataset import FeatureDataset
+        feature_dataset = FeatureDataset(
+            root_dir=self.config.dataset_path,
+            config=self.config
+        )
+        
+        dataset_time = time.time() - dataset_start_time
+        logger.info(f"Feature dataset created in {dataset_time:.2f}s with {len(feature_dataset)} images")
+        
+        # Create dataloader for feature extraction
+        logger.info(f"Creating feature extraction dataloader")
+        dataloader_start_time = time.time()
+        
+        from torch.utils.data import DataLoader
+        feature_loader = DataLoader(
+            feature_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=True
+        )
+        
+        dataloader_time = time.time() - dataloader_start_time
+        logger.info(f"Feature dataloader created in {dataloader_time:.2f}s with {len(feature_loader)} batches")
+        
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Extracting features from dataset", 10)
             
-            # Report progress
-            if self.progress_callback and self.rank == 0:
-                self.progress_callback("Cluster synchronization complete", 20)
-                
-            debug_print(f"Cluster manager initialized successfully on rank {self.rank}", self.rank)
-        except Exception as e:
-            debug_print(f"CRITICAL ERROR: Failed to initialize cluster manager on rank {self.rank}: {str(e)}", self.rank, True)
-            logger.error(f"Failed to initialize cluster manager: {str(e)}")
-            raise
+        # Create cluster manager
+        cluster_start_time = time.time()
+        self.cluster_manager = ClusterManager(
+            config=self.config,
+            feature_extractor=None  # Will be created internally based on config
+        )
+        
+        # Generate clusters
+        logger.info(f"Generating {self.config.num_experts} clusters from dataset")
+        
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Generating clusters", 15)
+            
+        # Generate clusters
+        clustering_start_time = time.time()
+        cluster_labels = self.cluster_manager.generate_clusters(
+            dataloader=feature_loader,
+            k=self.config.num_experts,
+            fine_clusters=getattr(self.config, 'fine_clusters', 1024)
+        )
+        
+        clustering_time = time.time() - clustering_start_time
+        logger.info(f"Clustering completed in {clustering_time:.2f}s")
+        
+        # Visualize clusters if configured
+        if getattr(self.config, 'visualize_clusters', False) and self.rank == 0:
+            try:
+                logger.info("Generating cluster visualization")
+                viz_path = os.path.join(self.config.output_dir, 'cluster_visualization.png')
+                self.cluster_manager.visualize_clusters(
+                    features=None,  # Use internal features
+                    labels=cluster_labels,
+                    output_path=viz_path
+                )
+            except Exception as e:
+                logger.warning(f"Failed to generate cluster visualization: {e}")
+        
+        # Synchronize after clustering
+        if self.world_size > 1:
+            self.safe_synchronize(timeout_seconds=300, name="cluster_initialization")
+            
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Clustering complete", 20)
+            
+        # Log completion
+        total_time = time.time() - init_start_time
+        logger.info(f"Cluster manager initialization completed in {total_time:.2f}s")
+        
+        return cluster_labels
             
     def init_data_loaders(self):
-        """Initialize data loaders for training"""
-        debug_print(f"Initializing data loaders on rank {self.rank}", self.rank)
+        """Initialize dataset and data loaders (Section 3.1)"""
+        logger.info(f"Initializing data loaders on rank {self.rank}")
+        init_start_time = time.time()
         
         try:
             # Create dataset
-            debug_print(f"Creating dataset on rank {self.rank}", self.rank)
+            logger.info(f"Creating dataset from {self.config.dataset_path}")
+            dataset_start_time = time.time()
             
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Creating dataset", 30)
                 
+            # Get cluster assignments from manager
+            cluster_assignments = self.cluster_manager.get_cluster_labels()
+            logger.info(f"Using {len(np.unique(cluster_assignments))} clusters for data assignment")
+            
+            from data.dataset import DDMDataset
             self.dataset = DDMDataset(
-                root_dir=self.config.dataset_path,
-                cluster_assignments=self.cluster_manager.get_cluster_assignments(),
                 config=self.config,
-                vae=self.vae,
-                clip=self.clip
+                split='train',
+                cluster_labels=cluster_assignments
             )
             
+            dataset_time = time.time() - dataset_start_time
+            logger.info(f"Dataset created in {dataset_time:.2f}s with {len(self.dataset)} samples")
+            
             # Create expert data loaders
-            debug_print(f"Creating expert bucket loaders on rank {self.rank}", self.rank)
+            logger.info(f"Creating expert bucket loaders on rank {self.rank}")
+            loaders_start_time = time.time()
             
             # Report progress
             if self.progress_callback and self.rank == 0:
@@ -344,136 +436,188 @@ class DDMTrainingCoordinator:
                 rank=self.rank
             )
             
+            # Log data loader stats
+            num_experts = len(self.expert_loaders)
+            total_batches = sum(len(loader) for loader in self.expert_loaders.values())
+            logger.info(f"Created {num_experts} expert loaders with {total_batches} total batches on rank {self.rank}")
+            
+            for expert_idx, loader in self.expert_loaders.items():
+                if self.is_expert_owned_by_rank(expert_idx):
+                    logger.info(f"Rank {self.rank} owns expert {expert_idx} with {len(loader)} batches")
+            
             # Create router data loader
-            debug_print(f"Creating router data loader on rank {self.rank}", self.rank)
+            logger.info(f"Creating router data loader on rank {self.rank}")
+            router_start_time = time.time()
             
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Creating router data loader", 40)
                 
-            from data.loader import create_router_loader
-            self.router_loader = create_router_loader(
-                dataset=self.dataset,
-                config=self.config,
-                world_size=self.world_size,
-                rank=self.rank
+            from torch.utils.data import DataLoader
+            self.router_loader = DataLoader(
+                self.dataset,
+                batch_size=self.config.router_batch_size,
+                shuffle=True,
+                num_workers=self.config.num_workers,
+                pin_memory=True
             )
             
-            # Log initialization statistics
-            num_experts = len(self.expert_loaders)
-            logger.info(f"Created {num_experts} expert data loaders")
-            logger.info(f"Created router data loader with {len(self.router_loader)} batches")
+            router_time = time.time() - router_start_time
+            loaders_time = time.time() - loaders_start_time
+            logger.info(f"Router loader created in {router_time:.2f}s with {len(self.router_loader)} batches")
+            logger.info(f"All data loaders created in {loaders_time:.2f}s")
             
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Data loaders ready", 45)
                 
+            # Log initialization statistics
+            if self.rank == 0:
+                num_clusters = len(np.unique(cluster_assignments))
+                logger.info(f"Dataset has {len(self.dataset)} samples assigned to {num_clusters} clusters")
+                logger.info(f"Created {len(self.expert_loaders)} expert loaders and 1 router loader")
+                
+            # Synchronize all processes after data loading
+            if self.world_size > 1:
+                self.safe_synchronize(timeout_seconds=60, name="data_loading")
+                
+            # Final timing
+            total_time = time.time() - init_start_time
+            logger.info(f"Data loader initialization completed in {total_time:.2f}s")
+                
         except Exception as e:
-            logger.error(f"Failed to initialize data loaders: {str(e)}")
+            logger.error(f"Error initializing data loaders on rank {self.rank}: {str(e)}")
             raise
             
     def init_models(self):
-        """Initialize models for training"""
-        debug_print(f"Initializing models on rank {self.rank}", self.rank)
+        """Initialize model components (VAE, CLIP, router, experts) (Section 3.2-3.3)"""
+        logger.info(f"Initializing models on rank {self.rank}")
+        init_start_time = time.time()
         
         try:
-            # Create VAE for latent encoding
-            debug_print(f"Creating VAE encoder/decoder on rank {self.rank}", self.rank)
+            # Load VAE for latent diffusion
+            logger.info(f"Loading VAE encoder/decoder on rank {self.rank}")
+            vae_start_time = time.time()
             
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Loading VAE encoder/decoder", 55)
                 
-            start_time = time.time()
             from data.vae import VAEWrapper
-            self.vae = VAEWrapper(self.device, self.config)
-            debug_print(f"VAE created in {time.time() - start_time:.2f}s on rank {self.rank}", self.rank)
+            self.vae = VAEWrapper(
+                device=self.device,
+                config=self.config
+            )
             
-            # Create CLIP for text conditioning
-            debug_print(f"Creating CLIP encoder on rank {self.rank}", self.rank)
+            vae_time = time.time() - vae_start_time
+            logger.info(f"VAE initialized in {vae_time:.2f}s")
+            
+            # Load CLIP text encoder for conditioning
+            logger.info(f"Loading CLIP text encoder on rank {self.rank}")
+            clip_start_time = time.time()
             
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Loading CLIP text encoder", 60)
                 
-            start_time = time.time()
             from data.clip import CLIPTextEncoder
-            self.clip = CLIPTextEncoder(self.device, self.config)
-            debug_print(f"CLIP created in {time.time() - start_time:.2f}s on rank {self.rank}", self.rank)
+            self.clip = CLIPTextEncoder(
+                device=self.device,
+                config=self.config
+            )
             
-            # Create router trainer
-            debug_print(f"Creating router model on rank {self.rank}", self.rank)
+            clip_time = time.time() - clip_start_time
+            logger.info(f"CLIP initialized in {clip_time:.2f}s")
+            
+            # Create router network
+            logger.info(f"Creating router network on rank {self.rank}")
+            router_start_time = time.time()
             
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Creating router network", 65)
                 
-            start_time = time.time()
-            self.router = RouterTrainer(
+            from trainers.router import DDMRouter
+            self.router = DDMRouter(
                 config=self.config,
-                device=self.device,
-                rank=self.rank,
-                world_size=self.world_size
-            )
-            debug_print(f"Router created in {time.time() - start_time:.2f}s on rank {self.rank}", self.rank)
+                num_clusters=self.config.num_experts,
+                device=self.device
+            ) if self.rank == 0 or not getattr(self.config, 'router_on_main_process_only', False) else None
             
-            # Create expert trainers (one per expert)
-            debug_print(f"Creating expert models for rank {self.rank}", self.rank)
+            router_time = time.time() - router_start_time
+            logger.info(f"Router created in {router_time:.2f}s on rank {self.rank}")
+            
+            # Create expert networks (only for experts assigned to this process)
+            logger.info(f"Creating expert networks for rank {self.rank}")
+            experts_start_time = time.time()
             
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Creating expert networks", 70)
                 
+            from trainers.expert import DDMExpert
             self.experts = {}
+            experts_per_process = max(1, self.config.num_experts // self.world_size)
             
-            # Only create expert models that are assigned to this rank
-            expert_count = 0
-            total_experts = sum(1 for expert_idx in range(self.config.num_experts) if self.is_expert_owned_by_rank(expert_idx))
+            # Count total experts this rank will initialize
+            expert_indices = [i for i in range(self.config.num_experts) if self.is_expert_owned_by_rank(i)]
+            logger.info(f"Rank {self.rank} will create {len(expert_indices)} expert networks")
             
-            for expert_idx in range(self.config.num_experts):
-                if self.is_expert_owned_by_rank(expert_idx):
-                    debug_print(f"Creating expert {expert_idx} on rank {self.rank}", self.rank)
-                    start_time = time.time()
-                    
-                    # Update progress for each expert
-                    if self.progress_callback and self.rank == 0:
-                        expert_progress = 70 + (expert_count / max(1, total_experts)) * 5
-                        self.progress_callback(f"Creating expert {expert_idx}", expert_progress)
-                        expert_count += 1
-                    
-                    if self.cache_manager:
-                        # If using cache manager, get expert from cache or create new
-                        self.experts[expert_idx] = self.cache_manager.get_expert(expert_idx)
-                    else:
-                        # Otherwise create expert directly
-                        self.experts[expert_idx] = ExpertTrainer(
-                            expert_idx=expert_idx,
-                            config=self.config,
-                            device=self.device,
-                            rank=self.rank,
-                            world_size=self.world_size
-                        )
-                    debug_print(f"Expert {expert_idx} created in {time.time() - start_time:.2f}s on rank {self.rank}", self.rank)
+            # Initialize experts assigned to this rank
+            for expert_idx in expert_indices:
+                expert_start = time.time()
+                logger.info(f"Initializing expert {expert_idx} on rank {self.rank}")
+                
+                self.experts[expert_idx] = DDMExpert(
+                    expert_idx=expert_idx,
+                    config=self.config,
+                    device=self.device,
+                    vae=self.vae,
+                    text_encoder=self.clip
+                )
+                
+                logger.info(f"Expert {expert_idx} initialized in {time.time() - expert_start:.2f}s on rank {self.rank}")
+                
+                # Update progress for each expert
+                if self.progress_callback and self.rank == 0:
+                    # Calculate progress based on how many experts we've initialized
+                    progress = 70 + (3 * (len(self.experts) / max(1, len(expert_indices))))
+                    self.progress_callback(f"Created expert {expert_idx}", min(73, progress))
             
-            debug_print(f"Model initialization complete on rank {self.rank}", self.rank)
+            experts_time = time.time() - experts_start_time
+            logger.info(f"All {len(self.experts)} experts initialized in {experts_time:.2f}s on rank {self.rank}")
             
-        except Exception as e:
-            debug_print(f"ERROR: Failed to initialize models on rank {self.rank}: {str(e)}", self.rank, True)
-            logger.error(f"Failed to initialize models: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            raise
+            # Get initialized expert indices
+            initialized_experts = list(self.experts.keys())
+            logger.info(f"Rank {self.rank} initialized experts: {initialized_experts}")
             
-        # Use synchronization
-        debug_print(f"Synchronizing after model initialization on rank {self.rank}", self.rank)
+            # Synchronize model initialization across processes
+            logger.info(f"Synchronizing model initialization on rank {self.rank}")
+            sync_start = time.time()
+            
+            if self.world_size > 1:
+                self.safe_synchronize(timeout_seconds=60, name="model_initialization")
+                
+            sync_time = time.time() - sync_start
+            logger.info(f"Synchronization completed in {sync_time:.2f}s")
+            
+            # Report final progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Models initialized", 75)
+                
+            # Final timing
+            total_time = time.time() - init_start_time
+            logger.info(f"Model initialization completed in {total_time:.2f}s")
+            
+            # Log memory usage after model initialization
+            if torch.cuda.is_available():
+                used_mem = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory / (1024 ** 3)
+                logger.info(f"GPU memory: {used_mem:.2f}GB used / {total_mem:.2f}GB total ({used_mem/total_mem*100:.1f}%)")
         
-        # Report progress
-        if self.progress_callback and self.rank == 0:
-            self.progress_callback("Synchronizing models across processes", 73)
-            
-        sync_start = time.time()
-        self.safe_synchronize(timeout_seconds=300, name="model_init")
-        debug_print(f"Model initialization synchronization completed in {time.time() - sync_start:.2f}s on rank {self.rank}", self.rank)
+        except Exception as e:
+            logger.error(f"Error initializing models on rank {self.rank}: {str(e)}")
+            raise
     
     def get_expert(self, expert_idx):
         """
@@ -632,93 +776,160 @@ class DDMTrainingCoordinator:
             # Continue with newly initialized expert if migration fails
     
     def train_experts(self, step):
-        """
-        Train expert models according to paper Section 3.2 and 3.4
-        
-        Args:
-            step: Current training step
+        """Train expert networks on their assigned data (Section 3.2)"""
+        if not self.experts:
+            logger.warning(f"No experts assigned to rank {self.rank}, skipping expert training")
+            return 0.0
             
-        Returns:
-            Mean expert loss
-        """
-        expert_losses = {}
+        logger.info(f"Training {len(self.experts)} experts on rank {self.rank} for step {step}")
+        training_start_time = time.time()
         
-        # Each process trains its assigned experts
-        for expert_idx in range(self.config.num_experts):
-            if self.is_expert_owned_by_rank(expert_idx):
-                # Get expert data loader iterator
-                if expert_idx not in self.expert_iterators:
-                    # Initialize iterator if not exists
-                    self.expert_iterators[expert_idx] = iter(self.expert_loaders[expert_idx])
+        # Track losses for each expert
+        expert_losses = {}
+        total_samples = 0
+        
+        # Train each expert assigned to this process
+        for expert_idx, expert in self.experts.items():
+            # Skip if no data loader for this expert
+            if expert_idx not in self.expert_loaders:
+                logger.warning(f"No data loader for expert {expert_idx} on rank {self.rank}, skipping")
+                continue
                 
-                try:
-                    # Get next batch
-                    batch = next(self.expert_iterators[expert_idx])
-                except StopIteration:
-                    # Reset iterator and get new batch
-                    self.expert_iterators[expert_idx] = iter(self.expert_loaders[expert_idx])
-                    batch = next(self.expert_iterators[expert_idx])
+            # Get data loader for this expert
+            loader = self.expert_loaders[expert_idx]
+            if not loader or len(loader) == 0:
+                logger.warning(f"Empty data loader for expert {expert_idx} on rank {self.rank}, skipping")
+                continue
                 
-                # Get expert model
-                expert = self.get_expert(expert_idx)
-                # Set to training mode
-                expert.train()
+            # Train this expert for one batch
+            expert_start_time = time.time()
+            logger.info(f"Training expert {expert_idx} on rank {self.rank}")
+            
+            try:
+                # Get a batch from the expert's data loader
+                batch = next(iter(loader))
+                batch_size = len(batch['image']) if isinstance(batch, dict) and 'image' in batch else len(batch)
+                total_samples += batch_size
                 
-                # Train step (Section 3.2 of the paper)
-                loss = expert.train_step(batch)
+                # Forward pass and update
+                loss = expert.train_step(batch, step=step)
+                
+                # Store loss
                 expert_losses[expert_idx] = loss
                 
+                # Log training stats
+                expert_time = time.time() - expert_start_time
+                logger.info(f"Expert {expert_idx} trained in {expert_time:.2f}s with loss {loss:.4f} "
+                           f"({batch_size} samples, {expert_time/batch_size:.3f}s per sample)")
+                
                 # Log per-expert metrics
-                if step % self.config.log_every_n_steps == 0 and self.rank == 0:
+                if step % self.config.log_every_n_steps == 0:
                     logger.info(f"Step {step}: Expert {expert_idx} loss: {loss:.4f}")
+            
+            except Exception as e:
+                logger.error(f"Error training expert {expert_idx} on rank {self.rank}: {str(e)}")
+                expert_losses[expert_idx] = float('nan')
+                
+        # Compute average loss across experts
+        valid_losses = [loss for loss in expert_losses.values() if not np.isnan(loss)]
+        avg_loss = np.mean(valid_losses).item() if valid_losses else 0.0
         
-        # Synchronize expert losses across processes
-        all_expert_losses = {}
-        for i in range(self.config.num_experts):
-            if i in expert_losses:
-                all_expert_losses[i] = expert_losses[i]
-            else:
-                all_expert_losses[i] = 0.0
+        # Log overall training stats
+        training_time = time.time() - training_start_time
+        experts_trained = len(valid_losses)
         
-        # Calculate mean loss
-        mean_loss = sum(all_expert_losses.values()) / max(len(all_expert_losses), 1)
-        
-        return mean_loss
+        if experts_trained > 0:
+            logger.info(f"Trained {experts_trained}/{len(self.experts)} experts in {training_time:.2f}s "
+                       f"with average loss {avg_loss:.4f} "
+                       f"({total_samples} total samples, {training_time/experts_trained:.3f}s per expert)")
+        else:
+            logger.warning(f"No experts successfully trained on rank {self.rank}")
+            
+        # Synchronize after expert training if needed
+        if self.world_size > 1 and step % getattr(self.config, 'sync_every_n_steps', 10) == 0:
+            sync_start = time.time()
+            self.safe_synchronize(timeout_seconds=30, name="expert_training")
+            logger.info(f"Expert training synchronization completed in {time.time() - sync_start:.2f}s")
+            
+        return avg_loss
             
     def train_router(self, step):
-        """
-        Train router model according to paper Section 3.3 (Algorithm 1)
-        
-        Args:
-            step: Current training step
-            
-        Returns:
-            Router loss
-        """
-        # Only train router on rank 0
-        if self.rank != 0:
+        """Train the router network to correctly predict data clusters (Section 3.3)"""
+        # Skip training if router not on this rank
+        if self.router is None:
             return 0.0
-        
-        # Get router data loader iterator
-        if not hasattr(self, 'router_iterator'):
-            self.router_iterator = iter(self.router_loader)
+            
+        # Only master process trains router if configured
+        if getattr(self.config, 'router_on_main_process_only', False) and self.rank != 0:
+            return 0.0
+            
+        logger.info(f"Training router on rank {self.rank} for step {step}")
+        training_start_time = time.time()
         
         try:
-            # Get next batch
-            batch = next(self.router_iterator)
-        except StopIteration:
-            # Reset iterator and get new batch
-            self.router_iterator = iter(self.router_loader)
-            batch = next(self.router_iterator)
-        
-        # Train step (Section 3.3 of the paper)
-        loss = self.router.train_step(batch)
-        
-        # Log router metrics
-        if step % self.config.log_every_n_steps == 0:
-            logger.info(f"Step {step}: Router loss: {loss:.4f}")
-        
-        return loss
+            # Get batch from router loader
+            batch_start_time = time.time()
+            
+            # Initialize iterator if not exists
+            if not hasattr(self, 'router_iterator') or self.router_iterator is None:
+                self.router_iterator = iter(self.router_loader)
+                
+            # Get next batch (with restart if needed)
+            try:
+                batch = next(self.router_iterator)
+            except StopIteration:
+                # Reset iterator and get new batch
+                self.router_iterator = iter(self.router_loader)
+                batch = next(self.router_iterator)
+                
+            batch_time = time.time() - batch_start_time
+            
+            # Get batch size and cluster info
+            batch_size = len(batch['image']) if isinstance(batch, dict) and 'image' in batch else len(batch)
+            cluster_labels = batch['cluster'] if isinstance(batch, dict) and 'cluster' in batch else None
+            
+            if cluster_labels is None:
+                logger.warning("No cluster labels in batch, cannot train router")
+                return 0.0
+                
+            # Filter out samples with no cluster assignment (-1)
+            valid_mask = cluster_labels >= 0
+            valid_count = valid_mask.sum().item()
+            
+            if valid_count == 0:
+                logger.warning("No valid cluster assignments in batch, skipping router training")
+                return 0.0
+                
+            if valid_count < batch_size:
+                logger.info(f"Found {batch_size - valid_count} samples without cluster assignments, "
+                          f"training with {valid_count}/{batch_size} samples")
+                
+            # Train router on this batch
+            logger.info(f"Training router with batch of {valid_count} samples")
+            train_start_time = time.time()
+            
+            # Forward pass and update
+            loss = self.router.train_step(batch, step=step)
+            
+            # Calculate training metrics
+            training_time = time.time() - train_start_time
+            total_time = time.time() - training_start_time
+            
+            # Log detailed statistics
+            logger.info(f"Router trained in {training_time:.2f}s with loss {loss:.4f} "
+                       f"({valid_count} samples, {training_time/valid_count:.3f}s per sample)")
+            logger.info(f"Total router processing time: {total_time:.2f}s "
+                       f"(batch loading: {batch_time:.2f}s, training: {training_time:.2f}s)")
+            
+            # Log router metrics
+            if step % self.config.log_every_n_steps == 0:
+                logger.info(f"Step {step}: Router loss: {loss:.4f}")
+                
+            return loss
+                
+        except Exception as e:
+            logger.error(f"Error training router on rank {self.rank}: {str(e)}")
+            return 0.0
     
     def run_ensemble_validation(self, step):
         """
@@ -831,34 +1042,106 @@ class DDMTrainingCoordinator:
             logger.error(f"Error in ensemble validation: {str(e)}")
     
     def run_validation(self, step):
-        """Run validation for current model state"""
+        """Run validation by generating samples and computing metrics"""
+        # Only run validation on main process
         if not is_main_process():
             return {}
             
         logger.info(f"Running validation at step {step}")
+        validation_start_time = time.time()
         
         # Generate samples
         try:
-            samples = self.generate_samples(
-                num_samples=self.config.validation_samples,
-                guidance_scale=self.config.cfg_scale
-            )
+            # Setup validation
+            num_samples = getattr(self.config, 'validation_samples', 4)
+            guidance_scale = getattr(self.config, 'validation_guidance_scale', 7.5)
             
-            # Log sample images
-            if samples is not None and len(samples) > 0:
-                log_images(
-                    images=samples, 
-                    step=step,
-                    prefix="validation"
-                )
+            # Get validation prompts
+            validation_prompts = getattr(self.config, 'validation_prompts', [
+                "a photo of a cat",
+                "a scenic mountain landscape",
+                "a still life with fruit on a table",
+                "portrait of a smiling person"
+            ])
+            
+            # Log validation settings
+            logger.info(f"Generating {num_samples} validation samples with guidance scale {guidance_scale}")
+            logger.info(f"Using validation prompts: {validation_prompts}")
+            
+            # Generate samples
+            generation_start_time = time.time()
+            samples = self.generate_samples(
+                prompts=validation_prompts,
+                num_samples=num_samples,
+                guidance_scale=guidance_scale
+            )
+            generation_time = time.time() - generation_start_time
+            
+            # Calculate stats
+            prompt_count = len(validation_prompts)
+            total_samples = len(samples)
+            
+            logger.info(f"Generated {total_samples} samples for {prompt_count} prompts in {generation_time:.2f}s "
+                       f"({generation_time/total_samples:.2f}s per sample)")
+            
+            # Save samples
+            if total_samples > 0:
+                save_start_time = time.time()
                 
-                # Calculate metrics if configured
-                metrics = self.metrics.calculate_metrics(samples, step)
+                # Create output directory
+                sample_dir = os.path.join(self.config.output_dir, 'samples', f'step_{step}')
+                os.makedirs(sample_dir, exist_ok=True)
                 
-                # Log metrics
-                log_metrics(metrics, step=step)
+                # Save each image
+                for i, img in enumerate(samples):
+                    prompt_idx = i % len(validation_prompts)
+                    prompt = validation_prompts[prompt_idx]
+                    # Create safe filename from prompt
+                    prompt_safe = "".join(c if c.isalnum() else "_" for c in prompt)[:50]
+                    img_path = os.path.join(sample_dir, f'{prompt_safe}_{i}.png')
+                    img.save(img_path)
                 
-                return metrics
+                save_time = time.time() - save_start_time
+                logger.info(f"Saved {total_samples} samples to {sample_dir} in {save_time:.2f}s")
+                
+                # Compute metrics (if FID evaluation enabled)
+                if getattr(self.config, 'compute_fid', False):
+                    metrics_start_time = time.time()
+                    try:
+                        # Compute FID and other metrics (implementation specific)
+                        metrics = self._compute_validation_metrics(sample_dir)
+                        metrics_time = time.time() - metrics_start_time
+                        logger.info(f"Computed validation metrics in {metrics_time:.2f}s: {metrics}")
+                    except Exception as e:
+                        logger.error(f"Error computing validation metrics: {str(e)}")
+                        metrics = {}
+                else:
+                    metrics = {}
+                    
+                # Log to wandb if configured
+                if getattr(self.config, 'use_wandb', False):
+                    import wandb
+                    try:
+                        # Log images to wandb
+                        wandb_images = [wandb.Image(img, caption=prompt) 
+                                      for img, prompt in zip(samples, validation_prompts * num_samples)]
+                        wandb.log({
+                            'validation/samples': wandb_images,
+                            'validation/step': step,
+                            **{f'validation/{k}': v for k, v in metrics.items()}
+                        })
+                        logger.info("Logged validation samples and metrics to wandb")
+                    except Exception as e:
+                        logger.error(f"Error logging to wandb: {str(e)}")
+            else:
+                logger.warning("No validation samples were generated")
+                metrics = {}
+                
+            # Log timing
+            validation_time = time.time() - validation_start_time
+            logger.info(f"Validation completed in {validation_time:.2f}s")
+                
+            return metrics
         except Exception as e:
             logger.error(f"Error during validation: {str(e)}")
             
@@ -1019,82 +1302,239 @@ class DDMTrainingCoordinator:
             return 0
     
     def save_sharded_checkpoints(self, step):
-        """Save sharded checkpoints"""
-        if not is_main_process():
+        """Save checkpoints for coordinator, router, and expert networks"""
+        if not is_main_process() and not getattr(self.config, 'save_all_ranks', False):
             return
             
-        logger.info(f"Saving checkpoint at step {step}")
+        logger.info(f"Saving checkpoint at step {step} on rank {self.rank}")
+        checkpoint_start_time = time.time()
         
         # Create checkpoint directory
-        checkpoint_dir = os.path.join(self.config.checkpoint_dir, f"step_{step}")
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        # Save router
         try:
-            router_path = os.path.join(checkpoint_dir, "router.pt")
-            torch.save({
-                'step': step,
-                'state_dict': self.router.state_dict(),
-                'optimizer': self.router.optimizer.state_dict(),
-                'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
-            }, router_path)
-            logger.info(f"Saved router to {router_path}")
+            checkpoint_dir = os.path.join(self.config.checkpoint_dir, f'step_{step}')
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            logger.info(f"Created checkpoint directory: {checkpoint_dir}")
         except Exception as e:
-            logger.error(f"Failed to save router: {str(e)}")
-        
-        # Save experts
-        for expert_idx, expert in self.experts.items():
+            logger.error(f"Failed to create checkpoint directory: {str(e)}")
+            return
+            
+        # Save router checkpoint (only on rank 0)
+        if self.rank == 0 and self.router is not None:
             try:
-                expert_path = os.path.join(checkpoint_dir, f"expert_{expert_idx}.pt")
+                router_start_time = time.time()
+                router_path = os.path.join(checkpoint_dir, 'router.pth')
+                
                 torch.save({
                     'step': step,
-                    'expert_idx': expert_idx,
-                    'state_dict': expert.state_dict(),
-                    'optimizer': expert.optimizer.state_dict(),
+                    'model_state_dict': self.router.state_dict(),
                     'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
-                }, expert_path)
-                logger.info(f"Saved expert {expert_idx} to {expert_path}")
+                }, router_path)
+                
+                router_time = time.time() - router_start_time
+                router_size = os.path.getsize(router_path) / (1024 * 1024) # size in MB
+                logger.info(f"Saved router to {router_path} in {router_time:.2f}s (size: {router_size:.1f} MB)")
             except Exception as e:
-                logger.error(f"Failed to save expert {expert_idx}: {str(e)}")
+                logger.error(f"Failed to save router: {str(e)}")
+        
+        # Save experts
+        expert_start_time = time.time()
+        experts_saved = 0
+        
+        for expert_idx, expert in self.experts.items():
+            # Only save experts assigned to this rank
+            if self.is_expert_owned_by_rank(expert_idx):
+                try:
+                    # Create expert sub-directory by rank for organization
+                    expert_dir = os.path.join(checkpoint_dir, f'rank_{self.rank}')
+                    os.makedirs(expert_dir, exist_ok=True)
+                    
+                    expert_path = os.path.join(expert_dir, f'expert_{expert_idx}.pth')
+                    expert_save_start = time.time()
+                    
+                    torch.save({
+                        'step': step,
+                        'expert_idx': expert_idx,
+                        'model_state_dict': expert.state_dict(),
+                        'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
+                    }, expert_path)
+                    
+                    expert_save_time = time.time() - expert_save_start
+                    expert_size = os.path.getsize(expert_path) / (1024 * 1024) # size in MB
+                    experts_saved += 1
+                    
+                    logger.info(f"Saved expert {expert_idx} to {expert_path} in {expert_save_time:.2f}s (size: {expert_size:.1f} MB)")
+                except Exception as e:
+                    logger.error(f"Failed to save expert {expert_idx}: {str(e)}")
+        
+        expert_time = time.time() - expert_start_time
+        if experts_saved > 0:
+            logger.info(f"Saved {experts_saved} experts in {expert_time:.2f}s (avg: {expert_time/experts_saved:.2f}s per expert)")
         
         # Save coordinator checkpoint
         try:
-            coordinator_path = os.path.join(checkpoint_dir, "coordinator.pt")
-            torch.save({
+            coordinator_start_time = time.time()
+            coordinator_path = os.path.join(checkpoint_dir, f'coordinator_rank_{self.rank}.pth')
+            
+            # Create minimal state dict for coordinator
+            coord_state = {
                 'step': step,
-                'router_state': self.router.state_dict() if self.router else None,
-                'expert_states': {idx: expert.state_dict() for idx, expert in self.experts.items()},
+                'rank': self.rank,
+                'world_size': self.world_size,
+                'experts': list(self.experts.keys()),
                 'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
-            }, coordinator_path)
-            logger.info(f"Saved coordinator checkpoint to {coordinator_path}")
+            }
+            
+            torch.save(coord_state, coordinator_path)
+            
+            coordinator_time = time.time() - coordinator_start_time
+            coordinator_size = os.path.getsize(coordinator_path) / (1024 * 1024) # size in MB
+            logger.info(f"Saved coordinator checkpoint to {coordinator_path} in {coordinator_time:.2f}s (size: {coordinator_size:.1f} MB)")
         except Exception as e:
             logger.error(f"Failed to save coordinator checkpoint: {str(e)}")
+            
+        # Synchronize after saving if needed
+        if self.world_size > 1:
+            sync_start = time.time()
+            self.safe_synchronize(timeout_seconds=60, name="checkpoint_saving")
+            sync_time = time.time() - sync_start
+            logger.info(f"Checkpoint synchronization completed in {sync_time:.2f}s")
+        
+        # Log final timing
+        total_time = time.time() - checkpoint_start_time
+        logger.info(f"Checkpoint saving completed in {total_time:.2f}s at step {step}")
     
     def train_distilled_model(self):
-        """Train distilled model from experts"""
+        """Train distilled model from experts (Section 4.3)"""
+        # Only run distillation on main process
+        if not is_main_process():
+            return
+            
         logger.info("Starting model distillation")
+        distill_start_time = time.time()
         
         try:
-            # Initialize distiller
-            distiller = DiffusionDistiller(
+            # Create output directory
+            distill_dir = os.path.join(self.config.output_dir, 'distilled')
+            os.makedirs(distill_dir, exist_ok=True)
+            logger.info(f"Created distillation directory: {distill_dir}")
+            
+            # Get distillation config from main config
+            distill_config = getattr(self.config, 'distillation', {})
+            
+            # Log distillation settings
+            num_steps = distill_config.get('num_steps', 10000)
+            batch_size = distill_config.get('batch_size', 16)
+            learning_rate = distill_config.get('learning_rate', 1e-5)
+            
+            logger.info(f"Distillation settings: {num_steps} steps, batch_size={batch_size}, " 
+                       f"learning_rate={learning_rate}")
+            
+            # Load experts for distillation
+            load_start_time = time.time()
+            logger.info("Loading expert models for distillation")
+            
+            # Get expert models (assuming they are already loaded)
+            experts = {}
+            for expert_idx in range(self.config.num_experts):
+                try:
+                    experts[expert_idx] = self.get_expert(expert_idx).expert
+                except Exception as e:
+                    logger.error(f"Error loading expert {expert_idx} for distillation: {str(e)}")
+                    
+            expert_count = len(experts)
+            load_time = time.time() - load_start_time
+            logger.info(f"Loaded {expert_count} experts for distillation in {load_time:.2f}s")
+            
+            if expert_count == 0:
+                logger.error("No experts available for distillation, aborting")
+                return
+                
+            # Create distillation trainer
+            from trainers.distillation import ModelDistiller
+            logger.info("Initializing model distiller")
+            init_start_time = time.time()
+            
+            distiller = ModelDistiller(
                 config=self.config,
-                experts={idx: expert.expert for idx, expert in self.experts.items()},
-                router=self.router,
-                dataset=self.dataset,
-                device=self.device,
-                rank=self.rank
+                experts=experts,
+                device=self.device
             )
             
-            # Train distilled model
-            distiller.train()
+            init_time = time.time() - init_start_time
+            logger.info(f"Model distiller initialized in {init_time:.2f}s")
+            
+            # Run distillation
+            logger.info(f"Starting distillation training for {num_steps} steps")
+            train_start_time = time.time()
+            
+            distiller.train(
+                num_steps=num_steps,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                progress_callback=lambda step, total, loss: 
+                    logger.info(f"Distillation step {step}/{total}, loss: {loss:.6f}")
+                    if step % 100 == 0 else None
+            )
+            
+            train_time = time.time() - train_start_time
+            avg_time_per_step = train_time / num_steps
+            logger.info(f"Distillation training completed in {train_time:.2f}s "
+                       f"({avg_time_per_step:.4f}s per step)")
             
             # Save distilled model
-            distill_path = os.path.join(self.config.checkpoint_dir, "distilled_model.pt")
+            save_start_time = time.time()
+            distill_path = os.path.join(distill_dir, 'distilled_model.pth')
+            
+            logger.info(f"Saving distilled model to {distill_path}")
             distiller.save(distill_path)
             
+            save_time = time.time() - save_start_time
+            model_size = os.path.getsize(distill_path) / (1024 * 1024) # size in MB
+            logger.info(f"Distilled model saved to {distill_path} in {save_time:.2f}s (size: {model_size:.1f} MB)")
+            
+            # Run validation on distilled model
+            if getattr(self.config, 'validate_distilled', True):
+                validation_start_time = time.time()
+                logger.info("Running validation on distilled model")
+                
+                try:
+                    # Generate samples with distilled model
+                    validation_prompts = getattr(self.config, 'validation_prompts', [
+                        "a photo of a cat",
+                        "a scenic mountain landscape",
+                        "a still life with fruit on a table",
+                        "portrait of a smiling person"
+                    ])
+                    
+                    samples = distiller.generate_samples(validation_prompts, num_samples=2)
+                    
+                    # Save samples
+                    if samples:
+                        sample_dir = os.path.join(distill_dir, 'samples')
+                        os.makedirs(sample_dir, exist_ok=True)
+                        
+                        for i, (prompt, img) in enumerate(zip(validation_prompts, samples)):
+                            img_path = os.path.join(sample_dir, f'sample_{i}.png')
+                            img.save(img_path)
+                            
+                        logger.info(f"Saved {len(samples)} validation samples to {sample_dir}")
+                    
+                    validation_time = time.time() - validation_start_time
+                    logger.info(f"Distilled model validation completed in {validation_time:.2f}s")
+                except Exception as e:
+                    logger.error(f"Error validating distilled model: {str(e)}")
+            
+            # Log total time
+            total_time = time.time() - distill_start_time
+            hrs, mins = divmod(total_time, 3600)
+            mins, secs = divmod(mins, 60)
+            
+            logger.info(f"Distillation completed in {int(hrs):02d}:{int(mins):02d}:{int(secs):02d}")
             logger.info(f"Distilled model saved to {distill_path}")
+            
         except Exception as e:
             logger.error(f"Error during distillation: {str(e)}")
+            raise
     
     def __del__(self):
         """Clean up resources"""
