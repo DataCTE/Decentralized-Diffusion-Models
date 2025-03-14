@@ -1264,8 +1264,8 @@ class ClusterManager:
                 # Final refinement
                 self.logger.info(f"Phase 2 completed in {phase2_time:.2f}s. Phase 3: Final refinement")
                 phase3_start = time.time()
-            kmeans = KMeans(
-                n_clusters=num_clusters,
+                kmeans = KMeans(
+                    n_clusters=num_clusters,
                     init=kmeans.cluster_centers_,
                     max_iter=10,
                     n_init=1,
@@ -1290,7 +1290,7 @@ class ClusterManager:
                     init='k-means++',
                     max_iter=300,
                     n_init=10 if features.shape[0] < 50000 else 3,  # More initializations for smaller datasets
-                random_state=random_state,
+                    random_state=random_state,
                     verbose=0
                 )
                 
