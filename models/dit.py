@@ -126,10 +126,12 @@ class ExpertDiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         
-        # Initialize modulation layers to zero
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+        # Initialize text projection
+        nn.init.normal_(self.text_projection.weight, std=0.02)
+        nn.init.zeros_(self.text_projection.bias)
         
+        # Note: Block adaLN modulation layers are already initialized in their constructor
+            
     def get_position_embeddings(self, h, w, device):
         """Generate position embeddings for arbitrary grid sizes"""
         grid_indices = torch.stack(torch.meshgrid(
@@ -150,7 +152,7 @@ class ExpertDiT(nn.Module):
         pos_embed = torch.cat([
             torch.sin(y_embed), torch.cos(y_embed),
             torch.sin(x_embed), torch.cos(x_embed)
-        ], dim=-1).flatten(0, 1).unsqueeze(0)  # [1, H*W, D]
+        ], dim=-1).reshape(h * w, self.hidden_size).unsqueeze(0)  # [1, H*W, D]
         
         return pos_embed
             
@@ -168,23 +170,60 @@ class ExpertDiT(nn.Module):
         return x
     
     def forward(self, x, t, text_embeds=None):
-        # FSDP-compatible forward pass
-        x = self.x_embedder(x)  # [B, C, H, W] -> [B, D, H/P, W/P]
-        x = x.flatten(2).permute(0, 2, 1)  # [B, D, N] -> [B, N, D]
+        # Get input dimensions
+        batch_size, channels, height, width = x.shape
         
-        # Generate dynamic position embeddings
-        h, w = x.shape[2] // self.patch_size, x.shape[3] // self.patch_size
-        self.pos_embed = self.get_position_embeddings(h, w, x.device)
+        # Compute patch count after convolution
+        h = height // self.patch_size
+        w = width // self.patch_size
         
-        # Add position embeddings with sharding awareness
-        x += self.pos_embed.to(x.dtype)  # FSDP handles sharded parameters
+        # Patch embedding
+        x = self.x_embedder(x)  # [B, D, H/P, W/P]
+        x = x.flatten(2).permute(0, 2, 1)  # [B, H/P*W/P, D]
         
+        # Time embedding
+        t_emb = self.t_embedder(t)  # [B, D]
+        
+        # Generate position embeddings if not cached or dimensions changed
+        if self.pos_embed is None or self.pos_embed.shape[1] != h * w:
+            self.pos_embed = self.get_position_embeddings(h, w, x.device)
+            
+        # Add position embeddings
+        x = x + self.pos_embed  # [B, H/P*W/P, D]
+        
+        # Apply text conditioning if provided
+        cond_vector = t_emb  # Start with timestep embedding
+        
+        if text_embeds is not None:
+            # Project text embeddings to hidden dimension
+            text_embeds = self.text_projection(text_embeds)  # [B, L, D]
+            
+            # Apply cross-attention from image tokens to text tokens
+            # This is how text conditions the diffusion process
+            attn_output, _ = self.text_cross_attention(
+                query=x,
+                key=text_embeds,
+                value=text_embeds
+            )
+            
+            # Add cross-attention output to sequence
+            x = x + attn_output
+            
+            # Create a combined conditioning vector (timestep + text)
+            # We use mean pooling over the text embeddings
+            text_pooled = text_embeds.mean(dim=1)  # [B, D]
+            cond_vector = cond_vector + text_pooled  # [B, D]
+            
         # Process through transformer blocks
         for block in self.blocks:
-            if self.use_gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(block, x, t)
+            if self.use_gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, cond_vector)
             else:
-                x = block(x, t)
+                x = block(x, cond_vector)
         
         # Final projection
-        return self.final_layer(x, t) 
+        x = self.final_layer(x, cond_vector)
+        
+        # Reshape to patch-based format expected by calling function
+        # x is now [B, H/P*W/P, P*P*C]
+        return x 

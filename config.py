@@ -16,6 +16,13 @@ class DDMConfig:
         self.num_experts = 8     # Number of expert models (paper recommends 8)
         self.router_hidden_dim = 512  # Smaller router dimension
         
+        # Expert Memory Management (new section)
+        self.expert_swap_strategy = "LRU"       # LRU, FIFO, or RANDOM
+        self.max_experts_in_memory = 3          # Maximum experts to keep in GPU memory
+        self.expert_offload_to_cpu = True       # Whether to offload experts to CPU
+        self.expert_prefetch_next = True        # Prefetch next predicted expert
+        self.sample_expert_cache_size = 2       # Number of experts to cache during sampling
+        
         # Training settings
         self.learning_rate = 1e-4
         self.weight_decay = 0.1
@@ -46,6 +53,15 @@ class DDMConfig:
         self.num_workers = 2     # DataLoader workers
         self.pin_memory = True   # Pin memory for faster data transfer
         
+        # Enhanced Clustering Settings (new section)
+        self.clustering_method = "two_stage"    # "two_stage" (recommended), "direct", or "kmeans"
+        self.fine_clusters = 1024               # Number of fine-grained clusters (paper recommendation)
+        self.use_hierarchical_clustering = True # Use hierarchical consolidation
+        self.feature_sub_batch_size = 32        # Sub-batch size for feature extraction
+        self.feature_extraction_model = "dinov2" # "dinov2", "clip", or "custom"
+        self.use_feature_cache = True           # Cache extracted features
+        self.cluster_cache_path = "cache"       # Path to store feature and cluster caches
+        
         # Training settings
         self.num_steps = 400000  
         self.log_dir = "runs/ddm"
@@ -54,10 +70,20 @@ class DDMConfig:
         self.sample_dir = "samples/ddm"  # Directory to save generated samples
         self.expert_steps_per_router = 1000  # Number of expert steps between router training
         
+        # Improved Router Settings (new section) 
+        self.router_architecture = "efficient"  # "efficient" or "standard"
+        self.router_attention_layers = 2        # Number of attention layers in router
+        self.router_calibration_method = "temperature" # "temperature" or "platt"
+        self.router_regularization = 0.01       # Regularization for router training
+        self.router_confidence_threshold = 0.7  # Confidence threshold for expert selection
+        
         # Inference settings
         self.use_top_k = 1  # Number of experts to use at inference time
         self.inference_steps = 50  # Number of steps for sampling
         self.inference_prompt = "1girl"  # Default prompt
+        self.use_nucleus_sampling = False  # Whether to use nucleus sampling
+        self.nucleus_threshold = 0.9  # Threshold for nucleus sampling
+        self.inference_temperature = 1.0  # Temperature for expert probabilities
         
         # VAE settings
         self.vae_model = "AuraDiffusion/16ch-vae"
@@ -96,13 +122,17 @@ class DDMConfig:
         self.feature_workers = 4
         self.dino_size = 518  # Size for DINO feature extraction
         
-        # Distillation settings
+        # Enhanced Distillation Settings (new section)
         self.distill_lr = 1e-5
         self.distill_batch_size = 1
         self.distill_epochs = 10
         self.distill_samples = 10000  # Number of samples for distillation
+        self.distill_balance_clusters = True  # Whether to balance samples across clusters
+        self.distill_ema_decay = 0.9999  # EMA decay for distilled model
+        self.distill_loss_type = "mse"  # "mse", "huber", or "l1"
+        self.distill_warmup_ratio = 0.1  # Warmup ratio for distillation
         
-        # Add these new params
+        # Other configurations
         self.max_loaded_experts = 3  # Paper recommends 2-3 for 8 experts
         self.validation_topk = 1     # Paper Section 4.3 recommendation
         self.validation_samples = 4  # Default from code 

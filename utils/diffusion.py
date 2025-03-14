@@ -7,6 +7,31 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+def get_timestep_embedding(timesteps, dim, max_period=10000):
+    """
+    Create sinusoidal timestep embeddings.
+    
+    Args:
+        timesteps: a 1-D Tensor of N indices, one per batch element.
+                  These may be fractional.
+        dim: the dimension of the output.
+        max_period: controls the minimum frequency of the embeddings.
+    
+    Returns:
+        an [N x dim] Tensor of positional embeddings.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device) / half
+    )
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        
+    return embedding
+
 def get_alphas_and_betas(num_timesteps=1000, schedule_type='cosine'):
     """Paper's noise schedules from Section 3.2 and Appendix B.1"""
     if schedule_type == 'cosine':
@@ -48,31 +73,6 @@ def get_noise_schedule(timesteps, schedule_type='cosine'):
     else:
         return 1 - timesteps
 
-def get_timestep_embedding(timesteps, dim, max_period=10000):
-    """
-    Create sinusoidal timestep embeddings.
-    
-    Args:
-        timesteps: a 1-D Tensor of N indices, one per batch element.
-                  These may be fractional.
-        dim: the dimension of the output.
-        max_period: controls the minimum frequency of the embeddings.
-    
-    Returns:
-        an [N x dim] Tensor of positional embeddings.
-    """
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device) / half
-    )
-    args = timesteps[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        
-    return embedding
-
 def get_variance_schedule(num_timesteps=1000, beta_start=0.0001, beta_end=0.02, schedule_type='cosine'):
     """Get variance schedule for given parameters"""
     if schedule_type == 'cosine':
@@ -90,6 +90,118 @@ def get_variance_schedule(num_timesteps=1000, beta_start=0.0001, beta_end=0.02, 
         return torch.linspace(beta_start**0.5, beta_end**0.5, num_timesteps, dtype=torch.float32) ** 2
     else:
         raise ValueError(f"Unknown schedule_type: {schedule_type}")
+
+def cosine_beta_schedule(timesteps, s=0.008):
+    """
+    Cosine beta schedule as used in the paper.
+    """
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0.0, 0.999)
+
+def ddim_step(x, predicted_noise, t, t_prev, alpha_bar=None):
+    """
+    DDIM step for deterministic sampling.
+    
+    Args:
+        x: Current noisy sample
+        predicted_noise: Predicted noise
+        t: Current timestep
+        t_prev: Previous timestep
+        alpha_bar: Optional precomputed alpha_bar values
+    """
+    if alpha_bar is None:
+        # Default to cosine schedule if not provided
+        steps = 1000
+        alpha_bar = torch.cos(((torch.arange(steps + 1) / steps) + 0.008) / 1.008 * torch.pi * 0.5) ** 2
+        alpha_bar = alpha_bar / alpha_bar[0]
+    
+    # Get alpha values
+    t_idx = int(t.item() * 999)
+    t_prev_idx = int(t_prev.item() * 999)
+    
+    # Clamp indices
+    t_idx = min(999, max(0, t_idx))
+    t_prev_idx = min(999, max(0, t_prev_idx))
+    
+    alpha_bar_t = alpha_bar[t_idx]
+    alpha_bar_prev = alpha_bar[t_prev_idx]
+    
+    # Scale predicted noise
+    sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
+    
+    # Predict x0
+    pred_x0 = (x - sqrt_one_minus_alpha_bar_t * predicted_noise) / torch.sqrt(alpha_bar_t)
+    
+    # Sample
+    pred_coef = torch.sqrt(alpha_bar_prev)
+    pred_noise_coef = torch.sqrt(1 - alpha_bar_prev)
+    x_prev = pred_coef * pred_x0 + pred_noise_coef * predicted_noise
+    
+    return x_prev
+
+def update_sample(x_t, pred_noise, t, alphas=None, alpha_bar=None, betas=None, steps=1000):
+    """
+    Update sample with predicted noise using DDIM sampler (deterministic)
+    
+    Args:
+        x_t: Current noisy sample [B, C, H, W]
+        pred_noise: Predicted noise [B, C, H, W]
+        t: Current timestep [B,]
+        alphas, alpha_bar, betas: Precomputed diffusion coefficients
+    """
+    if alphas is None or alpha_bar is None or betas is None:
+        alphas, alpha_bar, betas = get_alphas_and_betas(steps)
+    
+    # Move tensors to correct device and dtype
+    device = x_t.device
+    dtype = x_t.dtype
+    alphas = alphas.to(device=device, dtype=dtype)
+    alpha_bar = alpha_bar.to(device=device, dtype=dtype)
+    betas = betas.to(device=device, dtype=dtype)
+    
+    # Previous timestep
+    prev_t = (t - 1).clamp(min=0)
+    
+    # Get alpha values for current and previous timestep
+    alpha_t = alphas[t]
+    alpha_prev = alphas[prev_t]
+    alpha_bar_t = alpha_bar[t]
+    alpha_bar_prev = alpha_bar[prev_t]
+    
+    # Reshaping for broadcasting
+    alpha_t = alpha_t[:, None, None, None]
+    alpha_prev = alpha_prev[:, None, None, None]
+    alpha_bar_t = alpha_bar_t[:, None, None, None]
+    alpha_bar_prev = alpha_bar_prev[:, None, None, None]
+    
+    # Predict x0 from xt and predicted noise
+    sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+    sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
+    pred_x0 = (x_t - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
+    
+    # DDIM update (deterministic sampling)
+    sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
+    sqrt_one_minus_alpha_bar_prev = torch.sqrt(1 - alpha_bar_prev)
+    
+    # Compute "direction pointing to xt"
+    dir_xt = torch.sqrt(1. - alpha_bar_prev - sqrt_one_minus_alpha_bar_prev**2) * pred_noise
+    
+    # Update xt to xt-1
+    x_prev = sqrt_alpha_bar_prev * pred_x0 + sqrt_one_minus_alpha_bar_prev * pred_noise + dir_xt
+    
+    # Return properly thresholded results
+    return x_prev.clamp(-1., 1.)
+
+def get_schedule(timesteps, schedule_type='cosine'):
+    """Paper's noise schedules from Section 3.2"""
+    if schedule_type == 'cosine':
+        return torch.cos(timesteps * math.pi/2)
+    else:
+        return 1 - timesteps 
 
 class DecentralizedFlowMatcher:
     """Implements paper's Equations 6-8 for DFM"""
@@ -202,64 +314,4 @@ class DecentralizedFlowMatcher:
             # Update sample (Equation 8 Euler step)
             x = x + combined * dt
             
-        return x
-
-def update_sample(x_t, pred_noise, t, alphas=None, alpha_bar=None, betas=None, steps=1000):
-    """
-    Update sample with predicted noise using DDIM sampler (deterministic)
-    
-    Args:
-        x_t: Current noisy sample [B, C, H, W]
-        pred_noise: Predicted noise [B, C, H, W]
-        t: Current timestep [B,]
-        alphas, alpha_bar, betas: Precomputed diffusion coefficients
-    """
-    if alphas is None or alpha_bar is None or betas is None:
-        alphas, alpha_bar, betas = get_alphas_and_betas(steps)
-    
-    # Move tensors to correct device and dtype
-    device = x_t.device
-    dtype = x_t.dtype
-    alphas = alphas.to(device=device, dtype=dtype)
-    alpha_bar = alpha_bar.to(device=device, dtype=dtype)
-    betas = betas.to(device=device, dtype=dtype)
-    
-    # Previous timestep
-    prev_t = (t - 1).clamp(min=0)
-    
-    # Get alpha values for current and previous timestep
-    alpha_t = alphas[t]
-    alpha_prev = alphas[prev_t]
-    alpha_bar_t = alpha_bar[t]
-    alpha_bar_prev = alpha_bar[prev_t]
-    
-    # Reshaping for broadcasting
-    alpha_t = alpha_t[:, None, None, None]
-    alpha_prev = alpha_prev[:, None, None, None]
-    alpha_bar_t = alpha_bar_t[:, None, None, None]
-    alpha_bar_prev = alpha_bar_prev[:, None, None, None]
-    
-    # Predict x0 from xt and predicted noise
-    sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-    sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
-    pred_x0 = (x_t - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
-    
-    # DDIM update (deterministic sampling)
-    sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
-    sqrt_one_minus_alpha_bar_prev = torch.sqrt(1 - alpha_bar_prev)
-    
-    # Compute "direction pointing to xt"
-    dir_xt = torch.sqrt(1. - alpha_bar_prev - sqrt_one_minus_alpha_bar_prev**2) * pred_noise
-    
-    # Update xt to xt-1
-    x_prev = sqrt_alpha_bar_prev * pred_x0 + sqrt_one_minus_alpha_bar_prev * pred_noise + dir_xt
-    
-    # Return properly thresholded results
-    return x_prev.clamp(-1., 1.)
-
-def get_schedule(timesteps, schedule_type='cosine'):
-    """Paper's noise schedules from Section 3.2"""
-    if schedule_type == 'cosine':
-        return torch.cos(timesteps * math.pi/2)
-    else:
-        return 1 - timesteps 
+        return x 

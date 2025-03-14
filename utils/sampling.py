@@ -1,10 +1,18 @@
 """Sampling utilities for Decentralized Diffusion Models."""
 
+import math
 import torch
-import numpy as np
+import torch.nn.functional as F
 import logging
 from tqdm import tqdm
-from utils.diffusion import get_alphas_and_betas
+import numpy as np
+from utils.diffusion import (
+    get_alphas_and_betas, 
+    get_timestep_embedding, 
+    ddim_step,
+    cosine_beta_schedule,
+    update_sample
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,94 +216,46 @@ def euler_sample(
     
     return x
 
-def ddim_sample(
-    model,
-    shape,
-    steps=50,
-    device="cuda",
-    cfg_scale=7.5,
-    text_embeddings=None,
-    uncond_embeddings=None,
-    scheduler="cosine",
-    verbose=True,
-    callback=None,
-):
+def ddim_sample(model, shape, num_steps=50, clip=None, guidance_scale=7.5, device=None):
     """
-    Sample from diffusion model using DDIM method
+    DDIM sampling for a single diffusion model.
     
     Args:
-        model: Diffusion model (must accept x, t, text_embeddings)
-        shape: Output shape [B, C, H, W]
-        steps: Number of sampling steps
-        device: Device to sample on
-        cfg_scale: Classifier-free guidance scale (if text_embeddings provided)
-        text_embeddings: Optional text embeddings for conditioning
-        uncond_embeddings: Optional unconditional embeddings for CFG
-        scheduler: Noise schedule ("cosine", "linear", etc.)
-        verbose: Whether to show progress bar
-        callback: Optional callback function called after each step
-        
-    Returns:
-        Sampled tensor
+        model: Diffusion model
+        shape: Output shape
+        num_steps: Number of sampling steps
+        clip: CLIP encoder (optional)
+        guidance_scale: Classifier-free guidance scale
+        device: Device to use
     """
-    # Initialize with random noise
+    # Default device
+    if device is None:
+        device = next(model.parameters()).device
+        
+    # Create noise
     x = torch.randn(shape, device=device)
     
-    # Precompute diffusion parameters
-    alphas, alpha_bar, betas = get_alphas_and_betas(steps, scheduler)
-    alphas = alphas.to(device)
-    alpha_bar = alpha_bar.to(device)
-    betas = betas.to(device)
-    
-    # Create progress bar
-    pbar = tqdm(reversed(range(steps)), total=steps, disable=not verbose)
-    pbar.set_description("Sampling")
+    # Steps
+    timesteps = torch.linspace(1, 0, num_steps + 1, device=device)[:-1]
     
     # Sampling loop
-    for i in pbar:
+    for i, t in enumerate(tqdm(timesteps, desc="DDIM Sampling")):
         # Current timestep
-        t = torch.full((shape[0],), i/steps, device=device)
+        t_batch = torch.full((shape[0],), t, device=device)
         
-        # Get model prediction
-        if text_embeddings is not None:
-            # Get conditional and unconditional predictions for CFG
-            with torch.no_grad():
-                cond_pred = model(x, t, text_embeddings)
-                uncond_pred = model(x, t, uncond_embeddings)
+        with torch.no_grad():
+            # Predict noise
+            pred = model(x, t_batch)
             
-            # Apply classifier-free guidance
-            pred = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
-        else:
-            # Standard unconditional prediction
-            with torch.no_grad():
-                pred = model(x, t)
+            # Previous timestep
+            if i == len(timesteps) - 1:
+                prev_t = torch.tensor(0., device=device)
+            else:
+                prev_t = timesteps[i + 1]
+                
+            # Denoise
+            x = ddim_step(x, pred, t, prev_t)
         
-        # DDIM update step
-        if i > 0:
-            # Calculate parameters for current and previous timestep
-            alpha_bar_t = alpha_bar[i]
-            alpha_bar_prev = alpha_bar[i-1]
-            
-            # Predict x0
-            pred_x0 = (x - torch.sqrt(1 - alpha_bar_t).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * pred) / \
-                torch.sqrt(alpha_bar_t).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            
-            # Clip predicted x0 to prevent extreme values
-            pred_x0 = pred_x0.clamp(-1, 1)
-            
-            # Calculate direction to xt
-            dir_xt = torch.sqrt(1 - alpha_bar_prev).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * pred
-            
-            # Update xt to xt-1
-            x = torch.sqrt(alpha_bar_prev).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * pred_x0 + dir_xt
-        else:
-            # Last step - just predict x0 directly
-            x = pred
-        
-        # Run callback if provided
-        if callback is not None:
-            callback(x, i)
-    
     return x
 
 def flow_matching_sample(
@@ -568,4 +528,102 @@ def combined_expert_sample(
         if callback is not None:
             callback(x, i)
     
-    return x 
+    return x
+
+def get_distilled_model_prediction(distilled_model, x, t, prompt_embeds=None, cfg_scale=7.5):
+    """
+    Get prediction from a distilled model with classifier-free guidance
+    
+    Args:
+        distilled_model: Distilled model
+        x: Input tensor
+        t: Timestep
+        prompt_embeds: Text prompt embeddings (optional)
+        cfg_scale: Classifier-free guidance scale
+    """
+    # Prediction without prompt
+    uncond_pred = distilled_model(x, t)
+    
+    if prompt_embeds is not None and cfg_scale > 1.0:
+        # Prediction with prompt
+        cond_pred = distilled_model(x, t, prompt_embeds)
+        
+        # Combine with classifier-free guidance
+        pred = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
+    else:
+        pred = uncond_pred
+        
+    return pred
+
+def distilled_sample(distilled_model, shape, num_steps=50, prompt_embeds=None, 
+                    cfg_scale=7.5, device=None, scheduler_type='ddim', 
+                    noise=None, callback=None):
+    """
+    DDIM sampling using a distilled diffusion model.
+    
+    Args:
+        distilled_model: Distilled diffusion model
+        shape: Output shape
+        num_steps: Number of sampling steps
+        prompt_embeds: Text prompt embeddings (optional)
+        cfg_scale: Classifier-free guidance scale
+        device: Device to use
+        scheduler_type: Scheduler type ('ddim', 'euler', 'dpm')
+        noise: Initial noise (optional)
+        callback: Callback function for intermediate steps (optional)
+    """
+    # Default device
+    if device is None:
+        device = next(distilled_model.parameters()).device
+    
+    # Create initial noise if not provided
+    if noise is None:
+        x = torch.randn(shape, device=device)
+    else:
+        x = noise.to(device)
+    
+    batch_size = shape[0]
+    has_cond = prompt_embeds is not None
+    
+    # Calculate timesteps
+    if scheduler_type == 'ddim':
+        timesteps = torch.linspace(1, 0, num_steps + 1, device=device)[:-1]
+    else:  # Default linear space
+        timesteps = torch.linspace(1, 0, num_steps + 1, device=device)[:-1]
+    
+    # Progress bar
+    progress = tqdm(timesteps, desc="Distilled Sampling")
+    
+    # Store intermediate samples if needed for callback
+    intermediate_samples = []
+    
+    # Sampling loop
+    for step_idx, t in enumerate(progress):
+        # Scale timestep to model input range
+        t_input = (t * 999).long()  # Scale to [0, 999]
+        t_batch = torch.full((batch_size,), t_input, device=device)
+        
+        with torch.no_grad():
+            # Get model prediction
+            pred = get_distilled_model_prediction(
+                distilled_model, x, t_batch, 
+                prompt_embeds=prompt_embeds,
+                cfg_scale=cfg_scale
+            )
+            
+            # Previous timestep
+            if step_idx == len(timesteps) - 1:
+                prev_t = torch.tensor(0., device=device)
+            else:
+                prev_t = timesteps[step_idx + 1]
+            
+            # Denoise
+            x = ddim_step(x, pred, t, prev_t)
+            
+            # Store intermediate result if callback provided
+            if callback is not None:
+                if step_idx % max(num_steps // 10, 1) == 0 or step_idx == len(timesteps) - 1:
+                    intermediate_samples.append(x.detach().clone())
+                    callback(step_idx, x)
+    
+    return x, intermediate_samples if callback is not None else x 
