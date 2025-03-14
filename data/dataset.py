@@ -244,10 +244,15 @@ class FeatureDataset(Dataset):
         
         self.root = root_dir
         self.config = config or DDMConfig()
+        start_time = time.time()
         
         # Sharded validation across processes
         if dist.get_rank() == 0:
+            logger.info(f"Initializing FeatureDataset from {root_dir}")
+            logger.info(f"This process may take several minutes depending on dataset size")
             self.image_files = self._validate_files()
+            logger.info(f"Validation complete in {time.time() - start_time:.1f} seconds")
+            logger.info(f"Broadcasting dataset structure to all processes")
             files_tensor = torch.tensor(len(self.image_files), device='cuda')
             dist.broadcast(files_tensor, 0)
         else:
@@ -255,7 +260,10 @@ class FeatureDataset(Dataset):
             dist.broadcast(files_tensor, 0)
             self.image_files = [None] * files_tensor.item()
 
+        # Synchronize processes
         dist.barrier()
+        if dist.get_rank() == 0:
+            logger.info(f"All processes synchronized after validation")
 
         self.dino_size = self.config.dino_size
         self.transform = T.Compose([
@@ -264,21 +272,54 @@ class FeatureDataset(Dataset):
             T.ToTensor(),
             T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
-        logger.info(f"FeatureDataset initialized with {len(self.image_files)} valid images")
+        
+        if dist.get_rank() == 0:
+            logger.info(f"FeatureDataset initialized with {len(self.image_files):,} valid images")
+            logger.info(f"Image preprocessing: resize to {self.dino_size}px → center crop → normalize")
+            logger.info(f"Starting feature extraction process - this will utilize all GPUs at 100%")
+            logger.info(f"Feature extraction may take 20-30 minutes for large datasets")
 
     def _validate_files(self):
         """Validate all image files and return only the valid ones"""
+        start_time = time.time()
+        total_files = len(os.listdir(self.root))
+        
+        logger.info(f"Validating {total_files:,} potential image files in {self.root}")
+        logger.info(f"This step ensures all images can be properly loaded")
+        
         valid_files = []
         invalid_count = 0
+        last_log = time.time()
+        log_interval = 5.0  # seconds
         
-        for fname in tqdm(os.listdir(self.root), desc="Validating images"):
-            if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                if self._is_valid_image(os.path.join(self.root, fname)):
-                    valid_files.append(fname)
-                else:
-                    invalid_count += 1
+        with tqdm(total=total_files, desc="Validating images", dynamic_ncols=True) as pbar:
+            for i, fname in enumerate(os.listdir(self.root)):
+                # Log progress periodically
+                if time.time() - last_log > log_interval:
+                    elapsed = time.time() - start_time
+                    processed = i + 1
+                    percentage = (processed / total_files) * 100 if total_files > 0 else 0
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    eta = (total_files - processed) / rate if rate > 0 else 0
                     
+                    logger.info(f"Validating: {percentage:.1f}% complete | "
+                               f"{processed:,}/{total_files:,} files | "
+                               f"Rate: {rate:.1f} files/sec | "
+                               f"ETA: {eta/60:.1f} minutes")
+                    last_log = time.time()
+                
+                if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                    if self._is_valid_image(os.path.join(self.root, fname)):
+                        valid_files.append(fname)
+                    else:
+                        invalid_count += 1
+                pbar.update(1)
+        
+        total_time = time.time() - start_time
+        logger.info(f"Validation complete in {total_time:.1f} seconds ({total_files/total_time:.1f} files/sec)")        
         logger.info(f"Found {invalid_count} invalid images that will be excluded")
+        logger.info(f"Final dataset contains {len(valid_files):,} valid images")
+        
         return valid_files
 
     def _is_valid_image(self, path):
@@ -288,23 +329,33 @@ class FeatureDataset(Dataset):
                 # Just check if we can open it and access basic properties
                 img.size
                 return True
-        except Exception as e:
-            logger.debug(f"Invalid image {path}: {str(e)}")
+        except Exception:
             return False
-
+            
     def __len__(self):
         return len(self.image_files)
-
+    
     def __getitem__(self, idx):
-        img_path = os.path.join(self.root, self.image_files[idx])
+        """Load image and apply DINO-compatible transform"""
         try:
-            image = Image.open(img_path).convert('RGB')
-            return self.transform(image)
+            # Delayed loading of image paths from rank 0
+            if self.image_files[idx] is None:
+                # This shouldn't happen if broadcast was successful
+                raise RuntimeError("Image paths not properly synchronized across processes")
+                
+            image_path = os.path.join(self.root, self.image_files[idx])
+            image = Image.open(image_path).convert('RGB')
+            
+            # Apply feature extraction transform
+            image_tensor = self.transform(image)
+            return image_tensor
+            
         except Exception as e:
-            logger.error(f"Error loading image {img_path}: {e}")
-            # Return a blank image instead of failing
-            blank = torch.zeros(3, self.dino_size, self.dino_size)
-            return blank
+            # Log but try to continue with a blank tensor rather than crashing
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            logger.error(f"Process {rank}: Error loading image at index {idx}: {str(e)}")
+            # Return blank tensor of expected size to avoid crashing
+            return torch.zeros(3, self.dino_size, self.dino_size)
 
 class BucketBatchSampler:
     """

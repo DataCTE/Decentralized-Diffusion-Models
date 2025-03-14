@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 import wandb
-
+import time
 
 from models.dit import ExpertDiT
 from data.dataset import DDMDataset, FeatureDataset
@@ -39,11 +39,47 @@ class DDMTrainingCoordinator:
         self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
         self.current_step = 0
         
-        # Paper-recommended initialization sequence
+        if self.rank == 0:
+            logger.info(f"Initializing DDM Training Coordinator with {world_size} processes")
+            logger.info(f"Training will use {world_size} GPUs in parallel")
+            logger.info(f"Beginning initialization sequence - this may take 20-30 minutes")
+        
+        # Paper-recommended initialization sequence with better logging
+        start_time = time.time()
+        if self.rank == 0:
+            logger.info("Stage 1: Initializing cluster manager")
         self.init_cluster_manager()
+        
+        if self.rank == 0:
+            clustering_time = time.time() - start_time
+            logger.info(f"Clustering completed in {clustering_time/60:.1f} minutes")
+            logger.info("Stage 2: Initializing data loaders")
+            
+        loader_start = time.time()
         self.init_data_loaders()
+        
+        if self.rank == 0:
+            loader_time = time.time() - loader_start
+            logger.info(f"Data loaders initialized in {loader_time:.1f} seconds")
+            logger.info("Stage 3: Initializing models")
+            
+        model_start = time.time()
         self.init_models()
+        
+        if self.rank == 0:
+            model_time = time.time() - model_start
+            logger.info(f"Models initialized in {model_time:.1f} seconds")
+            logger.info("Stage 4: Initializing optimizers")
+            
+        opt_start = time.time()
         self.init_optimizers()
+        
+        if self.rank == 0:
+            opt_time = time.time() - opt_start
+            total_time = time.time() - start_time
+            logger.info(f"Optimizers initialized in {opt_time:.1f} seconds")
+            logger.info(f"Total initialization time: {total_time/60:.1f} minutes")
+            logger.info("Initialization complete - ready to begin training")
         
         # Metrics tracking (paper Section 4.3)
         self.best_fid = float('inf')
@@ -54,36 +90,89 @@ class DDMTrainingCoordinator:
         
     def init_cluster_manager(self):
         """Initialize clustering components with distributed synchronization"""
-        self.cluster_manager = ClusterManager()
+        # Log initialization start
+        if self.rank == 0:
+            logger.info(f"Initializing clustering manager (rank {self.rank})")
+            logger.info(f"This process involves feature extraction and clustering")
+            logger.info(f"GPUs will be at 100% during feature extraction - this is normal")
+            logger.info(f"Process steps: Extract DINOv2 features → Fine clustering → Coarse clustering")
+        
+        # Create cluster manager
+        self.cluster_manager = ClusterManager(local_rank=self.rank)
         
         # Only perform clustering on main process
+        feature_extraction_start = time.time()
         if self.rank == 0:
-            feature_loader = DataLoader(
-                FeatureDataset(self.config.dataset_path, self.config),
-                batch_size=self.config.feature_batch_size,
-                num_workers=self.config.feature_workers
-            )
-            self.cluster_manager.perform_clustering(feature_loader)
+            logger.info(f"Creating feature extraction dataset")
+            
+        feature_dataset = FeatureDataset(self.config.dataset_path, self.config)
+        
+        if self.rank == 0:
+            logger.info(f"Creating feature extraction dataloader with batch size {self.config.feature_batch_size}")
+            logger.info(f"Using {self.config.feature_workers} worker threads per GPU")
+            
+        feature_loader = DataLoader(
+            feature_dataset,
+            batch_size=self.config.feature_batch_size,
+            num_workers=self.config.feature_workers,
+            pin_memory=True
+        )
+        
+        if self.rank == 0:
+            logger.info(f"Starting clustering process - this will utilize all GPUs")
+            logger.info(f"Feature extraction phase will show periodic progress updates")
+            
+        # Perform the actual clustering
+        self.cluster_manager.perform_clustering(feature_loader)
+        
+        # Calculate and log time for clustering
+        if self.rank == 0:
+            feature_time = time.time() - feature_extraction_start
+            logger.info(f"Feature extraction and clustering completed in {feature_time/60:.1f} minutes")
         
         # Synchronize cluster labels across nodes
+        if self.rank == 0:
+            logger.info(f"Broadcasting cluster assignments to all processes")
+            
         cluster_labels = self.cluster_manager.get_clusters() if self.rank == 0 else None
         cluster_labels = self._broadcast_clusters(cluster_labels)
         self.cluster_manager.cluster_labels = cluster_labels
+        
+        if self.rank == 0:
+            logger.info(f"Clustering phase complete - all processes synchronized")
 
     def _broadcast_clusters(self, clusters):
         """Distributed broadcast of cluster assignments"""
         if self.rank == 0:
+            logger.info(f"Preparing to broadcast {len(clusters):,} cluster assignments")
             clusters_tensor = torch.tensor(clusters, dtype=torch.long, device=self.device)
             dist.broadcast(clusters_tensor, src=0)
         else:
-            clusters_tensor = torch.empty(self.config.dataset_size, 
+            # We don't know the size in advance on other ranks
+            dataset_size = self.config.dataset_size or 0
+            clusters_tensor = torch.empty(dataset_size, 
                                         dtype=torch.long, device=self.device)
             dist.broadcast(clusters_tensor, src=0)
         
-        return clusters_tensor.cpu().numpy()
+        result = clusters_tensor.cpu().numpy()
+        
+        if self.rank == 0:
+            logger.info(f"Cluster broadcast complete - {len(result):,} assignments distributed")
+            # Log distribution statistics
+            counts = np.bincount(result)
+            logger.info(f"Cluster distribution: {counts}")
+            
+        return result
 
     def init_data_loaders(self):
         """Initialize distributed data loaders with sharded validation"""
+        # Log initialization start
+        if self.rank == 0:
+            logger.info(f"Initializing data loaders with distributed sharding")
+            logger.info(f"Each GPU will process a different subset of the data")
+            
+        start_time = time.time()
+            
         # Shared dataset for all processes
         dataset = DDMDataset(
             self.config.dataset_path,
@@ -98,6 +187,9 @@ class DDMTrainingCoordinator:
             shuffle=True
         )
 
+        if self.rank == 0:
+            logger.info(f"Creating training dataloader with batch size {self.config.batch_size}")
+            
         self.train_loader = DataLoader(
             dataset,
             batch_size=self.config.batch_size,
@@ -106,6 +198,11 @@ class DDMTrainingCoordinator:
             pin_memory=True,
             persistent_workers=True
         )
+        
+        if self.rank == 0:
+            setup_time = time.time() - start_time
+            logger.info(f"Data loaders initialized in {setup_time:.2f} seconds")
+            logger.info(f"Each process will handle ~{len(dataset)/self.world_size:,.0f} images")
         
     def perform_initial_clustering(self):
         """Paper Algorithm 1: Initial dataset clustering"""
