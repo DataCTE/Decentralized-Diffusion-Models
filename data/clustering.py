@@ -21,7 +21,7 @@ from utils.distributed import (
     get_world_size, 
     synchronize
 )
-from utils.logging import setup_logger
+from utils.logging import setup_distributed_logger
 from utils.visualization import visualize_embeddings
 
 logger = logging.getLogger(__name__)
@@ -34,16 +34,18 @@ class ClusterManager:
     
     def __init__(self, config, feature_extractor=None):
         """
-        Initialize cluster manager
+        Initialize ClusterManager with config
         
         Args:
-            config: Configuration object
-            feature_extractor: Feature extractor model (optional)
+            config: Configuration with clustering settings
+            feature_extractor: Optional pre-initialized feature extractor
         """
         self.config = config
-        self.logger = logging.getLogger(__name__)
         
-        # Initialize feature extractor
+        # Initialize logger
+        self.logger = setup_distributed_logger(name="ClusterManager", rank=get_rank())
+        
+        # Initialize feature extractor if not provided
         self.feature_extractor = feature_extractor
         if self.feature_extractor is None:
             self.feature_extractor = self._initialize_feature_extractor()
@@ -61,9 +63,6 @@ class ClusterManager:
             'clustering'
         )
         os.makedirs(self.cache_dir, exist_ok=True)
-        
-        # Initialize logger
-        self.logger = setup_logger(name="ClusterManager", rank=get_rank())
         
         # Initialize vision encoder
         self._init_vision_encoder()

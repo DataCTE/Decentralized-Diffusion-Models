@@ -19,7 +19,7 @@ from utils.visualization import tensor_to_pil
 from utils.distributed import is_main_process, get_rank, setup_distributed
 
 # Import centralized utilities
-from utils.logging import setup_logger, log_images
+from utils.logging import setup_logger, log_images, setup_distributed_logger
 from trainers.sampling import ddm_sample, distilled_sample
 
 # Initialize logger
@@ -79,7 +79,7 @@ def setup_environment(config):
         log_file = os.path.join(getattr(config, 'log_dir', 'logs'), f"inference-{timestamp}.log")
     
     # Setup root logger
-    logger = setup_logger("DDMInference", rank=get_rank(), log_file=log_file)
+    logger = setup_distributed_logger("DDMInference", log_file=log_file, rank=get_rank())
     
     # Create output directories
     if is_main_process():

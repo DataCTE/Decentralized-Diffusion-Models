@@ -17,7 +17,7 @@ import torchvision.transforms as transforms
 
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, broadcast_object
-from utils.logging import setup_logger
+from utils.logging import setup_logger, setup_distributed_logger
 from data.transforms import resize_image, normalize
 from utils.distributed import synchronize
 
@@ -795,7 +795,7 @@ class FeatureDataset(Dataset):
         self.config = config
         
         # Initialize logger
-        self.logger = setup_logger(name="FeatureDataset", rank=get_rank())
+        self.logger = setup_distributed_logger(name="FeatureDataset", rank=get_rank())
         
         # Get image size from config or use default
         if config is not None:
@@ -931,11 +931,10 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     Returns:
         Dictionary mapping expert index to DataLoader
     """
-    logger = setup_logger(name="ExpertLoaders", rank=rank)
-    logger.info("Creating per-expert data loaders with bucket batching")
+    from utils.logging import setup_distributed_logger
     
-    # Initialize per-expert loaders
-    expert_loaders = {}
+    # Initialize logger
+    logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
     
     # Get all indices assigned to each expert
     expert_indices = {}
@@ -973,6 +972,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         expert_bucket_indices[expert_idx] = bucket_indices
         
     # Create loaders for each expert
+    expert_loaders = {}
     for expert_idx, bucket_indices in expert_bucket_indices.items():
         # Create sampler
         sampler = BucketBatchSampler(
