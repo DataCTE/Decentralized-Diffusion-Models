@@ -9,6 +9,12 @@ from tqdm import tqdm
 from collections import defaultdict
 import logging
 import time
+import glob
+import math
+import random
+import io
+import torchvision.transforms as transforms
+from typing import Dict, List, Tuple, Optional, Union, Set
 
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, get_world_size, broadcast_object, synchronize
@@ -18,6 +24,118 @@ from utils.visualization import tensor_to_pil
 
 # Setup logging
 logger = logging.getLogger(__name__)
+
+class DataValidator:
+    """Shared image validation utility to avoid duplicate validation between dataset classes"""
+    
+    _valid_files_cache = {}  # Cache for valid files
+    _invalid_files_cache = set()  # Cache for known invalid files
+    _validated = False  # Flag to track if validation has been performed
+    
+    @classmethod
+    def validate_images(cls, root_dir, extensions=None, min_size=256):
+        """
+        Validate all images in a directory, with results shared between processes
+        
+        Args:
+            root_dir: Directory containing images
+            extensions: List of valid extensions (default: ['.jpg', '.jpeg', '.png', '.webp'])
+            min_size: Minimum image size to be considered valid
+            
+        Returns:
+            List of valid image files
+        """
+        # Check if we've already validated this directory
+        cache_key = f"{root_dir}_{str(extensions)}_{min_size}"
+        if cache_key in cls._valid_files_cache:
+            return cls._valid_files_cache[cache_key]
+            
+        # Set default extensions if none provided
+        if extensions is None:
+            extensions = ['.jpg', '.jpeg', '.png', '.webp']
+            
+        # Only validate on main process (rank 0) to avoid duplicate work
+        if is_main_process():
+            logger.info(f"Validating images in {root_dir}")
+            start_time = time.time()
+            valid_files = []
+            invalid_count = 0
+            
+            # Get all image files in the directory
+            all_files = []
+            for ext in extensions:
+                all_files.extend(glob.glob(os.path.join(root_dir, f"*{ext}")))
+                all_files.extend(glob.glob(os.path.join(root_dir, f"*{ext.upper()}")))
+            
+            # Check validity of each file
+            for img_path in all_files:
+                # Skip if already known to be invalid
+                if img_path in cls._invalid_files_cache:
+                    invalid_count += 1
+                    continue
+                    
+                # Check if file is valid
+                if cls.is_valid_image(img_path, min_size):
+                    valid_files.append(img_path)
+                else:
+                    cls._invalid_files_cache.add(img_path)
+                    invalid_count += 1
+            
+            # Store valid files in cache
+            elapsed = time.time() - start_time
+            logger.info(f"Image validation completed in {elapsed:.2f}s: {len(valid_files)} valid, {invalid_count} invalid")
+            cls._valid_files_cache[cache_key] = valid_files
+            result = valid_files
+        else:
+            # Non-main processes get an empty list initially
+            result = []
+        
+        # Broadcast result from main process to all others
+        result = broadcast_object(result, src=0)
+        
+        # Update cache on all processes
+        if cache_key not in cls._valid_files_cache:
+            cls._valid_files_cache[cache_key] = result
+            
+        cls._validated = True
+        return result
+    
+    @staticmethod
+    def is_valid_image(img_path, min_size=256):
+        """
+        Check if an image is valid
+        
+        Args:
+            img_path: Path to image file
+            min_size: Minimum dimension size
+            
+        Returns:
+            Boolean indicating if image is valid
+        """
+        if not os.path.exists(img_path):
+            return False
+            
+        try:
+            # Attempt to open the image
+            with open(img_path, 'rb') as f:
+                img_bytes = f.read()
+                
+            # Verify image can be opened and has valid dimensions
+            with Image.open(io.BytesIO(img_bytes)) as img:
+                width, height = img.size
+                
+                # Check minimum dimensions
+                if width < min_size or height < min_size:
+                    return False
+                    
+                # Check if image has color channels (not grayscale)
+                if img.mode not in ('RGB', 'RGBA'):
+                    return False
+            
+            return True
+        except Exception:
+            # Any error means the image is invalid
+            return False
 
 class DDMDataset(Dataset):
     """Implementation of dataset from paper with batching by aspect ratio"""
@@ -44,11 +162,12 @@ class DDMDataset(Dataset):
         self.include_metadata = include_metadata
         
         # Initialize file paths
-        self.image_files = []
-        self.valid_indices = []
+        self.image_files = DataValidator.validate_images(root_dir)
         
-        # Validate and collect image files
-        self._validate_files()
+        if len(self.image_files) == 0:
+            raise ValueError(f"No valid images found in {root_dir}")
+            
+        self.logger.info(f"Found {len(self.image_files)} valid images")
         
         # Collect image sizes for bucket batching
         self.image_sizes = {}
@@ -66,12 +185,12 @@ class DDMDataset(Dataset):
         if cluster_labels is not None:
             self._init_shared_clusters(cluster_labels)
         else:
-            self.cluster_assignments = [-1] * len(self.valid_indices)  # Default: unassigned
+            self.cluster_assignments = [-1] * len(self.image_files)  # Default: unassigned
             
         # Initialize bucket assignments
         self._init_bucket_assignments()
         
-        self.logger.info(f"Initialized dataset with {len(self.valid_indices)} images across {len(self.buckets)} buckets")
+        self.logger.info(f"Initialized dataset with {len(self.image_files)} images across {len(self.buckets)} buckets")
         
     def _init_shared_clusters(self, cluster_labels):
         """
@@ -81,17 +200,17 @@ class DDMDataset(Dataset):
             cluster_labels: Pre-computed cluster labels
         """
         # Ensure correct length
-        if len(cluster_labels) != len(self.valid_indices):
-            self.logger.warning(f"Cluster labels length ({len(cluster_labels)}) does not match dataset length ({len(self.valid_indices)})")
+        if len(cluster_labels) != len(self.image_files):
+            self.logger.warning(f"Cluster labels length ({len(cluster_labels)}) does not match dataset length ({len(self.image_files)})")
             
             # Handle mismatch
-            if len(cluster_labels) > len(self.valid_indices):
-                cluster_labels = cluster_labels[:len(self.valid_indices)]
+            if len(cluster_labels) > len(self.image_files):
+                cluster_labels = cluster_labels[:len(self.image_files)]
             else:
                 # Pad with -1 (unassigned)
                 cluster_labels = np.concatenate([
                     cluster_labels, 
-                    np.full(len(self.valid_indices) - len(cluster_labels), -1)
+                    np.full(len(self.image_files) - len(cluster_labels), -1)
                 ])
         
         self.cluster_assignments = cluster_labels
@@ -104,53 +223,6 @@ class DDMDataset(Dataset):
             for i, idx in enumerate(indices):
                 self.bucket_assignments[idx] = (bucket_idx, i)
 
-    def _validate_files(self):
-        """Validate and collect image files"""
-        if is_main_process():
-            self.logger.info(f"Validating image files in {self.root_dir}")
-            
-        # Get all files in the directory
-        all_files = []
-        
-        for dirpath, _, filenames in os.walk(self.root_dir):
-            for filename in filenames:
-                path = os.path.join(dirpath, filename)
-                all_files.append(path)
-                
-        # Validate images
-        self.image_files = []
-        self.valid_indices = []
-        
-        for i, path in enumerate(tqdm(all_files, desc="Validating images", disable=not is_main_process())):
-            if self._is_valid_image(path):
-                self.image_files.append(path)
-                self.valid_indices.append(i)
-                
-        if is_main_process():
-            self.logger.info(f"Found {len(self.valid_indices)} valid images out of {len(all_files)} files")
-            
-    def _is_valid_image(self, path):
-        """Check if file is a valid image"""
-        if not (path.lower().endswith('.jpg') or 
-                path.lower().endswith('.jpeg') or 
-                path.lower().endswith('.png') or 
-                path.lower().endswith('.webp')):
-            return False
-            
-        try:
-            with Image.open(path) as img:
-                # Check if image has proper channels
-                if img.mode not in ('RGB', 'RGBA'):
-                    return False
-                    
-                # Check if image has minimum dimensions
-                if img.width < 16 or img.height < 16:
-                    return False
-                    
-                return True
-        except Exception:
-            return False
-            
     def _collect_image_sizes(self):
         """Collect image sizes for bucket batching"""
         if is_main_process():
@@ -278,7 +350,7 @@ class DDMDataset(Dataset):
                 
     def __len__(self):
         """Return the number of valid images"""
-        return len(self.valid_indices)
+        return len(self.image_files)
         
     def __getitem__(self, idx):
         """Get a dataset item with its cluster assignment"""
@@ -345,71 +417,25 @@ class FeatureDataset(Dataset):
             self.image_size = 224
             
         # Initialize file paths
-        self.image_files = []
+        self.image_files = DataValidator.validate_images(root_dir)
         self.valid_indices = []
         
-        # Validate and collect image files
-        self._validate_files()
-        
-        # Set up transform
-        self.transform = get_val_transforms(config)
-        
-        self.logger.info(f"Initialized feature dataset with {len(self.valid_indices)} images")
-        
-    def _validate_files(self):
-        """Validate and collect image files"""
-        if is_main_process():
-            self.logger.info(f"Validating image files in {self.root_dir}")
+        if len(self.image_files) == 0:
+            raise ValueError(f"No valid images found in {root_dir}")
             
-        # Get all files in the directory
-        all_files = []
-        
-        for dirpath, _, filenames in os.walk(self.root_dir):
-            for filename in filenames:
-                path = os.path.join(dirpath, filename)
-                all_files.append(path)
-                
-        # Validate images
-        self.image_files = []
-        self.valid_indices = []
-        
-        for i, path in enumerate(tqdm(all_files, desc="Validating images", disable=not is_main_process())):
-            if self._is_valid_image(path):
-                self.image_files.append(path)
-                self.valid_indices.append(i)
-                
-        if is_main_process():
-            self.logger.info(f"Found {len(self.valid_indices)} valid images out of {len(all_files)} files")
+        self.logger.info(f"Found {len(self.image_files)} valid images in {root_dir}")
             
-        # Synchronize in distributed setting
-        if get_world_size() > 1:
-            synchronize()
-            
-    def _is_valid_image(self, path):
-        """Check if file is a valid image"""
-        if not (path.lower().endswith('.jpg') or 
-                path.lower().endswith('.jpeg') or 
-                path.lower().endswith('.png') or 
-                path.lower().endswith('.webp')):
-            return False
-            
-        try:
-            with Image.open(path) as img:
-                # Check if image has proper channels
-                if img.mode not in ('RGB', 'RGBA'):
-                    return False
-                    
-                # Check if image has minimum dimensions
-                if img.width < 16 or img.height < 16:
-                    return False
-                    
-                return True
-        except Exception:
-            return False
-            
+        # Set transform for feature extraction
+        self.transform = transforms.Compose([
+            transforms.Resize(self.image_size, interpolation=PIL.Image.BILINEAR),
+            transforms.CenterCrop(self.image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
     def __len__(self):
         """Return the number of valid images"""
-        return len(self.valid_indices)
+        return len(self.image_files)
         
     def __getitem__(self, idx):
         """Get a dataset item for feature extraction"""
