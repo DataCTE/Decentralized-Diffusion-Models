@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 class SelfAttentionBlock(nn.Module):
     """Efficient self-attention block for the router"""

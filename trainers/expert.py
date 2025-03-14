@@ -9,9 +9,9 @@ from torch.distributed.fsdp.wrap import default_auto_wrap_policy, size_based_aut
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
 
 from models.dit import ExpertDiT
-from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
-from utils.vae import VAEWrapper
-from utils.clip import CLIPTextEncoder
+from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
+from data.vae import VAEWrapper
+from data.clip import CLIPTextEncoder
 from trainers.base import BaseTrainer
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 from utils.logging import logger

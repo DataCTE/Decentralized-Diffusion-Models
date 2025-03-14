@@ -1,8 +1,6 @@
 """Feature extraction for DDM clustering (Paper Section 3.2)"""
 
 import torch
-import torch.nn as nn
-from tqdm import tqdm
 import logging
 import torch.distributed as dist
 import time

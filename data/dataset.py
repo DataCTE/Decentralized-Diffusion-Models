@@ -3,24 +3,21 @@
 import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from tqdm import tqdm
 from collections import defaultdict
 import logging
 import time
 import glob
-import math
+
 import random
 import io
 import torchvision.transforms as transforms
-from typing import Dict, List, Tuple, Optional, Union, Set
 
 # Import centralized utilities
-from utils.distributed import is_main_process, get_rank, get_world_size, broadcast_object, synchronize
+from utils.distributed import is_main_process, get_rank, broadcast_object
 from utils.logging import setup_logger
-from utils.transforms import get_train_transforms, get_val_transforms, resize_image, normalize
-from utils.visualization import tensor_to_pil
+from data.transforms import resize_image, normalize
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -140,58 +137,126 @@ class DataValidator:
 class DDMDataset(Dataset):
     """Implementation of dataset from paper with batching by aspect ratio"""
     
-    def __init__(self, root_dir, transform=None, cluster_labels=None, include_metadata=True):
+    def __init__(self, config, split='train', transforms=None, cluster_labels=None, hf_split=None):
         """
-        Initialize dataset with cluster assignments from ClusterManager
+        Initialize dataset with cluster information
         
         Args:
-            root_dir: Directory containing images
-            transform: Optional transforms to apply
-            cluster_labels: Pre-computed cluster labels from ClusterManager
-            include_metadata: Whether to include image metadata
+            config: Config object with dataset parameters
+            split: Dataset split ('train', 'val', etc.)
+            transforms: Image transformations to apply
+            cluster_labels: Precomputed cluster labels for each image
+            hf_split: HuggingFace dataset split name if different from 'split'
         """
-        self.root_dir = root_dir
+        self.config = config
+        self.split = split
+        self.hf_split = hf_split or split
+        self.transforms = transforms
         
-        # Initialize logger
-        self.logger = setup_logger(name="DDMDataset", rank=get_rank())
+        # Setup logging
+        self.logger = logging.getLogger(__name__)
         
-        # Set transform or use default
-        self.transform = transform
+        # Initialize path and data
+        self.dataset_path = getattr(config, 'dataset_path', None)
+        self.image_files = []
+        self.captions = []
+        self.cluster_assignments = None
+        self.bucket_indices = {}  # Maps bucket index to list of indices
+        self.bucket_assignments = {}  # Maps sample index to (bucket_idx, position)
         
-        # Store other parameters
-        self.include_metadata = include_metadata
+        # Load dataset
+        self._load_dataset()
         
-        # Initialize file paths
-        self.image_files = DataValidator.validate_images(root_dir)
-        
-        if len(self.image_files) == 0:
-            raise ValueError(f"No valid images found in {root_dir}")
-            
-        self.logger.info(f"Found {len(self.image_files)} valid images")
-        
-        # Collect image sizes for bucket batching
-        self.image_sizes = {}
-        self._collect_image_sizes()
-        
-        # Generate dynamic buckets based on aspect ratios
-        self.buckets = []
-        self._generate_dynamic_buckets()
-        
-        # Assign images to buckets
-        self.bucket_indices = defaultdict(list)
-        self.assign_buckets()
-        
-        # Initialize cluster assignments
+        # Initialize clustering if provided
         if cluster_labels is not None:
             self._init_shared_clusters(cluster_labels)
-        else:
-            self.cluster_assignments = [-1] * len(self.image_files)  # Default: unassigned
-            
-        # Initialize bucket assignments
+        
+        # Initialize buckets for efficient batching by aspect ratio
+        self._init_buckets()
+        
+        # Initialize bucket assignments for faster lookup
         self._init_bucket_assignments()
         
-        self.logger.info(f"Initialized dataset with {len(self.image_files)} images across {len(self.buckets)} buckets")
+        # Log dataset stats
+        self.logger.info(f"Initialized {split} dataset with {len(self.image_files)} samples")
+        if self.cluster_assignments is not None:
+            valid_count = (self.cluster_assignments >= 0).sum()
+            self.logger.info(f"Dataset has {valid_count}/{len(self.cluster_assignments)} valid cluster assignments")
+    
+    def _load_dataset(self):
+        """Load dataset images and captions"""
+        # Use HuggingFace datasets if configured
+        if hasattr(self.config, 'use_hf_dataset') and self.config.use_hf_dataset:
+            self._load_from_huggingface()
+        else:
+            self._load_from_files()
+    
+    def _load_from_files(self):
+        """Load dataset from image files"""
+        if self.dataset_path is None:
+            raise ValueError("Dataset path not specified in config")
+            
+        # Build image list
+        split_path = os.path.join(self.dataset_path, self.split)
+        if not os.path.exists(split_path):
+            split_path = self.dataset_path  # Try using the main path if split subdirectory doesn't exist
         
+        # Get all image files with supported extensions
+        supported_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
+        self.image_files = []
+        
+        for root, _, files in os.walk(split_path):
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in supported_extensions):
+                    self.image_files.append(os.path.join(root, file))
+        
+        # Sort for reproducibility
+        self.image_files.sort()
+        
+        # Load captions if available (plain text files with same name as images)
+        self.captions = []
+        for img_path in self.image_files:
+            caption_path = os.path.splitext(img_path)[0] + '.txt'
+            if os.path.exists(caption_path):
+                try:
+                    with open(caption_path, 'r', encoding='utf-8') as f:
+                        caption = f.read().strip()
+                except:
+                    caption = ""
+            else:
+                caption = ""
+            self.captions.append(caption)
+    
+    def _load_from_huggingface(self):
+        """Load dataset from HuggingFace datasets"""
+        try:
+            from datasets import load_dataset
+            
+            # Load dataset
+            dataset_name = getattr(self.config, 'hf_dataset_name', None)
+            if dataset_name is None:
+                raise ValueError("HuggingFace dataset name not specified in config")
+                
+            # Load dataset split
+            dataset = load_dataset(dataset_name, split=self.hf_split)
+            
+            # Get image and caption columns
+            image_column = getattr(self.config, 'hf_image_column', 'image')
+            caption_column = getattr(self.config, 'hf_caption_column', 'caption')
+            
+            # Extract images and captions
+            for item in dataset:
+                # For HF datasets, we'll store the dataset index instead of file path
+                self.image_files.append(item[image_column])
+                
+                if caption_column in item:
+                    self.captions.append(item[caption_column])
+                else:
+                    self.captions.append("")
+        except Exception as e:
+            self.logger.error(f"Failed to load HuggingFace dataset: {e}")
+            raise
+    
     def _init_shared_clusters(self, cluster_labels):
         """
         Initialize cluster assignments from ClusterManager
@@ -199,22 +264,89 @@ class DDMDataset(Dataset):
         Args:
             cluster_labels: Pre-computed cluster labels
         """
-        # Ensure correct length
+        # Check input
+        if cluster_labels is None:
+            self.logger.warning("Received None for cluster_labels")
+            # Initialize with -1 (unassigned)
+            self.cluster_assignments = np.full(len(self.image_files), -1)
+            return
+        
+        # Check length match
         if len(cluster_labels) != len(self.image_files):
             self.logger.warning(f"Cluster labels length ({len(cluster_labels)}) does not match dataset length ({len(self.image_files)})")
             
-            # Handle mismatch
-            if len(cluster_labels) > len(self.image_files):
-                cluster_labels = cluster_labels[:len(self.image_files)]
+            # Create placeholder for actual dataset length
+            self.cluster_assignments = np.full(len(self.image_files), -1)
+            
+            # Copy available labels
+            if len(cluster_labels) < len(self.image_files):
+                # Fewer labels than images, copy what we have and leave the rest unassigned
+                self.cluster_assignments[:len(cluster_labels)] = cluster_labels
+                self.logger.warning(f"Only {len(cluster_labels)}/{len(self.image_files)} samples have cluster assignments")
             else:
-                # Pad with -1 (unassigned)
-                cluster_labels = np.concatenate([
-                    cluster_labels, 
-                    np.full(len(self.image_files) - len(cluster_labels), -1)
-                ])
+                # More labels than images, truncate
+                self.cluster_assignments = cluster_labels[:len(self.image_files)]
+                self.logger.warning(f"Truncated {len(cluster_labels) - len(self.image_files)} excess cluster labels")
+        else:
+            # Equal lengths, perfect match
+            self.cluster_assignments = cluster_labels
+
+    def _init_buckets(self):
+        """Initialize buckets for aspect ratio batching"""
+        # Get bucket specifications from config
+        if hasattr(self.config, 'buckets'):
+            buckets = self.config.buckets
+        else:
+            # Default buckets: square, 4:3, 3:4, 16:9, 9:16
+            buckets = [
+                (256, 256),   # Square
+                (288, 224),   # 4:3 landscape
+                (224, 288),   # 3:4 portrait
+                (320, 192),   # 16:9 landscape
+                (192, 320),   # 9:16 portrait
+            ]
         
-        self.cluster_assignments = cluster_labels
+        # Process images and assign to buckets
+        bucket_indices = {i: [] for i in range(len(buckets))}
         
+        for idx, img_path in enumerate(self.image_files):
+            try:
+                # Get image dimensions
+                if isinstance(img_path, str) and os.path.exists(img_path):
+                    # Regular file path
+                    with Image.open(img_path) as img:
+                        width, height = img.size
+                elif hasattr(img_path, 'width') and hasattr(img_path, 'height'):
+                    # HuggingFace dataset image
+                    width, height = img_path.width, img_path.height
+                else:
+                    # Unknown format, assume square
+                    width, height = 1, 1
+                    
+                # Calculate aspect ratio
+                aspect_ratio = width / height
+                
+                # Find closest bucket
+                bucket_aspects = [w/h for w, h in buckets]
+                distances = [abs(aspect_ratio - ba) for ba in bucket_aspects]
+                closest_bucket = np.argmin(distances)
+                
+                # Add to bucket
+                bucket_indices[closest_bucket].append(idx)
+                
+            except Exception as e:
+                # Skip problematic images
+                self.logger.warning(f"Error processing image {img_path}: {e}")
+        
+        # Store bucket info
+        self.buckets = buckets
+        self.bucket_indices = bucket_indices
+        
+        # Log bucket sizes
+        for i, (w, h) in enumerate(buckets):
+            count = len(bucket_indices[i])
+            self.logger.info(f"Bucket {i} ({w}x{h}): {count} images")
+    
     def _init_bucket_assignments(self):
         """Initialize bucket assignments for efficient batching"""
         # Map bucket indices to original indices
@@ -222,176 +354,146 @@ class DDMDataset(Dataset):
         for bucket_idx, indices in self.bucket_indices.items():
             for i, idx in enumerate(indices):
                 self.bucket_assignments[idx] = (bucket_idx, i)
-
-    def _collect_image_sizes(self):
-        """Collect image sizes for bucket batching"""
-        if is_main_process():
-            self.logger.info("Collecting image sizes for bucket batching")
-            
-        # Process images in chunks for memory efficiency
-        chunk_size = 1000
-        num_chunks = (len(self.image_files) + chunk_size - 1) // chunk_size
-        
-        for i in range(num_chunks):
-            start_idx = i * chunk_size
-            end_idx = min((i + 1) * chunk_size, len(self.image_files))
-            
-            for idx in tqdm(range(start_idx, end_idx), 
-                           desc=f"Collecting sizes {i+1}/{num_chunks}",
-                           disable=not is_main_process()):
-                path = self.image_files[idx]
-                
-                try:
-                    with Image.open(path) as img:
-                        self.image_sizes[path] = (img.width, img.height)
-                except Exception as e:
-                    self.logger.warning(f"Failed to get size for {path}: {str(e)}")
-                    
-    def _generate_dynamic_buckets(self, num_buckets=20):
-        """
-        Generate dynamic buckets based on aspect ratios
-        
-        Args:
-            num_buckets: Number of buckets to generate
-        """
-        if not self.image_sizes:
-            self.logger.warning("No image sizes collected, can't generate buckets")
-            return
-            
-        # Collect aspect ratios
-        aspect_ratios = []
-        for _, (width, height) in self.image_sizes.items():
-            aspect_ratios.append(width / height)
-            
-        if not aspect_ratios:
-            return
-            
-        # Generate buckets
-        min_ar = min(aspect_ratios)
-        max_ar = max(aspect_ratios)
-        
-        # Use logarithmic spacing for better distribution
-        log_min = np.log(min_ar)
-        log_max = np.log(max_ar)
-        
-        # Generate bucket boundaries
-        bucket_boundaries = np.exp(np.linspace(log_min, log_max, num_buckets + 1))
-        
-        # Create buckets as (min_ar, max_ar, target_ar)
-        self.buckets = []
-        for i in range(len(bucket_boundaries) - 1):
-            min_bucket_ar = bucket_boundaries[i]
-            max_bucket_ar = bucket_boundaries[i + 1]
-            target_ar = (min_bucket_ar + max_bucket_ar) / 2
-            self.buckets.append((min_bucket_ar, max_bucket_ar, target_ar))
-            
-    def find_closest_bucket(self, width, height):
-        """
-        Find the closest bucket for a given image size
-        
-        Args:
-            width: Image width
-            height: Image height
-            
-        Returns:
-            Index of the closest bucket
-        """
-        if not self.buckets:
-            return 0  # No buckets, use default
-            
-        aspect_ratio = width / height
-        
-        # Find bucket with exact range match
-        for i, (min_ar, max_ar, _) in enumerate(self.buckets):
-            if min_ar <= aspect_ratio <= max_ar:
-                return i
-                
-        # If no exact match, find closest bucket
-        closest_bucket = 0
-        min_distance = float('inf')
-        
-        for i, (_, _, target_ar) in enumerate(self.buckets):
-            distance = abs(target_ar - aspect_ratio)
-            if distance < min_distance:
-                min_distance = distance
-                closest_bucket = i
-                
-        return closest_bucket
-        
-    def assign_buckets(self):
-        """Assign images to buckets based on aspect ratio"""
-        if is_main_process():
-            self.logger.info("Assigning images to aspect ratio buckets")
-            
-        # Reset bucket indices
-        self.bucket_indices = defaultdict(list)
-        
-        # Assign images to buckets
-        for idx, path in enumerate(self.image_files):
-            if path in self.image_sizes:
-                width, height = self.image_sizes[path]
-                bucket_idx = self.find_closest_bucket(width, height)
-                self.bucket_indices[bucket_idx].append(idx)
-            else:
-                # Default bucket for unknown sizes
-                self.bucket_indices[0].append(idx)
-                
-        # Log bucket distribution
-        if is_main_process():
-            bucket_sizes = {i: len(indices) for i, indices in self.bucket_indices.items()}
-            total_images = sum(bucket_sizes.values())
-            
-            for bucket_idx, size in bucket_sizes.items():
-                if bucket_idx < len(self.buckets):
-                    min_ar, max_ar, target_ar = self.buckets[bucket_idx]
-                    self.logger.info(f"Bucket {bucket_idx}: {size} images ({size/total_images*100:.1f}%) - AR [{min_ar:.2f}-{max_ar:.2f}], Target: {target_ar:.2f}")
-                else:
-                    self.logger.info(f"Bucket {bucket_idx}: {size} images ({size/total_images*100:.1f}%) - Unknown AR range")
-                
+    
     def __len__(self):
-        """Return the number of valid images"""
+        """Get dataset length"""
         return len(self.image_files)
-        
+    
     def __getitem__(self, idx):
-        """Get a dataset item with its cluster assignment"""
+        """Get dataset item with clustering information"""
         # Get image path
-        path = self.image_files[idx]
+        img_path = self.image_files[idx]
         
-        # Load image
+        # Load and transform image
         try:
-            image = Image.open(path).convert('RGB')
+            if isinstance(img_path, str) and os.path.exists(img_path):
+                # Regular file path
+                img = Image.open(img_path).convert('RGB')
+            else:
+                # HuggingFace dataset image or other format
+                img = img_path.convert('RGB') if hasattr(img_path, 'convert') else img_path
+                
+            # Get bucket assignment
+            if idx in self.bucket_assignments:
+                bucket_idx, _ = self.bucket_assignments[idx]
+                target_size = self.buckets[bucket_idx]
+            else:
+                # Default to square if no bucket assignment
+                target_size = (256, 256)
+                
+            # Apply transforms if provided
+            if self.transforms is not None:
+                img = self.transforms(img, target_size=target_size)
+            else:
+                # Basic resize if no transforms provided
+                img = transforms.Compose([
+                    transforms.Resize(target_size),
+                    transforms.ToTensor(),
+                ])(img)
+                
         except Exception as e:
-            self.logger.warning(f"Failed to load image {path}: {str(e)}")
-            # Return a small black image as fallback
-            image = Image.new('RGB', (64, 64), color=0)
-            
-        # Apply transforms if specified
-        if self.transform:
-            image = self.transform(image)
-        else:
-            # Use centralized transforms
-            transform = get_train_transforms(self.config if hasattr(self, 'config') else None)
-            image = transform(image)
-            
-        # Get cluster assignment
-        cluster = self.cluster_assignments[idx]
+            # Return a blank tensor on error
+            self.logger.warning(f"Error loading image {img_path}: {e}")
+            img = torch.zeros((3, 256, 256), dtype=torch.float32)
         
-        # Create return dictionary
-        result = {
-            'image': image,
-            'cluster': cluster,
-            'idx': idx
+        # Get caption
+        caption = self.captions[idx] if idx < len(self.captions) else ""
+        
+        # Get cluster label if available
+        if self.cluster_assignments is not None and idx < len(self.cluster_assignments):
+            cluster = int(self.cluster_assignments[idx])
+        else:
+            cluster = -1  # -1 indicates no cluster
+            
+        # Return as dict for flexibility
+        return {
+            "image": img,
+            "caption": caption,
+            "cluster": cluster,
+            "index": idx,
+            "path": img_path if isinstance(img_path, str) else f"sample_{idx}"
         }
         
-        # Add metadata if requested
-        if self.include_metadata:
-            result['path'] = path
+    def update_cluster_assignments(self, cluster_labels):
+        """Update cluster assignments with new labels"""
+        self._init_shared_clusters(cluster_labels)
+        
+    def get_bucket_sampler(self, batch_size=32, shuffle=True, drop_last=True):
+        """
+        Create a batched sampler that maintains aspect ratio grouping
+        
+        Args:
+            batch_size: Batch size
+            shuffle: Whether to shuffle samples
+            drop_last: Whether to drop the last incomplete batch
             
-            # Get bucket assignment if available
-            if hasattr(self, 'bucket_assignments') and idx in self.bucket_assignments:
-                result['bucket'] = self.bucket_assignments[idx]
+        Returns:
+            BucketBatchSampler for efficient batching
+        """
+        from torch.utils.data import Sampler
+        import math
+        
+        class BucketBatchSampler(Sampler):
+            def __init__(self, bucket_indices, batch_size, shuffle=True, drop_last=True):
+                self.bucket_indices = bucket_indices
+                self.batch_size = batch_size
+                self.shuffle = shuffle
+                self.drop_last = drop_last
                 
-        return result
+                # Calculate number of batches per bucket
+                self.batch_counts = {}
+                self.total_batches = 0
+                
+                for bucket, indices in self.bucket_indices.items():
+                    if drop_last:
+                        count = len(indices) // batch_size
+                    else:
+                        count = math.ceil(len(indices) / batch_size)
+                    self.batch_counts[bucket] = count
+                    self.total_batches += count
+            
+            def __iter__(self):
+                # Create batches for each bucket
+                bucket_batches = {}
+                
+                for bucket, indices in self.bucket_indices.items():
+                    # Copy indices to avoid modifying original
+                    bucket_indices = indices.copy()
+                    
+                    # Shuffle if needed
+                    if self.shuffle:
+                        random.shuffle(bucket_indices)
+                    
+                    # Create batches
+                    bucket_batches[bucket] = []
+                    for i in range(0, len(bucket_indices), self.batch_size):
+                        if i + self.batch_size <= len(bucket_indices) or not self.drop_last:
+                            batch = bucket_indices[i:i + self.batch_size]
+                            if len(batch) > 0:  # Only add non-empty batches
+                                bucket_batches[bucket].append(batch)
+                
+                # Determine batch order
+                bucket_order = list(self.bucket_indices.keys())
+                if self.shuffle:
+                    random.shuffle(bucket_order)
+                
+                # Interleave batches from different buckets
+                batch_list = []
+                
+                # Continue until all batches are used
+                while any(len(bucket_batches[b]) > 0 for b in bucket_order):
+                    for bucket in bucket_order:
+                        if bucket_batches[bucket]:
+                            batch_list.append(bucket_batches[bucket].pop(0))
+                
+                # Yield batches
+                for batch in batch_list:
+                    yield batch
+            
+            def __len__(self):
+                return self.total_batches
+                
+        return BucketBatchSampler(self.bucket_indices, batch_size, shuffle, drop_last)
 
 class FeatureDataset(Dataset):
     """Dataset for extracting features for clustering"""

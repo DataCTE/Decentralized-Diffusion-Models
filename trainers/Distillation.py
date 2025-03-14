@@ -1,18 +1,15 @@
 """Distillation for Decentralized Diffusion Models"""
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import math
 import os
 import logging
 from tqdm import tqdm
-import numpy as np
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset
 
 from models.dit import ExpertDiT
-from utils.logging import log_metrics, log_images
-from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
+from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from utils.expert_cache import ExpertCacheManager
 
 logger = logging.getLogger(__name__)

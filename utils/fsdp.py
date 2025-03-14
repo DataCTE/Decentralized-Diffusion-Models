@@ -13,11 +13,9 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap
+    size_based_auto_wrap_policy
 )
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp import StateDictType
 
 logger = logging.getLogger(__name__)
 

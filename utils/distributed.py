@@ -2,10 +2,8 @@
 
 import torch
 import torch.distributed as dist
-import numpy as np
 import pickle
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 

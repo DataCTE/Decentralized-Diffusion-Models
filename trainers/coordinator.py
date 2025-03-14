@@ -2,12 +2,8 @@
 
 import math
 import torch
-import torch.nn as nn
-import numpy as np
-import time
 import os
 
-from models.dit import ExpertDiT
 from data.dataset import DDMDataset
 from data.clustering import ClusterManager
 from trainers.Distillation import DiffusionDistiller
@@ -15,19 +11,13 @@ from trainers.expert import ExpertTrainer
 from trainers.router import RouterTrainer
 
 # Import centralized utilities
-from utils.logging import setup_logger, log_metrics, log_images, log_training_start, log_training_end, init_wandb
+from utils.logging import setup_logger, log_metrics, log_images
 from utils.distributed import (
-    is_main_process, get_rank, get_world_size, synchronize, 
-    broadcast_object, reduce_dict, all_gather_tensor
+    is_main_process, synchronize
 )
-from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
-from utils.metrics import MetricCalculator
-from utils.checkpoint import save_model_checkpoint, load_model_checkpoint, save_sharded
-from utils.vae import VAEWrapper
-from utils.clip import CLIPTextEncoder
-from utils.sampling import ddm_sample
-from utils.visualization import tensor_to_pil, create_image_grid
-from utils.expert_cache import ExpertCacheManager
+from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
+from trainers.sampling import ddm_sample
+from utils.visualization import tensor_to_pil
 
 # Setup logger
 logger = setup_logger("DDMCoordinator")
@@ -141,49 +131,65 @@ class DDMTrainingCoordinator:
             return  # No need to synchronize for single-process training
         
         try:
-            # Use a context manager for timeout
-            import contextlib
-            import signal
+            # Use a platform-independent approach for timeouts
+            import threading
+            import time
             
-            @contextlib.contextmanager
-            def timeout_handler(seconds, operation):
-                def handler(signum, frame):
-                    ranks = list(range(self.world_size))
-                    ranks.remove(self.rank)
-                    raise TimeoutError(f"Synchronization timeout after {seconds}s. "
-                                     f"Waiting for ranks {ranks} for {operation}")
-                
-                # Set timeout
-                old_handler = signal.signal(signal.SIGALRM, handler)
-                signal.alarm(seconds)
-                
+            # Track success status
+            success = [False]
+            exception = [None]
+            
+            # Function to run in thread with timeout
+            def sync_with_timeout():
                 try:
-                    yield
-                finally:
-                    # Restore previous settings
-                    signal.alarm(0)
-                    signal.signal(signal.SIGALRM, old_handler)
+                    # Call the actual synchronization
+                    torch.distributed.barrier()
+                    success[0] = True
+                except Exception as e:
+                    exception[0] = e
             
-            # Only apply timeout on Unix-like systems
-            import platform
-            if platform.system() != "Windows":
-                with timeout_handler(timeout_seconds, name):
-                    synchronize()  # Call the distributed synchronization
-            else:
-                # On Windows, just synchronize without timeout (no SIGALRM)
-                synchronize()
+            # Start sync in a thread
+            thread = threading.Thread(target=sync_with_timeout)
+            thread.daemon = True
+            thread.start()
+            
+            # Wait with timeout
+            thread.join(timeout=timeout_seconds)
+            
+            if thread.is_alive():
+                # Thread is still running (timeout occurred)
+                ranks = list(range(self.world_size))
+                ranks.remove(self.rank)
+                self.logger.error(f"Synchronization timeout after {timeout_seconds}s. "
+                                 f"Waiting for ranks {ranks} for {name}")
                 
+                # Continue execution despite timeout
+                # We'll let the thread continue in background
+                return False
+            
+            if not success[0]:
+                # Thread completed but with an error
+                self.logger.error(f"Synchronization failed for '{name}': {str(exception[0])}")
+                return False
+            
             self.logger.debug(f"Synchronization for '{name}' completed successfully")
+            return True
+            
         except Exception as e:
             self.logger.error(f"Synchronization error for '{name}': {str(e)}")
-            # Continue execution despite synchronization failure
-            # This prevents the entire training from failing
+            return False
 
     def sync_experts_state(self):
-        """Synchronize expert states across all processes"""
-        if self.world_size <= 1:
-            return
+        """
+        Synchronize expert states across all processes with enhanced error handling
         
+        Returns:
+            bool: Whether synchronization was successful
+        """
+        if self.world_size <= 1:
+            return True
+        
+        sync_success = True
         try:
             # Log synchronization start
             self.logger.info("Synchronizing expert states across processes")
@@ -196,6 +202,10 @@ class DDMTrainingCoordinator:
                           if idx % self.world_size == i]
                 all_expert_indices.append(indices)
             
+            # Create a list to track successfully synchronized experts
+            synced_experts = set()
+            failed_experts = set()
+            
             # For each expert, synchronize from its owner to all other ranks
             for rank, indices in enumerate(all_expert_indices):
                 for expert_idx in indices:
@@ -203,13 +213,34 @@ class DDMTrainingCoordinator:
                     if self.rank == rank:
                         self.logger.debug(f"Broadcasting expert {expert_idx} from rank {rank}")
                     
-                    # Use safe synchronization with timeout
-                    self.safe_synchronize(timeout_seconds=120, 
-                                         name=f"expert_{expert_idx}_broadcast")
+                    try:
+                        # Try to synchronize this expert
+                        success = self.safe_synchronize(
+                            timeout_seconds=120, 
+                            name=f"expert_{expert_idx}_broadcast"
+                        )
+                        
+                        if success:
+                            synced_experts.add(expert_idx)
+                        else:
+                            failed_experts.add(expert_idx)
+                            sync_success = False
+                    except Exception as e:
+                        self.logger.error(f"Error synchronizing expert {expert_idx}: {str(e)}")
+                        failed_experts.add(expert_idx)
+                        sync_success = False
             
-            self.logger.info("Expert state synchronization completed")
+            # Report on synchronization results
+            if failed_experts:
+                self.logger.warning(f"Failed to synchronize {len(failed_experts)} experts: {sorted(failed_experts)}")
+                self.logger.info(f"Successfully synchronized {len(synced_experts)} experts")
+            else:
+                self.logger.info(f"Expert state synchronization completed successfully for all {len(synced_experts)} experts")
+            
+            return sync_success
         except Exception as e:
             self.logger.error(f"Expert state synchronization failed: {str(e)}")
+            return False
 
     def init_cluster_manager(self):
         """Initialize cluster manager for expert assignment"""
