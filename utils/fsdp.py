@@ -13,7 +13,8 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
-    size_based_auto_wrap_policy
+    size_based_auto_wrap_policy,
+    lambda_auto_wrap_policy
 )
 from torch.distributed.fsdp import StateDictType
 
@@ -335,7 +336,7 @@ def get_auto_wrap_policy(config):
             return transformer_auto_wrap_policy(transformer_layer_cls=transformer_layer_cls)
     
     # Default to size-based policy
-    return default_auto_wrap_policy
+    return lambda_auto_wrap_policy
 
 def get_backward_prefetch(config):
     """Get backward prefetch setting based on config"""

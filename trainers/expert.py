@@ -5,7 +5,7 @@ from bitsandbytes.optim import AdamW8bit
 import math
 import os
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import default_auto_wrap_policy, size_based_auto_wrap_policy
+from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy, size_based_auto_wrap_policy
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
 
 from models.dit import ExpertDiT
@@ -51,11 +51,11 @@ class ExpertTrainer(BaseTrainer):
             
         # Auto wrap policy
         if config.fsdp_auto_wrap_policy == "DEFAULT":
-            auto_wrap_policy = default_auto_wrap_policy
+            auto_wrap_policy = lambda_auto_wrap_policy
         elif config.fsdp_auto_wrap_policy == "SIZE_BASED":
             auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=config.fsdp_min_num_params)
         else:
-            auto_wrap_policy = default_auto_wrap_policy
+            auto_wrap_policy = lambda_auto_wrap_policy
             
         # Apply FSDP with proper isolation
         self.expert = FSDP(
