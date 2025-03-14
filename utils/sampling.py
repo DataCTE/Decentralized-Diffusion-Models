@@ -36,7 +36,7 @@ def ddm_sample(
     
     Args:
         router: Router model
-        experts: List of expert models
+        experts: Dict of expert models {expert_idx: model}
         shape: Output shape [B, C, H, W]
         steps: Number of sampling steps
         top_k: Number of experts to use per step
@@ -52,6 +52,11 @@ def ddm_sample(
     Returns:
         Sampled tensor
     """
+    # Check inputs
+    if not isinstance(experts, dict):
+        # Convert list to dict for backward compatibility
+        experts = {i: expert for i, expert in enumerate(experts) if expert is not None}
+    
     # Initialize with random noise
     x = torch.randn(shape, device=device)
     
@@ -61,92 +66,309 @@ def ddm_sample(
     alpha_bar = alpha_bar.to(device)
     betas = betas.to(device)
     
-    # Calculate timestep sequence
-    timesteps = torch.linspace(0, 1, steps + 1, device=device)[:-1]
+    # Convert to the timesteps we'll use for sampling
+    timesteps = torch.linspace(1, 0, steps + 1).to(device) * 1000
+    timesteps = timesteps.round().long()
     
-    # Create progress bar
-    pbar = tqdm(reversed(range(steps)), total=steps, disable=not verbose)
-    pbar.set_description("Sampling")
+    # Track active experts per step for metrics
+    expert_usage_counts = torch.zeros(len(experts), device=device)
     
-    # Sampling loop
-    for i in pbar:
+    # Setup progress bar
+    progress = tqdm(range(steps), desc="Sampling", disable=not verbose)
+    
+    # Create caching structures for improved memory efficiency
+    expert_cache = {}  # Cache for currently loaded experts
+    expert_latents = {}  # Cache for expert outputs
+    
+    # Get batch size
+    batch_size = shape[0]
+    
+    # Initialize memory tracker for adaptive expert loading
+    max_experts_per_batch = min(len(experts), top_k * batch_size)
+    available_memory = torch.cuda.get_device_properties(device).total_memory
+    used_memory_baseline = torch.cuda.memory_allocated(device)
+    
+    # Setup for conditional generation
+    use_cfg = text_embeddings is not None and uncond_embeddings is not None and cfg_scale > 1.0
+    
+    # For each sampling step
+    for step_idx, step in enumerate(progress):
         # Current timestep
-        t = torch.full((shape[0],), i/steps, device=device)
+        t_idx = step
+        t_next_idx = step + 1 if step + 1 < len(timesteps) else step
         
-        # Get router probabilities
+        # Calculate current and next timestep values
+        t = timesteps[t_idx].unsqueeze(0).repeat(batch_size)
+        t_next = timesteps[t_next_idx].unsqueeze(0).repeat(batch_size)
+        
+        # Scale t to [0, 1]
+        t_scaled = t.float() / 1000.0
+        
         with torch.no_grad():
-            logits = router(x, t)
-            probs = torch.softmax(logits, dim=-1)
-        
-        # Select top-k experts
-        top_probs, top_indices = torch.topk(probs, min(top_k, probs.size(1)), dim=-1)
-        top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
-        
-        # Compute and combine expert predictions
-        combined = torch.zeros_like(x)
-        
-        for expert_idx, expert in enumerate(experts):
-            # Get samples that should use this expert
-            mask = (top_indices == expert_idx).any(dim=-1)
+            # Get router predictions for each sample in the batch
+            router_preds = router(x, t_scaled)
             
-            if mask.any():
-                # Get conditional prediction
-                if text_embeddings is not None:
-                    # Split batch based on mask
-                    masked_x = x[mask]
-                    masked_t = t[mask]
+            # Apply softmax to get probabilities
+            router_probs = F.softmax(router_preds, dim=-1)  # [B, num_experts]
+            
+            # Get top-k expert indices and probabilities for each sample
+            # This is done efficiently to minimize redundant expert loads
+            all_selected_experts = []
+            all_weights = []
+            
+            # Router selection with nucleus sampling option
+            if getattr(router, 'nucleus_threshold', None) is not None and router.nucleus_threshold > 0:
+                # Nucleus sampling - only use experts that cumulatively exceed a probability threshold
+                for batch_idx in range(batch_size):
+                    # Sort probabilities for this sample
+                    probs, indices = router_probs[batch_idx].sort(descending=True)
                     
-                    # Get conditional and unconditional predictions for CFG
-                    with torch.no_grad():
-                        cond_pred = expert(masked_x, masked_t, text_embeddings[mask])
-                        uncond_pred = expert(masked_x, masked_t, uncond_embeddings[mask])
+                    # Find experts that exceed threshold
+                    cumsum = torch.cumsum(probs, dim=0)
+                    mask = cumsum <= router.nucleus_threshold
                     
-                    # Apply classifier-free guidance
-                    pred = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
-                else:
-                    # Standard unconditional prediction
-                    with torch.no_grad():
-                        pred = expert(x[mask], t[mask])
+                    # Always include at least one expert
+                    if not mask.any():
+                        mask[0] = True
+                    
+                    # Get selected experts and their weights
+                    selected_experts = indices[mask]
+                    weights = probs[mask]
+                    
+                    # Normalize weights to sum to 1
+                    weights = weights / weights.sum()
+                    
+                    all_selected_experts.append(selected_experts)
+                    all_weights.append(weights)
+            else:
+                # Standard top-k selection
+                for batch_idx in range(batch_size):
+                    # Get top-k expert indices and probabilities for this sample
+                    weights, indices = router_probs[batch_idx].topk(min(top_k, router_probs.shape[1]))
+                    
+                    # Normalize weights to sum to 1
+                    weights = weights / weights.sum()
+                    
+                    all_selected_experts.append(indices)
+                    all_weights.append(weights)
+            
+            # Get unique expert indices across all samples
+            unique_experts = set()
+            for experts_indices in all_selected_experts:
+                unique_experts.update(experts_indices.tolist())
+            
+            # Check if we need to manage memory
+            if len(unique_experts) > max_experts_per_batch:
+                # Clear cache to free memory
+                expert_cache.clear()
+                torch.cuda.empty_cache()
                 
-                # Weight prediction by router probability and add to combined prediction
-                expert_probs = top_probs[mask][top_indices[mask] == expert_idx]
-                combined[mask] += pred * expert_probs.view(-1, 1, 1, 1)
+                # Process in smaller batches
+                batch_size_adjust = max(1, max_experts_per_batch // len(unique_experts))
+                logger.warning(f"Too many unique experts ({len(unique_experts)}), splitting batch into {batch_size // batch_size_adjust} sub-batches")
+                
+                # Process in smaller sub-batches
+                sub_batches = []
+                for i in range(0, batch_size, batch_size_adjust):
+                    end_idx = min(i + batch_size_adjust, batch_size)
+                    sub_x = x[i:end_idx]
+                    sub_t = t[i:end_idx]
+                    if use_cfg:
+                        sub_text_embeddings = text_embeddings[i:end_idx] if text_embeddings is not None else None
+                        sub_uncond_embeddings = uncond_embeddings[i:end_idx] if uncond_embeddings is not None else None
+                    
+                    # Recursive call with smaller batch
+                    sub_result = ddm_sample(
+                        router=router,
+                        experts=experts,
+                        shape=sub_x.shape,
+                        steps=1,  # Just do one step
+                        top_k=top_k,
+                        device=device,
+                        cfg_scale=cfg_scale,
+                        text_embeddings=sub_text_embeddings if use_cfg else None,
+                        uncond_embeddings=sub_uncond_embeddings if use_cfg else None,
+                        eta=eta,
+                        scheduler=scheduler,
+                        verbose=False
+                    )
+                    sub_batches.append(sub_result)
+                
+                # Combine sub-batches
+                x = torch.cat(sub_batches, dim=0)
+                continue
+            
+            # Load all unique experts needed for this step
+            for expert_idx in unique_experts:
+                if expert_idx not in expert_cache and expert_idx in experts and experts[expert_idx] is not None:
+                    try:
+                        # Track current memory usage for monitoring
+                        mem_before = torch.cuda.memory_allocated(device)
+                        
+                        # Load expert (might already be on device)
+                        expert = experts[expert_idx]
+                        expert_cache[expert_idx] = expert
+                        
+                        # Track memory impact of loading this expert
+                        mem_after = torch.cuda.memory_allocated(device)
+                        expert_memory = mem_after - mem_before
+                        
+                        # Update max experts per batch based on actual memory usage
+                        if expert_memory > 0:
+                            available_memory_per_expert = (available_memory - used_memory_baseline) * 0.8 / expert_memory
+                            max_experts_per_batch = min(max_experts_per_batch, int(available_memory_per_expert))
+                            
+                        logger.debug(f"Loaded expert {expert_idx} for sampling")
+                    except Exception as e:
+                        logger.error(f"Failed to load expert {expert_idx}: {e}")
+                        expert_cache[expert_idx] = None
+            
+            # Process with conditional guidance if text embeddings are provided
+            if use_cfg:
+                # Do CFG with two forward passes (conditional and unconditional)
+                
+                # For memory efficiency, process each expert separately
+                pred_noise_latent = torch.zeros_like(x)
+                uncond_pred_noise_latent = torch.zeros_like(x)
+                
+                # Process each expert for all samples that need it
+                for expert_idx in unique_experts:
+                    if expert_idx not in expert_cache or expert_cache[expert_idx] is None:
+                        continue
+                    
+                    # Find which samples use this expert
+                    samples_using_expert = []
+                    expert_weights = []
+                    
+                    for batch_idx in range(batch_size):
+                        # Check if this sample uses this expert
+                        if expert_idx in all_selected_experts[batch_idx]:
+                            # Find weight for this expert
+                            expert_pos = (all_selected_experts[batch_idx] == expert_idx).nonzero(as_tuple=True)[0]
+                            weight = all_weights[batch_idx][expert_pos]
+                            
+                            samples_using_expert.append(batch_idx)
+                            expert_weights.append(weight.item())
+                    
+                    if not samples_using_expert:
+                        continue
+                    
+                    # Prepare batch for this expert
+                    expert_batch_x = x[samples_using_expert]
+                    expert_batch_t = t[samples_using_expert]
+                    expert_batch_text = text_embeddings[samples_using_expert]
+                    expert_batch_uncond = uncond_embeddings[samples_using_expert]
+                    expert_weights = torch.tensor(expert_weights, device=device).view(-1, 1, 1, 1)
+                    
+                    # Forward pass with text condition
+                    expert_output_cond = expert_cache[expert_idx](expert_batch_x, expert_batch_t, expert_batch_text)
+                    
+                    # Forward pass with unconditional embeddings
+                    expert_output_uncond = expert_cache[expert_idx](expert_batch_x, expert_batch_t, expert_batch_uncond)
+                    
+                    # Apply CFG formula: pred = uncond + cfg_scale * (cond - uncond)
+                    expert_output = expert_output_uncond + cfg_scale * (expert_output_cond - expert_output_uncond)
+                    
+                    # Apply expert weights and add to output latent
+                    for idx, batch_idx in enumerate(samples_using_expert):
+                        weight = expert_weights[idx]
+                        pred_noise_latent[batch_idx] += expert_output[idx] * weight
+                        
+                        # Update usage stats
+                        expert_usage_counts[expert_idx] += 1
+                
+                # Apply diffusion update
+                x = update_sample(
+                    x=x,
+                    pred=pred_noise_latent,
+                    t_index=t_idx,
+                    t_next_index=t_next_idx,
+                    alphas=alphas,
+                    alpha_bar=alpha_bar,
+                    eta=eta
+                )
+                
+            else:
+                # Standard non-guided generation
+                # Process each expert for all samples that need it
+                pred_noise_latent = torch.zeros_like(x)
+                
+                for expert_idx in unique_experts:
+                    if expert_idx not in expert_cache or expert_cache[expert_idx] is None:
+                        continue
+                    
+                    # Find which samples use this expert
+                    samples_using_expert = []
+                    expert_weights = []
+                    
+                    for batch_idx in range(batch_size):
+                        # Check if this sample uses this expert
+                        if expert_idx in all_selected_experts[batch_idx]:
+                            # Find weight for this expert
+                            expert_pos = (all_selected_experts[batch_idx] == expert_idx).nonzero(as_tuple=True)[0]
+                            weight = all_weights[batch_idx][expert_pos]
+                            
+                            samples_using_expert.append(batch_idx)
+                            expert_weights.append(weight.item())
+                    
+                    if not samples_using_expert:
+                        continue
+                    
+                    # Process this batch with the expert
+                    expert_batch_x = x[samples_using_expert]
+                    expert_batch_t = t[samples_using_expert]
+                    expert_weights = torch.tensor(expert_weights, device=device).view(-1, 1, 1, 1)
+                    
+                    # Forward pass with this expert
+                    expert_output = expert_cache[expert_idx](
+                        expert_batch_x, expert_batch_t, 
+                        text_embeddings[samples_using_expert] if text_embeddings is not None else None
+                    )
+                    
+                    # Apply expert weights and add to output latent
+                    for idx, batch_idx in enumerate(samples_using_expert):
+                        weight = expert_weights[idx]
+                        pred_noise_latent[batch_idx] += expert_output[idx] * weight
+                        
+                        # Update usage stats
+                        expert_usage_counts[expert_idx] += 1
+                
+                # Apply diffusion update
+                x = update_sample(
+                    x=x,
+                    pred=pred_noise_latent,
+                    t_index=t_idx,
+                    t_next_index=t_next_idx,
+                    alphas=alphas,
+                    alpha_bar=alpha_bar,
+                    eta=eta
+                )
+                
+        # Clear expert cache after each step to save memory
+        expert_cache.clear()
+        torch.cuda.empty_cache()
         
-        # Update sample with combined prediction
-        if i > 0:
-            # Calculate parameters for current and previous timestep
-            alpha = alphas[i]
-            alpha_prev = alphas[i-1]
-            alpha_bar_t = alpha_bar[i]
-            alpha_bar_prev = alpha_bar[i-1]
-            beta = betas[i]
+        # Update progress bar
+        if verbose:
+            progress.set_postfix({
+                "step": step_idx,
+                "active_experts": len(unique_experts),
+                "mem_used": f"{torch.cuda.memory_allocated(device) / 1024**3:.2f}GB"
+            })
             
-            # DDIM update step
-            # Predict x0
-            pred_x0 = (x - torch.sqrt(1 - alpha_bar_t).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * combined) / \
-                torch.sqrt(alpha_bar_t).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            
-            # Clip predicted x0 to prevent extreme values
-            pred_x0 = pred_x0.clamp(-1, 1)
-            
-            # Calculate direction to xt
-            dir_xt = torch.sqrt(1 - alpha_bar_prev - eta**2 * (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * combined
-            
-            # Calculate random noise for stochastic sampling
-            noise = torch.randn_like(x)
-            noise_strength = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            
-            # Update xt to xt-1
-            x = torch.sqrt(alpha_bar_prev).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * pred_x0 + \
-                dir_xt + \
-                noise_strength * noise
-        else:
-            # Last step - just predict x0 directly
-            x = combined
-        
-        # Run callback if provided
+        # Call callback if provided
         if callback is not None:
-            callback(x, i)
+            callback(x, step_idx)
+    
+    # Log expert usage statistics
+    if verbose:
+        # Calculate expert usage percentage
+        expert_usage_pct = expert_usage_counts / (steps * batch_size) * 100
+        top_experts = torch.topk(expert_usage_pct, min(5, len(expert_usage_pct)))
+        
+        logger.info("Expert usage statistics:")
+        for i, (idx, pct) in enumerate(zip(top_experts.indices.tolist(), top_experts.values.tolist())):
+            logger.info(f"  Top-{i+1}: Expert {idx} - {pct:.2f}%")
     
     return x
 

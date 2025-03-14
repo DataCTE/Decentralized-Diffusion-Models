@@ -8,11 +8,12 @@ import os
 import logging
 from tqdm import tqdm
 import numpy as np
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 from models.dit import ExpertDiT
 from utils.logging import log_metrics, log_images
 from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
+from utils.expert_cache import ExpertCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,9 @@ class DiffusionDistiller:
         self.experts = experts
         self.router = router
         self.dataset = dataset
+        
+        # Create expert cache manager for memory efficiency
+        self.expert_cache = ExpertCacheManager(config, device)
         
         # Initialize distilled model
         self.distilled_model = ExpertDiT(config).to(device)
@@ -80,8 +84,16 @@ class DiffusionDistiller:
         # Track metrics
         self.best_loss = float('inf')
         
+        # Setup AMP scaler for mixed precision training
+        self.scaler = torch.cuda.amp.GradScaler(enabled=config.use_mixed_precision)
+        
+        # Cache for expert outputs to avoid duplicate computations
+        self.expert_output_cache = {}
+        
+        logger.info(f"Initialized DiffusionDistiller with {len(experts)} experts")
+        
     def setup_data_loader(self):
-        """Create data loader for distillation training"""
+        """Create data loader for distillation training with balanced cluster representation"""
         # For distillation, we can use a balanced subset of the data
         balanced_indices = self._get_balanced_indices(self.config.distill_samples)
         distill_subset = Subset(self.dataset, balanced_indices)
@@ -99,38 +111,48 @@ class DiffusionDistiller:
         return distill_loader
         
     def _get_balanced_indices(self, num_samples):
-        """Get balanced indices from the dataset based on cluster assignments"""
-        cluster_labels = self.dataset.cluster_assignments
-        unique_clusters = np.unique(cluster_labels)
-        num_clusters = len(unique_clusters)
+        """
+        Get balanced indices from dataset for distillation
         
-        # Samples per cluster (ensure balanced representation)
+        This ensures all clusters are equally represented in the distillation training
+        """
+        # Get all cluster assignments
+        cluster_assignments = self.dataset.cluster_assignments
+        
+        # Count samples per cluster
+        unique_clusters, cluster_counts = torch.unique(
+            torch.tensor(cluster_assignments), 
+            return_counts=True
+        )
+        
+        # Calculate number of samples per cluster
+        num_clusters = len(unique_clusters)
         samples_per_cluster = num_samples // num_clusters
         
+        # Create balanced indices
         balanced_indices = []
-        for cluster in unique_clusters:
+        
+        # Get indices for each cluster
+        for cluster_idx in unique_clusters:
             # Get indices for this cluster
-            cluster_indices = np.where(cluster_labels == cluster)[0]
+            cluster_indices = torch.where(torch.tensor(cluster_assignments) == cluster_idx)[0]
             
-            # If not enough samples in this cluster, sample with replacement
-            if len(cluster_indices) < samples_per_cluster:
-                sampled_indices = np.random.choice(
-                    cluster_indices, 
-                    size=samples_per_cluster, 
-                    replace=True
-                )
+            # Randomly select samples from this cluster
+            if len(cluster_indices) <= samples_per_cluster:
+                # Use all samples if we have fewer than needed
+                selected_indices = cluster_indices
             else:
-                # Otherwise sample without replacement
-                sampled_indices = np.random.choice(
-                    cluster_indices, 
-                    size=samples_per_cluster, 
-                    replace=False
-                )
+                # Randomly select samples
+                perm = torch.randperm(len(cluster_indices))
+                selected_indices = cluster_indices[perm[:samples_per_cluster]]
                 
-            balanced_indices.extend(sampled_indices)
+            balanced_indices.extend(selected_indices.tolist())
             
-        # Shuffle the indices
-        np.random.shuffle(balanced_indices)
+        # Shuffle indices
+        perm = torch.randperm(len(balanced_indices))
+        balanced_indices = [balanced_indices[i] for i in perm]
+        
+        logger.info(f"Created balanced dataset with {len(balanced_indices)} samples across {num_clusters} clusters")
         
         return balanced_indices
     
@@ -188,96 +210,139 @@ class DiffusionDistiller:
                 if "caption_embedding" in batch:
                     text_embeds = batch["caption_embedding"].to(self.device)
                 
-                # Forward through student (distilled) model
-                self.distilled_model.train()
-                student_pred = self.distilled_model(x_t, t_indices, text_embeds)
-                
-                # Forward through teacher (expert) models
-                # Each batch item uses its corresponding expert as teacher
-                with torch.no_grad():
+                # Train with mixed precision
+                with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+                    # Forward through student (distilled) model
+                    self.distilled_model.train()
+                    student_pred = self.distilled_model(x_t, t_indices, text_embeds)
+                    
+                    # Forward through teacher (expert) models
                     # Create target tensor same shape as student prediction
                     teacher_pred = torch.zeros_like(student_pred)
                     
-                    # For each item in batch, use the expert assigned to its cluster
-                    for i in range(batch_size):
-                        # Get expert index
-                        expert_idx = cluster_labels[i].item()
-                        
-                        # Get the expert
-                        expert = self.experts[expert_idx]
-                        
-                        # Forward through expert
-                        if text_embeds is not None:
-                            # Include text conditioning
-                            expert_output = expert(
-                                x_t[i:i+1], 
-                                t_indices[i:i+1], 
-                                text_embeds[i:i+1]
-                            )
-                        else:
-                            # No text conditioning
-                            expert_output = expert(
-                                x_t[i:i+1], 
-                                t_indices[i:i+1]
-                            )
-                        
-                        # Store expert output
-                        teacher_pred[i:i+1] = expert_output
-                
-                # Compute distillation loss
-                loss = F.mse_loss(student_pred, teacher_pred)
+                    # Get unique cluster labels in batch for efficient expert loading
+                    unique_clusters, cluster_counts = torch.unique(cluster_labels, return_counts=True)
+                    
+                    # Process each unique cluster with the corresponding expert
+                    for cluster_idx in unique_clusters:
+                        # Get expert model
+                        try:
+                            # Use expert cache manager to efficiently retrieve expert
+                            expert_idx = cluster_idx.item()
+                            expert = self._get_expert(expert_idx)
+                            
+                            if expert is None:
+                                logger.warning(f"Expert {expert_idx} not found, skipping")
+                                continue
+                                
+                            # Get mask for all samples from this cluster
+                            cluster_mask = (cluster_labels == cluster_idx)
+                            
+                            # Skip if no samples from this cluster
+                            if not cluster_mask.any():
+                                continue
+                                
+                            # Get all samples from this cluster
+                            cluster_x_t = x_t[cluster_mask]
+                            cluster_t_indices = t_indices[cluster_mask]
+                            cluster_text = text_embeds[cluster_mask] if text_embeds is not None else None
+                            
+                            # Forward through expert
+                            with torch.no_grad():
+                                expert_output = expert(cluster_x_t, cluster_t_indices, cluster_text)
+                                
+                            # Fill teacher predictions for this cluster
+                            teacher_pred[cluster_mask] = expert_output
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing expert {cluster_idx.item()}: {str(e)}")
+                            # Continue with next expert
+                    
+                    # Compute distillation loss
+                    if self.config.distill_loss_type == "mse":
+                        loss = F.mse_loss(student_pred, teacher_pred)
+                    elif self.config.distill_loss_type == "huber":
+                        loss = F.huber_loss(student_pred, teacher_pred)
+                    elif self.config.distill_loss_type == "l1":
+                        loss = F.l1_loss(student_pred, teacher_pred)
+                    else:
+                        loss = F.mse_loss(student_pred, teacher_pred)
                 
                 # Backward and optimize
                 self.optimizer.zero_grad()
-                loss.backward()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self.distilled_model.parameters(), 
                     max_norm=self.config.max_grad_norm
                 )
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                # Update learning rate
                 self.scheduler.step()
                 
                 # Update EMA model
-                self.update_ema()
+                self._update_ema_model()
                 
-                # Track loss
+                # Update loss stats
                 epoch_loss += loss.item()
                 steps += 1
                 
                 # Update progress bar
-                pbar.set_postfix({"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]})
-            
-            # Calculate average epoch loss
-            epoch_loss /= steps
-            total_loss += epoch_loss
-            count += 1
-            
-            # Log epoch metrics
-            if self.rank == 0:
-                log_metrics({
-                    "distill/epoch": epoch,
-                    "distill/loss": epoch_loss,
-                    "distill/lr": self.scheduler.get_last_lr()[0]
-                }, step=epoch)
+                pbar.set_postfix({
+                    "loss": loss.item(),
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "clusters": len(unique_clusters)
+                })
                 
-                # Save best model
-                if epoch_loss < self.best_loss:
-                    self.best_loss = epoch_loss
-                    self.save_checkpoint(epoch, is_best=True)
+                # Clear cache after each step to save memory
+                self._clear_expert_cache()
+            
+            # Log epoch stats
+            avg_epoch_loss = epoch_loss / max(1, steps)
+            logger.info(f"Epoch {epoch+1}/{self.config.distill_epochs}, Loss: {avg_epoch_loss:.6f}")
+            
+            # Save checkpoint if this is the best model
+            if avg_epoch_loss < self.best_loss:
+                self.best_loss = avg_epoch_loss
+                self.save_checkpoint(epoch, is_best=True)
+                logger.info(f"Saved best model with loss {self.best_loss:.6f}")
                 
-                # Regular checkpoint
-                if (epoch + 1) % 5 == 0 or epoch == self.config.distill_epochs - 1:
-                    self.save_checkpoint(epoch)
-        
-        # Calculate final average loss
-        avg_loss = total_loss / count
-        
-        logger.info(f"Distillation complete, average loss: {avg_loss:.6f}")
-        
         # Save final model
         self.save_checkpoint(self.config.distill_epochs - 1, is_final=True)
+        logger.info("Distillation training completed")
         
-        return avg_loss
+        return avg_epoch_loss
+    
+    def _update_ema_model(self):
+        """Update EMA model with current model weights"""
+        with torch.no_grad():
+            for ema_param, param in zip(self.ema_model.parameters(), self.distilled_model.parameters()):
+                ema_param.data.mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
+    
+    def _get_expert(self, expert_idx):
+        """Get expert model using cache manager"""
+        # Check if expert is available
+        if expert_idx not in self.experts:
+            return None
+            
+        # Define expert builder function for cache manager
+        def expert_builder(idx):
+            return self.experts[idx]
+            
+        # Use expert cache manager to retrieve expert
+        try:
+            return self.expert_cache.get_expert(expert_idx, expert_builder)
+        except Exception as e:
+            logger.error(f"Error getting expert {expert_idx}: {str(e)}")
+            return None
+    
+    def _clear_expert_cache(self):
+        """Clear expert cache to free memory"""
+        self.expert_output_cache.clear()
+        self.expert_cache.clear_cache()
+        torch.cuda.empty_cache()
     
     def save_checkpoint(self, epoch, is_best=False, is_final=False):
         """Save distilled model checkpoint"""
