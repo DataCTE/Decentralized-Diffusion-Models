@@ -149,7 +149,6 @@ class DDMConfig:
         """Calculate dataset size from directory (only called on rank 0)"""
         # Check if we should use a cached value
         cache_path = os.path.join(getattr(self, 'cache_dir', 'cache'), 'dataset_size_cache.json')
-        quick_count = getattr(self, 'quick_dataset_count', True)
         
         # Create cache directory if it doesn't exist
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -173,92 +172,37 @@ class DDMConfig:
             logger.warning(f"Dataset path does not exist: {self.dataset_path}")
             return 0
         
-        # Fast path: just count total files without checking extensions
-        if quick_count:
-            try:
-                # Get all files in directory without loading them all into memory
-                # This is more efficient than os.listdir() for large directories
-                total_files = sum(1 for _ in os.scandir(self.dataset_path) if _.is_file())
-                
-                # Save to cache
-                try:
-                    with open(cache_path, 'w') as f:
-                        json.dump({
-                            'path': self.dataset_path,
-                            'size': total_files,
-                            'timestamp': time.time()
-                        }, f)
-                except Exception as e:
-                    logger.debug(f"Could not write cache: {str(e)}")
-                
-                logger.info(f"Quick dataset size calculation: {total_files} total files")
-                return total_files
-            except Exception as e:
-                logger.error(f"Error in quick calculation: {str(e)}")
-                return 0
-        
-        # Detailed mode with extension checking
+        # Count only image files, excluding text files
         start_time = time.time()
         logger.info(f"Calculating dataset size from: {self.dataset_path}")
         
-        # More efficient extension checking using a set
+        # Define valid image extensions
         valid_extensions = {'.png', '.jpg', '.jpeg', '.webp'}
         count = 0
         
         try:
-            # Use sampling for very large directories
-            total_size = sum(1 for _ in os.scandir(self.dataset_path))
-            
-            if total_size > 100000:  # Very large directory
-                # Sample 10,000 files to estimate proportion of images
-                logger.info(f"Large directory detected ({total_size} files), using sampling")
-                sample_size = 10000
-                sampled_files = os.listdir(self.dataset_path)[:sample_size]
-                
-                # Count valid images in sample
-                valid_in_sample = sum(1 for f in sampled_files if os.path.splitext(f.lower())[1] in valid_extensions)
-                
-                # Estimate total
-                ratio = valid_in_sample / len(sampled_files)
-                estimated_count = int(total_size * ratio)
-                
-                logger.info(f"Sampled {sample_size} files, found {valid_in_sample} images (ratio: {ratio:.2f})")
-                logger.info(f"Estimated dataset size: {estimated_count} images")
-                
-                # Save to cache
-                try:
-                    with open(cache_path, 'w') as f:
-                        json.dump({
-                            'path': self.dataset_path,
-                            'size': estimated_count,
-                            'timestamp': time.time(),
-                            'is_estimate': True
-                        }, f)
-                except Exception as e:
-                    logger.debug(f"Could not write cache: {str(e)}")
-                
-                return estimated_count
-            else:
-                # For smaller directories, count all files
-                for entry in os.scandir(self.dataset_path):
-                    if entry.is_file() and os.path.splitext(entry.name.lower())[1] in valid_extensions:
+            # Count only image files
+            for entry in os.scandir(self.dataset_path):
+                if entry.is_file():
+                    file_ext = os.path.splitext(entry.name.lower())[1]
+                    if file_ext in valid_extensions:
                         count += 1
-                
-                elapsed_time = time.time() - start_time
-                logger.info(f"Dataset size calculation completed in {elapsed_time:.2f}s, found {count} valid images")
-                
-                # Save to cache
-                try:
-                    with open(cache_path, 'w') as f:
-                        json.dump({
-                            'path': self.dataset_path,
-                            'size': count,
-                            'timestamp': time.time()
-                        }, f)
-                except Exception as e:
-                    logger.debug(f"Could not write cache: {str(e)}")
-                
-                return count
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"Dataset size calculation completed in {elapsed_time:.2f}s, found {count} image files")
+            
+            # Save to cache
+            try:
+                with open(cache_path, 'w') as f:
+                    json.dump({
+                        'path': self.dataset_path,
+                        'size': count,
+                        'timestamp': time.time()
+                    }, f)
+            except Exception as e:
+                logger.debug(f"Could not write cache: {str(e)}")
+            
+            return count
         except Exception as e:
             logger.error(f"Error calculating dataset size: {str(e)}")
             return 0

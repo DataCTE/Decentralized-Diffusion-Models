@@ -182,10 +182,8 @@ def main():
         cache_manager = ExpertCacheManager(
             config=config,
             device=torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"),
-            max_experts_in_memory=config.max_experts_in_memory,
-            swap_strategy=config.expert_swap_strategy,
-            cpu_offload=config.expert_offload_to_cpu,
-            prefetch=config.expert_prefetch_next
+            max_experts=config.max_experts_in_memory,
+            cpu_offload=config.expert_offload_to_cpu
         )
         console_print(f"Rank {rank}: Expert Cache Manager initialized")
         
