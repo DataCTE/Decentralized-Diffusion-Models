@@ -154,11 +154,15 @@ class DDMTrainingCoordinator:
         total_steps = config.num_steps
         
         for key, optimizer in self.optimizers.items():
-            self.schedulers[key] = torch.optim.lr_scheduler.LambdaLR(
-                optimizer,
-                lambda step: min(step / warmup_steps, 1.0) if step < warmup_steps else 
-                0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps)))
-            )
+            # Define scheduler function
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    return min(step / warmup_steps, 1.0)
+                else:
+                    return 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps)))
+                    
+            # Create scheduler
+            self.schedulers[key] = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
         # Initialize flow matcher for loss computation
         debug_print(f"Initializing flow matcher", rank)
@@ -1556,3 +1560,12 @@ class DDMTrainingCoordinator:
         """
         # Simple sharding: expert_idx % world_size == rank
         return expert_idx % self.world_size == self.rank
+
+    def create_lr_scheduler(self):
+        """
+        Initialize learning rate scheduler function
+        """
+        # This method is now here to avoid AttributeError, but the actual
+        # scheduler creation happens in the __init__ method
+        logger.debug("Learning rate scheduler configuration is handled during initialization")
+        pass

@@ -122,3 +122,25 @@ class ExpertCacheManager:
             with torch.no_grad():
                 expert = expert_builder_fn(expert_idx)
                 self.cpu_cache[expert_idx] = expert.to('cpu') 
+
+    def shutdown(self):
+        """
+        Clean up resources used by the cache manager
+        """
+        try:
+            # Clear references to experts
+            if hasattr(self, 'expert_cache'):
+                self.expert_cache.clear()
+            
+            # Free memory
+            import gc
+            gc.collect()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            logger.info("Expert cache manager shutdown completed successfully")
+        except Exception as e:
+            logger.error(f"Error during expert cache manager shutdown: {str(e)}")
+            return False
+        return True 
