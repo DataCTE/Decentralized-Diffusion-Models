@@ -5,6 +5,8 @@ import torch
 import os
 import datetime
 import torch.nn.functional as F
+import time
+import sys
 
 from data.dataset import DDMDataset
 from data.clustering import ClusterManager
@@ -24,6 +26,18 @@ from utils.visualization import tensor_to_pil
 # Setup logger
 logger = setup_logger("DDMCoordinator")
 
+# Direct console print function for immediate feedback
+def debug_print(message, rank=None, force=False):
+    """Print directly to console regardless of logger configuration"""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if rank is not None:
+        prefix = f"[COORD-{rank}]"
+    else:
+        prefix = "[COORD]"
+        
+    if force or (rank is not None and rank == 0) or rank is None:
+        print(f"{prefix} [{timestamp}] {message}", flush=True)
+
 class DDMTrainingCoordinator:
     """Implements the core training logic from Section 3 of the paper"""
     
@@ -36,26 +50,43 @@ class DDMTrainingCoordinator:
             world_size: Total number of processes
             cache_manager: Optional ExpertCacheManager for efficient expert loading/unloading
         """
+        init_start_time = time.time()
+        debug_print(f"Starting coordinator initialization on rank {rank}/{world_size}", rank)
+        
         self.config = config
         self.rank = rank
         self.world_size = world_size
         self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
         self.cache_manager = cache_manager
         
+        debug_print(f"Initializing with device: {self.device}", rank)
+        
         # Initialize clustering
+        debug_print(f"Starting cluster manager initialization", rank)
+        cluster_start = time.time()
         self.init_cluster_manager()
+        debug_print(f"Cluster manager initialized in {time.time() - cluster_start:.2f}s", rank)
         
         # Initialize data loaders
+        debug_print(f"Starting data loader initialization", rank)
+        data_start = time.time()
         self.init_data_loaders()
+        debug_print(f"Data loaders initialized in {time.time() - data_start:.2f}s", rank)
         
         # Initialize models
+        debug_print(f"Starting model initialization", rank)
+        models_start = time.time()
         self.init_models()
+        debug_print(f"Models initialized in {time.time() - models_start:.2f}s", rank)
+        
+        debug_print(f"Setting up optimizers and schedulers", rank)
         
         # Set up optimizers and schedulers
         self.optimizers = {}
         self.schedulers = {}
         
         # Initialize router optimizer
+        debug_print(f"Initializing router optimizer", rank)
         self.optimizers['router'] = torch.optim.AdamW(
             self.router.parameters(),
             lr=config.router_learning_rate,
@@ -64,9 +95,11 @@ class DDMTrainingCoordinator:
         )
         
         # Initialize expert optimizers (one per expert)
+        debug_print(f"Initializing expert optimizers", rank)
         for expert_idx in range(config.num_experts):
             if self.is_expert_owned_by_rank(expert_idx):
                 # Only create optimizer for experts owned by this rank
+                debug_print(f"Creating optimizer for expert {expert_idx} on rank {rank}", rank)
                 expert = self.get_expert(expert_idx)
                 self.optimizers[f'expert_{expert_idx}'] = torch.optim.AdamW(
                     expert.parameters(),
@@ -76,6 +109,7 @@ class DDMTrainingCoordinator:
                 )
         
         # Create learning rate schedulers (cosine decay)
+        debug_print(f"Setting up learning rate schedulers", rank)
         warmup_steps = getattr(config, 'warmup_steps', 1000)
         total_steps = config.num_steps
         
@@ -87,12 +121,14 @@ class DDMTrainingCoordinator:
             )
         
         # Initialize flow matcher for loss computation
+        debug_print(f"Initializing flow matcher", rank)
         self.flow_matcher = DecentralizedFlowMatcher(
             sigma=config.sigma,
             loss_type=config.loss_type
         )
         
         # Get diffusion parameters
+        debug_print(f"Computing diffusion parameters", rank)
         self.alphas, self.alpha_bar, _ = get_alphas_and_betas()
         
         # Track metrics
@@ -104,11 +140,14 @@ class DDMTrainingCoordinator:
         }
         
         # Create AMP grad scaler for mixed precision training
+        debug_print(f"Setting up mixed precision training", rank)
         self.grad_scaler = torch.cuda.amp.GradScaler(enabled=config.use_mixed_precision)
         
         # Expert data loaders and iterators
         self.expert_iterators = {}
         
+        total_init_time = time.time() - init_start_time
+        debug_print(f"DDMTrainingCoordinator initialization completed in {total_init_time:.2f}s", rank)
         logger.info(f"DDMTrainingCoordinator initialized on rank {rank}/{world_size}")
         
         # If we're the main process, log the configuration
@@ -119,7 +158,10 @@ class DDMTrainingCoordinator:
                     logger.info(f"  {key}: {value}")
                     
         # Synchronize to ensure all processes have completed initialization
+        debug_print(f"Waiting for synchronization across all processes", rank)
+        sync_start = time.time()
         synchronize()
+        debug_print(f"All processes synchronized in {time.time() - sync_start:.2f}s", rank)
         
     def safe_synchronize(self, timeout_seconds=60, name="operation"):
         """
@@ -211,7 +253,7 @@ class DDMTrainingCoordinator:
 
     def init_cluster_manager(self):
         """Initialize cluster manager for expert assignment"""
-        self.logger.info("Initializing cluster manager")
+        debug_print(f"Creating ClusterManager for rank {self.rank}", self.rank)
         
         try:
             # Create cluster manager
@@ -221,20 +263,25 @@ class DDMTrainingCoordinator:
                 config=self.config
             )
             
-            # Use safe synchronization
+            # Use synchronization to ensure all processes have initialized
+            debug_print(f"Waiting for cluster manager sync on rank {self.rank}", self.rank)
+            sync_start = time.time()
             self.safe_synchronize(timeout_seconds=300, name="cluster_manager_init")
+            debug_print(f"Cluster manager sync completed in {time.time() - sync_start:.2f}s", self.rank)
             
-            self.logger.info("Cluster manager initialized successfully")
+            debug_print(f"Cluster manager initialized successfully on rank {self.rank}", self.rank)
         except Exception as e:
-            self.logger.error(f"Failed to initialize cluster manager: {str(e)}")
+            debug_print(f"CRITICAL ERROR: Failed to initialize cluster manager on rank {self.rank}: {str(e)}", self.rank, True)
+            logger.error(f"Failed to initialize cluster manager: {str(e)}")
             raise
             
     def init_data_loaders(self):
         """Initialize data loaders for training"""
-        self.logger.info("Initializing data loaders")
+        debug_print(f"Initializing data loaders on rank {self.rank}", self.rank)
         
         try:
             # Create dataset
+            debug_print(f"Creating dataset on rank {self.rank}", self.rank)
             self.dataset = DDMDataset(
                 root_dir=self.config.dataset_path,
                 cluster_assignments=self.cluster_manager.get_cluster_assignments(),
@@ -244,6 +291,7 @@ class DDMTrainingCoordinator:
             )
             
             # Create expert data loaders
+            debug_print(f"Creating expert bucket loaders on rank {self.rank}", self.rank)
             from data.loader import create_expert_bucket_loaders
             self.expert_loaders = create_expert_bucket_loaders(
                 dataset=self.dataset,
@@ -271,41 +319,72 @@ class DDMTrainingCoordinator:
             raise
             
     def init_models(self):
-        """Initialize router and expert models"""
-        self.logger.info("Initializing models")
+        """Initialize models for training"""
+        debug_print(f"Initializing models on rank {self.rank}", self.rank)
         
-        # Initialize router trainer
         try:
-            self.router_trainer = RouterTrainer(
+            # Create VAE for latent encoding
+            debug_print(f"Creating VAE encoder/decoder on rank {self.rank}", self.rank)
+            start_time = time.time()
+            from data.vae import VAEWrapper
+            self.vae = VAEWrapper(self.device, self.config)
+            debug_print(f"VAE created in {time.time() - start_time:.2f}s on rank {self.rank}", self.rank)
+            
+            # Create CLIP for text conditioning
+            debug_print(f"Creating CLIP encoder on rank {self.rank}", self.rank)
+            start_time = time.time()
+            from data.clip import CLIPTextEncoder
+            self.clip = CLIPTextEncoder(self.device, self.config)
+            debug_print(f"CLIP created in {time.time() - start_time:.2f}s on rank {self.rank}", self.rank)
+            
+            # Create router trainer
+            debug_print(f"Creating router model on rank {self.rank}", self.rank)
+            start_time = time.time()
+            self.router = RouterTrainer(
                 config=self.config,
                 device=self.device,
                 rank=self.rank,
                 world_size=self.world_size
             )
-            self.logger.info("Router trainer initialized successfully")
+            debug_print(f"Router created in {time.time() - start_time:.2f}s on rank {self.rank}", self.rank)
+            
+            # Create expert trainers (one per expert)
+            debug_print(f"Creating expert models for rank {self.rank}", self.rank)
+            self.experts = {}
+            
+            # Only create expert models that are assigned to this rank
+            for expert_idx in range(self.config.num_experts):
+                if self.is_expert_owned_by_rank(expert_idx):
+                    debug_print(f"Creating expert {expert_idx} on rank {self.rank}", self.rank)
+                    start_time = time.time()
+                    if self.cache_manager:
+                        # If using cache manager, get expert from cache or create new
+                        self.experts[expert_idx] = self.cache_manager.get_expert(expert_idx)
+                    else:
+                        # Otherwise create expert directly
+                        self.experts[expert_idx] = ExpertTrainer(
+                            expert_idx=expert_idx,
+                            config=self.config,
+                            device=self.device,
+                            rank=self.rank,
+                            world_size=self.world_size
+                        )
+                    debug_print(f"Expert {expert_idx} created in {time.time() - start_time:.2f}s on rank {self.rank}", self.rank)
+            
+            debug_print(f"Model initialization complete on rank {self.rank}", self.rank)
+            
         except Exception as e:
-            self.logger.error(f"Failed to initialize router trainer: {str(e)}")
+            debug_print(f"ERROR: Failed to initialize models on rank {self.rank}: {str(e)}", self.rank, True)
+            logger.error(f"Failed to initialize models: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise
-        
-        # Initialize expert trainers - only for experts assigned to this rank
-        assigned_experts = []
-        for expert_idx in range(self.config.num_experts):
-            # Only create experts assigned to this rank
-            if expert_idx % self.world_size == self.rank:
-                try:
-                    expert = ExpertTrainer(
-                        expert_idx=expert_idx,
-                        config=self.config,
-                        device=self.device,
-                        rank=self.rank,
-                        world_size=self.world_size
-                    )
-                    self.experts[expert_idx] = expert
-                    assigned_experts.append(expert_idx)
-                except Exception as e:
-                    self.logger.error(f"Failed to initialize expert {expert_idx}: {str(e)}")
-                    
-        self.logger.info(f"Initialized {len(assigned_experts)} experts on rank {self.rank}: {assigned_experts}")
+            
+        # Use synchronization
+        debug_print(f"Synchronizing after model initialization on rank {self.rank}", self.rank)
+        sync_start = time.time()
+        self.safe_synchronize(timeout_seconds=300, name="model_init")
+        debug_print(f"Model initialization synchronization completed in {time.time() - sync_start:.2f}s on rank {self.rank}", self.rank)
     
     def get_expert(self, expert_idx):
         """
@@ -544,7 +623,7 @@ class DDMTrainingCoordinator:
             batch = next(self.router_iterator)
         
         # Train step (Section 3.3 of the paper)
-        loss = self.router_trainer.train_step(batch)
+        loss = self.router.train_step(batch)
         
         # Log router metrics
         if step % self.config.log_every_n_steps == 0:
@@ -591,7 +670,7 @@ class DDMTrainingCoordinator:
             noisy_images = alpha_t * images + sigma_t * noise
             
             # Get router predictions
-            router_outputs = self.router_trainer.router(noisy_images, timesteps, text_embeds)
+            router_outputs = self.router.router(noisy_images, timesteps, text_embeds)
             router_probs = torch.softmax(router_outputs, dim=1)
             
             # Load all experts (for validation only)
@@ -720,7 +799,7 @@ class DDMTrainingCoordinator:
         device = self.device
         
         # Get router model
-        router = self.router_trainer.router
+        router = self.router.router
         
         # Get experts
         experts = {}
@@ -791,8 +870,8 @@ class DDMTrainingCoordinator:
             if hasattr(expert, 'optimizer') and expert.optimizer:
                 metrics["expert_lr"] = expert.optimizer.param_groups[0]['lr']
                 
-        if hasattr(self, 'router_trainer') and hasattr(self.router_trainer, 'optimizer'):
-            metrics["router_lr"] = self.router_trainer.optimizer.param_groups[0]['lr']
+        if hasattr(self, 'router') and hasattr(self.router, 'optimizer'):
+            metrics["router_lr"] = self.router.optimizer.param_groups[0]['lr']
             
         # Log metrics
         log_metrics(metrics, step=step)
@@ -818,8 +897,8 @@ class DDMTrainingCoordinator:
             
             # Extract router state
             router_state = checkpoint.get('router_state', None)
-            if router_state and self.router_trainer:
-                self.router_trainer.load_state_dict(router_state)
+            if router_state and self.router:
+                self.router.load_state_dict(router_state)
                 self.logger.info("Loaded router state from checkpoint")
                 
             # Extract expert states
@@ -866,8 +945,8 @@ class DDMTrainingCoordinator:
             router_path = os.path.join(checkpoint_dir, "router.pt")
             torch.save({
                 'step': step,
-                'state_dict': self.router_trainer.router.state_dict(),
-                'optimizer': self.router_trainer.optimizer.state_dict(),
+                'state_dict': self.router.state_dict(),
+                'optimizer': self.router.optimizer.state_dict(),
                 'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
             }, router_path)
             self.logger.info(f"Saved router to {router_path}")
@@ -881,7 +960,7 @@ class DDMTrainingCoordinator:
                 torch.save({
                     'step': step,
                     'expert_idx': expert_idx,
-                    'state_dict': expert.expert.state_dict(),
+                    'state_dict': expert.state_dict(),
                     'optimizer': expert.optimizer.state_dict(),
                     'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
                 }, expert_path)
@@ -894,7 +973,7 @@ class DDMTrainingCoordinator:
             coordinator_path = os.path.join(checkpoint_dir, "coordinator.pt")
             torch.save({
                 'step': step,
-                'router_state': self.router_trainer.state_dict() if self.router_trainer else None,
+                'router_state': self.router.state_dict() if self.router else None,
                 'expert_states': {idx: expert.state_dict() for idx, expert in self.experts.items()},
                 'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
             }, coordinator_path)
@@ -911,7 +990,7 @@ class DDMTrainingCoordinator:
             distiller = DiffusionDistiller(
                 config=self.config,
                 experts={idx: expert.expert for idx, expert in self.experts.items()},
-                router=self.router_trainer.router,
+                router=self.router,
                 dataset=self.dataset,
                 device=self.device,
                 rank=self.rank
