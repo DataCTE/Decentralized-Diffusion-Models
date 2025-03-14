@@ -106,51 +106,95 @@ def ddm_sample(
         
         with torch.no_grad():
             # Get router predictions for each sample in the batch
-            router_preds = router(x, t_scaled)
-            
-            # Apply softmax to get probabilities
-            router_probs = F.softmax(router_preds, dim=-1)  # [B, num_experts]
-            
-            # Get top-k expert indices and probabilities for each sample
-            # This is done efficiently to minimize redundant expert loads
-            all_selected_experts = []
-            all_weights = []
-            
-            # Router selection with nucleus sampling option
-            if getattr(router, 'nucleus_threshold', None) is not None and router.nucleus_threshold > 0:
-                # Nucleus sampling - only use experts that cumulatively exceed a probability threshold
-                for batch_idx in range(batch_size):
-                    # Sort probabilities for this sample
-                    probs, indices = router_probs[batch_idx].sort(descending=True)
+            if hasattr(router, 'get_routing_weights'):
+                # Use improved routing with temperature scaling
+                all_weights, all_selected_experts = router.get_routing_weights(
+                    x, t_scaled, top_k=top_k,
+                    # Use a slightly higher temperature during sampling for more diversity
+                    temperature=getattr(router, 'temperature', 1.0) * 1.1
+                )
+                
+                # Router selection with nucleus sampling option
+                if getattr(router, 'nucleus_threshold', None) is not None and router.nucleus_threshold > 0:
+                    # Apply nucleus sampling with temperature-scaled probabilities
+                    router_probs = F.softmax(router(x, t_scaled) / (getattr(router, 'temperature', 1.0) * 1.1), dim=-1)
                     
-                    # Find experts that exceed threshold
-                    cumsum = torch.cumsum(probs, dim=0)
-                    mask = cumsum <= router.nucleus_threshold
+                    # Lists to store processed selections
+                    all_weights_list = []
+                    all_selected_experts_list = []
                     
-                    # Always include at least one expert
-                    if not mask.any():
-                        mask[0] = True
+                    # Nucleus sampling - only use experts that cumulatively exceed a probability threshold
+                    for batch_idx in range(batch_size):
+                        # Sort probabilities for this sample
+                        probs, indices = router_probs[batch_idx].sort(descending=True)
+                        
+                        # Find experts that exceed threshold
+                        cumsum = torch.cumsum(probs, dim=0)
+                        mask = cumsum <= router.nucleus_threshold
+                        
+                        # Always include at least one expert
+                        if not mask.any():
+                            mask[0] = True
+                        
+                        # Get selected experts and their weights
+                        selected_experts = indices[mask]
+                        weights = probs[mask]
+                        
+                        # Normalize weights to sum to 1
+                        weights = weights / weights.sum()
+                        
+                        all_weights_list.append(weights)
+                        all_selected_experts_list.append(selected_experts)
                     
-                    # Get selected experts and their weights
-                    selected_experts = indices[mask]
-                    weights = probs[mask]
-                    
-                    # Normalize weights to sum to 1
-                    weights = weights / weights.sum()
-                    
-                    all_selected_experts.append(selected_experts)
-                    all_weights.append(weights)
+                    # Override the selections
+                    all_weights = all_weights_list
+                    all_selected_experts = all_selected_experts_list
             else:
-                # Standard top-k selection
-                for batch_idx in range(batch_size):
-                    # Get top-k expert indices and probabilities for this sample
-                    weights, indices = router_probs[batch_idx].topk(min(top_k, router_probs.shape[1]))
-                    
-                    # Normalize weights to sum to 1
-                    weights = weights / weights.sum()
-                    
-                    all_selected_experts.append(indices)
-                    all_weights.append(weights)
+                # Fallback to original implementation
+                router_preds = router(x, t_scaled)
+                
+                # Apply softmax to get probabilities
+                router_probs = F.softmax(router_preds, dim=-1)  # [B, num_experts]
+                
+                # Get top-k expert indices and probabilities for each sample
+                all_selected_experts = []
+                all_weights = []
+                
+                # Router selection with nucleus sampling option
+                if getattr(router, 'nucleus_threshold', None) is not None and router.nucleus_threshold > 0:
+                    # Nucleus sampling - only use experts that cumulatively exceed a probability threshold
+                    for batch_idx in range(batch_size):
+                        # Sort probabilities for this sample
+                        probs, indices = router_probs[batch_idx].sort(descending=True)
+                        
+                        # Find experts that exceed threshold
+                        cumsum = torch.cumsum(probs, dim=0)
+                        mask = cumsum <= router.nucleus_threshold
+                        
+                        # Always include at least one expert
+                        if not mask.any():
+                            mask[0] = True
+                        
+                        # Get selected experts and their weights
+                        selected_experts = indices[mask]
+                        weights = probs[mask]
+                        
+                        # Normalize weights to sum to 1
+                        weights = weights / weights.sum()
+                        
+                        all_selected_experts.append(selected_experts)
+                        all_weights.append(weights)
+                else:
+                    # Standard top-k selection
+                    for batch_idx in range(batch_size):
+                        # Get top-k expert indices and probabilities for this sample
+                        weights, indices = router_probs[batch_idx].topk(min(top_k, router_probs.shape[1]))
+                        
+                        # Normalize weights to sum to 1
+                        weights = weights / weights.sum()
+                        
+                        all_selected_experts.append(indices)
+                        all_weights.append(weights)
             
             # Get unique expert indices across all samples
             unique_experts = set()
@@ -199,29 +243,76 @@ def ddm_sample(
                 continue
             
             # Load all unique experts needed for this step
-            for expert_idx in unique_experts:
-                if expert_idx not in expert_cache and expert_idx in experts and experts[expert_idx] is not None:
+            # Replace the existing expert loading code with this memory-aware implementation
+            expert_memory_usage = {}
+            required_experts = list(unique_experts)
+            total_available_memory = torch.cuda.get_device_properties(device).total_memory * 0.8
+            used_memory_baseline = torch.cuda.memory_allocated(device)
+            available_memory = total_available_memory - used_memory_baseline
+            
+            # First, calculate memory requirements for experts
+            for expert_idx in required_experts:
+                if expert_idx not in expert_cache and expert_idx in experts:
                     try:
-                        # Track current memory usage for monitoring
-                        mem_before = torch.cuda.memory_allocated(device)
+                        # Estimate memory usage
+                        if expert_idx in expert_memory_usage:
+                            # Use cached estimate
+                            expert_size = expert_memory_usage[expert_idx]
+                        else:
+                            # Use model size as proxy for memory usage or from experts metadata if available
+                            expert_size = sum(p.numel() * p.element_size() for p in experts[expert_idx].parameters())
+                            expert_memory_usage[expert_idx] = expert_size
                         
-                        # Load expert (might already be on device)
-                        expert = experts[expert_idx]
-                        expert_cache[expert_idx] = expert
-                        
-                        # Track memory impact of loading this expert
-                        mem_after = torch.cuda.memory_allocated(device)
-                        expert_memory = mem_after - mem_before
-                        
-                        # Update max experts per batch based on actual memory usage
-                        if expert_memory > 0:
-                            available_memory_per_expert = (available_memory - used_memory_baseline) * 0.8 / expert_memory
-                            max_experts_per_batch = min(max_experts_per_batch, int(available_memory_per_expert))
-                            
-                        logger.debug(f"Loaded expert {expert_idx} for sampling")
+                        logger.debug(f"Expert {expert_idx} estimated memory: {expert_size / 1e6:.2f} MB")
                     except Exception as e:
-                        logger.error(f"Failed to load expert {expert_idx}: {e}")
-                        expert_cache[expert_idx] = None
+                        logger.error(f"Failed to estimate memory for expert {expert_idx}: {e}")
+                        expert_memory_usage[expert_idx] = 0  # Use 0 as fallback
+            
+            # Sort experts by priority (router confidence)
+            expert_priorities = {}
+            for batch_idx in range(batch_size):
+                for i, expert_idx in enumerate(all_selected_experts[batch_idx]):
+                    if expert_idx in expert_priorities:
+                        expert_priorities[expert_idx] += all_weights[batch_idx][i].item()
+                    else:
+                        expert_priorities[expert_idx] = all_weights[batch_idx][i].item()
+            
+            # Sort experts by priority
+            sorted_experts = sorted(required_experts, key=lambda idx: expert_priorities.get(idx, 0), reverse=True)
+            
+            # Load experts until we reach memory limit or all experts are loaded
+            loaded_experts = set()
+            for expert_idx in sorted_experts:
+                if expert_idx not in expert_cache and expert_idx in experts:
+                    expert_size = expert_memory_usage.get(expert_idx, 0)
+                    
+                    if expert_size < available_memory:
+                        try:
+                            # Track current memory usage for monitoring
+                            mem_before = torch.cuda.memory_allocated(device)
+                            
+                            # Load expert (might already be on device)
+                            expert = experts[expert_idx]
+                            expert_cache[expert_idx] = expert
+                            loaded_experts.add(expert_idx)
+                            
+                            # Track actual memory impact
+                            mem_after = torch.cuda.memory_allocated(device)
+                            actual_expert_memory = mem_after - mem_before
+                            expert_memory_usage[expert_idx] = actual_expert_memory  # Update with actual usage
+                            available_memory -= actual_expert_memory
+                            
+                            logger.debug(f"Loaded expert {expert_idx} for sampling, {available_memory / 1e6:.2f} MB remaining")
+                        except Exception as e:
+                            logger.error(f"Failed to load expert {expert_idx}: {e}")
+                            expert_cache[expert_idx] = None
+                    else:
+                        logger.warning(f"Skipping expert {expert_idx} due to memory constraints")
+            
+            # If we couldn't load all required experts, adjust batch strategy
+            if len(loaded_experts) < len(required_experts):
+                logger.warning(f"Could only load {len(loaded_experts)}/{len(required_experts)} experts, adjusting batching strategy")
+                # We'll continue with loaded experts and adapt the selection strategy
             
             # Process with conditional guidance if text embeddings are provided
             if use_cfg:
@@ -232,7 +323,7 @@ def ddm_sample(
                 uncond_pred_noise_latent = torch.zeros_like(x)
                 
                 # Process each expert for all samples that need it
-                for expert_idx in unique_experts:
+                for expert_idx in loaded_experts:
                     if expert_idx not in expert_cache or expert_cache[expert_idx] is None:
                         continue
                     
@@ -293,7 +384,7 @@ def ddm_sample(
                 # Process each expert for all samples that need it
                 pred_noise_latent = torch.zeros_like(x)
                 
-                for expert_idx in unique_experts:
+                for expert_idx in loaded_experts:
                     if expert_idx not in expert_cache or expert_cache[expert_idx] is None:
                         continue
                     
@@ -352,7 +443,7 @@ def ddm_sample(
         if verbose:
             progress.set_postfix({
                 "step": step_idx,
-                "active_experts": len(unique_experts),
+                "active_experts": len(loaded_experts),
                 "mem_used": f"{torch.cuda.memory_allocated(device) / 1024**3:.2f}GB"
             })
             
@@ -849,3 +940,71 @@ def distilled_sample(distilled_model, shape, num_steps=50, prompt_embeds=None,
                     callback(step_idx, x)
     
     return x, intermediate_samples if callback is not None else x 
+
+def quantize_model_for_inference(model, dtype=torch.float16):
+    """
+    Quantize a model for more memory-efficient inference
+    
+    Args:
+        model: The model to quantize
+        dtype: Target dtype for quantization (default: float16)
+        
+    Returns:
+        Quantized model
+    """
+    try:
+        # Check if torch.ao.quantization is available (PyTorch ≥ 1.13)
+        has_quantization = hasattr(torch, 'ao') and hasattr(torch.ao, 'quantization')
+        
+        if has_quantization:
+            from torch.ao.quantization import quantize_dynamic
+            try:
+                # Try to use int8 dynamic quantization for maximum memory savings
+                quantized_model = quantize_dynamic(
+                    model, 
+                    qconfig_spec={torch.nn.Linear},  # Quantize linear layers
+                    dtype=torch.qint8
+                )
+                logger.info("Successfully applied int8 dynamic quantization")
+                return quantized_model
+            except Exception as e:
+                logger.warning(f"Int8 quantization failed, falling back to {dtype}: {e}")
+        
+        # If int8 quantization is not available or failed, fall back to float16
+        # This is a simpler approach but still saves memory
+        model = model.to(dtype)
+        logger.info(f"Converted model to {dtype} for efficient inference")
+        return model
+    except Exception as e:
+        logger.error(f"Quantization failed: {e}")
+        # Return original model
+        return model
+
+def ddm_sample_optimized(router, experts, shape, steps=50, top_k=1, **kwargs):
+    """
+    Memory-optimized version of ddm_sample that quantizes models
+    
+    Args:
+        Same as ddm_sample but applies quantization
+        
+    Returns:
+        Sampled tensor
+    """
+    # Quantize router for efficient inference
+    quantized_router = quantize_model_for_inference(router)
+    
+    # Quantize experts
+    quantized_experts = {}
+    for idx, expert in experts.items():
+        if expert is not None:
+            quantized_experts[idx] = quantize_model_for_inference(expert)
+    
+    # Call regular sampling with quantized models
+    return ddm_sample(
+        router=quantized_router,
+        experts=quantized_experts,
+        shape=shape,
+        steps=steps,
+        top_k=top_k,
+        **kwargs
+    ) 

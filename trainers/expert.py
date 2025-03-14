@@ -6,7 +6,6 @@ import math
 import os
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import default_auto_wrap_policy, size_based_auto_wrap_policy
-from torch.distributed.fsdp import StateDictType
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
 
 from models.dit import ExpertDiT
@@ -15,6 +14,9 @@ from utils.vae import VAEWrapper
 from utils.clip import CLIPTextEncoder
 from trainers.base import BaseTrainer
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
+from utils.logging import logger
+
+
 
 class ExpertTrainer(BaseTrainer):
     """Trainer for expert DiT models in DDM"""
@@ -55,7 +57,7 @@ class ExpertTrainer(BaseTrainer):
         else:
             auto_wrap_policy = default_auto_wrap_policy
             
-        # Apply FSDP with explicit isolation
+        # Apply FSDP with proper isolation
         self.expert = FSDP(
             base_expert,
             device_id=torch.cuda.current_device(),
@@ -64,8 +66,7 @@ class ExpertTrainer(BaseTrainer):
             backward_prefetch=backward_prefetch,
             auto_wrap_policy=auto_wrap_policy,
             use_orig_params=True,
-            # Paper-mandated isolation parameters
-            ignored_parameters=[],  # Remove incorrect base_router reference
+            # Properly isolate parameters - don't use ignored_parameters
             param_init_fn=lambda module: module.to_empty(device=torch.cuda.current_device(), recurse=False)
         )
         
@@ -110,7 +111,7 @@ class ExpertTrainer(BaseTrainer):
 
     def train_step(self, batch):
         """
-        Implements Algorithm 1 from paper (expert training)
+        Implements Algorithm 1 from paper with proper gradient isolation
         
         This trains an expert model using the flow matching objective
         as described in Section 3.2 of the paper.
@@ -122,66 +123,74 @@ class ExpertTrainer(BaseTrainer):
         
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             # VAE encoding (paper section 4.1)
-            # The paper uses a VAE to encode images into latent space
             latents = self.vae.encode(images)
             
             # Sample random timesteps t ∈ [0, 1] (Section 3.2)
-            # Note: We sample from [0, 1000) and normalize to [0, 1]
-            # The paper uses uniform sampling of t in [0, 1]
             t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
             t = t_indices.float() / 1000.0  # Normalize to [0, 1]
             
             # Sample random noise (Section 3.2)
-            # ε ~ N(0, I) as in Algorithm 1
             noise = torch.randn_like(latents)
             
             # Forward process using cosine schedule (Section 3.2)
-            # x_t = alpha_t * x_0 + sigma_t * noise
-            # This follows the cosine schedule in the paper:
-            # alpha_t = cos(t * pi/2), sigma_t = sin(t * pi/2)
             alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * noise
             
             # Text conditioning (paper section 4.1)
-            # The paper uses CLIP text embeddings for conditioning
             text_embeds = self.clip.encode(batch["caption"])
             
             # Expert prediction of flow field u_t(x_t) (Equation 6)
-            # The expert predicts the flow field at the current timestep
             pred_flow = self.expert(latent_t, t_indices, text_embeds)
             
             # The target flow field v_t(x_t) (Equation 4)
-            # This is the ground truth for flow matching objective
             target_flow = self.flow_matcher.compute_flow_matching_target(
                 latents, latent_t, t
             )
             
             # Flow matching loss (Equation 7)
-            # L_flow = E_{x_0,t}[|| u_t(x_t) - v_t(x_t) ||^2]
             loss = self.flow_matcher.compute_flow_matching_loss(
                 pred_flow, target_flow
             )
         
-        # Optimize using mixed precision
+        # Optimize with gradient isolation
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(self.optimizer)
-        # Paper-recommended per-expert gradient clipping
-        with self.expert.summon_full_params():
-            torch.nn.utils.clip_grad_norm_(
-                self.expert.parameters(), 
-                max_norm=self.config.max_grad_norm,
-                norm_type=2.0,
-                # Prevent cross-expert norm calculation
-                foreach=False  # Important for isolation
-            )
-        scaler.step(self.optimizer)
-        scaler.update()
         
+        # Use isolated gradient norm calculation for proper clipping
+        with torch.no_grad():
+            # Get this expert's parameters only
+            expert_params = list(self.expert.parameters())
+            
+            # Calculate norm for only this expert's gradients
+            if expert_params and expert_params[0].grad is not None:
+                grad_norm = torch.norm(
+                    torch.stack([
+                        torch.norm(p.grad.detach(), 2, dim=-1) 
+                        for p in expert_params if p.grad is not None
+                    ]), 
+                    2
+                )
+                
+                # Apply clipping if norm exceeds threshold
+                clip_coef = self.config.max_grad_norm / (grad_norm + 1e-6)
+                if clip_coef < 1:
+                    for p in expert_params:
+                        if p.grad is not None:
+                            p.grad.detach().mul_(clip_coef)
+                
+                if self.rank == 0 and torch.rand(1).item() < 0.01:  # Log occasionally
+                    logger.debug(f"Expert {self.expert_idx} grad norm: {grad_norm:.4f}, clip: {clip_coef < 1}")
+        
+        # Apply affinity masking if configured
         if self.config.use_affinity_mask:
             mask = (batch['cluster'] == self.expert_idx).float()
             loss = mask * loss + (1-mask) * loss.detach()
+        
+        # Finish optimization
+        scaler.step(self.optimizer)
+        scaler.update()
         
         # Update learning rate
         self.lr_scheduler.step()
@@ -261,3 +270,27 @@ class ExpertTrainer(BaseTrainer):
             if step < warmup_steps
             else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (self.config.num_steps - warmup_steps)))
         ) 
+
+    def isolate_optimizer_state(self):
+        """Prevent contamination of optimizer state across experts"""
+        # Get current optimizer state
+        state = self.optimizer.state_dict()
+        
+        # Identify parameters specific to this expert
+        expert_params = {id(p): p for p in self.expert.parameters()}
+        
+        # Filter optimizer state to only include this expert's parameters
+        if 'state' in state and state['state']:
+            filtered_state = {}
+            for param_id, param_state in state['state'].items():
+                if param_id in expert_params:
+                    filtered_state[param_id] = param_state
+            
+            # Replace with filtered state
+            state['state'] = filtered_state
+            
+            # Load filtered state back
+            self.optimizer.load_state_dict(state)
+            
+            if self.rank == 0:
+                logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 

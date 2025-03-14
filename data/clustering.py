@@ -64,10 +64,13 @@ class ClusterManager:
         )
         os.makedirs(self.cache_dir, exist_ok=True)
         
-        # Feature cache file
-        self.feature_cache_file = os.path.join(
+        # Feature cache file - use chunked format for large datasets
+        self.feature_chunks_dir = os.path.join(self.cache_dir, f"feature_chunks_dino_{config.dino_size}")
+        os.makedirs(self.feature_chunks_dir, exist_ok=True)
+        
+        self.feature_index_file = os.path.join(
             self.cache_dir, 
-            f"features_dino_{config.dino_size}.pkl"
+            f"features_index_dino_{config.dino_size}.pkl"
         )
         
         # Cluster cache files
@@ -80,6 +83,9 @@ class ClusterManager:
             self.cache_dir, 
             f"coarse_clusters_{config.num_experts}.pkl"
         )
+        
+        # New: Track cluster statistics
+        self.cluster_stats = {}
         
     def _init_vision_encoder(self):
         """Initialize vision encoder for feature extraction"""
@@ -98,7 +104,7 @@ class ClusterManager:
 
     def extract_features(self, dataloader):
         """
-        Extract features from dataset images with caching
+        Extract features from dataset images with efficient chunked caching
         
         Args:
             dataloader: DataLoader for dataset
@@ -106,31 +112,62 @@ class ClusterManager:
         Returns:
             Tensor of extracted features
         """
-        # Try to load features from cache
-        if is_main_process() and os.path.exists(self.feature_cache_file):
-            self.logger.info(f"Loading features from cache: {self.feature_cache_file}")
+        # Check if chunked features exist
+        if is_main_process() and os.path.exists(self.feature_index_file):
+            self.logger.info(f"Loading feature index from: {self.feature_index_file}")
             try:
-                with open(self.feature_cache_file, "rb") as f:
-                    cached_data = pickle.load(f)
-                    features = cached_data["features"]
-                    image_paths = cached_data["paths"]
+                with open(self.feature_index_file, "rb") as f:
+                    index_data = pickle.load(f)
+                    num_chunks = index_data["num_chunks"]
+                    total_features = index_data["total_features"]
+                    feature_dim = index_data["feature_dim"]
+                    image_paths = index_data["paths"]
                     
-                    # Verify cached features shape
-                    if len(features) > 0:
-                        self.logger.info(f"Loaded {features.shape[0]} cached features")
-                        return torch.from_numpy(features), image_paths
+                    # Verify chunks exist
+                    chunks_exist = True
+                    for i in range(num_chunks):
+                        chunk_file = os.path.join(self.feature_chunks_dir, f"chunk_{i}.npy")
+                        if not os.path.exists(chunk_file):
+                            chunks_exist = False
+                            break
+                    
+                    if chunks_exist:
+                        self.logger.info(f"Found {num_chunks} feature chunks with {total_features} total features")
+                        
+                        # Load and concatenate chunks efficiently
+                        features_list = []
+                        for i in range(num_chunks):
+                            chunk_file = os.path.join(self.feature_chunks_dir, f"chunk_{i}.npy")
+                            chunk = np.load(chunk_file, mmap_mode='r')  # Memory-mapped loading
+                            features_list.append(chunk)
+                            
+                        # Concatenate features
+                        features = np.concatenate(features_list, axis=0)
+                        
+                        # Verify loaded features shape
+                        if features.shape[0] > 0:
+                            self.logger.info(f"Loaded {features.shape[0]} cached features")
+                            return torch.from_numpy(features), image_paths
+                        else:
+                            self.logger.warning("Cached features are empty, re-extracting")
                     else:
-                        self.logger.warning("Cached features are empty, re-extracting")
+                        self.logger.warning("Some feature chunks are missing, re-extracting")
             except Exception as e:
                 self.logger.warning(f"Failed to load cached features: {e}. Extracting new features.")
         
-        # Extract features if not loaded from cache
+        # Extract features in chunks if not loaded from cache
         self.logger.info("Extracting features from dataset")
-        features = []
+        features_list = []
         image_paths = []
         
         # Only extract on main process in distributed setting
         if get_rank() == 0:
+            # Determine chunk size and maximum memory usage
+            max_chunk_size = getattr(self.config, "feature_chunk_size", 10000)
+            chunk_idx = 0
+            current_chunk = []
+            current_paths = []
+            
             with torch.no_grad():
                 for batch in tqdm(dataloader, desc="Extracting features"):
                     # Get images and paths from batch
@@ -160,27 +197,58 @@ class ClusterManager:
                         batch_features = self.vision_encoder(images).cpu()
                     
                     # Store features and paths
-                    features.append(batch_features)
-                    image_paths.extend(paths)
+                    current_chunk.append(batch_features)
+                    current_paths.extend(paths)
+                    
+                    # Check if we should save this chunk
+                    if len(current_chunk) * sub_batch_size >= max_chunk_size:
+                        # Concatenate features in current chunk
+                        chunk_tensor = torch.cat(current_chunk, dim=0)
+                        features_list.append(chunk_tensor)
+                        
+                        # Save chunk to disk
+                        chunk_file = os.path.join(self.feature_chunks_dir, f"chunk_{chunk_idx}.npy")
+                        np.save(chunk_file, chunk_tensor.numpy())
+                        
+                        self.logger.info(f"Saved feature chunk {chunk_idx} with {chunk_tensor.size(0)} features")
+                        
+                        # Update chunk index and reset current chunk
+                        chunk_idx += 1
+                        current_chunk = []
                 
-                # Concatenate features
-                if features:
-                    features = torch.cat(features, dim=0)
+                # Save final chunk if not empty
+                if current_chunk:
+                    # Concatenate features in current chunk
+                    chunk_tensor = torch.cat(current_chunk, dim=0)
+                    features_list.append(chunk_tensor)
+                    
+                    # Save chunk to disk
+                    chunk_file = os.path.join(self.feature_chunks_dir, f"chunk_{chunk_idx}.npy")
+                    np.save(chunk_file, chunk_tensor.numpy())
+                    
+                    self.logger.info(f"Saved final feature chunk {chunk_idx} with {chunk_tensor.size(0)} features")
+                
+                # Concatenate all features
+                if features_list:
+                    features = torch.cat(features_list, dim=0)
+                    
+                    # Save feature index
+                    try:
+                        with open(self.feature_index_file, "wb") as f:
+                            pickle.dump({
+                                "num_chunks": chunk_idx + 1,
+                                "total_features": features.size(0),
+                                "feature_dim": features.size(1),
+                                "paths": current_paths
+                            }, f)
+                        self.logger.info(f"Saved feature index to: {self.feature_index_file}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to save feature index: {e}")
                 else:
                     features = torch.empty((0, self.vision_encoder.feature_dim))
                 
                 self.logger.info(f"Extracted features for {features.size(0)} images")
-                
-                # Save to cache
-                try:
-                    with open(self.feature_cache_file, "wb") as f:
-                        pickle.dump({
-                            "features": features.numpy(),
-                            "paths": image_paths
-                        }, f)
-                    self.logger.info(f"Saved features to cache: {self.feature_cache_file}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to save features to cache: {e}")
+                image_paths = current_paths
         
         # Broadcast features in distributed setting
         if get_world_size() > 1:
@@ -234,7 +302,7 @@ class ClusterManager:
         return self.cluster_labels
     
     def _create_fine_clusters(self, features):
-        """Create fine-grained clusters (1024 as recommended in paper)"""
+        """Create fine-grained clusters with efficient MiniBatch K-means"""
         # Check cache first
         if is_main_process() and os.path.exists(self.fine_cluster_cache_file):
             self.logger.info(f"Loading fine clusters from cache: {self.fine_cluster_cache_file}")
@@ -248,50 +316,69 @@ class ClusterManager:
                     # Broadcast to all processes
                     if get_world_size() > 1:
                         fine_cluster_labels = broadcast_numpy_array(fine_cluster_labels)
-                    
+                        
                     self.fine_cluster_labels = fine_cluster_labels
                     return fine_cluster_labels
             except Exception as e:
                 self.logger.warning(f"Failed to load fine clusters from cache: {e}")
         
-        # Compute fine clusters
-        num_fine_clusters = min(self.config.num_experts * 8, features.shape[0] // 100)
-        self.logger.info(f"Creating {num_fine_clusters} fine-grained clusters")
-        
-        # Only perform clustering on main process
+        # Run clustering on main process only
         if get_rank() == 0:
-            # Convert features to numpy for sklearn
-            features_np = features.numpy()
-            
-            # Initialize MiniBatchKMeans for memory efficiency
-            fine_kmeans = MiniBatchKMeans(
-                n_clusters=num_fine_clusters,
-                batch_size=min(4096, features_np.shape[0]),
-                init="k-means++",
-                max_iter=300,
-                random_state=42
-            )
-            
-            # Fit K-means
-            self.logger.info("Fitting fine-grained K-means")
-            fine_kmeans.fit(features_np)
-            
-            # Get cluster assignments
-            fine_cluster_labels = fine_kmeans.labels_
-            
-            # Store model
-            self.fine_kmeans = fine_kmeans
-            
-            # Save to cache
+            self.logger.info(f"Creating {self.config.num_experts * 8} fine-grained clusters")
             try:
-                with open(self.fine_cluster_cache_file, "wb") as f:
-                    pickle.dump({
-                        "labels": fine_cluster_labels,
-                        "model": fine_kmeans
-                    }, f)
-                self.logger.info(f"Saved fine clusters to cache: {self.fine_cluster_cache_file}")
+                # Use MiniBatchKMeans for large datasets for efficiency (paper recommends this)
+                # Very large datasets benefit from this approach
+                if len(features) > 100000:
+                    n_clusters = self.config.num_experts * 8
+                    
+                    # Initialize with scalable MiniBatchKMeans
+                    self.fine_kmeans = MiniBatchKMeans(
+                        n_clusters=n_clusters,
+                        batch_size=4096,  # Large batch for faster convergence
+                        init='k-means++',
+                        max_iter=100,
+                        random_state=42
+                    )
+                    
+                    # Fit with progress bar
+                    batch_size = 4096
+                    n_batches = int(np.ceil(len(features) / batch_size))
+                    
+                    with tqdm(total=n_batches, desc="MiniBatchKMeans") as pbar:
+                        for i in range(n_batches):
+                            start = i * batch_size
+                            end = min((i + 1) * batch_size, len(features))
+                            self.fine_kmeans.partial_fit(features[start:end])
+                            pbar.update(1)
+                else:
+                    # For smaller datasets, use standard K-means
+                    self.fine_kmeans = KMeans(
+                        n_clusters=self.config.num_experts * 8,
+                        init='k-means++',
+                        n_init=10,
+                        random_state=42
+                    )
+                    self.fine_kmeans.fit(features)
+                
+                # Get cluster assignments
+                fine_cluster_labels = self.fine_kmeans.predict(features)
+                
+                # Save to cache for future use
+                try:
+                    with open(self.fine_cluster_cache_file, "wb") as f:
+                        pickle.dump({
+                            "labels": fine_cluster_labels,
+                            "model": self.fine_kmeans,
+                            "num_clusters": self.config.num_experts * 8
+                        }, f)
+                    self.logger.info(f"Saved fine clusters to cache: {self.fine_cluster_cache_file}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to save fine clusters to cache: {e}")
             except Exception as e:
-                self.logger.warning(f"Failed to save fine clusters to cache: {e}")
+                self.logger.error(f"Error in fine clustering: {e}")
+                # Fallback to random assignments
+                fine_cluster_labels = np.random.randint(0, self.config.num_experts * 8, size=len(features))
+                self.logger.warning("Using random fine cluster assignments due to error")
         else:
             fine_cluster_labels = None
             
@@ -411,13 +498,115 @@ class ClusterManager:
             
         return coarse_cluster_labels
 
+    def update_clusters_incremental(self, new_features, old_features_ratio=0.9):
+        """
+        Perform incremental clustering update with new features
+        
+        Args:
+            new_features: New features to incorporate [N, D]
+            old_features_ratio: Ratio of old features to keep (0.9 means 90% old, 10% new)
+            
+        Returns:
+            Updated cluster assignments
+        """
+        if self.features is None or len(self.features) == 0:
+            self.logger.warning("No existing features, cannot update incrementally")
+            return None
+            
+        if get_rank() == 0:
+            self.logger.info(f"Updating clusters with {len(new_features)} new features")
+            
+            # Combine old and new features with proper ratio
+            old_keep_count = int(len(self.features) * old_features_ratio)
+            
+            # Randomly select features to keep
+            keep_indices = np.random.choice(
+                len(self.features), 
+                size=old_keep_count, 
+                replace=False
+            )
+            
+            # Combine old (selected) and new features
+            combined_features = torch.cat([
+                self.features[keep_indices],
+                new_features
+            ], dim=0)
+            
+            self.logger.info(f"Combined {old_keep_count} old features with {len(new_features)} new features")
+            
+            # Update internal feature store
+            self.features = combined_features
+            
+            # Perform clustering on updated features
+            cluster_labels = self.cluster_dataset(combined_features)
+            
+            return cluster_labels
+        else:
+            return None
+
     def get_clusters(self):
         """Get current cluster assignments"""
         return self.cluster_labels
 
+    def visualize_cluster_samples(self, dataloader, output_dir="cluster_samples", samples_per_cluster=10):
+        """
+        Visualize sample images from each cluster
+        
+        Args:
+            dataloader: DataLoader for dataset
+            output_dir: Directory to save visualizations
+            samples_per_cluster: Number of sample images per cluster
+        """
+        if not is_main_process() or self.cluster_labels is None:
+            return
+            
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            self.logger.info(f"Visualizing cluster samples to {output_dir}")
+            
+            # Collect sample indices for each cluster
+            cluster_samples = {}
+            for i, cluster in enumerate(self.cluster_labels):
+                if cluster not in cluster_samples:
+                    cluster_samples[cluster] = []
+                if len(cluster_samples[cluster]) < samples_per_cluster:
+                    cluster_samples[cluster].append(i)
+            
+            # Create visualization for each cluster
+            for cluster, indices in cluster_samples.items():
+                sample_images = []
+                sample_count = 0
+                
+                # Collect actual images
+                for batch in dataloader:
+                    if isinstance(batch, dict):
+                        images = batch["image"]
+                        idx_offset = batch.get("index", list(range(len(images))))
+                    else:
+                        images = batch
+                        idx_offset = list(range(len(images)))
+                    
+                    for i, idx in enumerate(idx_offset):
+                        if idx in indices and sample_count < samples_per_cluster:
+                            sample_images.append(images[i])
+                            sample_count += 1
+                    
+                    if sample_count >= samples_per_cluster:
+                        break
+                
+                # Create and save grid
+                if sample_images:
+                    grid = create_image_grid(sample_images, nrow=min(5, len(sample_images)))
+                    grid_pil = tensor_to_pil(grid)
+                    grid_pil.save(os.path.join(output_dir, f"cluster_{cluster}.png"))
+            
+            self.logger.info(f"Saved cluster visualizations to {output_dir}")
+        except Exception as e:
+            self.logger.error(f"Failed to visualize cluster samples: {e}")
+
     def perform_clustering(self, dataloader=None):
         """
-        Extract features and perform clustering
+        Extract features and perform clustering with improved efficiency
         
         Args:
             dataloader: DataLoader for dataset
@@ -429,29 +618,78 @@ class ClusterManager:
             self.logger.error("No dataloader provided for clustering")
             return None
             
-        # Extract features
+        # Extract features with chunking for memory efficiency
         features, _ = self.extract_features(dataloader)
         
         # Perform clustering
         cluster_labels = self.cluster_dataset(features)
         
+        # Analyze and log cluster statistics
+        if is_main_process():
+            unique_clusters, counts = np.unique(cluster_labels, return_counts=True)
+            self.cluster_stats["distribution"] = {c: int(count) for c, count in zip(unique_clusters, counts)}
+            self.cluster_stats["num_clusters"] = len(unique_clusters)
+            self.cluster_stats["largest_cluster"] = int(max(counts))
+            self.cluster_stats["smallest_cluster"] = int(min(counts))
+            
+            # Log detailed statistics
+            self.logger.info(f"Clustering Statistics:")
+            self.logger.info(f"  Number of clusters: {self.cluster_stats['num_clusters']}")
+            self.logger.info(f"  Largest cluster: {self.cluster_stats['largest_cluster']} samples")
+            self.logger.info(f"  Smallest cluster: {self.cluster_stats['smallest_cluster']} samples")
+            
+            # Compute cluster balance metric (coefficient of variation)
+            cv = np.std(counts) / np.mean(counts)
+            self.cluster_stats["balance_cv"] = float(cv)
+            self.logger.info(f"  Cluster balance (CV): {cv:.4f} (lower is better)")
+            
+            # Save statistics
+            try:
+                stats_file = os.path.join(self.cache_dir, "cluster_stats.pkl")
+                with open(stats_file, "wb") as f:
+                    pickle.dump(self.cluster_stats, f)
+                self.logger.info(f"Saved cluster statistics to {stats_file}")
+            except Exception as e:
+                self.logger.warning(f"Failed to save cluster statistics: {e}")
+        
         # Visualize clusters if main process and logging enabled
         if is_main_process() and hasattr(self.config, 'visualize_clusters') and self.config.visualize_clusters:
             try:
-                # Plot cluster visualization
-                fig, _ = visualize_embeddings(
-                    features.numpy(), 
-                    cluster_labels,
-                    method='tsne' if features.size(0) < 10000 else 'pca'
-                )
+                # Memory-efficient visualization using PCA
+                from sklearn.decomposition import PCA
+                
+                # Always use PCA first to reduce dimensionality
+                pca = PCA(n_components=min(50, features.size(1)))
+                reduced_features = pca.fit_transform(features.numpy())
+                
+                if len(reduced_features) < 10000 and hasattr(self.config, 'use_tsne') and self.config.use_tsne:
+                    # Further reduce with t-SNE for smaller datasets
+                    from sklearn.manifold import TSNE
+                    vis_features = TSNE(n_components=2, perplexity=30, n_iter=1000).fit_transform(reduced_features)
+                    method = 'tsne'
+                else:
+                    # Just use first 2 PCA components for large datasets
+                    vis_features = reduced_features[:, :2]
+                    method = 'pca'
+                
+                # Plot visualization
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots(figsize=(10, 10))
+                scatter = ax.scatter(vis_features[:, 0], vis_features[:, 1], 
+                                    c=cluster_labels, cmap='tab20', s=2, alpha=0.5)
+                ax.set_title(f"Cluster Visualization ({method.upper()})")
+                fig.colorbar(scatter, ax=ax, label="Cluster ID")
                 
                 # Save visualization
-                import matplotlib.pyplot as plt
                 os.makedirs("visualizations", exist_ok=True)
-                fig.savefig(f"visualizations/clusters_{time.strftime('%Y%m%d-%H%M%S')}.png")
+                viz_path = f"visualizations/clusters_{time.strftime('%Y%m%d-%H%M%S')}.png"
+                fig.savefig(viz_path)
                 plt.close(fig)
                 
-                self.logger.info("Saved cluster visualization to visualizations/")
+                self.logger.info(f"Saved cluster visualization to {viz_path}")
+                
+                # Also save sample images from each cluster for better interpretability
+                self.visualize_cluster_samples(dataloader)
             except Exception as e:
                 self.logger.warning(f"Failed to visualize clusters: {str(e)}")
         

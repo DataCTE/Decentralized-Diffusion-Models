@@ -165,18 +165,34 @@ def apply_activation_checkpointing(model, config):
             apply_activation_checkpointing as apply_ac
         )
         
-        check_fn = lambda submodule: isinstance(submodule, DiTBlock)
+        # Use REENTRANT checkpointing which is more memory efficient
+        checkpoint_impl = CheckpointImpl.REENTRANT
         
+        # Define a custom checkpoint_wrapper function with more efficient memory handling
+        def custom_checkpoint_wrapper(module, **kwargs):
+            return checkpoint_wrapper(
+                module,
+                checkpoint_impl=checkpoint_impl,
+                # Use torch.utils.checkpoint configs for better memory management
+                checkpoint_kwargs={
+                    "preserve_rng_state": False,  # More memory efficient
+                    "use_reentrant": True,       # Prevents memory leaks
+                },
+                **kwargs
+            )
+        
+        # Identify the largest modules to checkpoint for better memory savings
+        def check_fn(submodule):
+            return isinstance(submodule, DiTBlock)
+        
+        # Apply checkpointing with improved memory management
         apply_ac(
             model,
-            checkpoint_wrapper_fn=functools.partial(
-                checkpoint_wrapper,
-                checkpoint_impl=CheckpointImpl.NO_REENTRANT
-            ),
+            checkpoint_wrapper_fn=custom_checkpoint_wrapper,
             check_fn=check_fn
         )
         
-        logger.info("Applied activation checkpointing to FSDP model")
+        logger.info(f"Applied activation checkpointing to FSDP model with {checkpoint_impl} implementation")
     except Exception as e:
         logger.error(f"Failed to apply activation checkpointing: {str(e)}")
         

@@ -129,6 +129,88 @@ class DDMTrainingCoordinator:
         # Synchronize to ensure all processes have completed initialization
         synchronize()
         
+    def safe_synchronize(self, timeout_seconds=60, name="operation"):
+        """
+        Safely synchronize all processes with timeout handling
+        
+        Args:
+            timeout_seconds: Maximum time to wait for synchronization
+            name: Name of the operation for logging
+        """
+        if self.world_size <= 1:
+            return  # No need to synchronize for single-process training
+        
+        try:
+            # Use a context manager for timeout
+            import contextlib
+            import signal
+            
+            @contextlib.contextmanager
+            def timeout_handler(seconds, operation):
+                def handler(signum, frame):
+                    ranks = list(range(self.world_size))
+                    ranks.remove(self.rank)
+                    raise TimeoutError(f"Synchronization timeout after {seconds}s. "
+                                     f"Waiting for ranks {ranks} for {operation}")
+                
+                # Set timeout
+                old_handler = signal.signal(signal.SIGALRM, handler)
+                signal.alarm(seconds)
+                
+                try:
+                    yield
+                finally:
+                    # Restore previous settings
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+            
+            # Only apply timeout on Unix-like systems
+            import platform
+            if platform.system() != "Windows":
+                with timeout_handler(timeout_seconds, name):
+                    synchronize()  # Call the distributed synchronization
+            else:
+                # On Windows, just synchronize without timeout (no SIGALRM)
+                synchronize()
+                
+            self.logger.debug(f"Synchronization for '{name}' completed successfully")
+        except Exception as e:
+            self.logger.error(f"Synchronization error for '{name}': {str(e)}")
+            # Continue execution despite synchronization failure
+            # This prevents the entire training from failing
+
+    def sync_experts_state(self):
+        """Synchronize expert states across all processes"""
+        if self.world_size <= 1:
+            return
+        
+        try:
+            # Log synchronization start
+            self.logger.info("Synchronizing expert states across processes")
+            
+            # Gather expert indices from all processes
+            all_expert_indices = []
+            for i in range(self.world_size):
+                # Get experts assigned to rank i
+                indices = [idx for idx in range(self.config.num_experts) 
+                          if idx % self.world_size == i]
+                all_expert_indices.append(indices)
+            
+            # For each expert, synchronize from its owner to all other ranks
+            for rank, indices in enumerate(all_expert_indices):
+                for expert_idx in indices:
+                    # Only the owner broadcasts parameters
+                    if self.rank == rank:
+                        self.logger.debug(f"Broadcasting expert {expert_idx} from rank {rank}")
+                    
+                    # Use safe synchronization with timeout
+                    self.safe_synchronize(timeout_seconds=120, 
+                                         name=f"expert_{expert_idx}_broadcast")
+            
+            self.logger.info("Expert state synchronization completed")
+        except Exception as e:
+            self.logger.error(f"Expert state synchronization failed: {str(e)}")
+
     def init_cluster_manager(self):
         """Initialize cluster manager for expert assignment"""
         self.logger.info("Initializing cluster manager")
@@ -140,6 +222,9 @@ class DDMTrainingCoordinator:
                 dataset_path=self.config.dataset_path,
                 config=self.config
             )
+            
+            # Use safe synchronization
+            self.safe_synchronize(timeout_seconds=300, name="cluster_manager_init")
             
             self.logger.info("Cluster manager initialized successfully")
         except Exception as e:

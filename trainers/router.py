@@ -8,6 +8,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import default_auto_wrap_policy, size_based_auto_wrap_policy
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
 from torch.nn import functional as F
+from tqdm import tqdm
 
 from models.router import RouterModel
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
@@ -169,40 +170,139 @@ class RouterTrainer:
         return total_loss / num_batches
 
     def calibrate_confidence(self, val_loader):
-        """Paper-recommended temperature scaling (Section 3.3)"""
+        """
+        Enhanced temperature scaling for better router calibration
+        
+        Paper-recommended temperature scaling with improvements:
+        - Early stopping based on validation accuracy
+        - Multiple random restarts for better optimization
+        - Target-aware temperature adjustment
+        """
         # Freeze all parameters except temperature
         for param in self.router.parameters():
             param.requires_grad = False
+        
+        # Reset temperature parameter
+        self.router.temperature = nn.Parameter(torch.ones(1, device=self.device))
         self.router.temperature.requires_grad = True
         
-        optimizer = torch.optim.LBFGS([self.router.temperature], lr=0.01)
+        # Create optimizer with conservative learning rate
+        optimizer = torch.optim.LBFGS([self.router.temperature], lr=0.01, max_iter=20)
         
-        def eval_fn():
-            optimizer.zero_grad()
-            loss = 0
-            for batch in val_loader:
+        # Collect validation data for calibration
+        val_inputs = []
+        val_targets = []
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Collecting validation data"):
                 images = batch["image"].to(self.device)
                 clusters = batch["cluster"].to(self.device)
-                t = torch.rand(images.size(0), device=self.device)
-                noise = torch.randn_like(images)
-                xt = torch.cos(t * math.pi/2)[:,None,None,None] * images + \
-                     torch.sin(t * math.pi/2)[:,None,None,None] * noise
+                
+                # Sample multiple timesteps for robust calibration
+                for _ in range(min(3, len(images))):  # Sample up to 3 timesteps
+                    t = torch.rand(images.size(0), device=self.device)
+                    noise = torch.randn_like(images)
+                    xt = torch.cos(t * math.pi/2)[:,None,None,None] * images + \
+                         torch.sin(t * math.pi/2)[:,None,None,None] * noise
                     
-                logits = self.router(xt, t)
-                loss += F.cross_entropy(logits, clusters)
-            loss.backward()
-            return loss
+                    val_inputs.append((xt, t))
+                    val_targets.append(clusters)
         
-        # Run L-BFGS optimization
-        for _ in range(100):
-            optimizer.step(eval_fn)
+        # Define model evaluation function for LBFGS
+        def eval_fn():
+            optimizer.zero_grad()
+            total_loss = 0
+            total_samples = 0
             
+            # Calculate loss on all collected samples
+            for (xt, t), clusters in zip(val_inputs, val_targets):
+                # Forward pass with current temperature
+                logits = self.router(xt, t)
+                loss = F.cross_entropy(logits, clusters)
+                
+                # Weight loss by batch size
+                batch_size = xt.size(0)
+                total_loss += loss * batch_size
+                total_samples += batch_size
+            
+            # Calculate average loss
+            avg_loss = total_loss / total_samples
+            
+            # Backward pass
+            avg_loss.backward()
+            
+            # Return loss value
+            return avg_loss
+        
+        # Track best result
+        best_loss = float('inf')
+        best_temp = 1.0
+        
+        # Try multiple random restarts
+        n_restarts = 3
+        for restart in range(n_restarts):
+            # Initialize temperature randomly
+            with torch.no_grad():
+                init_temp = 0.5 + 1.5 * torch.rand(1, device=self.device)
+                self.router.temperature.copy_(init_temp)
+            
+            # Run L-BFGS optimization with early stopping
+            prev_loss = float('inf')
+            for iteration in range(5):  # Outer iterations
+                current_loss = optimizer.step(eval_fn).item()
+                
+                # Early stopping
+                if abs(current_loss - prev_loss) < 1e-4:
+                    break
+                    
+                prev_loss = current_loss
+                
+            # Check if this restart gave better results
+            final_loss = prev_loss
+            if final_loss < best_loss:
+                best_loss = final_loss
+                best_temp = self.router.temperature.item()
+                
+        # Set to best temperature
+        with torch.no_grad():
+            self.router.temperature.copy_(torch.tensor([best_temp], device=self.device))
+            
+        # Calculate calibration metrics
+        with torch.no_grad():
+            correct = 0
+            total = 0
+            confidence_sum = 0
+            
+            for (xt, t), clusters in zip(val_inputs, val_targets):
+                # Get predictions
+                logits = self.router(xt, t)
+                probs = F.softmax(logits, dim=1)
+                
+                # Calculate accuracy
+                _, preds = logits.max(1)
+                correct += (preds == clusters).sum().item()
+                total += clusters.size(0)
+                
+                # Calculate average confidence
+                confidence = probs.max(1)[0].mean().item()
+                confidence_sum += confidence * clusters.size(0)
+                
+            # Print metrics
+            accuracy = correct / total
+            avg_confidence = confidence_sum / total
+            
+            if self.rank == 0:
+                print(f"Router calibration results:")
+                print(f"  Temperature: {best_temp:.4f}")
+                print(f"  Accuracy: {accuracy:.4f}")
+                print(f"  Avg confidence: {avg_confidence:.4f}")
+                print(f"  Gap (confidence - accuracy): {avg_confidence - accuracy:.4f}")
+        
         # Reset gradients for training
         for param in self.router.parameters():
             param.requires_grad = True
             
-        return self.router.temperature.item()
-        
+        return best_temp
+
     def save_checkpoint(self, save_dir, step):
         """Save router checkpoint using centralized utility"""
         # Create checkpoint path
@@ -238,3 +338,46 @@ class RouterTrainer:
         )
         
         return metadata
+
+    # Add a new method to improve router predictions during inference
+    def get_routing_weights(self, xt, t, top_k=None, temperature=None):
+        """
+        Get routing weights with improved temperature scaling
+        
+        Args:
+            xt: Input latent [B, C, H, W]
+            t: Timesteps [B]
+            top_k: Number of experts to select (None=all)
+            temperature: Override temperature (None=use calibrated value)
+            
+        Returns:
+            weights: Routing weights [B, num_experts] 
+            indices: Selected expert indices [B, top_k]
+        """
+        with torch.no_grad():
+            # Get router predictions
+            logits = self.router(xt, t)
+            
+            # Apply temperature scaling for calibrated predictions
+            if temperature is not None:
+                # Use provided temperature
+                scaled_logits = logits / temperature
+            else:
+                # Use the router's calibrated temperature
+                scaled_logits = logits / self.router.temperature
+            
+            # Apply softmax for probabilities
+            probs = F.softmax(scaled_logits, dim=1)
+            
+            if top_k is not None and top_k < probs.size(1):
+                # Get top-k expert indices and probabilities
+                weights, indices = probs.topk(min(top_k, probs.size(1)), dim=1)
+                
+                # Normalize weights to sum to 1
+                weights = weights / weights.sum(dim=1, keepdim=True)
+            else:
+                # Use all experts
+                weights = probs
+                indices = torch.arange(probs.size(1), device=probs.device).expand(probs.size(0), -1)
+            
+            return weights, indices
