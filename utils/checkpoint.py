@@ -4,6 +4,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 import os
 import logging
+from utils.distributed import is_main_process, synchronize
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +16,9 @@ def save_sharded(checkpoint, path, model=None):
             state = model.state_dict()
         checkpoint = {**checkpoint, 'model': state}
     
-    if dist.is_initialized() and dist.get_rank() != 0:
-        # Only save from rank 0
+    if not is_main_process():
+        # Only save from main process
+        synchronize()  # Ensure all processes wait for main to complete save
         return None
         
     # Create directory if it doesn't exist
@@ -25,9 +27,11 @@ def save_sharded(checkpoint, path, model=None):
     try:
         torch.save(checkpoint, path)
         logger.info(f"Saved checkpoint to {path}")
+        synchronize()  # Ensure all processes wait for main to complete save
         return path
     except Exception as e:
         logger.error(f"Failed to save checkpoint to {path}: {str(e)}")
+        synchronize()  # Ensure all processes wait even if there was an error
         return None
 
 def save_model_checkpoint(model, optimizer=None, scheduler=None, path=None, metadata=None, is_fsdp=True):
@@ -43,10 +47,11 @@ def save_model_checkpoint(model, optimizer=None, scheduler=None, path=None, meta
         is_fsdp: Whether the model is using FSDP
         
     Returns:
-        Path to saved checkpoint (None if not rank 0)
+        Path to saved checkpoint (None if not main process)
     """
-    if dist.is_initialized() and dist.get_rank() != 0:
-        # Only save from rank 0
+    if not is_main_process():
+        # Only save from main process
+        synchronize()  # Wait for main process to finish saving
         return None
         
     # Create checkpoint
@@ -71,7 +76,18 @@ def save_model_checkpoint(model, optimizer=None, scheduler=None, path=None, meta
     if scheduler is not None:
         checkpoint['scheduler'] = scheduler.state_dict()
         
-    return save_sharded(checkpoint, path)
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    try:
+        torch.save(checkpoint, path)
+        logger.info(f"Saved checkpoint to {path}")
+        synchronize()  # Ensure all processes wait for main to complete save
+        return path
+    except Exception as e:
+        logger.error(f"Failed to save checkpoint to {path}: {str(e)}")
+        synchronize()  # Ensure all processes wait even if there was an error
+        return None
 
 def load_model_checkpoint(model, path, optimizer=None, scheduler=None, is_fsdp=True, device=None):
     """
@@ -97,7 +113,7 @@ def load_model_checkpoint(model, path, optimizer=None, scheduler=None, is_fsdp=T
         if device is not None:
             checkpoint = torch.load(path, map_location=device)
         else:
-            checkpoint = torch.load(path)
+            checkpoint = torch.load(path, map_location='cpu' if is_fsdp else 'cuda')
             
         # Load model state
         if is_fsdp and isinstance(model, FSDP):

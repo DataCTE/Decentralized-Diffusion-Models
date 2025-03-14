@@ -2,6 +2,10 @@
 
 import math
 import torch
+import logging
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 def get_alphas_and_betas(num_timesteps=1000, schedule_type='cosine'):
     """Paper's noise schedules from Section 3.2 and Appendix B.1"""
@@ -11,10 +15,18 @@ def get_alphas_and_betas(num_timesteps=1000, schedule_type='cosine'):
         alphas = torch.cos((ts + 0.008) / 1.008 * math.pi / 2).pow(2)  # Paper Eq.4
         alphas = alphas / alphas[0]  # Ensure alpha_0 = 1 (Paper Eq.4)
         betas = 1 - (alphas[1:] / alphas[:-1])
-    else:  # Linear schedule (paper baseline comparison)
+    elif schedule_type == 'linear':
+        # Linear schedule (paper baseline comparison)
         beta_start = 0.0001
         beta_end = 0.02
         betas = torch.linspace(beta_start, beta_end, num_timesteps)
+    elif schedule_type == 'squared_linear':
+        # Squared linear schedule
+        beta_start = 0.0001
+        beta_end = 0.02
+        betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_timesteps) ** 2
+    else:
+        raise ValueError(f"Unknown schedule_type: {schedule_type}")
     
     alphas = 1 - betas
     alpha_bar = torch.cumprod(alphas, dim=0)
@@ -28,6 +40,56 @@ def forward_diffuse(x0, t, alpha_bar, noise=None):
     sqrt_alpha_bar = torch.sqrt(alpha_bar[t])[:, None, None, None]
     sqrt_one_minus = torch.sqrt(1. - alpha_bar[t])[:, None, None, None]
     return sqrt_alpha_bar * x0 + sqrt_one_minus * noise
+
+def get_noise_schedule(timesteps, schedule_type='cosine'):
+    """Get noise schedule for given timesteps"""
+    if schedule_type == 'cosine':
+        return torch.cos(timesteps * math.pi / 2)
+    else:
+        return 1 - timesteps
+
+def get_timestep_embedding(timesteps, dim, max_period=10000):
+    """
+    Create sinusoidal timestep embeddings.
+    
+    Args:
+        timesteps: a 1-D Tensor of N indices, one per batch element.
+                  These may be fractional.
+        dim: the dimension of the output.
+        max_period: controls the minimum frequency of the embeddings.
+    
+    Returns:
+        an [N x dim] Tensor of positional embeddings.
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device) / half
+    )
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        
+    return embedding
+
+def get_variance_schedule(num_timesteps=1000, beta_start=0.0001, beta_end=0.02, schedule_type='cosine'):
+    """Get variance schedule for given parameters"""
+    if schedule_type == 'cosine':
+        # Cosine schedule
+        steps = torch.linspace(0, 1, num_timesteps + 1, dtype=torch.float32)
+        alpha_bar = torch.cos((steps + 0.008) / 1.008 * math.pi / 2).pow(2)
+        alpha_bar = alpha_bar / alpha_bar[0]
+        betas = 1 - (alpha_bar[1:] / alpha_bar[:-1])
+        return torch.clamp(betas, min=0, max=0.999)
+    elif schedule_type == 'linear':
+        # Linear schedule
+        return torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
+    elif schedule_type == 'squared_linear':
+        # Squared linear schedule
+        return torch.linspace(beta_start**0.5, beta_end**0.5, num_timesteps, dtype=torch.float32) ** 2
+    else:
+        raise ValueError(f"Unknown schedule_type: {schedule_type}")
 
 class DecentralizedFlowMatcher:
     """Implements paper's Equations 6-8 for DFM"""
@@ -71,6 +133,38 @@ class DecentralizedFlowMatcher:
         # Apply router weights and reduce
         weighted_losses = router_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * expert_losses
         return weighted_losses.sum(dim=1).mean()
+
+    def compute_flow_matching_target(self, x0, x_t, t):
+        """
+        Compute the flow matching target v_t(x_t)
+        
+        Args:
+            x0: Original clean data [B, C, H, W]
+            x_t: Noisy data at timestep t [B, C, H, W]
+            t: Timestep values [B,]
+            
+        Returns:
+            Target flow field [B, C, H, W]
+        """
+        # Compute sigma_t
+        sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
+        
+        # Compute target flow
+        target_flow = (x0 - x_t) / sigma_t
+        return target_flow
+        
+    def compute_flow_matching_loss(self, pred_flow, target_flow):
+        """
+        Compute flow matching loss between predicted and target flows
+        
+        Args:
+            pred_flow: Predicted flow field [B, C, H, W]
+            target_flow: Target flow field [B, C, H, W]
+            
+        Returns:
+            Loss value
+        """
+        return self.loss_fn(pred_flow, target_flow)
 
     def sample(self, router, experts, shape, alpha_bar, steps=50, top_k=1):
         """

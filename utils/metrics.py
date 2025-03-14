@@ -1,9 +1,12 @@
+"""Metrics utilities for Decentralized Diffusion Models."""
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 import logging
 from torchvision.models import inception_v3
 from scipy import linalg
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -122,3 +125,120 @@ class MetricCalculator:
             )
             
         return metrics
+        
+    @staticmethod
+    def extract_inception_features(dataloader, max_samples=None, device='cuda'):
+        """
+        Extract features from a dataset using Inception v3
+        
+        Args:
+            dataloader: DataLoader for dataset
+            max_samples: Maximum number of samples to process (optional)
+            device: Device to run extraction on
+            
+        Returns:
+            [N, 2048] numpy array of features
+        """
+        # Load inception model
+        inception = inception_v3(pretrained=True, transform_input=False)
+        inception.fc = torch.nn.Identity()  # Remove classification layer
+        inception = inception.to(device).eval()
+        
+        # Extract features
+        features = []
+        sample_count = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Extracting features"):
+                if isinstance(batch, dict):
+                    images = batch.get('image', batch.get('images', None))
+                else:
+                    images = batch
+                    
+                # Check if we have a valid tensor
+                if not isinstance(images, torch.Tensor):
+                    logger.warning(f"Unexpected batch format: {type(batch)}")
+                    continue
+                    
+                # Move to device
+                images = images.to(device)
+                
+                # Extract features
+                batch_features = inception(images)
+                features.append(batch_features.cpu())
+                
+                # Update sample count
+                sample_count += images.size(0)
+                
+                # Check if we've reached the maximum
+                if max_samples is not None and sample_count >= max_samples:
+                    break
+                    
+        # Concatenate features
+        features = torch.cat(features, dim=0)
+        
+        # Limit to max_samples if specified
+        if max_samples is not None:
+            features = features[:max_samples]
+            
+        return features.numpy()
+        
+    @staticmethod
+    def psnr(img1, img2):
+        """
+        Calculate Peak Signal-to-Noise Ratio between two images
+        
+        Args:
+            img1: First image tensor [B, C, H, W]
+            img2: Second image tensor [B, C, H, W]
+            
+        Returns:
+            PSNR value
+        """
+        mse = F.mse_loss(img1, img2, reduction='mean')
+        if mse == 0:
+            return float('inf')
+        max_pixel = 1.0
+        psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
+        return psnr.item()
+        
+    @staticmethod
+    def ssim(img1, img2):
+        """
+        Calculate Structural Similarity Index between two images
+        
+        Args:
+            img1: First image tensor [B, C, H, W]
+            img2: Second image tensor [B, C, H, W]
+            
+        Returns:
+            SSIM value
+        """
+        import pytorch_msssim
+        ssim_module = pytorch_msssim.SSIM(data_range=1.0, size_average=True, channel=3)
+        return ssim_module(img1, img2).item()
+        
+    @staticmethod
+    def lpips(img1, img2, lpips_model=None):
+        """
+        Calculate Learned Perceptual Image Patch Similarity
+        
+        Args:
+            img1: First image tensor [B, C, H, W]
+            img2: Second image tensor [B, C, H, W]
+            lpips_model: LPIPS model (will be loaded if None)
+            
+        Returns:
+            LPIPS distance
+        """
+        try:
+            import lpips
+            if lpips_model is None:
+                lpips_model = lpips.LPIPS(net='alex').to(img1.device)
+            
+            with torch.no_grad():
+                distance = lpips_model(img1, img2)
+            return distance.mean().item()
+        except ImportError:
+            logger.warning("LPIPS not available. Install with: pip install lpips")
+            return None

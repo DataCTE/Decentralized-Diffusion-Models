@@ -1,29 +1,35 @@
 """Training coordinator for Decentralized Diffusion Models (Paper implementation)"""
 
-
 import math
-import logging
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-from torch.utils.data import DataLoader
-
-from tqdm import tqdm
 import numpy as np
-import wandb
 import time
 import os
 
 from models.dit import ExpertDiT
-from data.dataset import DDMDataset, FeatureDataset, create_expert_bucket_loaders
-from utils.diffusion import DecentralizedFlowMatcher
+from data.dataset import DDMDataset
 from data.clustering import ClusterManager
 from trainers.Distillation import DiffusionDistiller
-from utils.clip import CLIPTextEncoder
-from utils.checkpoint import save_sharded
-from utils.metrics import MetricCalculator
+from trainers.expert import ExpertTrainer
+from trainers.router import RouterTrainer
 
-logger = logging.getLogger(__name__)
+# Import centralized utilities
+from utils.logging import setup_logger, log_metrics, log_images, log_training_start, log_training_end, init_wandb
+from utils.distributed import (
+    is_main_process, get_rank, get_world_size, synchronize, 
+    broadcast_object, reduce_dict, all_gather_tensor
+)
+from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
+from utils.metrics import MetricCalculator
+from utils.checkpoint import save_model_checkpoint, load_model_checkpoint, save_sharded
+from utils.vae import VAEWrapper
+from utils.clip import CLIPTextEncoder
+from utils.sampling import ddm_sample
+from utils.visualization import tensor_to_pil, create_image_grid
+
+# Setup logger
+logger = setup_logger("DDMCoordinator")
 
 class DDMTrainingCoordinator:
     """Implements the core training logic from Section 3 of the paper"""
@@ -39,451 +45,533 @@ class DDMTrainingCoordinator:
         self.config = config
         self.rank = rank
         self.world_size = world_size
-        self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-        self.current_step = 0
+        self.device = torch.device(f"cuda:{rank}")
         
-        if self.rank == 0:
-            logger.info(f"Initializing DDM Training Coordinator with {world_size} processes")
-            logger.info(f"Training will use {world_size} GPUs in parallel")
-            logger.info(f"Beginning initialization sequence - this may take 20-30 minutes")
+        # Initialize logger
+        self.logger = setup_logger(name="DDMCoordinator", rank=rank)
         
-        # Paper-recommended initialization sequence with better logging
-        start_time = time.time()
-        if self.rank == 0:
-            logger.info("Stage 1: Initializing cluster manager")
+        # Log starting information
+        if is_main_process():
+            log_training_start(self.logger, config)
+        
+        # Initialize WandB if specified
+        if is_main_process() and hasattr(config, 'use_wandb') and config.use_wandb:
+            self.run = init_wandb(config)
+        else:
+            self.run = None
+        
+        # Initialize cluster manager
         self.init_cluster_manager()
         
-        if self.rank == 0:
-            clustering_time = time.time() - start_time
-            logger.info(f"Clustering completed in {clustering_time/60:.1f} minutes")
-            logger.info("Stage 2: Initializing data loaders")
-            
-        loader_start = time.time()
+        # Initialize data loaders
         self.init_data_loaders()
         
-        if self.rank == 0:
-            loader_time = time.time() - loader_start
-            logger.info(f"Data loaders initialized in {loader_time:.1f} seconds")
-            logger.info("Stage 3: Initializing models")
-            
-        model_start = time.time()
+        # Initialize models
         self.init_models()
         
-        if self.rank == 0:
-            model_time = time.time() - model_start
-            logger.info(f"Models initialized in {model_time:.1f} seconds")
-            logger.info("Stage 4: Initializing optimizers")
-            
-        opt_start = time.time()
+        # Initialize optimizers
         self.init_optimizers()
         
-        if self.rank == 0:
-            opt_time = time.time() - opt_start
-            total_time = time.time() - start_time
-            logger.info(f"Optimizers initialized in {opt_time:.1f} seconds")
-            logger.info(f"Total initialization time: {total_time/60:.1f} minutes")
-            logger.info("Initialization complete - ready to begin training")
+        # Initialize diffusion components
+        self.alphas, self.alpha_bar, self.betas = get_alphas_and_betas(
+            num_timesteps=1000,
+            schedule_type='cosine'
+        )
         
-        # Metrics tracking (paper Section 4.3)
-        self.best_fid = float('inf')
-        self.train_losses = []
+        # Initialize flow matcher
+        self.flow_matcher = DecentralizedFlowMatcher(
+            sigma=config.sigma,
+            loss_type=config.loss_type
+        )
         
-        self.loaded_experts = {}  # Track loaded experts
-        self.expert_loading_count = 0
+        # Initialize VAE and CLIP
+        self.vae = VAEWrapper(self.device, config)
+        self.clip = CLIPTextEncoder(self.device, config)
+        
+        # Initialize metrics calculator
+        self.metrics_calculator = MetricCalculator()
+        
+        # Initialize step counter
+        self.current_step = 0
+        
+        self.logger.info("DDM Training Coordinator initialized successfully")
         
     def init_cluster_manager(self):
-        """Initialize clustering components with distributed synchronization"""
-        # Log initialization start
-        if self.rank == 0:
-            logger.info(f"Initializing clustering manager (rank {self.rank})")
-            logger.info(f"This process involves feature extraction and clustering")
-            logger.info(f"GPUs will be at 100% during feature extraction - this is normal")
-            logger.info(f"Process steps: Extract DINOv2 features → Fine clustering → Coarse clustering")
+        """Initialize cluster manager for expert assignment"""
+        self.logger.info("Initializing cluster manager")
         
-        # Create cluster manager with dataset path and config
-        self.cluster_manager = ClusterManager(
-            local_rank=self.rank,
-            dataset_path=self.config.dataset_path,
-            config=self.config
-        )
-        
-        # Centralized clustering call - this handles everything including dataloader creation
-        self.cluster_manager.perform_clustering()
-        
-        if self.rank == 0:
-            logger.info(f"Clustering phase complete - all processes synchronized")
-
+        try:
+            # Create cluster manager
+            self.cluster_manager = ClusterManager(
+                local_rank=self.rank,
+                dataset_path=self.config.dataset_path,
+                config=self.config
+            )
+            
+            self.logger.info("Cluster manager initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize cluster manager: {str(e)}")
+            raise
+            
     def init_data_loaders(self):
-        """Initialize distributed data loaders with sharded validation"""
-        # Log initialization start
-        if self.rank == 0:
-            logger.info(f"Initializing data loaders with distributed sharding")
-            logger.info(f"Each GPU will process a different subset of the data")
-            
-        start_time = time.time()
-            
-        # Shared dataset for all processes
-        dataset = DDMDataset(
-            self.config.dataset_path,
-            cluster_labels=self.cluster_manager.get_clusters()
-        )
-
-        # Distributed sampler for sharding
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=True
-        )
-
-        if self.rank == 0:
-            logger.info(f"Creating training dataloader with batch size {self.config.batch_size}")
-            
-        self.train_loader = DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            sampler=sampler,
-            num_workers=2,
-            pin_memory=True,
-            persistent_workers=True
-        )
+        """Initialize data loaders for training"""
+        self.logger.info("Initializing data loaders")
         
-        if self.rank == 0:
-            setup_time = time.time() - start_time
-            logger.info(f"Data loaders initialized in {setup_time:.2f} seconds")
-            logger.info(f"Each process will handle ~{len(dataset)/self.world_size:,.0f} images")
-    
+        try:
+            # Create feature dataset for clustering
+            from data.dataset import FeatureDataset
+            feature_dataset = FeatureDataset(
+                root_dir=self.config.dataset_path,
+                config=self.config
+            )
+            
+            # Create feature loader
+            from data.loader import create_loader
+            feature_loader = create_loader(
+                dataset=feature_dataset,
+                config=self.config,
+                is_train=False,
+                distributed=(self.world_size > 1),
+                rank=self.rank,
+                world_size=self.world_size
+            )
+            
+            # Perform initial clustering
+            self.cluster_manager.perform_clustering(feature_loader)
+            
+            # Get cluster assignments
+            cluster_labels = self.cluster_manager.get_clusters()
+            
+            # Create main dataset
+            self.dataset = DDMDataset(
+                root_dir=self.config.dataset_path,
+                cluster_labels=cluster_labels,
+                include_metadata=True
+            )
+            
+            # Create per-expert data loaders
+            from data.loader import create_expert_bucket_loaders
+            self.expert_loaders = create_expert_bucket_loaders(
+                dataset=self.dataset,
+                config=self.config,
+                world_size=self.world_size,
+                rank=self.rank
+            )
+            
+            # Create router data loader
+            self.router_loader = create_loader(
+                dataset=self.dataset,
+                config=self.config,
+                is_train=True,
+                distributed=(self.world_size > 1),
+                rank=self.rank,
+                world_size=self.world_size
+            )
+            
+            self.logger.info(f"Data loaders initialized with {len(self.dataset)} images")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize data loaders: {str(e)}")
+            raise
+            
     def perform_reclustering(self):
-        """Perform dynamic reclustering during training using ClusterManager"""
-        if self.rank == 0:
-            logger.info("Starting dynamic reclustering process")
+        """Perform reclustering of the dataset"""
+        self.logger.info("Performing reclustering")
+        
+        try:
+            # Create feature dataset for reclustering
+            from data.dataset import FeatureDataset
+            feature_dataset = FeatureDataset(
+                root_dir=self.config.dataset_path,
+                config=self.config
+            )
             
-        # Let ClusterManager handle all reclustering logic
-        old_clusters, new_clusters = self.cluster_manager.perform_reclustering()
-        
-        # Get mapping from old to new clusters
-        cluster_mapping = self.cluster_manager.get_cluster_mapping(old_clusters, new_clusters)
-        
-        # Migrate expert parameters based on mapping
-        if self.rank == 0:
-            logger.info("Migrating expert parameters based on new clustering")
+            # Create feature loader
+            from data.loader import create_loader
+            feature_loader = create_loader(
+                dataset=feature_dataset,
+                config=self.config,
+                is_train=False,
+                distributed=(self.world_size > 1),
+                rank=self.rank,
+                world_size=self.world_size
+            )
             
-        for old_idx, new_idx in cluster_mapping.items():
-            if old_idx != new_idx:
-                if self.rank == 0:
-                    logger.info(f"Migrating expert data from {old_idx} to {new_idx}")
-                self.migrate_expert_data(old_idx, new_idx)
-        
-        # Update validation dataset assignments
-        if hasattr(self, 'val_dataset'):
-            if self.rank == 0:
-                logger.info("Updating validation dataset cluster assignments")
-            self.val_dataset.update_clusters(new_clusters)
-        
-        # Paper-recommended expert reset for empty clusters
-        for expert_idx in range(self.config.num_experts):
-            if expert_idx not in cluster_mapping.values():
-                if self.rank == 0:
-                    logger.info(f"Resetting parameters for empty expert {expert_idx}")
-                self.expert_trainers[expert_idx].reset_parameters()
-        
-        if self.rank == 0:
-            logger.info("Dynamic reclustering complete")
-        
-        return new_clusters
-    
+            # Perform reclustering
+            new_labels, cluster_mapping = self.cluster_manager.perform_reclustering(feature_loader)
+            
+            # Update dataset clusters
+            self.dataset.cluster_assignments = new_labels
+            
+            # Recreate per-expert data loaders
+            from data.loader import create_expert_bucket_loaders
+            self.expert_loaders = create_expert_bucket_loaders(
+                dataset=self.dataset,
+                config=self.config,
+                world_size=self.world_size,
+                rank=self.rank
+            )
+            
+            # Handle expert parameter migration
+            for old_idx, new_idx in cluster_mapping.items():
+                if old_idx != new_idx:
+                    self.migrate_expert_data(old_idx, new_idx)
+            
+            self.logger.info("Reclustering completed successfully")
+            
+            # Log clustering metrics if using wandb
+            if self.run is not None and is_main_process():
+                # Log cluster distribution
+                cluster_counts = np.bincount(new_labels, minlength=self.config.num_experts)
+                cluster_metrics = {f"cluster_{i}_count": count for i, count in enumerate(cluster_counts)}
+                log_metrics(cluster_metrics, step=self.current_step, prefix="clustering")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to perform reclustering: {str(e)}")
+            raise
+            
     def init_models(self):
-        """Initialize models with parameter isolation checks"""
-        from trainers.expert import ExpertTrainer
-        from trainers.router import RouterTrainer
+        """Initialize models for training"""
+        self.logger.info("Initializing models")
         
-        # Initialize expert trainers
-        self.expert_trainers = [
-            ExpertTrainer(
-                expert_idx=i,
+        try:
+            # Initialize experts
+            self.experts = {}
+            for expert_idx in range(self.config.num_experts):
+                # Only initialize experts assigned to this process
+                if expert_idx % self.world_size == self.rank:
+                    self.experts[expert_idx] = ExpertTrainer(
+                        expert_idx=expert_idx,
+                        config=self.config,
+                        device=self.device,
+                        rank=self.rank,
+                        world_size=self.world_size
+                    )
+            
+            # Initialize router
+            self.router_trainer = RouterTrainer(
                 config=self.config,
                 device=self.device,
                 rank=self.rank,
                 world_size=self.world_size
-            ) for i in range(self.config.num_experts)
-        ]
-        
-        # Initialize router trainer
-        self.router_trainer = RouterTrainer(
-            config=self.config,
-            device=self.device,
-            rank=self.rank,
-            world_size=self.world_size
-        )
-        
-        if self.rank == 0:
-            logger.info(f"Initialized {len(self.expert_trainers)} experts and router with dedicated trainers")
-        
-        expert_params = set()
-        for i in range(self.config.num_experts):
-            expert = ExpertDiT(self.config)
-            current_params = {id(p) for p in expert.parameters()}
-            if expert_params & current_params:
-                raise RuntimeError(f"Parameter sharing detected in expert {i}")
-            expert_params |= current_params
-        
-    def init_optimizers(self):
-        """Initialize optimizers - REMOVED implementation as optimizers are already initialized in respective trainers"""
-        # The optimizers are already initialized in the respective trainers,
-        # so we don't need to create duplicate optimizers here.
-        # Just log that we're using the trainers' optimizers
-        if self.rank == 0:
-            logger.info(f"Using optimizers from {len(self.expert_trainers)} expert trainers and router trainer")
-        
-    def train_experts(self, step):
-        """Delegate expert training to ExpertTrainer instances"""
-        # Since each ExpertTrainer handles its own optimization,
-        # we just need to call train_step on each trainer
-        losses = []
-        for trainer, loader in zip(self.expert_trainers, self.expert_loaders):
-            for batch in loader:
-                loss = trainer.train_step(batch)
-                losses.append(loss)
+            )
             
-        # Calculate mean loss
-        mean_loss = np.mean(losses) if losses else 0.0
+            self.logger.info(f"Initialized {len(self.experts)} experts on this process")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize models: {str(e)}")
+            raise
+            
+    def init_optimizers(self):
+        """Initialize optimizers for models"""
+        # Optimizers are initialized in the respective trainers
+        pass
+            
+    def train_experts(self, step):
+        """Train expert models for one step"""
+        self.current_step = step
+        total_loss = 0.0
         
-        # Add diversity loss if needed
-        if hasattr(self.expert_trainers[0], 'diversity') and hasattr(self.config, 'diversity_lambda'):
-            diversity_loss = torch.stack([e.diversity() for e in self.expert_trainers]).mean()
-            mean_loss += self.config.diversity_lambda * diversity_loss.item()
+        # Train each expert assigned to this process
+        for expert_idx, expert in self.experts.items():
+            # Skip if no data loader for this expert
+            if expert_idx not in self.expert_loaders:
+                continue
+                
+            # Get batch
+            try:
+                batch = next(iter(self.expert_loaders[expert_idx]))
+            except (StopIteration, IndexError):
+                continue
+                
+            # Train expert
+            loss = expert.train_step(batch)
+            total_loss += loss
+            
+        # Average loss across experts
+        avg_loss = total_loss / max(1, len(self.experts))
         
-        return mean_loss
-    
+        return avg_loss
+            
     def train_router(self, step):
-        """Delegate router training to RouterTrainer"""
-        # The RouterTrainer handles its own optimization logic internally,
-        # so we just need to call train_epoch and get the resulting loss
+        """Train router model for one step"""
+        self.current_step = step
+        
+        # Skip router training if no data loader
+        if not hasattr(self, 'router_loader') or not self.router_loader:
+            return 0.0
+            
+        # Get batch
+        try:
+            batch = next(iter(self.router_loader))
+        except (StopIteration, IndexError):
+            return 0.0
+            
+        # Train router
         loss = self.router_trainer.train_epoch(self.router_loader)
         
-        # Update learning rate scheduler if present
-        if hasattr(self.router_trainer, 'lr_scheduler'):
-            self.router_trainer.lr_scheduler.step()
-        
         return loss
-    
-    def run_validation(self, step):
-        """Modified validation with confidence checks"""
-        fallback_count = 0
-        total_samples = 0
-        
-        samples = []
-        for _ in range(self.config.validation_samples):
-            with torch.no_grad():
-                latent = torch.randn(...)
-                for t in reversed(range(0, 1000)):
-                    probs = self.router_trainer.router(latent, t)
-                    max_prob = probs.max(dim=-1)[0]
-                    
-                    # Apply confidence threshold
-                    if self.config.router_confidence_threshold > 0:
-                        low_conf = max_prob < self.config.router_confidence_threshold
-                        if low_conf.any():
-                            # Use fallback expert for low confidence samples
-                            probs[low_conf] = 0
-                            probs[low_conf, 0] = 1.0  # Assign to expert 0
-                            fallback_count += low_conf.sum().item()
-                            total_samples += low_conf.size(0)
-                    
-                    top_k = torch.topk(probs, self.config.validation_topk)
-                    
-                    # Aggregate only needed experts
-                    combined_flow = 0
-                    for expert_idx in top_k.indices:
-                        expert = self.get_expert(expert_idx.item())
-                        flow = expert(latent, t)
-                        combined_flow += flow * top_k.values[expert_idx]
-                    
-                    # Update latent
-                    latent -= combined_flow * self.config.step_size
             
-            samples.append(self.vae.decode(latent))
+    def run_validation(self, step):
+        """Run validation at current step"""
+        self.current_step = step
+        self.logger.info(f"Running validation at step {step}")
         
-        # Calculate metrics
-        fid = self.calculate_fid(samples, self.val_dataset)
-        self.log_to_wandb(step, fid, samples)
-        
-        # Calibrate router after validation
-        if step % self.config.calibration_interval == 0:
-            self.router_trainer.calibrate_confidence(self.val_loader)
-        
-        # Log fallback usage
-        metrics = {
-            'fallback_rate': fallback_count / total_samples if total_samples > 0 else 0,
-            'fid': fid,
-            'best_fid': min(fid, self.best_fid),
-            'samples': [wandb.Image(sample) for sample in samples]
-        }
-        wandb.log(metrics, step=step)
-        
-        # Update best FID
-        if fid < self.best_fid:
-            self.best_fid = fid
-            torch.save({
-                'experts': [trainer.expert.state_dict() for trainer in self.expert_trainers],
-                'router': self.router_trainer.router.state_dict()
-            }, f"{self.config.save_dir}/best_fid.pt")
-
+        # Skip if not main process
+        if not is_main_process():
+            return
+            
+        try:
+            # Sample images
+            with torch.no_grad():
+                # Setup for sampling
+                sample_shape = (
+                    getattr(self.config, 'validation_samples', 4),
+                    self.config.latent_channels,
+                    self.config.image_size // 8,
+                    self.config.image_size // 8
+                )
+                
+                # Get text conditioning
+                prompts = getattr(self.config, 'validation_prompts', ['a photo of a cat'])
+                if isinstance(prompts, str):
+                    prompts = [prompts]
+                
+                # Ensure we have enough prompts
+                while len(prompts) < sample_shape[0]:
+                    prompts.extend(prompts[:sample_shape[0] - len(prompts)])
+                prompts = prompts[:sample_shape[0]]
+                
+                # Encode prompts
+                text_embeddings, uncond_embeddings = self.clip.encode_with_uncond(prompts)
+                
+                # Sample from models
+                latents = ddm_sample(
+                    router=self.router_trainer.router,
+                    experts=[expert.expert for expert in self.experts.values()],
+                    shape=sample_shape,
+                    steps=getattr(self.config, 'inference_steps', 50),
+                    top_k=getattr(self.config, 'validation_topk', 1),
+                    device=self.device,
+                    cfg_scale=getattr(self.config, 'cfg_scale', 7.5),
+                    text_embeddings=text_embeddings,
+                    uncond_embeddings=uncond_embeddings
+                )
+                
+                # Decode latents
+                images = self.vae.decode(latents)
+                
+                # Log images
+                if self.run is not None:
+                    log_images(
+                        images=images,
+                        captions=prompts,
+                        step=step,
+                        prefix="validation"
+                    )
+                
+                # Create grid for visualization
+                grid = create_image_grid(images)
+                
+                # Save grid
+                os.makedirs(self.config.sample_dir, exist_ok=True)
+                grid.save(os.path.join(self.config.sample_dir, f"step_{step}.png"))
+                
+            self.logger.info(f"Validation completed, samples saved to {self.config.sample_dir}")
+        except Exception as e:
+            self.logger.error(f"Failed to run validation: {str(e)}")
+            
     def save_sharded_checkpoints(self, step):
-        """Paper-recommended sharded checkpoint format"""
-        # Use utils.checkpoint to save coordinator metadata
-        from utils.checkpoint import save_sharded
+        """Save checkpoints for all models"""
+        self.current_step = step
+        self.logger.info(f"Saving checkpoints at step {step}")
         
-        # Metadata for the coordinator checkpoint
-        meta_checkpoint = {
-            'meta': {
-                'step': step, 
-                'best_fid': self.best_fid,
-                'config': self.config.__dict__
-            }
-        }
-        
-        # Have experts save themselves through their own methods
-        expert_paths = []
-        for idx, trainer in enumerate(self.expert_trainers):
-            # Check if trainer has save_checkpoint method, otherwise use fallback
-            if hasattr(trainer, 'save_checkpoint'):
-                path = trainer.save_checkpoint(self.config.save_dir, step)
-                if path:  # Save path might be None for non-rank-0 processes
-                    expert_paths.append(path)
-            else:
-                # Fallback for trainers without save_checkpoint method
-                if self.rank == 0:
-                    logger.warning(f"Expert trainer {idx} has no save_checkpoint method, using fallback")
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        try:
+            # Create checkpoint directory
+            os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+            
+            # Save expert checkpoints
+            for expert_idx, expert in self.experts.items():
+                expert.save_checkpoint(
+                    save_dir=self.config.checkpoint_dir,
+                    step=step
+                )
                 
-                path = f"{self.config.save_dir}/expert_{idx}_step{step}_v{self.config.version}.pt"
-                if isinstance(trainer.expert, FSDP) and self.rank == 0:
-                    state_dict = FSDP.state_dict(trainer.expert)
-                    torch.save(state_dict, path)
-                    expert_paths.append(path)
-        
-        # Save router model
-        if self.rank == 0:
-            if hasattr(self.router_trainer, 'save_checkpoint'):
-                router_path = self.router_trainer.save_checkpoint(self.config.save_dir, step)
-                meta_checkpoint['router_path'] = router_path
-            else:
-                # Fallback for router without save_checkpoint method
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            # Save router checkpoint
+            self.router_trainer.save_checkpoint(
+                save_dir=self.config.checkpoint_dir,
+                step=step
+            )
+            
+            # Save coordinator state
+            if is_main_process():
+                coordinator_state = {
+                    'step': step,
+                    'config': vars(self.config)
+                }
+                save_sharded(
+                    checkpoint=coordinator_state,
+                    path=os.path.join(self.config.checkpoint_dir, f"coordinator_step{step}.pt")
+                )
                 
-                router_path = f"{self.config.save_dir}/router_step{step}.pt"
-                if isinstance(self.router_trainer.router, FSDP):
-                    state_dict = FSDP.state_dict(self.router_trainer.router)
-                    torch.save(state_dict, router_path)
-                else:
-                    torch.save(self.router_trainer.router.state_dict(), router_path)
-                meta_checkpoint['router_path'] = router_path
-        
-        # Save paths to expert checkpoints
-        meta_checkpoint['expert_paths'] = expert_paths
-        
-        # Save coordinator checkpoint with metadata
-        if self.rank == 0:
-            os.makedirs(self.config.save_dir, exist_ok=True)
-            coord_path = f"{self.config.save_dir}/coordinator_step{step}.pt"
-            torch.save(meta_checkpoint, coord_path)
-            logger.info(f"Saved coordinator checkpoint to {coord_path} with {len(expert_paths)} expert paths")
+            self.logger.info(f"Checkpoints saved to {self.config.checkpoint_dir}")
+        except Exception as e:
+            self.logger.error(f"Failed to save checkpoints: {str(e)}")
             
     def log_sharded_metrics(self, step, expert_loss, router_loss):
-        """Log training metrics to WandB"""
-        if self.rank == 0:
-            metrics = {
-                'expert_loss': expert_loss,
-                'router_loss': router_loss,
-                'learning_rate': self.get_current_lr(),
-                'step': step
-            }
-            wandb.log(metrics)
+        """Log metrics using centralized logging"""
+        self.current_step = step
+        
+        # Skip if not using wandb
+        if self.run is None:
+            return
             
+        # Collect metrics
+        metrics = {
+            'expert_loss': expert_loss,
+            'router_loss': router_loss,
+            'lr': self.get_current_lr()
+        }
+        
+        # Log metrics
+        log_metrics(metrics, step=step)
+        
     def calculate_fid(self, generated_samples, real_dataset):
         """Calculate FID score between generated and real samples"""
-        
-        # Use the centralized MetricCalculator instead of duplicating the logic
-        return MetricCalculator.fid(real_dataset, generated_samples)
+        return self.metrics_calculator.fid(real_dataset, generated_samples)
         
     def get_current_lr(self):
-        """Paper-recommended learning rate schedule"""
-        # Linear warmup over first 5% of training
-        warmup_steps = int(0.05 * self.config.num_steps)
-        if self.current_step < warmup_steps:
-            return self.config.learning_rate * (self.current_step / warmup_steps)
+        """Get current learning rate"""
+        # Get learning rate from first expert
+        if self.experts:
+            expert = next(iter(self.experts.values()))
+            return expert.get_learning_rate()
+        return 0.0
         
-        # Cosine decay for remaining steps
-        progress = (self.current_step - warmup_steps) / (self.config.num_steps - warmup_steps)
-        return self.config.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
-
     def log_to_wandb(self, step, fid, samples):
-        """Paper Section 4.3: Logging metrics and samples"""
-        if self.rank == 0:
-            # Log metrics
-            metrics = {
-                'fid': fid,
-                'best_fid': min(fid, self.best_fid),
-                'samples': [wandb.Image(sample) for sample in samples]
-            }
-            wandb.log(metrics, step=step)
+        """Log metrics and samples to W&B"""
+        # Skip if not using wandb
+        if self.run is None:
+            return
             
-            # Update best FID
-            if fid < self.best_fid:
-                self.best_fid = fid
-                torch.save({
-                    'experts': [trainer.expert.state_dict() for trainer in self.expert_trainers],
-                    'router': self.router_trainer.router.state_dict()
-                }, f"{self.config.save_dir}/best_fid.pt")
-
+        # Log metrics
+        metrics = {
+            'fid': fid,
+            'step': step
+        }
+        log_metrics(metrics, step=step)
+        
+        # Log samples
+        log_images(
+            images=samples,
+            step=step,
+            prefix="samples"
+        )
+        
     def train_distilled_model(self):
-        """Paper Section 3.6: Knowledge Distillation"""
-        teacher = DecentralizedFlowMatcher(
-            self.config, self.router_trainer.router, self.expert_trainers
-        )
-        student = ExpertDiT(self.config).to(self.device)
+        """Train distilled model from experts"""
+        if not hasattr(self.config, 'do_distillation') or not self.config.do_distillation:
+            self.logger.info("Skipping distillation as it's disabled in config")
+            return
+            
+        self.logger.info("Training distilled model")
         
-        distiller = DiffusionDistiller(
-            teacher=teacher,
-            student=student,
-            num_train_timesteps=self.config.num_timesteps,
-            loss_fn=nn.MSELoss(),
-            lr=self.config.distill_lr,
-            warmup_ratio=0.05
-        )
-        
-        # Train and save distilled model
-        distiller.train(self.distill_loader)
-        if self.rank == 0:
-            torch.save(student.state_dict(), f"{self.config.save_dir}/distilled_model.pt")
-
-    def needs_reclustering(self, step):
-        """Paper's dynamic reclustering schedule"""
-        return step % self.config.recluster_interval == 0
-
-    def get_expert(self, idx):
-        """Lazy-load experts with fallback mechanism"""
         try:
-            return super().get_expert(idx)
-        except KeyError:
-            if self.config.router_confidence_threshold > 0:
-                logger.warning(f"Using fallback expert for {idx}")
-                return self.expert_trainers[0]
-            raise
-
+            # Initialize distilled model
+            distilled_model = ExpertDiT(self.config).to(self.device)
+            
+            # Create distiller
+            distiller = DiffusionDistiller(
+                teacher={
+                    'router': self.router_trainer.router,
+                    'experts': [expert.expert for expert in self.experts.values()]
+                },
+                student=distilled_model,
+                num_train_timesteps=1000,
+                lr=getattr(self.config, 'distill_lr', 1e-5),
+                warmup_ratio=0.05
+            )
+            
+            # Create dataset for distillation
+            from data.dataset import DDMDataset
+            from data.loader import create_loader
+            
+            distill_dataset = DDMDataset(
+                root_dir=self.config.dataset_path,
+                include_metadata=False
+            )
+            
+            distill_loader = create_loader(
+                dataset=distill_dataset,
+                config=self.config,
+                is_train=True,
+                distributed=(self.world_size > 1),
+                rank=self.rank,
+                world_size=self.world_size
+            )
+            
+            # Train distilled model
+            distiller.train(
+                loader=distill_loader,
+                epochs=getattr(self.config, 'distill_epochs', 10)
+            )
+            
+            # Save distilled model
+            if is_main_process():
+                save_model_checkpoint(
+                    model=distilled_model,
+                    path=os.path.join(self.config.checkpoint_dir, "distilled_model.pt"),
+                    metadata={'step': self.current_step}
+                )
+                
+            self.logger.info("Distillation completed, model saved")
+        except Exception as e:
+            self.logger.error(f"Failed to train distilled model: {str(e)}")
+            
+    def needs_reclustering(self, step):
+        """Check if reclustering is needed at current step"""
+        if not hasattr(self.config, 'recluster_interval'):
+            return False
+            
+        return step > 0 and step % self.config.recluster_interval == 0
+        
+    def get_expert(self, idx):
+        """Get expert by index"""
+        if idx in self.experts:
+            return self.experts[idx]
+            
+        # Broadcast expert from the process that owns it
+        owner_rank = idx % self.world_size
+        if is_main_process():
+            self.logger.info(f"Requesting expert {idx} from rank {owner_rank}")
+            
+        expert = None
+        if self.rank == owner_rank:
+            expert = self.experts[idx]
+            
+        return broadcast_object(expert, src=owner_rank)
+        
     def migrate_expert_data(self, old_idx, new_idx):
-        """Transfer expert parameters and training data"""
-        # Parameter transfer
-        self.expert_trainers[new_idx].load_state_dict(
-            self.expert_trainers[old_idx].state_dict()
-        )
+        """Migrate expert data during reclustering"""
+        self.logger.info(f"Migrating expert data from {old_idx} to {new_idx}")
         
-        # Data migration
-        old_mask = (self.cluster_labels == old_idx)
-        self.cluster_labels[old_mask] = new_idx
+        # Get source expert
+        source_expert = self.get_expert(old_idx)
         
-        # Update data loaders
-        self.expert_loaders[new_idx].dataset.add_samples(
-            self.expert_loaders[old_idx].dataset.remove_samples(old_mask)
-        )
+        # If we don't own the target expert, no need to do anything
+        if new_idx % self.world_size != self.rank:
+            return
+            
+        # If we don't have the target expert, create it
+        if new_idx not in self.experts:
+            self.experts[new_idx] = ExpertTrainer(
+                expert_idx=new_idx,
+                config=self.config,
+                device=self.device,
+                rank=self.rank,
+                world_size=self.world_size
+            )
+            
+        # Copy parameters from source to target
+        target_expert = self.experts[new_idx]
+        target_expert.expert.load_state_dict(source_expert.expert.state_dict())
+        
+        self.logger.info(f"Expert data migrated from {old_idx} to {new_idx}")
