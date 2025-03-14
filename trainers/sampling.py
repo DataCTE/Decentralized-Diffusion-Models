@@ -6,9 +6,9 @@ from tqdm import tqdm
 from trainers.diffusion import (
     get_alphas_and_betas, 
     ddim_step,
-    cosine_beta_schedule,
     update_sample
 )
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +27,10 @@ def ddm_sample(
     verbose=True,
     callback=None,
     expert_cache_manager=None,
+    temperature=1.0,
 ):
     """
-    Sample from Decentralized Diffusion Models
+    Sample from Decentralized Diffusion Models with improved expert selection
     
     Args:
         router: Router model
@@ -46,35 +47,16 @@ def ddm_sample(
         verbose: Whether to show progress bar
         callback: Optional callback function called after each step
         expert_cache_manager: Optional ExpertCacheManager for memory-efficient expert loading
+        temperature: Temperature for router softmax
         
     Returns:
         Sampled batch of images
     """
     # Setup noise schedule
-    if scheduler == "cosine":
-        alpha_bar = cosine_beta_schedule(steps)  # alpha_cumprod
-        betas = 1 - alpha_bar[1:] / alpha_bar[:-1]  # beta
-    else:
-        # Default linear schedule
-        betas = torch.linspace(0.0001, 0.02, steps)
-        alpha = 1 - betas
-        alpha_bar = alpha.cumprod(0)
-        
+    alphas, alpha_bar, betas = get_alphas_and_betas(steps, scheduler)
+    
     alpha_bar = alpha_bar.to(device)
     betas = betas.to(device)
-    
-    # Convert to the timesteps we'll use for sampling
-    timesteps = torch.linspace(1, 0, steps + 1).to(device) * 1000
-    timesteps = timesteps.round().long()
-    
-    # Track active experts per step for metrics
-    expert_usage_counts = torch.zeros(len(experts), device=device)
-    
-    # Setup progress bar
-    progress = tqdm(range(steps), desc="Sampling", disable=not verbose)
-    
-    # Create memory-efficient expert management
-    managed_experts = expert_cache_manager is not None
     
     # Get batch size
     batch_size = shape[0]
@@ -86,253 +68,197 @@ def ddm_sample(
     x = torch.randn(shape, device=device)
     
     # Initialize expert usage tracking
-    expert_selections = {}  # Maps timestep to list of selected experts
+    expert_usage_counts = torch.zeros(len(experts), device=device)
+    
+    # Setup progress bar
+    progress = tqdm(range(steps), desc="Sampling", disable=not verbose)
     
     # For each sampling step
-    for step_idx, step in enumerate(progress):
-        # Current and next timesteps
-        t = timesteps[step]
-        t_next = timesteps[step + 1]
+    for t in progress:
+        # Current timestep
+        timestep = torch.full((batch_size,), t, device=device)
         
-        # Create timesteps for the batch
-        ts = t.expand(batch_size)
-        
-        # Process inputs in manageable sub-batches if needed
-        # Determine if sub-batching is needed
-        max_batch_size = getattr(router.config, 'max_inference_batch_size', batch_size)
-        use_sub_batches = batch_size > max_batch_size
-        
-        # Process in sub-batches if needed
-        if use_sub_batches:
-            logger.info(f"Processing batch of size {batch_size} in sub-batches of max size {max_batch_size}")
-            # Initialize storage for results
-            sub_batch_results = torch.zeros_like(x)
+        # Get router predictions for which experts to use
+        with torch.no_grad():
+            # Get router probabilities
+            router_outputs = router(x, timestep, text_embeddings, temperature=temperature)
             
-            for i in range(0, batch_size, max_batch_size):
-                end_idx = min(i + max_batch_size, batch_size)
-                sub_batch_size = end_idx - i
+            # Get top-k experts for each sample
+            if top_k == 1:
+                # Faster path for common case
+                selected_experts = router_outputs.argmax(dim=1).tolist()
+                selected_weights = [1.0] * batch_size
+            else:
+                # Get top-k experts and their weights
+                top_values, top_indices = torch.topk(router_outputs, k=min(top_k, router_outputs.size(1)), dim=1)
                 
-                # Extract sub-batch
-                sub_x = x[i:end_idx]
-                sub_ts = ts[i:end_idx]
-                sub_text_emb = text_embeddings[i:end_idx] if use_cfg and text_embeddings is not None else None
-                sub_uncond_emb = uncond_embeddings[i:end_idx] if use_cfg and uncond_embeddings is not None else None
+                # Normalize weights to sum to 1
+                top_weights = F.softmax(top_values, dim=1)
                 
-                # Process sub-batch
-                sub_result = process_ddm_batch(
-                    router=router,
-                    experts=experts,
-                    x=sub_x,
-                    t=sub_ts,
-                    t_next=t_next,
-                    text_embeddings=sub_text_emb,
-                    uncond_embeddings=sub_uncond_emb,
-                    use_cfg=use_cfg,
-                    cfg_scale=cfg_scale,
-                    top_k=top_k,
-                    step=step,
-                    device=device,
-                    expert_usage_counts=expert_usage_counts,
-                    expert_selections=expert_selections,
-                    expert_cache_manager=expert_cache_manager
-                )
-                
-                # Store sub-batch results
-                sub_batch_results[i:end_idx] = sub_result
-                
-            # Use combined results for this step
-            x = sub_batch_results
+                # Convert to lists for easier handling
+                selected_experts = [top_indices[i].tolist() for i in range(batch_size)]
+                selected_weights = [top_weights[i].tolist() for i in range(batch_size)]
+            
+            # Count expert usage
+            if top_k == 1:
+                for expert_idx in selected_experts:
+                    expert_usage_counts[expert_idx] += 1
+            else:
+                for batch_experts in selected_experts:
+                    for expert_idx in batch_experts:
+                        expert_usage_counts[expert_idx] += 1
+        
+        # Prepare for conditional guidance if needed
+        if use_cfg:
+            # Double the batch
+            x_in = torch.cat([x] * 2)
+            timestep_in = torch.cat([timestep] * 2)
+            emb_in = torch.cat([uncond_embeddings, text_embeddings])
         else:
-            # Process entire batch at once
-            x = process_ddm_batch(
-                router=router,
-                experts=experts,
-                x=x,
-                t=ts,
-                t_next=t_next,
-                text_embeddings=text_embeddings,
-                uncond_embeddings=uncond_embeddings,
-                use_cfg=use_cfg,
-                cfg_scale=cfg_scale,
-                top_k=top_k,
-                step=step,
-                device=device,
-                expert_usage_counts=expert_usage_counts,
-                expert_selections=expert_selections,
-                expert_cache_manager=expert_cache_manager
-            )
-        
-        # Call the callback if provided
-        if callback is not None:
-            callback(x, step_idx)
+            x_in = x
+            timestep_in = timestep
+            emb_in = text_embeddings
             
-        # Update progress
-        if verbose:
-            progress.set_postfix({"t": t.item()})
-    
-    # Log active expert usage
-    if verbose:
-        total_activations = expert_usage_counts.sum().item()
-        expert_usage_pct = expert_usage_counts / max(1, total_activations) * 100
+        # Compute denoised prediction
+        with torch.no_grad():
+            if top_k == 1:
+                # Efficient single expert selection
+                denoised = torch.zeros_like(x_in)
+                
+                # Group samples by expert for efficiency
+                expert_to_samples = {}
+                for sample_idx, expert_idx in enumerate(selected_experts):
+                    if use_cfg:
+                        # For CFG, we need both conditional and unconditional indices
+                        cond_idx = sample_idx + batch_size
+                        uncond_idx = sample_idx
+                        if expert_idx not in expert_to_samples:
+                            expert_to_samples[expert_idx] = {"cond": [], "uncond": []}
+                        expert_to_samples[expert_idx]["cond"].append(cond_idx)
+                        expert_to_samples[expert_idx]["uncond"].append(uncond_idx)
+                    else:
+                        if expert_idx not in expert_to_samples:
+                            expert_to_samples[expert_idx] = []
+                        expert_to_samples[expert_idx].append(sample_idx)
+                
+                # Process each expert once with all its samples
+                for expert_idx, sample_indices in expert_to_samples.items():
+                    # Get expert (from cache if using cache manager)
+                    if expert_cache_manager:
+                        expert = expert_cache_manager.get_expert(
+                            expert_idx,
+                            lambda idx: experts[idx]
+                        )
+                    else:
+                        expert = experts[expert_idx]
+                        
+                    if use_cfg:
+                        # Process conditional and unconditional samples
+                        cond_indices = sample_indices["cond"]
+                        uncond_indices = sample_indices["uncond"]
+                        
+                        if cond_indices:
+                            # Process conditional samples
+                            cond_out = expert(
+                                x_in[cond_indices],
+                                timestep_in[cond_indices[:len(cond_indices)]],
+                                emb_in[cond_indices[:len(cond_indices)]]
+                            )
+                            denoised[cond_indices] = cond_out
+                            
+                        if uncond_indices:
+                            # Process unconditional samples
+                            uncond_out = expert(
+                                x_in[uncond_indices],
+                                timestep_in[uncond_indices[:len(uncond_indices)]],
+                                emb_in[uncond_indices[:len(uncond_indices)]]
+                            )
+                            denoised[uncond_indices] = uncond_out
+                    else:
+                        # Simpler case without CFG
+                        if sample_indices:
+                            indices = sample_indices
+                            out = expert(
+                                x_in[indices],
+                                timestep_in[indices[:len(indices)]],
+                                emb_in[indices[:len(indices)]] if emb_in is not None else None
+                            )
+                            denoised[indices] = out
+            else:
+                # Handle multiple experts per sample
+                denoised = torch.zeros_like(x_in)
+                
+                # Process each sample individually with its experts
+                for i in range(batch_size):
+                    experts_i = selected_experts[i]
+                    weights_i = selected_weights[i]
+                    
+                    sample_pred = torch.zeros_like(x_in[i:i+1])
+                    
+                    # Weighted average of expert predictions
+                    for expert_idx, weight in zip(experts_i, weights_i):
+                        # Get expert
+                        if expert_cache_manager:
+                            expert = expert_cache_manager.get_expert(
+                                expert_idx,
+                                lambda idx: experts[idx]
+                            )
+                        else:
+                            expert = experts[expert_idx]
+                            
+                        # Get prediction
+                        if use_cfg:
+                            # For CFG we need to do this twice
+                            # Unconditional
+                            uncond_pred = expert(
+                                x_in[i:i+1],
+                                timestep_in[i:i+1],
+                                emb_in[i:i+1]
+                            )
+                            # Conditional 
+                            cond_pred = expert(
+                                x_in[i+batch_size:i+batch_size+1],
+                                timestep_in[i+batch_size:i+batch_size+1],
+                                emb_in[i+batch_size:i+batch_size+1]
+                            )
+                            
+                            # Apply weight
+                            denoised[i:i+1] += uncond_pred * weight
+                            denoised[i+batch_size:i+batch_size+1] += cond_pred * weight
+                        else:
+                            # Single prediction
+                            pred = expert(
+                                x_in[i:i+1],
+                                timestep_in[i:i+1],
+                                emb_in[i:i+1] if emb_in is not None else None
+                            )
+                            
+                            # Apply weight
+                            sample_pred += pred * weight
+                    
+                    if not use_cfg:
+                        denoised[i:i+1] = sample_pred
         
-        logger.info(f"Expert usage distribution:")
-        for expert_idx, usage_pct in enumerate(expert_usage_pct.cpu().numpy()):
-            logger.info(f"  Expert {expert_idx}: {usage_pct:.1f}%")
+        # Apply classifier-free guidance
+        if use_cfg:
+            unconditional, conditional = denoised.chunk(2)
+            denoised = unconditional + cfg_scale * (conditional - unconditional)
+            
+        # Update sample with new prediction
+        x = update_sample(x, denoised, t, steps, eta, betas, alphas, alpha_bar)
+        
+        # Call callback if provided
+        if callback is not None:
+            callback(x, t)
+    
+    # Log expert usage statistics
+    if verbose:
+        expert_usage_pct = 100 * expert_usage_counts / steps / batch_size
+        logger.info("Expert usage percentages:")
+        for expert_idx, pct in enumerate(expert_usage_pct):
+            logger.info(f"  Expert {expert_idx}: {pct:.1f}%")
     
     return x
-
-def process_ddm_batch(
-    router,
-    experts,
-    x,
-    t,
-    t_next,
-    text_embeddings=None,
-    uncond_embeddings=None,
-    use_cfg=False,
-    cfg_scale=7.5,
-    top_k=1,
-    step=0,
-    device="cuda",
-    expert_usage_counts=None,
-    expert_selections=None,
-    expert_cache_manager=None
-):
-    """
-    Process a single batch for DDM sampling
-    
-    Args:
-        router: Router model
-        experts: Dict of expert models {expert_idx: model}
-        x: Current noisy samples [B, C, H, W]
-        t: Current timesteps [B]
-        t_next: Next timestep (scalar)
-        text_embeddings: Optional text embeddings for conditioning [B, seq_len, dim]
-        uncond_embeddings: Optional unconditional embeddings [B, seq_len, dim]
-        use_cfg: Whether to use classifier-free guidance
-        cfg_scale: CFG scale
-        top_k: Number of experts to use
-        step: Current sampling step
-        device: Device to use
-        expert_usage_counts: Tensor to track expert usage
-        expert_selections: Dict to track expert selections
-        expert_cache_manager: Optional ExpertCacheManager
-    
-    Returns:
-        Updated samples
-    """
-    batch_size = x.shape[0]
-    managed_experts = expert_cache_manager is not None
-    
-    # Forward pass through router
-    with torch.no_grad():
-        # For cond + uncond if using CFG
-        if use_cfg:
-            # Process conditional
-            cond_router_output = router(x, t, text_embeddings)
-            # Process unconditional (empty/null embedding)
-            uncond_router_output = router(x, t, uncond_embeddings)
-            # Get expert weights
-            expert_weights = (1 + cfg_scale) * cond_router_output - cfg_scale * uncond_router_output
-        else:
-            # Process without CFG
-            expert_weights = router(x, t, text_embeddings)
-        
-        # Get top experts for each sample
-        if top_k > 1:
-            # Select top-k experts per sample
-            topk_weights, topk_indices = torch.topk(expert_weights, min(top_k, expert_weights.size(1)), dim=1)
-            # Normalize weights
-            topk_weights = torch.softmax(topk_weights, dim=1)
-        else:
-            # Select single best expert per sample
-            topk_weights, topk_indices = torch.max(expert_weights, dim=1)
-            # Reshape to match expected dimensions
-            topk_weights = topk_weights.view(-1, 1)
-            topk_indices = topk_indices.view(-1, 1)
-        
-        # Track which experts are used
-        unique_experts = torch.unique(topk_indices).cpu().numpy()
-        
-        # Update tracking
-        if expert_usage_counts is not None:
-            for idx in unique_experts:
-                expert_usage_counts[idx] += torch.sum(topk_indices == idx).item()
-        
-        if expert_selections is not None:
-            expert_selections[step] = unique_experts.tolist()
-        
-        # Prepare memory-efficient expert loading
-        expert_predictions = {}
-        
-        # Load experts and get predictions
-        for expert_idx in unique_experts:
-            # Get expert model (from cache manager if available)
-            if managed_experts:
-                expert = expert_cache_manager.get_expert(
-                    expert_idx=expert_idx, 
-                    expert_builder=lambda idx: experts[idx] if idx in experts else None
-                )
-            else:
-                expert = experts[expert_idx] if expert_idx in experts else None
-            
-            if expert is None:
-                logger.warning(f"Expert {expert_idx} not found")
-                continue
-            
-            # Run expert with conditioning
-            if use_cfg:
-                # Process conditional
-                with torch.no_grad():
-                    cond_flow = expert(x, t, text_embeddings)
-                    
-                # Process unconditional
-                with torch.no_grad():
-                    uncond_flow = expert(x, t, uncond_embeddings)
-                    
-                # Apply classifier-free guidance
-                expert_flow = uncond_flow + cfg_scale * (cond_flow - uncond_flow)
-            else:
-                # Process without CFG
-                with torch.no_grad():
-                    expert_flow = expert(x, t, text_embeddings)
-            
-            # Save prediction
-            expert_predictions[expert_idx] = expert_flow
-        
-        # Combine expert predictions based on router weights
-        combined_flow = torch.zeros_like(x)
-        
-        for sample_idx in range(batch_size):
-            sample_weights = topk_weights[sample_idx]
-            sample_experts = topk_indices[sample_idx]
-            
-            # Only use available predictions
-            valid_mask = torch.tensor([idx.item() in expert_predictions for idx in sample_experts], 
-                                     device=device)
-            
-            if not valid_mask.any():
-                logger.warning(f"No valid experts for sample {sample_idx}")
-                continue
-                
-            # Renormalize weights for available experts
-            if valid_mask.any():
-                valid_weights = sample_weights[valid_mask]
-                valid_experts = sample_experts[valid_mask]
-                
-                if len(valid_weights) > 0:
-                    valid_weights = valid_weights / valid_weights.sum()
-                    
-                    # Weighted sum of expert predictions
-                    for i, (weight, expert_idx) in enumerate(zip(valid_weights, valid_experts)):
-                        expert_idx = expert_idx.item()
-                        if expert_idx in expert_predictions:
-                            combined_flow[sample_idx] += weight * expert_predictions[expert_idx][sample_idx]
-        
-        # Update samples with combined flow
-        updated_x = update_sample(x, combined_flow, t, t_next)
-        
-        return updated_x
 
 def euler_sample(
     model,

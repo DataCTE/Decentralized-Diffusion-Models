@@ -162,6 +162,154 @@ class DiffusionDistiller:
             ):
                 ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
     
+    def distill_step(self, batch, timesteps=None):
+        """
+        Perform one distillation training step
+        
+        Args:
+            batch: Training batch with images and cluster labels
+            timesteps: Optional specific timesteps to use
+            
+        Returns:
+            loss: Distillation loss
+        """
+        images = batch["image"].to(self.device)
+        cluster_labels = batch["cluster_label"].to(self.device)
+        text_embeddings = batch.get("text_embeddings", None)
+        
+        if text_embeddings is not None:
+            text_embeddings = text_embeddings.to(self.device)
+            
+        batch_size = images.shape[0]
+        
+        # Sample timesteps if not provided
+        if timesteps is None:
+            timesteps = torch.randint(
+                0, self.config.num_diffusion_timesteps, 
+                (batch_size,), 
+                device=self.device
+            )
+        
+        # Get alphas for noise schedule
+        alpha_bar = self.alpha_bar[timesteps].view(-1, 1, 1, 1)
+        
+        # Generate noise
+        noise = torch.randn_like(images)
+        
+        # Create noisy images
+        x_t = torch.sqrt(alpha_bar) * images + torch.sqrt(1 - alpha_bar) * noise
+        
+        # Use multiple teacher experts for each sample
+        with torch.no_grad():
+            # For each sample in the batch
+            teacher_outputs = []
+            
+            # Option 1: Use cluster label to select expert (most efficient)
+            if getattr(self.config, 'distill_use_multiple_experts', False):
+                # Option 2: Use router to select top-k experts (more accurate)
+                router_outputs = self.router(x_t, timesteps, text_embeddings)
+                top_k = min(getattr(self.config, 'distill_top_k', 2), len(self.experts))
+                weights, indices = torch.topk(router_outputs, k=top_k, dim=1)
+                
+                # Normalize weights 
+                weights = F.softmax(weights, dim=1)
+                
+                # Initialize combined teacher output
+                combined_teacher_output = torch.zeros_like(x_t)
+                
+                # Combine outputs from top-k experts
+                for i in range(batch_size):
+                    batch_weights = []
+                    batch_outputs = []
+                    
+                    for k in range(top_k):
+                        expert_idx = indices[i, k].item()
+                        expert_weight = weights[i, k].item()
+                        
+                        # Skip experts with very low weight
+                        if expert_weight < 0.01:
+                            continue
+                            
+                        # Get expert from cache
+                        expert = self.expert_cache.get_expert(
+                            expert_idx,
+                            lambda idx: self.experts[idx]
+                        )
+                        
+                        # Get expert prediction
+                        expert_output = expert(
+                            x_t[i:i+1], 
+                            timesteps[i:i+1], 
+                            text_embeddings[i:i+1] if text_embeddings is not None else None
+                        )
+                        
+                        batch_outputs.append(expert_output)
+                        batch_weights.append(expert_weight)
+                    
+                    # Normalize weights (sum to 1)
+                    if batch_weights:
+                        batch_weights = [w / sum(batch_weights) for w in batch_weights]
+                        
+                        # Weighted combination
+                        for idx, (output, weight) in enumerate(zip(batch_outputs, batch_weights)):
+                            combined_teacher_output[i:i+1] += output * weight
+                
+                teacher_outputs = combined_teacher_output
+            else:
+                # Just use cluster labels to select experts (simpler approach)
+                for i in range(batch_size):
+                    expert_idx = cluster_labels[i].item()
+                    expert = self.expert_cache.get_expert(
+                        expert_idx,
+                        lambda idx: self.experts[idx]
+                    )
+                    
+                    # Get prediction from selected expert
+                    expert_output = expert(
+                        x_t[i:i+1], 
+                        timesteps[i:i+1], 
+                        text_embeddings[i:i+1] if text_embeddings is not None else None
+                    )
+                    
+                    teacher_outputs.append(expert_output)
+                    
+                # Stack outputs if they're in a list
+                if isinstance(teacher_outputs, list):
+                    teacher_outputs = torch.cat(teacher_outputs, dim=0)
+        
+        # Train student (distilled) model
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            # Forward pass
+            student_output = self.distilled_model(x_t, timesteps, text_embeddings)
+            
+            # MSE loss between student and teacher predictions
+            loss = F.mse_loss(student_output, teacher_outputs.detach())
+        
+        # Update model
+        self.optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.distilled_model.parameters(), self.config.max_grad_norm)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.scheduler.step()
+        
+        # Update EMA model
+        self._update_ema()
+        
+        return loss.item()
+    
+    def _update_ema(self):
+        """Update EMA model parameters"""
+        with torch.no_grad():
+            for param, ema_param in zip(
+                self.distilled_model.parameters(), 
+                self.ema_model.parameters()
+            ):
+                ema_param.data.mul_(self.ema_decay).add_(
+                    param.data, alpha=(1 - self.ema_decay)
+                )
+    
     def train(self):
         """Train distilled model from expert ensemble"""
         logger.info("Starting distillation training")

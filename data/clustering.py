@@ -1,7 +1,6 @@
 """Clustering functionality for Decentralized Diffusion Models."""
 
 import torch
-import torch.nn as nn
 import numpy as np
 import time
 import logging
@@ -11,6 +10,7 @@ import hashlib
 import json
 from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans, KMeans, DBSCAN
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
 from data.feature_extractor import DINOv2FeatureExtractor
 from utils.distributed import (
@@ -1195,3 +1195,158 @@ class ClusterManager:
         }
         
         return stats 
+
+    def cluster_data(self, features, num_clusters, algorithm='kmeans', random_state=42):
+        """
+        Cluster data with balancing support
+        
+        Args:
+            features: Feature matrix (n_samples, n_features)
+            num_clusters: Number of clusters
+            algorithm: Clustering algorithm
+            random_state: Random seed
+            
+        Returns:
+            cluster_labels: Cluster assignments for each sample
+            centroids: Cluster centroids
+        """
+        if algorithm == 'kmeans':
+            # Standard k-means clustering
+            kmeans = KMeans(
+                n_clusters=num_clusters,
+                random_state=random_state,
+                n_init=10
+            )
+            cluster_labels = kmeans.fit_predict(features)
+            centroids = kmeans.cluster_centers_
+            
+            # Check for balanced clusters
+            cluster_sizes = np.bincount(cluster_labels, minlength=num_clusters)
+            self.logger.info(f"Initial cluster sizes: {cluster_sizes}")
+            
+            # Balance clusters if severely imbalanced
+            if self._is_severely_imbalanced(cluster_sizes):
+                self.logger.info("Clusters are severely imbalanced, applying balancing procedure")
+                cluster_labels = self._balance_clusters(features, cluster_labels, num_clusters)
+                
+                # Recompute centroids based on new assignments
+                centroids = np.zeros((num_clusters, features.shape[1]))
+                for cluster_idx in range(num_clusters):
+                    mask = cluster_labels == cluster_idx
+                    if np.any(mask):
+                        centroids[cluster_idx] = features[mask].mean(axis=0)
+                
+                # Log balanced sizes
+                balanced_sizes = np.bincount(cluster_labels, minlength=num_clusters)
+                self.logger.info(f"Balanced cluster sizes: {balanced_sizes}")
+                
+        elif algorithm == 'minibatch_kmeans':
+            # Memory-efficient MiniBatch KMeans
+            kmeans = MiniBatchKMeans(
+                n_clusters=num_clusters,
+                random_state=random_state,
+                batch_size=1024,
+                max_iter=100
+            )
+            cluster_labels = kmeans.fit_predict(features)
+            centroids = kmeans.cluster_centers_
+            
+            # Apply balancing as above
+            cluster_sizes = np.bincount(cluster_labels, minlength=num_clusters)
+            self.logger.info(f"Initial cluster sizes: {cluster_sizes}")
+            
+            if self._is_severely_imbalanced(cluster_sizes):
+                self.logger.info("Clusters are severely imbalanced, applying balancing procedure")
+                cluster_labels = self._balance_clusters(features, cluster_labels, num_clusters)
+                
+                # Recompute centroids
+                centroids = np.zeros((num_clusters, features.shape[1]))
+                for cluster_idx in range(num_clusters):
+                    mask = cluster_labels == cluster_idx
+                    if np.any(mask):
+                        centroids[cluster_idx] = features[mask].mean(axis=0)
+                
+                balanced_sizes = np.bincount(cluster_labels, minlength=num_clusters)
+                self.logger.info(f"Balanced cluster sizes: {balanced_sizes}")
+        else:
+            raise ValueError(f"Unsupported clustering algorithm: {algorithm}")
+            
+        return cluster_labels, centroids
+    
+    def _is_severely_imbalanced(self, cluster_sizes, threshold=10.0):
+        """Check if the clusters are severely imbalanced"""
+        if len(cluster_sizes) <= 1:
+            return False
+            
+        max_size = max(cluster_sizes)
+        min_size = min(cluster_sizes)
+        
+        if min_size == 0:
+            return True  # Avoid division by zero
+            
+        # If the ratio between largest and smallest cluster exceeds threshold
+        return max_size / min_size > threshold
+        
+    def _balance_clusters(self, features, cluster_labels, num_clusters):
+        """Balance clusters by reassigning samples from large to small clusters"""
+        cluster_sizes = np.bincount(cluster_labels, minlength=num_clusters)
+        target_size = int(np.mean(cluster_sizes))
+        
+        # Calculate distance to all centroids
+        centroids = np.zeros((num_clusters, features.shape[1]))
+        for cluster_idx in range(num_clusters):
+            mask = cluster_labels == cluster_idx
+            if np.any(mask):
+                centroids[cluster_idx] = features[mask].mean(axis=0)
+        
+        # Find distances from each point to each centroid
+        distances = np.zeros((features.shape[0], num_clusters))
+        for cluster_idx in range(num_clusters):
+            distances[:, cluster_idx] = np.sum((features - centroids[cluster_idx])**2, axis=1)
+            
+        # Create new balanced cluster assignments
+        new_labels = cluster_labels.copy()
+        
+        # Identify large and small clusters
+        large_clusters = [idx for idx, size in enumerate(cluster_sizes) if size > target_size]
+        small_clusters = [idx for idx, size in enumerate(cluster_sizes) if size < target_size]
+        
+        # For each small cluster
+        for small_idx in small_clusters:
+            # How many samples to add to this cluster
+            samples_needed = target_size - cluster_sizes[small_idx]
+            
+            if samples_needed <= 0:
+                continue
+                
+            # For each large cluster, find closest points and reassign
+            for large_idx in large_clusters:
+                # Don't take too many from any one cluster
+                samples_to_take = min(
+                    samples_needed,
+                    cluster_sizes[large_idx] - target_size
+                )
+                
+                if samples_to_take <= 0:
+                    continue
+                    
+                # Find points in large cluster sorted by distance to small cluster
+                in_large_cluster = (cluster_labels == large_idx)
+                distances_to_small = distances[in_large_cluster, small_idx]
+                closest_indices = np.argsort(distances_to_small)
+                
+                # Get actual indices
+                actual_indices = np.where(in_large_cluster)[0][closest_indices[:samples_to_take]]
+                
+                # Reassign these points
+                new_labels[actual_indices] = small_idx
+                
+                # Update counts
+                cluster_sizes[large_idx] -= samples_to_take
+                cluster_sizes[small_idx] += samples_to_take
+                samples_needed -= samples_to_take
+                
+                if samples_needed <= 0:
+                    break
+                    
+        return new_labels 

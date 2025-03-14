@@ -3,6 +3,7 @@
 import math
 import torch
 import os
+import datetime
 
 from data.dataset import DDMDataset
 from data.clustering import ClusterManager
@@ -121,60 +122,25 @@ class DDMTrainingCoordinator:
         
     def safe_synchronize(self, timeout_seconds=60, name="operation"):
         """
-        Safely synchronize all processes with timeout handling
+        Safely synchronize all processes with simplified timeout handling
         
         Args:
             timeout_seconds: Maximum time to wait for synchronization
             name: Name of the operation for logging
         """
         if self.world_size <= 1:
-            return  # No need to synchronize for single-process training
+            return True  # No need to synchronize for single-process training
         
         try:
-            # Use a platform-independent approach for timeouts
-            import threading
-            import time
-            
-            # Track success status
-            success = [False]
-            exception = [None]
-            
-            # Function to run in thread with timeout
-            def sync_with_timeout():
-                try:
-                    # Call the actual synchronization
-                    torch.distributed.barrier()
-                    success[0] = True
-                except Exception as e:
-                    exception[0] = e
-            
-            # Start sync in a thread
-            thread = threading.Thread(target=sync_with_timeout)
-            thread.daemon = True
-            thread.start()
-            
-            # Wait with timeout
-            thread.join(timeout=timeout_seconds)
-            
-            if thread.is_alive():
-                # Thread is still running (timeout occurred)
-                ranks = list(range(self.world_size))
-                ranks.remove(self.rank)
-                self.logger.error(f"Synchronization timeout after {timeout_seconds}s. "
-                                 f"Waiting for ranks {ranks} for {name}")
-                
-                # Continue execution despite timeout
-                # We'll let the thread continue in background
-                return False
-            
-            if not success[0]:
-                # Thread completed but with an error
-                self.logger.error(f"Synchronization failed for '{name}': {str(exception[0])}")
-                return False
-            
+            # Simple barrier with timeout
+            # This handles the synchronization in a clean way
+            torch.distributed.barrier(timeout=datetime.timedelta(seconds=timeout_seconds))
             self.logger.debug(f"Synchronization for '{name}' completed successfully")
             return True
-            
+        except torch.distributed.DistBackendError as e:
+            self.logger.error(f"Synchronization timeout after {timeout_seconds}s for '{name}': {str(e)}")
+            # Attempt recovery by continuing execution
+            return False
         except Exception as e:
             self.logger.error(f"Synchronization error for '{name}': {str(e)}")
             return False

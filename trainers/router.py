@@ -381,3 +381,100 @@ class RouterTrainer:
                 indices = torch.arange(probs.size(1), device=probs.device).expand(probs.size(0), -1)
             
             return weights, indices
+
+    def forward(self, x_t, timesteps, clip_embeddings=None, temperature=1.0):
+        """
+        Forward pass for router model
+        
+        Args:
+            x_t: Noisy data at timestep t
+            timesteps: Timestep values
+            clip_embeddings: Optional text embeddings for conditional generation
+            temperature: Temperature for softmax (higher = more uniform)
+            
+        Returns:
+            expert_weights: Expert selection weights [batch_size, num_experts]
+        """
+        # Get router outputs (logits)
+        router_logits = self.router(x_t, timesteps, clip_embeddings)
+        
+        # Apply temperature scaling and convert to probabilities
+        expert_weights = F.softmax(router_logits / temperature, dim=-1)
+        
+        return expert_weights
+    
+    def predict_expert(self, x_t, timesteps, clip_embeddings=None, temperature=1.0, top_k=1, use_threshold=False, threshold=0.1):
+        """
+        Predict which expert(s) to use for a given input
+        
+        Args:
+            x_t: Noisy data at timestep t
+            timesteps: Timestep values
+            clip_embeddings: Optional text embeddings
+            temperature: Temperature for softmax
+            top_k: Number of top experts to select
+            use_threshold: Whether to use probability threshold
+            threshold: Minimum probability threshold
+            
+        Returns:
+            selected_experts: List of selected expert indices for each batch item
+            expert_weights: Expert weights for each batch item
+        """
+        batch_size = x_t.shape[0]
+        
+        # Get expert weights
+        expert_weights = self.forward(x_t, timesteps, clip_embeddings, temperature)
+        
+        if use_threshold:
+            # Select experts with probability above threshold
+            selected_experts = [
+                torch.where(weights >= threshold)[0].cpu().tolist()
+                for weights in expert_weights
+            ]
+            
+            # Ensure at least one expert is selected
+            for i in range(batch_size):
+                if not selected_experts[i]:
+                    # If no experts selected, use top expert
+                    selected_experts[i] = [torch.argmax(expert_weights[i]).item()]
+        else:
+            # Select top-k experts
+            _, indices = torch.topk(expert_weights, k=min(top_k, expert_weights.size(1)), dim=1)
+            selected_experts = [indices[i].cpu().tolist() for i in range(batch_size)]
+            
+        return selected_experts, expert_weights
+            
+    def train_step(self, x_t, t, cluster_labels, clip_embeddings=None):
+        """
+        Train the router for one step, using cluster labels as supervision
+        
+        Args:
+            x_t: Noisy data at timestep t
+            t: Timestep values
+            cluster_labels: Ground truth cluster labels
+            clip_embeddings: Optional text embeddings
+            
+        Returns:
+            loss: Training loss
+        """
+        # Get router logits
+        router_logits = self.router(x_t, t, clip_embeddings)
+        
+        # Compute cross entropy loss
+        loss = self.criterion(router_logits, cluster_labels)
+        
+        # Apply regularization to prevent overconfidence
+        if getattr(self.config, 'router_entropy_reg', 0.0) > 0:
+            probs = F.softmax(router_logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean()
+            entropy_reg = getattr(self.config, 'router_entropy_reg', 0.0)
+            loss -= entropy_reg * entropy  # Encourage higher entropy (more uniform)
+        
+        # Update model
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.max_grad_norm)
+        self.optimizer.step()
+        self.lr_scheduler.step()
+        
+        return loss.item()

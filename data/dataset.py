@@ -18,6 +18,7 @@ import torchvision.transforms as transforms
 from utils.distributed import is_main_process, get_rank, broadcast_object
 from utils.logging import setup_logger
 from data.transforms import resize_image, normalize
+from utils.distributed import synchronize
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -133,6 +134,132 @@ class DataValidator:
         except Exception:
             # Any error means the image is invalid
             return False
+
+    @classmethod
+    def validate_images_batch(cls, file_paths, min_size=256, max_workers=8):
+        """
+        Validate a batch of images efficiently using multiprocessing
+        
+        Args:
+            file_paths: List of image file paths
+            min_size: Minimum image size to be considered valid
+            max_workers: Maximum number of worker processes
+            
+        Returns:
+            (valid_files, invalid_files): Tuple of lists
+        """
+        import concurrent.futures
+        from functools import partial
+        
+        # Function to validate a single image
+        def _validate_single(img_path, min_size):
+            if img_path in cls._invalid_files_cache:
+                return (False, img_path)
+                
+            if img_path in cls._valid_files_cache:
+                return (True, img_path)
+                
+            try:
+                # Use PIL's lazy loading for faster validation
+                with Image.open(img_path) as img:
+                    # Validate image dimensions
+                    if img.width < min_size or img.height < min_size:
+                        cls._invalid_files_cache.add(img_path)
+                        return (False, img_path)
+                        
+                    # Check if image can be fully loaded
+                    img.load()
+                    
+                    # Valid image
+                    return (True, img_path)
+            except Exception as e:
+                # Invalid image
+                cls._invalid_files_cache.add(img_path)
+                return (False, img_path)
+        
+        # Set up number of workers (limit to CPU count)
+        import os
+        cpu_count = os.cpu_count() or 4
+        workers = min(max_workers, cpu_count)
+        
+        # Process images in parallel
+        valid_files = []
+        invalid_files = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            validator_fn = partial(_validate_single, min_size=min_size)
+            for is_valid, img_path in executor.map(validator_fn, file_paths):
+                if is_valid:
+                    valid_files.append(img_path)
+                    # Add to cache
+                    cls._valid_files_cache[img_path] = True
+                else:
+                    invalid_files.append(img_path)
+                    
+        return valid_files, invalid_files
+        
+    @classmethod
+    def validate_images_efficient(cls, root_dir, extensions=None, min_size=256, batch_size=1000):
+        """
+        Efficiently validate all images in a directory with batched processing and multiprocessing
+        
+        Args:
+            root_dir: Directory containing images
+            extensions: List of valid extensions (default: ['.jpg', '.jpeg', '.png', '.webp'])
+            min_size: Minimum image size to be considered valid
+            batch_size: Number of images to process in a batch
+            
+        Returns:
+            List of valid image files
+        """
+        # Set default extensions if none provided
+        if extensions is None:
+            extensions = ['.jpg', '.jpeg', '.png', '.webp']
+            
+        # Only validate on main process (rank 0) to avoid duplicate work
+        if not is_main_process():
+            # Wait for rank 0 to finish validation
+            synchronize()
+            # Get result from rank 0
+            return broadcast_object([], src=0)
+            
+        logger.info(f"Efficiently validating images in {root_dir}")
+        start_time = time.time()
+        
+        # Get all image files in the directory
+        all_files = []
+        for ext in extensions:
+            all_files.extend(glob.glob(os.path.join(root_dir, f"*{ext}")))
+            all_files.extend(glob.glob(os.path.join(root_dir, f"*{ext.upper()}")))
+            
+        # Process in batches
+        all_valid_files = []
+        total_processed = 0
+        
+        for i in range(0, len(all_files), batch_size):
+            batch = all_files[i:i+batch_size]
+            valid_batch, invalid_batch = cls.validate_images_batch(batch, min_size=min_size)
+            
+            all_valid_files.extend(valid_batch)
+            total_processed += len(batch)
+            
+            # Log progress
+            if total_processed % 10000 == 0 or total_processed == len(all_files):
+                elapsed = time.time() - start_time
+                logger.info(f"Validated {total_processed}/{len(all_files)} images in {elapsed:.2f}s. "
+                           f"{len(all_valid_files)} valid so far.")
+                
+        # Final timing
+        elapsed = time.time() - start_time
+        invalid_count = len(all_files) - len(all_valid_files)
+        logger.info(f"Image validation completed in {elapsed:.2f}s: "
+                   f"{len(all_valid_files)} valid, {invalid_count} invalid")
+                
+        # Synchronize after validation
+        synchronize()
+        
+        # Broadcast to other processes
+        return broadcast_object(all_valid_files, src=0)
 
 class DDMDataset(Dataset):
     """Implementation of dataset from paper with batching by aspect ratio"""
