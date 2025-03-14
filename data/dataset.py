@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+import PIL  # Add direct import of PIL module
 from collections import defaultdict
 import logging
 import time
@@ -65,8 +66,13 @@ class DataValidator:
                 all_files.extend(glob.glob(os.path.join(root_dir, f"*{ext}")))
                 all_files.extend(glob.glob(os.path.join(root_dir, f"*{ext.upper()}")))
             
+            total_files = len(all_files)
+            logger.info(f"Found {total_files} potential image files to validate")
+            last_update_time = time.time()
+            update_interval = 2.0  # Update progress every 2 seconds
+            
             # Check validity of each file
-            for img_path in all_files:
+            for i, img_path in enumerate(all_files):
                 # Skip if already known to be invalid
                 if img_path in cls._invalid_files_cache:
                     invalid_count += 1
@@ -78,6 +84,18 @@ class DataValidator:
                 else:
                     cls._invalid_files_cache.add(img_path)
                     invalid_count += 1
+                
+                # Show progress periodically
+                current_time = time.time()
+                if current_time - last_update_time > update_interval or i == total_files - 1:
+                    progress = (i + 1) / total_files * 100
+                    elapsed = current_time - start_time
+                    remaining = elapsed / (i + 1) * (total_files - i - 1) if i > 0 else 0
+                    
+                    logger.info(f"Validation progress: {progress:.1f}% ({i+1}/{total_files}) - "
+                               f"Valid: {len(valid_files)}, Invalid: {invalid_count} - "
+                               f"Elapsed: {elapsed:.1f}s, Estimated remaining: {remaining:.1f}s")
+                    last_update_time = current_time
             
             # Store valid files in cache
             elapsed = time.time() - start_time
@@ -182,12 +200,22 @@ class DataValidator:
         cpu_count = os.cpu_count() or 4
         workers = min(max_workers, cpu_count)
         
+        batch_size = len(file_paths)
+        logger.debug(f"Validating batch of {batch_size} images with {workers} workers")
+        start_time = time.time()
+        
         # Process images in parallel
         valid_files = []
         invalid_files = []
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             validator_fn = partial(_validate_single, min_size=min_size)
+            
+            # Process files with progress tracking
+            processed = 0
+            last_update_time = time.time()
+            update_interval = 5.0  # Update every 5 seconds for large batches
+            
             for is_valid, img_path in executor.map(validator_fn, file_paths):
                 if is_valid:
                     valid_files.append(img_path)
@@ -195,6 +223,27 @@ class DataValidator:
                     cls._valid_files_cache[img_path] = True
                 else:
                     invalid_files.append(img_path)
+                
+                # Update progress for large batches
+                processed += 1
+                current_time = time.time()
+                if batch_size > 100 and (current_time - last_update_time > update_interval or processed == batch_size):
+                    progress = processed / batch_size * 100
+                    elapsed = current_time - start_time
+                    remaining = (elapsed / processed) * (batch_size - processed) if processed > 0 else 0
+                    speed = processed / elapsed if elapsed > 0 else 0
+                    
+                    logger.debug(f"Batch validation progress: {progress:.1f}% ({processed}/{batch_size}) - "
+                                f"Speed: {speed:.1f} images/sec - "
+                                f"Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s")
+                    last_update_time = current_time
+        
+        # Final timing
+        elapsed = time.time() - start_time
+        if batch_size > 10:  # Only log timing for non-trivial batches
+            speed = batch_size / elapsed if elapsed > 0 else 0
+            logger.debug(f"Batch validation complete: {len(valid_files)} valid, {len(invalid_files)} invalid - "
+                        f"Took {elapsed:.2f}s, Speed: {speed:.1f} images/sec")
                     
         return valid_files, invalid_files
         
@@ -232,28 +281,53 @@ class DataValidator:
             all_files.extend(glob.glob(os.path.join(root_dir, f"*{ext}")))
             all_files.extend(glob.glob(os.path.join(root_dir, f"*{ext.upper()}")))
             
+        total_files = len(all_files)
+        logger.info(f"Found {total_files} potential image files to validate")
+        
         # Process in batches
         all_valid_files = []
         total_processed = 0
+        batch_start_time = time.time()
         
         for i in range(0, len(all_files), batch_size):
             batch = all_files[i:i+batch_size]
+            current_batch_size = len(batch)
+            
+            # Log batch start
+            logger.info(f"Processing batch {i//batch_size + 1}/{(total_files + batch_size - 1)//batch_size} "
+                       f"({i}-{min(i+batch_size, total_files)})")
+            
+            # Process batch
+            batch_start = time.time()
             valid_batch, invalid_batch = cls.validate_images_batch(batch, min_size=min_size)
+            batch_time = time.time() - batch_start
             
             all_valid_files.extend(valid_batch)
             total_processed += len(batch)
             
-            # Log progress
-            if total_processed % 10000 == 0 or total_processed == len(all_files):
-                elapsed = time.time() - start_time
-                logger.info(f"Validated {total_processed}/{len(all_files)} images in {elapsed:.2f}s. "
-                           f"{len(all_valid_files)} valid so far.")
+            # Calculate progress metrics
+            progress = total_processed / total_files * 100
+            elapsed = time.time() - start_time
+            avg_time_per_file = elapsed / total_processed if total_processed > 0 else 0
+            remaining = avg_time_per_file * (total_files - total_processed)
+            
+            # Log detailed progress
+            logger.info(f"Batch completed in {batch_time:.2f}s - "
+                       f"Speed: {current_batch_size/batch_time:.1f} images/sec - "
+                       f"Valid: {len(valid_batch)}, Invalid: {len(invalid_batch)}")
+            
+            logger.info(f"Overall progress: {progress:.1f}% ({total_processed}/{total_files}) - "
+                       f"Valid so far: {len(all_valid_files)} - "
+                       f"Elapsed: {elapsed:.1f}s, Estimated remaining: {remaining:.1f}s")
                 
         # Final timing
         elapsed = time.time() - start_time
-        invalid_count = len(all_files) - len(all_valid_files)
+        invalid_count = total_files - len(all_valid_files)
+        avg_speed = total_files / elapsed if elapsed > 0 else 0
+        
         logger.info(f"Image validation completed in {elapsed:.2f}s: "
-                   f"{len(all_valid_files)} valid, {invalid_count} invalid")
+                   f"{len(all_valid_files)} valid, {invalid_count} invalid - "
+                   f"Average speed: {avg_speed:.1f} images/sec")
                 
         # Synchronize after validation
         synchronize()
@@ -328,31 +402,89 @@ class DDMDataset(Dataset):
         if not os.path.exists(split_path):
             split_path = self.dataset_path  # Try using the main path if split subdirectory doesn't exist
         
+        self.logger.info(f"Loading dataset from {split_path}")
+        start_time = time.time()
+        
         # Get all image files with supported extensions
         supported_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
         self.image_files = []
         
+        # First, count all files to estimate total
+        self.logger.info("Scanning directory for image files...")
+        file_count_start = time.time()
+        total_files_estimate = 0
+        
         for root, _, files in os.walk(split_path):
             for file in files:
                 if any(file.lower().endswith(ext) for ext in supported_extensions):
+                    total_files_estimate += 1
+        
+        self.logger.info(f"Found approximately {total_files_estimate} potential image files in {time.time() - file_count_start:.2f}s")
+        
+        # Now collect the actual files
+        self.logger.info("Collecting image files...")
+        collection_start = time.time()
+        processed_dirs = 0
+        for root, _, files in os.walk(split_path):
+            dir_files = 0
+            for file in files:
+                if any(file.lower().endswith(ext) for ext in supported_extensions):
                     self.image_files.append(os.path.join(root, file))
+                    dir_files += 1
+            
+            if dir_files > 0:
+                processed_dirs += 1
+                self.logger.debug(f"Found {dir_files} images in {root}")
+        
+        collection_time = time.time() - collection_start
+        speed = len(self.image_files) / collection_time if collection_time > 0 else 0
+        self.logger.info(f"Collected {len(self.image_files)} images from {processed_dirs} directories in {collection_time:.2f}s "
+                        f"({speed:.1f} files/sec)")
         
         # Sort for reproducibility
+        self.logger.info("Sorting image files for reproducibility...")
+        sort_start = time.time()
         self.image_files.sort()
+        self.logger.info(f"Sorted {len(self.image_files)} files in {time.time() - sort_start:.2f}s")
         
         # Load captions if available (plain text files with same name as images)
+        self.logger.info("Loading captions...")
+        caption_start = time.time()
         self.captions = []
-        for img_path in self.image_files:
+        caption_count = 0
+        last_update_time = time.time()
+        update_interval = 2.0  # Update progress every 2 seconds
+        
+        for i, img_path in enumerate(self.image_files):
             caption_path = os.path.splitext(img_path)[0] + '.txt'
             if os.path.exists(caption_path):
                 try:
                     with open(caption_path, 'r', encoding='utf-8') as f:
                         caption = f.read().strip()
+                    caption_count += 1
                 except:
                     caption = ""
             else:
                 caption = ""
             self.captions.append(caption)
+            
+            # Show progress periodically for large datasets
+            current_time = time.time()
+            if len(self.image_files) > 1000 and (current_time - last_update_time > update_interval or i == len(self.image_files) - 1):
+                progress = (i + 1) / len(self.image_files) * 100
+                elapsed = current_time - caption_start
+                remaining = elapsed / (i + 1) * (len(self.image_files) - i - 1) if i > 0 else 0
+                
+                self.logger.info(f"Caption loading progress: {progress:.1f}% ({i+1}/{len(self.image_files)}) - "
+                                f"Found {caption_count} captions - "
+                                f"Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s")
+                last_update_time = current_time
+        
+        caption_time = time.time() - caption_start
+        total_time = time.time() - start_time
+        
+        self.logger.info(f"Loaded {caption_count}/{len(self.image_files)} captions in {caption_time:.2f}s")
+        self.logger.info(f"Dataset loading completed in {total_time:.2f}s")
     
     def _load_from_huggingface(self):
         """Load dataset from HuggingFace datasets"""
@@ -436,6 +568,12 @@ class DDMDataset(Dataset):
         # Process images and assign to buckets
         bucket_indices = {i: [] for i in range(len(buckets))}
         
+        self.logger.info(f"Assigning {len(self.image_files)} images to {len(buckets)} aspect ratio buckets")
+        start_time = time.time()
+        total_images = len(self.image_files)
+        last_update_time = time.time()
+        update_interval = 2.0  # Update progress every 2 seconds
+        
         for idx, img_path in enumerate(self.image_files):
             try:
                 # Get image dimensions
@@ -461,6 +599,19 @@ class DDMDataset(Dataset):
                 # Add to bucket
                 bucket_indices[closest_bucket].append(idx)
                 
+                # Show progress periodically
+                current_time = time.time()
+                if current_time - last_update_time > update_interval or idx == total_images - 1:
+                    progress = (idx + 1) / total_images * 100
+                    elapsed = current_time - start_time
+                    remaining = elapsed / (idx + 1) * (total_images - idx - 1) if idx > 0 else 0
+                    speed = (idx + 1) / elapsed if elapsed > 0 else 0
+                    
+                    self.logger.info(f"Bucket assignment progress: {progress:.1f}% ({idx+1}/{total_images}) - "
+                                     f"Speed: {speed:.1f} images/sec - "
+                                     f"Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s")
+                    last_update_time = current_time
+                
             except Exception as e:
                 # Skip problematic images
                 self.logger.warning(f"Error processing image {img_path}: {e}")
@@ -470,9 +621,16 @@ class DDMDataset(Dataset):
         self.bucket_indices = bucket_indices
         
         # Log bucket sizes
+        bucket_stats = []
+        elapsed = time.time() - start_time
         for i, (w, h) in enumerate(buckets):
             count = len(bucket_indices[i])
-            self.logger.info(f"Bucket {i} ({w}x{h}): {count} images")
+            percent = count / total_images * 100 if total_images > 0 else 0
+            bucket_stats.append(f"Bucket {i} ({w}x{h}): {count} images ({percent:.1f}%)")
+            self.logger.info(f"Bucket {i} ({w}x{h}): {count} images ({percent:.1f}%)")
+        
+        self.logger.info(f"Bucket assignment completed in {elapsed:.2f}s - " 
+                         f"Processed {total_images} images at {total_images/elapsed:.1f} images/sec")
     
     def _init_bucket_assignments(self):
         """Initialize bucket assignments for efficient batching"""

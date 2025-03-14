@@ -29,24 +29,23 @@ class FeatureExtractor:
         should_log = log_progress and (not dist.is_initialized() or dist.get_rank() == 0)
         
         if should_log:
-            logger.info(f"Starting feature extraction on {total_images:,} images")
-            logger.info(f"Process will take approximately {total_images * 0.01 / max(1, dist.get_world_size()):.1f} minutes (estimate)")
+            logger.info(f"Starting feature extraction on {total_images:,} images in {total_batches:,} batches")
+            logger.info(f"Using device: {self.device}")
+            # More accurate estimate based on typical processing speeds (can be adjusted based on hardware)
+            est_images_per_sec = 100 if torch.cuda.is_available() else 10  # Rough estimate
+            est_minutes = total_images / (est_images_per_sec * 60 * max(1, dist.get_world_size() if dist.is_initialized() else 1))
+            logger.info(f"Estimated time: {est_minutes:.1f} minutes ({est_images_per_sec} images/sec)")
             
-        log_interval = max(1, total_batches // 20)  # Log 20 times during extraction
+        # Adaptive logging interval - more frequent updates for small datasets, fewer for large ones
+        log_interval = max(1, min(total_batches // 20, 10))  # Log at least 20 times, but not more often than every 10 batches
+        
+        # Track batch processing times for better estimates
+        batch_times = []
+        last_update_time = time.time()
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(dataloader):
-                # Log progress periodically
-                if should_log and (batch_idx % log_interval == 0 or batch_idx == total_batches - 1):
-                    elapsed = time.time() - start_time
-                    images_per_sec = processed_images / max(1, elapsed)
-                    progress = batch_idx / max(1, total_batches) * 100
-                    eta = (total_batches - batch_idx) / max(1, batch_idx) * elapsed if batch_idx > 0 else 0
-                    logger.info(f"Feature extraction: {progress:.1f}% complete | "
-                                f"Batch {batch_idx+1}/{total_batches} | "
-                                f"Images: {processed_images:,}/{total_images:,} | "
-                                f"Speed: {images_per_sec:.1f} img/s | "
-                                f"ETA: {eta/60:.1f} min")
+                batch_start = time.time()
                 
                 # Process batch
                 try:
@@ -55,11 +54,62 @@ class FeatureExtractor:
                         images = batch['image'].to(self.device)
                     else:
                         images = batch.to(self.device)
-                        
+                    
+                    batch_size = len(images)
+                    
                     # Extract features
                     batch_features = self.extract_batch(images)
                     features.append(batch_features)
-                    processed_images += len(images)
+                    processed_images += batch_size
+                    
+                    # Record batch processing time
+                    batch_end = time.time()
+                    batch_time = batch_end - batch_start
+                    batch_times.append((batch_size, batch_time))
+                    
+                    # Keep only recent batch times for more accurate estimates
+                    if len(batch_times) > 50:
+                        batch_times = batch_times[-50:]
+                    
+                    # Log progress periodically or if it's been a while since last update
+                    current_time = time.time()
+                    time_since_update = current_time - last_update_time
+                    should_update = (batch_idx % log_interval == 0 or 
+                                     batch_idx == total_batches - 1 or
+                                     time_since_update > 30)  # Force update every 30 seconds
+                    
+                    if should_log and should_update:
+                        # Calculate statistics
+                        elapsed = current_time - start_time
+                        images_per_sec = processed_images / max(1, elapsed)
+                        progress = (batch_idx + 1) / max(1, total_batches) * 100
+                        
+                        # Calculate ETA based on recent batch times for more accuracy
+                        if batch_times:
+                            # Calculate average time per image from recent batches
+                            total_batch_images = sum(size for size, _ in batch_times)
+                            total_batch_time = sum(time for _, time in batch_times)
+                            avg_time_per_image = total_batch_time / max(1, total_batch_images)
+                            
+                            # Estimate remaining time
+                            remaining_images = total_images - processed_images
+                            eta = avg_time_per_image * remaining_images
+                        else:
+                            # Fallback to simple estimate
+                            eta = (total_batches - batch_idx - 1) / max(1, batch_idx + 1) * elapsed if batch_idx > 0 else 0
+                        
+                        # Format time as hours:minutes:seconds
+                        eta_str = f"{int(eta // 3600):02d}:{int((eta % 3600) // 60):02d}:{int(eta % 60):02d}"
+                        elapsed_str = f"{int(elapsed // 3600):02d}:{int((elapsed % 3600) // 60):02d}:{int(elapsed % 60):02d}"
+                        
+                        logger.info(f"Feature extraction: {progress:.1f}% complete | "
+                                    f"Batch {batch_idx+1}/{total_batches} | "
+                                    f"Images: {processed_images:,}/{total_images:,} | "
+                                    f"Speed: {images_per_sec:.1f} img/s | "
+                                    f"Elapsed: {elapsed_str} | ETA: {eta_str}")
+                        
+                        last_update_time = current_time
+                        
                 except Exception as e:
                     logger.error(f"Error in feature extraction at batch {batch_idx}: {str(e)}")
                     continue
@@ -67,13 +117,21 @@ class FeatureExtractor:
         # Final stats
         if should_log:
             total_time = time.time() - start_time
-            logger.info(f"Feature extraction complete: {processed_images:,} images processed in {total_time/60:.1f} minutes "
-                      f"({processed_images/total_time:.1f} images/sec)")
+            hours, remainder = divmod(total_time, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            time_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+            
+            logger.info(f"Feature extraction complete: {processed_images:,}/{total_images:,} images processed in {time_str} "
+                       f"({processed_images/total_time:.1f} images/sec)")
                 
         # Synchronize before continuing
         if dist.is_initialized():
             dist.barrier()
         
+        if len(features) == 0:
+            logger.warning("No features were extracted! Returning empty tensor.")
+            return torch.zeros((0, 1)).numpy()
+            
         return torch.cat(features).cpu().numpy()
 
 

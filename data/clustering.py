@@ -1207,155 +1207,337 @@ class ClusterManager:
 
     def cluster_data(self, features, num_clusters, algorithm='kmeans', random_state=42):
         """
-        Cluster data with balancing support
+        Cluster feature data using specified algorithm
         
         Args:
-            features: Feature matrix (n_samples, n_features)
-            num_clusters: Number of clusters
-            algorithm: Clustering algorithm
-            random_state: Random seed
+            features: Feature array to cluster
+            num_clusters: Number of clusters to create
+            algorithm: Clustering algorithm to use ('kmeans', 'minibatch_kmeans', 'gmm', 'dbscan')
+            random_state: Random seed for reproducibility
             
         Returns:
-            cluster_labels: Cluster assignments for each sample
-            centroids: Cluster centroids
+            Tuple of (cluster_labels, centroids, clustering_model)
         """
+        start_time = time.time()
+        self.logger.info(f"Starting clustering using {algorithm} algorithm for {num_clusters} clusters "
+                         f"on {features.shape[0]} samples with {features.shape[1]} features")
+        
+        # Choose algorithm and cluster
         if algorithm == 'kmeans':
-            # Standard k-means clustering
-            kmeans = KMeans(
-                n_clusters=num_clusters,
-                random_state=random_state,
-                n_init=10
-            )
-            cluster_labels = kmeans.fit_predict(features)
-            centroids = kmeans.cluster_centers_
+            # Regular KMeans - good quality but slow for large datasets
+            self.logger.info(f"Using KMeans with {num_clusters} clusters")
             
-            # Check for balanced clusters
-            cluster_sizes = np.bincount(cluster_labels, minlength=num_clusters)
-            self.logger.info(f"Initial cluster sizes: {cluster_sizes}")
+            # Get batch size from config or use default
+            batch_size = getattr(self.config, 'kmeans_batch_size', 1024)
+            algorithm_start = time.time()
             
-            # Balance clusters if severely imbalanced
-            if self._is_severely_imbalanced(cluster_sizes):
-                self.logger.info("Clusters are severely imbalanced, applying balancing procedure")
-                cluster_labels = self._balance_clusters(features, cluster_labels, num_clusters)
+            # For large datasets, use mini-batch with increasingly larger batches
+            if features.shape[0] > 100000:
+                self.logger.info(f"Large dataset with {features.shape[0]} samples detected, using progressive mini-batch approach")
                 
-                # Recompute centroids based on new assignments
-                centroids = np.zeros((num_clusters, features.shape[1]))
-                for cluster_idx in range(num_clusters):
-                    mask = cluster_labels == cluster_idx
-                    if np.any(mask):
-                        centroids[cluster_idx] = features[mask].mean(axis=0)
+                # Initial model with small batches
+                self.logger.info("Phase 1: Initial clustering with small batches")
+                phase1_start = time.time()
+                kmeans = MiniBatchKMeans(
+                    n_clusters=num_clusters,
+                    batch_size=min(batch_size, features.shape[0]//10),
+                    init='k-means++',
+                    max_iter=100,
+                    random_state=random_state
+                )
+                kmeans.fit(features)
+                phase1_time = time.time() - phase1_start
                 
-                # Log balanced sizes
-                balanced_sizes = np.bincount(cluster_labels, minlength=num_clusters)
-                self.logger.info(f"Balanced cluster sizes: {balanced_sizes}")
+                # Refine with larger batches
+                self.logger.info(f"Phase 1 completed in {phase1_time:.2f}s. Phase 2: Refining with larger batches")
+                phase2_start = time.time()
+                kmeans = MiniBatchKMeans(
+                    n_clusters=num_clusters,
+                    batch_size=min(batch_size*4, features.shape[0]//5),
+                    init=kmeans.cluster_centers_,
+                    max_iter=50,
+                    random_state=random_state
+                )
+                kmeans.fit(features)
+                phase2_time = time.time() - phase2_start
                 
-        elif algorithm == 'minibatch_kmeans':
-            # Memory-efficient MiniBatch KMeans
-            kmeans = MiniBatchKMeans(
-                n_clusters=num_clusters,
-                random_state=random_state,
-                batch_size=1024,
-                max_iter=100
-            )
-            cluster_labels = kmeans.fit_predict(features)
-            centroids = kmeans.cluster_centers_
-            
-            # Apply balancing as above
-            cluster_sizes = np.bincount(cluster_labels, minlength=num_clusters)
-            self.logger.info(f"Initial cluster sizes: {cluster_sizes}")
-            
-            if self._is_severely_imbalanced(cluster_sizes):
-                self.logger.info("Clusters are severely imbalanced, applying balancing procedure")
-                cluster_labels = self._balance_clusters(features, cluster_labels, num_clusters)
+                # Final refinement
+                self.logger.info(f"Phase 2 completed in {phase2_time:.2f}s. Phase 3: Final refinement")
+                phase3_start = time.time()
+                kmeans = KMeans(
+                    n_clusters=num_clusters,
+                    init=kmeans.cluster_centers_,
+                    max_iter=10,
+                    n_init=1,
+                    random_state=random_state
+                )
+                kmeans.fit(features)
+                phase3_time = time.time() - phase3_start
+                self.logger.info(f"Phase 3 completed in {phase3_time:.2f}s")
                 
-                # Recompute centroids
-                centroids = np.zeros((num_clusters, features.shape[1]))
-                for cluster_idx in range(num_clusters):
-                    mask = cluster_labels == cluster_idx
-                    if np.any(mask):
-                        centroids[cluster_idx] = features[mask].mean(axis=0)
+            else:
+                # Regular KMeans for smaller datasets with progress updates
+                self.logger.info(f"Using standard KMeans for dataset with {features.shape[0]} samples")
                 
-                balanced_sizes = np.bincount(cluster_labels, minlength=num_clusters)
-                self.logger.info(f"Balanced cluster sizes: {balanced_sizes}")
-        else:
-            raise ValueError(f"Unsupported clustering algorithm: {algorithm}")
-            
-        return cluster_labels, centroids
-    
-    def _is_severely_imbalanced(self, cluster_sizes, threshold=10.0):
-        """Check if the clusters are severely imbalanced"""
-        if len(cluster_sizes) <= 1:
-            return False
-            
-        max_size = max(cluster_sizes)
-        min_size = min(cluster_sizes)
-        
-        if min_size == 0:
-            return True  # Avoid division by zero
-            
-        # If the ratio between largest and smallest cluster exceeds threshold
-        return max_size / min_size > threshold
-        
-    def _balance_clusters(self, features, cluster_labels, num_clusters):
-        """Balance clusters by reassigning samples from large to small clusters"""
-        cluster_sizes = np.bincount(cluster_labels, minlength=num_clusters)
-        target_size = int(np.mean(cluster_sizes))
-        
-        # Calculate distance to all centroids
-        centroids = np.zeros((num_clusters, features.shape[1]))
-        for cluster_idx in range(num_clusters):
-            mask = cluster_labels == cluster_idx
-            if np.any(mask):
-                centroids[cluster_idx] = features[mask].mean(axis=0)
-        
-        # Find distances from each point to each centroid
-        distances = np.zeros((features.shape[0], num_clusters))
-        for cluster_idx in range(num_clusters):
-            distances[:, cluster_idx] = np.sum((features - centroids[cluster_idx])**2, axis=1)
-            
-        # Create new balanced cluster assignments
-        new_labels = cluster_labels.copy()
-        
-        # Identify large and small clusters
-        large_clusters = [idx for idx, size in enumerate(cluster_sizes) if size > target_size]
-        small_clusters = [idx for idx, size in enumerate(cluster_sizes) if size < target_size]
-        
-        # For each small cluster
-        for small_idx in small_clusters:
-            # How many samples to add to this cluster
-            samples_needed = target_size - cluster_sizes[small_idx]
-            
-            if samples_needed <= 0:
-                continue
+                # Custom implementation with progress tracking for standard KMeans
+                # We can't directly modify sklearn's implementation, so we'll track iterations externally
                 
-            # For each large cluster, find closest points and reassign
-            for large_idx in large_clusters:
-                # Don't take too many from any one cluster
-                samples_to_take = min(
-                    samples_needed,
-                    cluster_sizes[large_idx] - target_size
+                # Initialize with k-means++
+                self.logger.info("Initializing clusters with k-means++")
+                init_start = time.time()
+                kmeans = KMeans(
+                    n_clusters=num_clusters,
+                    init='k-means++',
+                    max_iter=300,
+                    n_init=10 if features.shape[0] < 50000 else 3,  # More initializations for smaller datasets
+                    random_state=random_state,
+                    verbose=0
                 )
                 
-                if samples_to_take <= 0:
-                    continue
+                # Use a trick to monitor progress - create a callback for verbose output
+                from sklearn.utils.validation import check_is_fitted
+                orig_fit = kmeans.fit
+                
+                def verbose_fit(X, y=None, sample_weight=None):
+                    """Wrapper around KMeans fit method to add progress updates"""
+                    self.logger.info(f"Starting KMeans fitting with {kmeans.max_iter} max iterations")
+                    fit_start = time.time()
                     
-                # Find points in large cluster sorted by distance to small cluster
-                in_large_cluster = (cluster_labels == large_idx)
-                distances_to_small = distances[in_large_cluster, small_idx]
-                closest_indices = np.argsort(distances_to_small)
-                
-                # Get actual indices
-                actual_indices = np.where(in_large_cluster)[0][closest_indices[:samples_to_take]]
-                
-                # Reassign these points
-                new_labels[actual_indices] = small_idx
-                
-                # Update counts
-                cluster_sizes[large_idx] -= samples_to_take
-                cluster_sizes[small_idx] += samples_to_take
-                samples_needed -= samples_to_take
-                
-                if samples_needed <= 0:
-                    break
+                    # Call original fit method
+                    result = orig_fit(X, y, sample_weight)
                     
-        return new_labels 
+                    # Log completion
+                    fit_time = time.time() - fit_start
+                    n_iter = kmeans.n_iter_
+                    self.logger.info(f"KMeans fitting completed in {fit_time:.2f}s after {n_iter} iterations "
+                                    f"({fit_time/n_iter:.2f}s per iteration)")
+                    return result
+                
+                kmeans.fit = verbose_fit
+                kmeans.fit(features)
+                
+            # Get results
+            labels = kmeans.labels_
+            centroids = kmeans.cluster_centers_
+            
+            # Calculate metrics
+            inertia = kmeans.inertia_
+            iterations = kmeans.n_iter_
+            
+            # Log clustering stats
+            algorithm_time = time.time() - algorithm_start
+            self.logger.info(f"KMeans clustering completed in {algorithm_time:.2f}s after {iterations} iterations "
+                           f"with inertia {inertia:.2f}")
+            
+        elif algorithm == 'minibatch_kmeans':
+            # MiniBatch KMeans - faster but less accurate
+            self.logger.info(f"Using MiniBatchKMeans with {num_clusters} clusters")
+            batch_size = min(getattr(self.config, 'minibatch_size', 1024), features.shape[0])
+            
+            algorithm_start = time.time()
+            self.logger.info(f"Using batch size of {batch_size} samples")
+            
+            # Calculate total iterations and time estimate
+            max_iter = 300
+            n_batches = features.shape[0] // batch_size + (1 if features.shape[0] % batch_size > 0 else 0)
+            self.logger.info(f"Will process approximately {n_batches} batches per iteration, "
+                            f"with up to {max_iter} iterations")
+            
+            # Initialize and fit
+            kmeans = MiniBatchKMeans(
+                n_clusters=num_clusters,
+                batch_size=batch_size,
+                max_iter=max_iter,
+                init='k-means++',
+                reassignment_ratio=0.01,
+                random_state=random_state,
+                verbose=0
+            )
+            
+            # Monitor time
+            last_log_time = time.time()
+            log_interval = 5.0  # Log every 5 seconds
+            
+            # Fit in smaller chunks to track progress
+            n_samples = features.shape[0]
+            chunk_size = min(10000, n_samples)
+            n_chunks = (n_samples + chunk_size - 1) // chunk_size
+            
+            self.logger.info(f"Fitting in {n_chunks} chunks of {chunk_size} samples for better progress tracking")
+            
+            for i in range(0, n_samples, chunk_size):
+                chunk_end = min(i + chunk_size, n_samples)
+                chunk_features = features[i:chunk_end]
+                
+                # Fit this chunk
+                chunk_start = time.time()
+                kmeans = kmeans.partial_fit(chunk_features)
+                chunk_time = time.time() - chunk_start
+                
+                # Log progress
+                current_time = time.time()
+                if current_time - last_log_time > log_interval or chunk_end == n_samples:
+                    progress = chunk_end / n_samples * 100
+                    elapsed = current_time - algorithm_start
+                    remaining = (elapsed / chunk_end) * (n_samples - chunk_end) if chunk_end > 0 else 0
+                    
+                    self.logger.info(f"MiniBatchKMeans progress: {progress:.1f}% ({chunk_end}/{n_samples}) - "
+                                   f"Current inertia: {kmeans.inertia_:.2f} - "
+                                   f"Elapsed: {elapsed:.2f}s, Estimated remaining: {remaining:.2f}s")
+                    last_log_time = current_time
+            
+            # Get results
+            labels = kmeans.labels_
+            centroids = kmeans.cluster_centers_
+            
+            # Log final stats
+            algorithm_time = time.time() - algorithm_start
+            self.logger.info(f"MiniBatchKMeans completed in {algorithm_time:.2f}s with final inertia {kmeans.inertia_:.2f}")
+            
+        elif algorithm == 'gmm':
+            # Gaussian Mixture Model
+            self.logger.info(f"Using Gaussian Mixture Model with {num_clusters} components")
+            algorithm_start = time.time()
+            
+            # Initialize model with progress monitoring
+            gmm = GaussianMixture(
+                n_components=num_clusters,
+                covariance_type='full',
+                max_iter=100,
+                random_state=random_state,
+                verbose=0
+            )
+            
+            # Fit model
+            fit_start = time.time()
+            gmm.fit(features)
+            fit_time = time.time() - fit_start
+            
+            # Get results
+            labels = gmm.predict(features)
+            centroids = gmm.means_
+            
+            # Log clustering stats
+            algorithm_time = time.time() - algorithm_start
+            self.logger.info(f"GMM clustering completed in {algorithm_time:.2f}s after {gmm.n_iter_} iterations "
+                           f"with log-likelihood {gmm.score(features):.2f}")
+            
+        elif algorithm == 'dbscan':
+            # DBSCAN (Density-Based Spatial Clustering of Applications with Noise)
+            self.logger.info("Using DBSCAN for density-based clustering")
+            algorithm_start = time.time()
+            
+            # Calculate epsilon based on feature dimensionality and dataset size
+            from sklearn.neighbors import NearestNeighbors
+            sample_size = min(10000, features.shape[0])  # Sample for epsilon calculation
+            
+            self.logger.info(f"Calculating epsilon parameter using {sample_size} samples...")
+            epsilon_start = time.time()
+            
+            # Sample data
+            indices = np.random.choice(features.shape[0], sample_size, replace=False)
+            sample_features = features[indices]
+            
+            # Find distances to nearest neighbors
+            nn = NearestNeighbors(n_neighbors=2)
+            nn.fit(sample_features)
+            distances, _ = nn.kneighbors(sample_features)
+            
+            # Sort distances to find "elbow" point
+            distances = np.sort(distances[:, 1])
+            
+            # Simple automatic epsilon selection based on distance distribution
+            epsilon = np.percentile(distances, 95)  # Use 95th percentile as cutoff
+            
+            epsilon_time = time.time() - epsilon_start
+            self.logger.info(f"Calculated epsilon = {epsilon:.4f} in {epsilon_time:.2f}s")
+            
+            # Adjust min_samples based on dataset size
+            min_samples = max(5, int(np.log(features.shape[0])))
+            self.logger.info(f"Using min_samples = {min_samples}")
+            
+            # Run DBSCAN
+            fit_start = time.time()
+            dbscan = DBSCAN(
+                eps=epsilon,
+                min_samples=min_samples,
+                metric='euclidean',
+                n_jobs=-1
+            )
+            
+            self.logger.info(f"Starting DBSCAN fitting...")
+            dbscan.fit(features)
+            fit_time = time.time() - fit_start
+            
+            # Get results
+            labels = dbscan.labels_
+            
+            # Handle noise points (labeled as -1) by assigning to nearest cluster
+            noise_mask = labels == -1
+            noise_count = np.sum(noise_mask)
+            
+            if noise_count > 0:
+                self.logger.info(f"Found {noise_count} noise points ({noise_count/features.shape[0]:.1%}), "
+                               f"assigning to nearest clusters...")
+                
+                # Get non-noise cluster indices and compute centroids
+                cluster_indices = np.unique(labels[~noise_mask])
+                centroids = np.array([features[labels == i].mean(axis=0) for i in cluster_indices])
+                
+                # For each noise point, find nearest centroid
+                noise_features = features[noise_mask]
+                for i, feat in enumerate(noise_features):
+                    # Compute distances to all centroids
+                    distances = np.linalg.norm(centroids - feat, axis=1)
+                    nearest_cluster = cluster_indices[np.argmin(distances)]
+                    
+                    # Assign to nearest cluster
+                    labels[np.where(noise_mask)[0][i]] = nearest_cluster
+                
+                self.logger.info(f"Reassigned all noise points to nearest clusters")
+            else:
+                # Compute centroids
+                cluster_indices = np.unique(labels)
+                centroids = np.array([features[labels == i].mean(axis=0) for i in cluster_indices])
+            
+            # If too few clusters, fall back to KMeans
+            if len(cluster_indices) < num_clusters / 2:
+                self.logger.warning(f"DBSCAN found only {len(cluster_indices)} clusters, "
+                                 f"falling back to KMeans for {num_clusters} clusters")
+                return self.cluster_data(features, num_clusters, algorithm='kmeans', random_state=random_state)
+            
+            # Log clustering stats
+            algorithm_time = time.time() - algorithm_start
+            self.logger.info(f"DBSCAN clustering completed in {algorithm_time:.2f}s with {len(cluster_indices)} clusters")
+            
+        else:
+            raise ValueError(f"Unknown clustering algorithm: {algorithm}")
+        
+        # Verify cluster assignments
+        unique_labels = np.unique(labels)
+        self.logger.info(f"Found {len(unique_labels)} unique clusters")
+        
+        # Calculate and log cluster sizes
+        cluster_sizes = np.bincount(labels.astype(np.int64))
+        smallest = np.min(cluster_sizes)
+        largest = np.max(cluster_sizes)
+        mean_size = np.mean(cluster_sizes)
+        median_size = np.median(cluster_sizes)
+        
+        self.logger.info(f"Cluster sizes - Min: {smallest}, Max: {largest}, Mean: {mean_size:.1f}, Median: {median_size:.1f}")
+        
+        # Calculate silhouette score if dataset is not too large
+        if features.shape[0] <= 10000:  # Only compute for smaller datasets
+            try:
+                sample_size = min(5000, features.shape[0])
+                sample_indices = np.random.choice(features.shape[0], sample_size, replace=False)
+                silhouette = silhouette_score(features[sample_indices], labels[sample_indices])
+                self.logger.info(f"Silhouette score (on {sample_size} samples): {silhouette:.4f}")
+            except Exception as e:
+                self.logger.warning(f"Could not compute silhouette score: {str(e)}")
+        
+        # Log total time
+        total_time = time.time() - start_time
+        self.logger.info(f"Total clustering process completed in {total_time:.2f}s")
+        
+        return labels, centroids, locals().get(algorithm, None)  # Return local variable with algorithm name 
