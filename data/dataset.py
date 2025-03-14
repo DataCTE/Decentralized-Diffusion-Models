@@ -12,6 +12,7 @@ from sklearn.cluster import MiniBatchKMeans
 import logging
 import torch.distributed as dist
 import time
+from utils.distributed import broadcast_object, broadcast_tensor
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -21,49 +22,54 @@ handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s -
 logger.addHandler(handler)
 
 class DDMDataset(Dataset):
-    """Dataset with cluster assignments and multi-resolution buckets for DDM training"""
+    """Implementation of dataset from paper with batching by aspect ratio"""
+    
     def __init__(self, root_dir, transform=None, cluster_labels=None, include_metadata=True):
+        """
+        Initialize dataset with cluster assignments from ClusterManager
+        
+        Args:
+            root_dir: Directory containing images
+            transform: Optional transforms to apply
+            cluster_labels: Pre-computed cluster labels from ClusterManager
+            include_metadata: Whether to include image metadata
+        """
         self.root = root_dir
         self.transform = transform
+        self.cluster_labels = None
         self.include_metadata = include_metadata
         
-        # Validate and filter image files
-        if dist.get_rank() == 0:  # Only validate on main process
-            logger.info("Initializing DDMDataset and validating images...")
-            self.image_files = self._validate_files()
-            logger.info(f"DDMDataset initialized with {len(self.image_files)} valid images")
+        start_time = time.time()
+        
+        # Validate files first
+        self.image_files = self._validate_files()
+        
+        # Initialize cluster labels
+        if cluster_labels is not None:
+            self._init_shared_clusters(cluster_labels)
+        
+        # Generate buckets for aspect ratio batching
+        self.sizes = self._collect_image_sizes()
+        self.buckets = self._generate_dynamic_buckets()
+        self.bucket_indices = self._init_bucket_assignments()
+        
+        # Load captions if needed
+        self.captions = {}
+        if include_metadata:
+            self._load_metadata()
             
-            # Broadcast validated files to all processes
-            files_tensor = torch.tensor(len(self.image_files), device='cuda')
-            dist.broadcast(files_tensor, 0)
-        else:
-            files_tensor = torch.tensor(0, device='cuda')
-            dist.broadcast(files_tensor, 0)
-            self.image_files = [None] * files_tensor.item()
-
-        # Distributed synchronization point
-        dist.barrier()
-        logger.info(f"Rank {dist.get_rank()} synchronized at {time.asctime()}")
-
-        # Only main process needs to extract captions and sizes
-        if dist.get_rank() == 0:
-            self.captions = self._extract_captions()
-            self.actual_sizes = self._collect_image_sizes()
-            self.buckets = self._generate_dynamic_buckets()
-        else:
-            self.captions = {}
-            self.actual_sizes = []
-            self.buckets = []
-
-        # Initialize cluster labels from shared memory
-        self.cluster_labels = self._init_shared_clusters(cluster_labels)
-        self._init_bucket_assignments()
+        logger.info(f"Dataset initialized in {time.time() - start_time:.1f} seconds")
+        logger.info(f"Found {len(self.image_files):,} valid images in {len(self.buckets)} aspect ratio buckets")
 
     def _init_shared_clusters(self, cluster_labels):
-        """Initialize cluster labels using shared memory"""
-        if cluster_labels is None:
-            return torch.zeros(len(self), dtype=torch.long)
-        return cluster_labels
+        """Set cluster labels from ClusterManager without duplicating logic"""
+        if len(cluster_labels) != len(self.image_files):
+            logger.warning(f"Cluster label count ({len(cluster_labels)}) doesn't match image count ({len(self.image_files)})")
+            # Truncate to match valid images
+            cluster_labels = cluster_labels[:len(self.image_files)]
+            
+        self.cluster_labels = cluster_labels
+        logger.info(f"Initialized {len(self.cluster_labels)} cluster assignments")
 
     def _init_bucket_assignments(self):
         """Distribute bucket assignments across processes"""
@@ -137,12 +143,12 @@ class DDMDataset(Dataset):
 
     def _generate_dynamic_buckets(self, num_buckets=20):
         """Generate buckets based on actual image size distribution"""
-        if len(self.actual_sizes) == 0:
+        if len(self.sizes) == 0:
             return [(512, 512)]
             
         # Cluster similar sizes using K-means
-        kmeans = MiniBatchKMeans(n_clusters=min(num_buckets, len(self.actual_sizes)))
-        kmeans.fit(self.actual_sizes)
+        kmeans = MiniBatchKMeans(n_clusters=min(num_buckets, len(self.sizes)))
+        kmeans.fit(self.sizes)
         
         # Get cluster centers and round to nearest 256 (VAE downscale * patch size)
         buckets = []
@@ -253,17 +259,28 @@ class FeatureDataset(Dataset):
             self.image_files = self._validate_files()
             logger.info(f"Validation complete in {time.time() - start_time:.1f} seconds")
             logger.info(f"Broadcasting dataset structure to all processes")
-            files_tensor = torch.tensor(len(self.image_files), device='cuda')
-            dist.broadcast(files_tensor, 0)
-        else:
-            files_tensor = torch.tensor(0, device='cuda')
-            dist.broadcast(files_tensor, 0)
-            self.image_files = [None] * files_tensor.item()
-
-        # Synchronize processes
-        dist.barrier()
-        if dist.get_rank() == 0:
-            logger.info(f"All processes synchronized after validation")
+        
+        # Broadcast validated files to all processes
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                # Broadcast the number of files first
+                num_files = torch.tensor(len(self.image_files), device='cuda')
+                dist.broadcast(num_files, 0)
+                # Broadcast the actual files
+                self.image_files = broadcast_object(self.image_files, src_rank=0)
+            else:
+                # Receive number of files
+                num_files = torch.tensor(0, device='cuda')
+                dist.broadcast(num_files, 0)
+                # Receive the actual files
+                self.image_files = broadcast_object(None, src_rank=0)
+                
+            # Synchronize processes
+            dist.barrier()
+            if dist.get_rank() == 0:
+                logger.info(f"All processes synchronized with {len(self.image_files)} image files")
+        elif dist.get_rank() == 0:
+            self.image_files = self._validate_files()
 
         self.dino_size = self.config.dino_size
         self.transform = T.Compose([

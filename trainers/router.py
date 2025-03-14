@@ -10,6 +10,7 @@ from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffloa
 from torch.nn import functional as F
 
 from models.router import RouterModel
+from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 
 class RouterTrainer:
     """Trainer for the router model in DDM"""
@@ -79,11 +80,15 @@ class RouterTrainer:
         self.criterion = nn.CrossEntropyLoss()
 
         # Paper-recommended learning schedule
+        # Add warmup steps if not in config
+        self.warmup_steps = getattr(config, 'warmup_steps', int(0.05 * config.num_steps))
+        self.total_steps = getattr(config, 'num_steps', 400000)
+        
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: min(step/self.config.warmup_steps, 1.0) 
-            if step < self.config.warmup_steps 
-            else 0.5*(1 + math.cos(math.pi*(step - self.config.warmup_steps)/self.config.total_steps))
+            lr_lambda=lambda step: min(step/self.warmup_steps, 1.0) 
+            if step < self.warmup_steps 
+            else 0.5*(1 + math.cos(math.pi*(step - self.warmup_steps)/self.total_steps))
         )
 
     def train_epoch(self, loader):
@@ -138,7 +143,7 @@ class RouterTrainer:
             loss = self.criterion(logits, clusters)
             
             # Add confidence thresholding
-            if self.config.router_confidence_threshold > 0:
+            if hasattr(self.config, 'router_confidence_threshold') and self.config.router_confidence_threshold > 0:
                 probs = torch.softmax(logits, dim=1)
                 max_prob = probs.max(dim=1)[0]
                 mask = (max_prob > self.config.router_confidence_threshold).float()
@@ -191,3 +196,45 @@ class RouterTrainer:
         # Run L-BFGS optimization
         for _ in range(100):
             optimizer.step(eval_fn)
+            
+        # Reset gradients for training
+        for param in self.router.parameters():
+            param.requires_grad = True
+            
+        return self.router.temperature.item()
+        
+    def save_checkpoint(self, save_dir, step):
+        """Save router checkpoint using centralized utility"""
+        # Create checkpoint path
+        checkpoint_path = f"{save_dir}/router_step{step}.pt"
+        
+        # Create metadata
+        metadata = {
+            'step': step,
+            'temperature': self.router.temperature.item(),
+            'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
+        }
+        
+        # Save using the centralized utility
+        return save_model_checkpoint(
+            model=self.router,
+            optimizer=self.optimizer,
+            scheduler=self.lr_scheduler,
+            path=checkpoint_path,
+            metadata=metadata,
+            is_fsdp=isinstance(self.router, FSDP)
+        )
+        
+    def load_checkpoint(self, checkpoint_path):
+        """Load router checkpoint using centralized utility"""
+        # Load using the centralized utility
+        metadata = load_model_checkpoint(
+            model=self.router,
+            optimizer=self.optimizer,
+            scheduler=self.lr_scheduler,
+            path=checkpoint_path,
+            is_fsdp=isinstance(self.router, FSDP),
+            device=self.device
+        )
+        
+        return metadata

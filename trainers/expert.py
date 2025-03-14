@@ -14,15 +14,14 @@ from utils.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from utils.vae import VAEWrapper
 from utils.clip import CLIPTextEncoder
 from trainers.base import BaseTrainer
+from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 
 class ExpertTrainer(BaseTrainer):
     """Trainer for expert DiT models in DDM"""
     def __init__(self, expert_idx, config, device, rank, world_size):
         # Paper-recommended initialization (section 4.1)
+        super().__init__(config, device, rank)
         self.expert_idx = expert_idx  # Store the expert index for identification
-        self.config = config
-        self.device = device
-        self.rank = rank
         self.world_size = world_size
         
         # Create base model
@@ -88,6 +87,15 @@ class ExpertTrainer(BaseTrainer):
         
         # Precompute diffusion schedule as in paper appendix
         self.alphas, self.alpha_bar, _ = get_alphas_and_betas()
+        
+        # Learning rate scheduler
+        warmup_steps = int(0.05 * config.num_steps)
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: min(step/warmup_steps, 1.0) 
+            if step < warmup_steps
+            else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (config.num_steps - warmup_steps)))
+        )
         
         # Log initialization of this expert
         if rank == 0:
@@ -175,27 +183,46 @@ class ExpertTrainer(BaseTrainer):
             mask = (batch['cluster'] == self.expert_idx).float()
             loss = mask * loss + (1-mask) * loss.detach()
         
+        # Update learning rate
+        self.lr_scheduler.step()
+        
         return loss.item()
     
     def save_checkpoint(self, save_dir, step):
-        """Save a checkpoint for the expert model using FSDP state dict utilities"""
-        if self.rank == 0:
-            os.makedirs(save_dir, exist_ok=True)
-            checkpoint_path = f"{save_dir}/expert_{self.expert_idx}_step{step}.pt"
-            
-            # Check if model is wrapped with FSDP
-            if isinstance(self.expert, FSDP):
-                # Get consolidated state dict using FSDP
-                with FSDP.state_dict_type(self.expert, StateDictType.FULL_STATE_DICT):
-                    state_dict = self.expert.state_dict()
-            else:
-                # Regular state dict
-                state_dict = self.expert.state_dict()
-            
-            # Only rank 0 saves the model
-            torch.save(state_dict, checkpoint_path)
-            return checkpoint_path
-        return None
+        """Save a checkpoint for the expert model using consolidated checkpoint utility"""
+        # Create checkpoint path
+        os.makedirs(save_dir, exist_ok=True)
+        checkpoint_path = f"{save_dir}/expert_{self.expert_idx}_step{step}.pt"
+        
+        # Create metadata
+        metadata = {
+            'expert_idx': self.expert_idx,
+            'step': step,
+            'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
+        }
+        
+        # Save using the centralized utility
+        return save_model_checkpoint(
+            model=self.expert,
+            optimizer=self.optimizer,
+            scheduler=self.lr_scheduler,
+            path=checkpoint_path,
+            metadata=metadata,
+            is_fsdp=True
+        )
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Load a checkpoint for the expert model using consolidated checkpoint utility"""
+        # Load using the centralized utility
+        metadata = load_model_checkpoint(
+            model=self.expert,
+            optimizer=self.optimizer,
+            scheduler=self.lr_scheduler,
+            path=checkpoint_path,
+            is_fsdp=True
+        )
+        
+        return metadata
     
     def forward_diffuse(self, x0, t, noise):
         """Forward diffusion process with precomputed alpha_bar"""
@@ -206,4 +233,31 @@ class ExpertTrainer(BaseTrainer):
         sqrt_one_minus = torch.sqrt(1. - alpha_bar[t])[:, None, None, None]
         
         # Apply forward diffusion: x_t = sqrt(α_t)·x_0 + sqrt(1-α_t)·ε
-        return sqrt_alpha_bar * x0 + sqrt_one_minus * noise 
+        return sqrt_alpha_bar * x0 + sqrt_one_minus * noise
+
+    def reset_parameters(self):
+        """Reset expert parameters when assigned to a new cluster"""
+        if self.rank == 0:
+            print(f"Resetting parameters for expert {self.expert_idx}")
+            
+        # Reinitialize the model
+        for module in self.expert.modules():
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+                
+        # Reset optimizer state
+        self.optimizer = AdamW8bit(
+            self.expert.parameters(),
+            lr=self.config.learning_rate,
+            betas=self.config.adam_betas,
+            weight_decay=self.config.weight_decay
+        )
+        
+        # Reset scheduler
+        warmup_steps = int(0.05 * self.config.num_steps)
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda step: min(step/warmup_steps, 1.0) 
+            if step < warmup_steps
+            else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (self.config.num_steps - warmup_steps)))
+        ) 

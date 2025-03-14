@@ -12,13 +12,16 @@ from tqdm import tqdm
 import numpy as np
 import wandb
 import time
+import os
 
 from models.dit import ExpertDiT
-from data.dataset import DDMDataset, FeatureDataset
+from data.dataset import DDMDataset, FeatureDataset, create_expert_bucket_loaders
 from utils.diffusion import DecentralizedFlowMatcher
 from data.clustering import ClusterManager
 from trainers.Distillation import DiffusionDistiller
 from utils.clip import CLIPTextEncoder
+from utils.checkpoint import save_sharded
+from utils.metrics import MetricCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -225,33 +228,44 @@ class DDMTrainingCoordinator:
             expert_params |= current_params
         
     def init_optimizers(self):
-        """Initialize optimizers following paper Section 4.1"""
-        self.expert_optims = [torch.optim.AdamW8bit(expert.parameters(), 
-                                              lr=self.config.learning_rate,
-                                              weight_decay=self.config.weight_decay)
-                            for expert in self.expert_trainers]
-        
-        self.router_optim = torch.optim.AdamW8bit(self.router_trainer.router.parameters(),
-                                            lr=self.config.router_learning_rate,
-                                            weight_decay=self.config.weight_decay)
+        """Initialize optimizers - REMOVED implementation as optimizers are already initialized in respective trainers"""
+        # The optimizers are already initialized in the respective trainers,
+        # so we don't need to create duplicate optimizers here.
+        # Just log that we're using the trainers' optimizers
+        if self.rank == 0:
+            logger.info(f"Using optimizers from {len(self.expert_trainers)} expert trainers and router trainer")
         
     def train_experts(self, step):
         """Delegate expert training to ExpertTrainer instances"""
-        loss = np.mean([
-            trainer.train_step(batch)
-            for trainer, loader in zip(self.expert_trainers, self.expert_loaders)
-            for batch in loader
-        ])
+        # Since each ExpertTrainer handles its own optimization,
+        # we just need to call train_step on each trainer
+        losses = []
+        for trainer, loader in zip(self.expert_trainers, self.expert_loaders):
+            for batch in loader:
+                loss = trainer.train_step(batch)
+                losses.append(loss)
+            
+        # Calculate mean loss
+        mean_loss = np.mean(losses) if losses else 0.0
         
-        # Add diversity loss
-        diversity_loss = torch.stack([e.diversity() for e in self.expert_trainers]).mean()
-        loss += self.config.diversity_lambda * diversity_loss
+        # Add diversity loss if needed
+        if hasattr(self.expert_trainers[0], 'diversity') and hasattr(self.config, 'diversity_lambda'):
+            diversity_loss = torch.stack([e.diversity() for e in self.expert_trainers]).mean()
+            mean_loss += self.config.diversity_lambda * diversity_loss.item()
         
-        return loss
+        return mean_loss
     
     def train_router(self, step):
         """Delegate router training to RouterTrainer"""
-        return self.router_trainer.train_epoch(self.router_loader)
+        # The RouterTrainer handles its own optimization logic internally,
+        # so we just need to call train_epoch and get the resulting loss
+        loss = self.router_trainer.train_epoch(self.router_loader)
+        
+        # Update learning rate scheduler if present
+        if hasattr(self.router_trainer, 'lr_scheduler'):
+            self.router_trainer.lr_scheduler.step()
+        
+        return loss
     
     def run_validation(self, step):
         """Modified validation with confidence checks"""
@@ -317,26 +331,64 @@ class DDMTrainingCoordinator:
 
     def save_sharded_checkpoints(self, step):
         """Paper-recommended sharded checkpoint format"""
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        # Use utils.checkpoint to save coordinator metadata
+        from utils.checkpoint import save_sharded
         
-        checkpoint = {
-            'meta': {'step': step, 'best_fid': self.best_fid},
-            'router': FSDP.state_dict(self.router_trainer.router),
+        # Metadata for the coordinator checkpoint
+        meta_checkpoint = {
+            'meta': {
+                'step': step, 
+                'best_fid': self.best_fid,
+                'config': self.config.__dict__
+            }
         }
         
-        # Save experts separately using FSDP sharded format
+        # Have experts save themselves through their own methods
         expert_paths = []
         for idx, trainer in enumerate(self.expert_trainers):
-            expert_state = FSDP.state_dict(trainer.expert)
-            path = f"{self.config.save_dir}/expert_{idx}_step{step}_v{self.config.version}.pt"
-            if self.rank == 0:
-                torch.save(expert_state, path)
-            expert_paths.append(path)
+            # Check if trainer has save_checkpoint method, otherwise use fallback
+            if hasattr(trainer, 'save_checkpoint'):
+                path = trainer.save_checkpoint(self.config.save_dir, step)
+                if path:  # Save path might be None for non-rank-0 processes
+                    expert_paths.append(path)
+            else:
+                # Fallback for trainers without save_checkpoint method
+                if self.rank == 0:
+                    logger.warning(f"Expert trainer {idx} has no save_checkpoint method, using fallback")
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                
+                path = f"{self.config.save_dir}/expert_{idx}_step{step}_v{self.config.version}.pt"
+                if isinstance(trainer.expert, FSDP) and self.rank == 0:
+                    state_dict = FSDP.state_dict(trainer.expert)
+                    torch.save(state_dict, path)
+                    expert_paths.append(path)
         
-        checkpoint['expert_paths'] = expert_paths
-        
+        # Save router model
         if self.rank == 0:
-            torch.save(checkpoint, f"{self.config.save_dir}/coordinator_step{step}.pt")
+            if hasattr(self.router_trainer, 'save_checkpoint'):
+                router_path = self.router_trainer.save_checkpoint(self.config.save_dir, step)
+                meta_checkpoint['router_path'] = router_path
+            else:
+                # Fallback for router without save_checkpoint method
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                
+                router_path = f"{self.config.save_dir}/router_step{step}.pt"
+                if isinstance(self.router_trainer.router, FSDP):
+                    state_dict = FSDP.state_dict(self.router_trainer.router)
+                    torch.save(state_dict, router_path)
+                else:
+                    torch.save(self.router_trainer.router.state_dict(), router_path)
+                meta_checkpoint['router_path'] = router_path
+        
+        # Save paths to expert checkpoints
+        meta_checkpoint['expert_paths'] = expert_paths
+        
+        # Save coordinator checkpoint with metadata
+        if self.rank == 0:
+            os.makedirs(self.config.save_dir, exist_ok=True)
+            coord_path = f"{self.config.save_dir}/coordinator_step{step}.pt"
+            torch.save(meta_checkpoint, coord_path)
+            logger.info(f"Saved coordinator checkpoint to {coord_path} with {len(expert_paths)} expert paths")
             
     def log_sharded_metrics(self, step, expert_loss, router_loss):
         """Log training metrics to WandB"""
@@ -350,74 +402,11 @@ class DDMTrainingCoordinator:
             wandb.log(metrics)
             
     def calculate_fid(self, generated_samples, real_dataset):
-        """Paper Section 4.3: Frechet Inception Distance calculation"""
-        # Use paper-recommended InceptionV3 features
-        fid_model = torch.hub.load('pytorch/vision:v0.10.0', 'inception_v3', pretrained=True)
-        fid_model.eval().to(self.device)
-        fid_model.fc = torch.nn.Identity()  # Remove final layer
+        """Calculate FID score between generated and real samples"""
         
-        def extract_features(dataloader):
-            features = []
-            for batch in tqdm(dataloader, desc="Extracting FID features"):
-                images = batch['image'].to(self.device)
-                with torch.no_grad():
-                    feats = fid_model(images)
-                features.append(feats.cpu())
-            return torch.cat(features)
+        # Use the centralized MetricCalculator instead of duplicating the logic
+        return MetricCalculator.fid(real_dataset, generated_samples)
         
-        # Real data features
-        real_loader = DataLoader(real_dataset, batch_size=256, num_workers=4)
-        real_features = extract_features(real_loader)
-        
-        # Generated samples features
-        gen_loader = DataLoader(generated_samples, batch_size=256, num_workers=4)
-        gen_features = extract_features(gen_loader)
-        
-        # Compute FID
-        mu_real, sigma_real = real_features.mean(dim=0), torch.cov(real_features.T)
-        mu_gen, sigma_gen = gen_features.mean(dim=0), torch.cov(gen_features.T)
-        
-        diff = mu_real - mu_gen
-        cov_mean = (sigma_real @ sigma_gen).sqrt()
-        fid = diff.dot(diff) + torch.trace(sigma_real + sigma_gen - 2*cov_mean)
-        fid_inception = fid.item()
-        
-        # New CLIP-FID calculation
-        clip_model = CLIPTextEncoder(self.device, self.config).model.visual
-        clip_model.eval()
-        
-        def clip_features(images):
-            with torch.no_grad():
-                return clip_model(images)
-        
-        # DINOv2-FID calculation
-        dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
-        dino_model.eval().to(self.device)
-        
-        def dino_features(images):
-            with torch.no_grad():
-                return dino_model(images)
-        
-        # Compute all metrics
-        return {
-            'inception_fid': fid_inception,
-            'clip_fid': self._compute_fid_pair(clip_features, real_loader, gen_loader),
-            'dino_fid': self._compute_fid_pair(dino_features, real_loader, gen_loader)
-        }
-
-    def _compute_fid_pair(self, feature_fn, real_loader, gen_loader):
-        """Helper to compute FID for different feature extractors"""
-        real_feats = torch.cat([feature_fn(batch['image'].to(self.device)) 
-                              for batch in real_loader])
-        gen_feats = torch.cat([feature_fn(batch.to(self.device)) 
-                             for batch in gen_loader])
-        
-        mu_real, sigma_real = torch.mean(real_feats, 0), torch.cov(real_feats.T)
-        mu_gen, sigma_gen = torch.mean(gen_feats, 0), torch.cov(gen_feats.T)
-        
-        return ((mu_real - mu_gen).pow(2).sum() + 
-                torch.trace(sigma_real + sigma_gen - 2*(sigma_real@sigma_gen).sqrt())).item()
-
     def get_current_lr(self):
         """Paper-recommended learning rate schedule"""
         # Linear warmup over first 5% of training
