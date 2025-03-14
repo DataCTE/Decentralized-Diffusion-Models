@@ -41,7 +41,7 @@ def debug_print(message, rank=None, force=False):
 class DDMTrainingCoordinator:
     """Implements the core training logic from Section 3 of the paper"""
     
-    def __init__(self, config, rank, world_size, cache_manager=None):
+    def __init__(self, config, rank, world_size, cache_manager=None, progress_callback=None):
         """
         Initialize coordinator as per paper Section 4.1
         Args:
@@ -49,6 +49,7 @@ class DDMTrainingCoordinator:
             rank: Process rank (0 is main)
             world_size: Total number of processes
             cache_manager: Optional ExpertCacheManager for efficient expert loading/unloading
+            progress_callback: Optional callback function to report initialization progress
         """
         init_start_time = time.time()
         debug_print(f"Starting coordinator initialization on rank {rank}/{world_size}", rank)
@@ -58,8 +59,13 @@ class DDMTrainingCoordinator:
         self.world_size = world_size
         self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
         self.cache_manager = cache_manager
+        self.progress_callback = progress_callback
         
         debug_print(f"Initializing with device: {self.device}", rank)
+        
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Starting initialization", 0)
         
         # Initialize clustering
         debug_print(f"Starting cluster manager initialization", rank)
@@ -67,17 +73,29 @@ class DDMTrainingCoordinator:
         self.init_cluster_manager()
         debug_print(f"Cluster manager initialized in {time.time() - cluster_start:.2f}s", rank)
         
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Cluster manager initialized", 25)
+        
         # Initialize data loaders
         debug_print(f"Starting data loader initialization", rank)
         data_start = time.time()
         self.init_data_loaders()
         debug_print(f"Data loaders initialized in {time.time() - data_start:.2f}s", rank)
         
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Data loaders initialized", 50)
+        
         # Initialize models
         debug_print(f"Starting model initialization", rank)
         models_start = time.time()
         self.init_models()
         debug_print(f"Models initialized in {time.time() - models_start:.2f}s", rank)
+        
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Models initialized", 75)
         
         debug_print(f"Setting up optimizers and schedulers", rank)
         
@@ -146,6 +164,10 @@ class DDMTrainingCoordinator:
         # Expert data loaders and iterators
         self.expert_iterators = {}
         
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Initialization complete", 100)
+        
         total_init_time = time.time() - init_start_time
         debug_print(f"DDMTrainingCoordinator initialization completed in {total_init_time:.2f}s", rank)
         logger.info(f"DDMTrainingCoordinator initialized on rank {rank}/{world_size}")
@@ -178,14 +200,14 @@ class DDMTrainingCoordinator:
             # Simple barrier with timeout
             # This handles the synchronization in a clean way
             torch.distributed.barrier(timeout=datetime.timedelta(seconds=timeout_seconds))
-            self.logger.debug(f"Synchronization for '{name}' completed successfully")
+            logger.debug(f"Synchronization for '{name}' completed successfully")
             return True
         except torch.distributed.DistBackendError as e:
-            self.logger.error(f"Synchronization timeout after {timeout_seconds}s for '{name}': {str(e)}")
+            logger.error(f"Synchronization timeout after {timeout_seconds}s for '{name}': {str(e)}")
             # Attempt recovery by continuing execution
             return False
         except Exception as e:
-            self.logger.error(f"Synchronization error for '{name}': {str(e)}")
+            logger.error(f"Synchronization error for '{name}': {str(e)}")
             return False
 
     def sync_experts_state(self):
@@ -201,7 +223,7 @@ class DDMTrainingCoordinator:
         sync_success = True
         try:
             # Log synchronization start
-            self.logger.info("Synchronizing expert states across processes")
+            logger.info("Synchronizing expert states across processes")
             
             # Gather expert indices from all processes
             all_expert_indices = []
@@ -220,7 +242,7 @@ class DDMTrainingCoordinator:
                 for expert_idx in indices:
                     # Only the owner broadcasts parameters
                     if self.rank == rank:
-                        self.logger.debug(f"Broadcasting expert {expert_idx} from rank {rank}")
+                        logger.debug(f"Broadcasting expert {expert_idx} from rank {rank}")
                     
                     try:
                         # Try to synchronize this expert
@@ -235,20 +257,20 @@ class DDMTrainingCoordinator:
                             failed_experts.add(expert_idx)
                             sync_success = False
                     except Exception as e:
-                        self.logger.error(f"Error synchronizing expert {expert_idx}: {str(e)}")
+                        logger.error(f"Error synchronizing expert {expert_idx}: {str(e)}")
                         failed_experts.add(expert_idx)
                         sync_success = False
             
             # Report on synchronization results
             if failed_experts:
-                self.logger.warning(f"Failed to synchronize {len(failed_experts)} experts: {sorted(failed_experts)}")
-                self.logger.info(f"Successfully synchronized {len(synced_experts)} experts")
+                logger.warning(f"Failed to synchronize {len(failed_experts)} experts: {sorted(failed_experts)}")
+                logger.info(f"Successfully synchronized {len(synced_experts)} experts")
             else:
-                self.logger.info(f"Expert state synchronization completed successfully for all {len(synced_experts)} experts")
+                logger.info(f"Expert state synchronization completed successfully for all {len(synced_experts)} experts")
             
             return sync_success
         except Exception as e:
-            self.logger.error(f"Expert state synchronization failed: {str(e)}")
+            logger.error(f"Expert state synchronization failed: {str(e)}")
             return False
 
     def init_cluster_manager(self):
@@ -256,6 +278,10 @@ class DDMTrainingCoordinator:
         debug_print(f"Creating ClusterManager for rank {self.rank}", self.rank)
         
         try:
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Extracting dataset features for clustering", 5)
+                
             # Create cluster manager
             self.cluster_manager = ClusterManager(
                 local_rank=self.rank,
@@ -263,12 +289,20 @@ class DDMTrainingCoordinator:
                 config=self.config
             )
             
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Performing initial data clustering", 15)
+                
             # Use synchronization to ensure all processes have initialized
             debug_print(f"Waiting for cluster manager sync on rank {self.rank}", self.rank)
             sync_start = time.time()
             self.safe_synchronize(timeout_seconds=300, name="cluster_manager_init")
             debug_print(f"Cluster manager sync completed in {time.time() - sync_start:.2f}s", self.rank)
             
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Cluster synchronization complete", 20)
+                
             debug_print(f"Cluster manager initialized successfully on rank {self.rank}", self.rank)
         except Exception as e:
             debug_print(f"CRITICAL ERROR: Failed to initialize cluster manager on rank {self.rank}: {str(e)}", self.rank, True)
@@ -282,6 +316,11 @@ class DDMTrainingCoordinator:
         try:
             # Create dataset
             debug_print(f"Creating dataset on rank {self.rank}", self.rank)
+            
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Creating dataset", 30)
+                
             self.dataset = DDMDataset(
                 root_dir=self.config.dataset_path,
                 cluster_assignments=self.cluster_manager.get_cluster_assignments(),
@@ -292,6 +331,11 @@ class DDMTrainingCoordinator:
             
             # Create expert data loaders
             debug_print(f"Creating expert bucket loaders on rank {self.rank}", self.rank)
+            
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Creating expert data loaders", 35)
+                
             from data.loader import create_expert_bucket_loaders
             self.expert_loaders = create_expert_bucket_loaders(
                 dataset=self.dataset,
@@ -301,6 +345,12 @@ class DDMTrainingCoordinator:
             )
             
             # Create router data loader
+            debug_print(f"Creating router data loader on rank {self.rank}", self.rank)
+            
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Creating router data loader", 40)
+                
             from data.loader import create_router_loader
             self.router_loader = create_router_loader(
                 dataset=self.dataset,
@@ -311,11 +361,15 @@ class DDMTrainingCoordinator:
             
             # Log initialization statistics
             num_experts = len(self.expert_loaders)
-            self.logger.info(f"Created {num_experts} expert data loaders")
-            self.logger.info(f"Created router data loader with {len(self.router_loader)} batches")
+            logger.info(f"Created {num_experts} expert data loaders")
+            logger.info(f"Created router data loader with {len(self.router_loader)} batches")
             
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Data loaders ready", 45)
+                
         except Exception as e:
-            self.logger.error(f"Failed to initialize data loaders: {str(e)}")
+            logger.error(f"Failed to initialize data loaders: {str(e)}")
             raise
             
     def init_models(self):
@@ -325,6 +379,11 @@ class DDMTrainingCoordinator:
         try:
             # Create VAE for latent encoding
             debug_print(f"Creating VAE encoder/decoder on rank {self.rank}", self.rank)
+            
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Loading VAE encoder/decoder", 55)
+                
             start_time = time.time()
             from data.vae import VAEWrapper
             self.vae = VAEWrapper(self.device, self.config)
@@ -332,6 +391,11 @@ class DDMTrainingCoordinator:
             
             # Create CLIP for text conditioning
             debug_print(f"Creating CLIP encoder on rank {self.rank}", self.rank)
+            
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Loading CLIP text encoder", 60)
+                
             start_time = time.time()
             from data.clip import CLIPTextEncoder
             self.clip = CLIPTextEncoder(self.device, self.config)
@@ -339,6 +403,11 @@ class DDMTrainingCoordinator:
             
             # Create router trainer
             debug_print(f"Creating router model on rank {self.rank}", self.rank)
+            
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Creating router network", 65)
+                
             start_time = time.time()
             self.router = RouterTrainer(
                 config=self.config,
@@ -350,13 +419,28 @@ class DDMTrainingCoordinator:
             
             # Create expert trainers (one per expert)
             debug_print(f"Creating expert models for rank {self.rank}", self.rank)
+            
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Creating expert networks", 70)
+                
             self.experts = {}
             
             # Only create expert models that are assigned to this rank
+            expert_count = 0
+            total_experts = sum(1 for expert_idx in range(self.config.num_experts) if self.is_expert_owned_by_rank(expert_idx))
+            
             for expert_idx in range(self.config.num_experts):
                 if self.is_expert_owned_by_rank(expert_idx):
                     debug_print(f"Creating expert {expert_idx} on rank {self.rank}", self.rank)
                     start_time = time.time()
+                    
+                    # Update progress for each expert
+                    if self.progress_callback and self.rank == 0:
+                        expert_progress = 70 + (expert_count / max(1, total_experts)) * 5
+                        self.progress_callback(f"Creating expert {expert_idx}", expert_progress)
+                        expert_count += 1
+                    
                     if self.cache_manager:
                         # If using cache manager, get expert from cache or create new
                         self.experts[expert_idx] = self.cache_manager.get_expert(expert_idx)
@@ -382,6 +466,11 @@ class DDMTrainingCoordinator:
             
         # Use synchronization
         debug_print(f"Synchronizing after model initialization on rank {self.rank}", self.rank)
+        
+        # Report progress
+        if self.progress_callback and self.rank == 0:
+            self.progress_callback("Synchronizing models across processes", 73)
+            
         sync_start = time.time()
         self.safe_synchronize(timeout_seconds=300, name="model_init")
         debug_print(f"Model initialization synchronization completed in {time.time() - sync_start:.2f}s on rank {self.rank}", self.rank)
@@ -432,7 +521,7 @@ class DDMTrainingCoordinator:
         This updates data partitions based on current model performance
         and reassigns experts to clusters.
         """
-        self.logger.info("Starting reclustering procedure")
+        logger.info("Starting reclustering procedure")
         
         # Step 1: Extract features from validation set
         features = self.cluster_manager.extract_validation_features()
@@ -443,7 +532,7 @@ class DDMTrainingCoordinator:
         
         # Step 3: Compute cluster changes
         changed_ratio = self.cluster_manager.compute_cluster_changes(old_clusters, new_clusters)
-        self.logger.info(f"Reclustering: {changed_ratio:.2%} of data points changed clusters")
+        logger.info(f"Reclustering: {changed_ratio:.2%} of data points changed clusters")
         
         # Step 4: Update data loaders with new clusters
         self.dataset.update_cluster_assignments(new_clusters)
@@ -491,7 +580,7 @@ class DDMTrainingCoordinator:
         # Step 8: Synchronize after reclustering is complete
         self.safe_synchronize(timeout_seconds=300, name="reclustering")
         
-        self.logger.info("Reclustering completed successfully")
+        logger.info("Reclustering completed successfully")
         return True
     
     def migrate_expert_data(self, old_idx, new_idx, old_experts):
@@ -503,16 +592,16 @@ class DDMTrainingCoordinator:
             new_idx: New expert index
             old_experts: Dictionary of old experts
         """
-        self.logger.info(f"Migrating expert data from {old_idx} to {new_idx}")
+        logger.info(f"Migrating expert data from {old_idx} to {new_idx}")
         
         # Check if we have the source expert
         if old_idx not in old_experts:
-            self.logger.warning(f"Source expert {old_idx} not found for migration")
+            logger.warning(f"Source expert {old_idx} not found for migration")
             return
             
         # If we don't own the target expert, no need to do anything
         if new_idx % self.world_size != self.rank:
-            self.logger.debug(f"Target expert {new_idx} not assigned to this rank, skipping migration")
+            logger.debug(f"Target expert {new_idx} not assigned to this rank, skipping migration")
             return
             
         try:
@@ -537,9 +626,9 @@ class DDMTrainingCoordinator:
                 source_state = source_expert.expert.state_dict()
                 target_expert.expert.load_state_dict(source_state)
                 
-            self.logger.info(f"Expert data migrated from {old_idx} to {new_idx}")
+            logger.info(f"Expert data migrated from {old_idx} to {new_idx}")
         except Exception as e:
-            self.logger.error(f"Error during expert migration: {str(e)}")
+            logger.error(f"Error during expert migration: {str(e)}")
             # Continue with newly initialized expert if migration fails
     
     def train_experts(self, step):
@@ -581,7 +670,7 @@ class DDMTrainingCoordinator:
                 
                 # Log per-expert metrics
                 if step % self.config.log_every_n_steps == 0 and self.rank == 0:
-                    self.logger.info(f"Step {step}: Expert {expert_idx} loss: {loss:.4f}")
+                    logger.info(f"Step {step}: Expert {expert_idx} loss: {loss:.4f}")
         
         # Synchronize expert losses across processes
         all_expert_losses = {}
@@ -627,7 +716,7 @@ class DDMTrainingCoordinator:
         
         # Log router metrics
         if step % self.config.log_every_n_steps == 0:
-            self.logger.info(f"Step {step}: Router loss: {loss:.4f}")
+            logger.info(f"Step {step}: Router loss: {loss:.4f}")
         
         return loss
     
@@ -641,7 +730,7 @@ class DDMTrainingCoordinator:
         if self.rank != 0:
             return  # Only run on main process
             
-        self.logger.info(f"Running ensemble validation at step {step}")
+        logger.info(f"Running ensemble validation at step {step}")
         
         # Setup validation
         num_samples = min(16, self.config.batch_size)  # Small batch for validation
@@ -718,13 +807,13 @@ class DDMTrainingCoordinator:
                 expert_losses[expert_idx] = F.mse_loss(pred, target).item()
                 
             # Log metrics
-            self.logger.info(f"Ensemble validation loss: {ensemble_loss.item():.6f}")
+            logger.info(f"Ensemble validation loss: {ensemble_loss.item():.6f}")
             for expert_idx, loss in expert_losses.items():
-                self.logger.info(f"Expert {expert_idx} validation loss: {loss:.6f}")
+                logger.info(f"Expert {expert_idx} validation loss: {loss:.6f}")
                 
             # Log router accuracy
             top1_accuracy = (router_probs.argmax(dim=1) == cluster_labels).float().mean()
-            self.logger.info(f"Router accuracy: {top1_accuracy.item():.2f}")
+            logger.info(f"Router accuracy: {top1_accuracy.item():.2f}")
             
             # Log metrics to tracking system
             if hasattr(self.config, 'use_wandb') and self.config.use_wandb:
@@ -739,14 +828,14 @@ class DDMTrainingCoordinator:
                 log_metrics(metrics, step=step)
                 
         except Exception as e:
-            self.logger.error(f"Error in ensemble validation: {str(e)}")
+            logger.error(f"Error in ensemble validation: {str(e)}")
     
     def run_validation(self, step):
         """Run validation for current model state"""
         if not is_main_process():
             return {}
             
-        self.logger.info(f"Running validation at step {step}")
+        logger.info(f"Running validation at step {step}")
         
         # Generate samples
         try:
@@ -771,7 +860,7 @@ class DDMTrainingCoordinator:
                 
                 return metrics
         except Exception as e:
-            self.logger.error(f"Error during validation: {str(e)}")
+            logger.error(f"Error during validation: {str(e)}")
             
         return {}
     
@@ -808,7 +897,7 @@ class DDMTrainingCoordinator:
                 try:
                     experts[expert_idx] = self.get_expert(expert_idx).expert
                 except Exception as e:
-                    self.logger.error(f"Error loading expert {expert_idx} for sampling: {str(e)}")
+                    logger.error(f"Error loading expert {expert_idx} for sampling: {str(e)}")
                     
         # Create empty list for missing experts
         for expert_idx in range(self.config.num_experts):
@@ -849,7 +938,7 @@ class DDMTrainingCoordinator:
             
             return pil_images
         except Exception as e:
-            self.logger.error(f"Error generating samples: {str(e)}")
+            logger.error(f"Error generating samples: {str(e)}")
             return []
     
     def log_sharded_metrics(self, step, expert_loss, router_loss):
@@ -885,7 +974,7 @@ class DDMTrainingCoordinator:
     
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint for coordinator"""
-        self.logger.info(f"Loading checkpoint from {checkpoint_path}")
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
         
         try:
             # Load checkpoint
@@ -899,7 +988,7 @@ class DDMTrainingCoordinator:
             router_state = checkpoint.get('router_state', None)
             if router_state and self.router:
                 self.router.load_state_dict(router_state)
-                self.logger.info("Loaded router state from checkpoint")
+                logger.info("Loaded router state from checkpoint")
                 
             # Extract expert states
             expert_states = checkpoint.get('expert_states', {})
@@ -919,14 +1008,14 @@ class DDMTrainingCoordinator:
                     # Load expert state
                     try:
                         self.experts[int(expert_idx)].load_state_dict(state)
-                        self.logger.info(f"Loaded state for expert {expert_idx}")
+                        logger.info(f"Loaded state for expert {expert_idx}")
                     except Exception as e:
-                        self.logger.error(f"Failed to load state for expert {expert_idx}: {str(e)}")
+                        logger.error(f"Failed to load state for expert {expert_idx}: {str(e)}")
             
-            self.logger.info(f"Checkpoint loaded successfully, resuming from step {step}")
+            logger.info(f"Checkpoint loaded successfully, resuming from step {step}")
             return step
         except Exception as e:
-            self.logger.error(f"Failed to load checkpoint: {str(e)}")
+            logger.error(f"Failed to load checkpoint: {str(e)}")
             return 0
     
     def save_sharded_checkpoints(self, step):
@@ -934,7 +1023,7 @@ class DDMTrainingCoordinator:
         if not is_main_process():
             return
             
-        self.logger.info(f"Saving checkpoint at step {step}")
+        logger.info(f"Saving checkpoint at step {step}")
         
         # Create checkpoint directory
         checkpoint_dir = os.path.join(self.config.checkpoint_dir, f"step_{step}")
@@ -949,9 +1038,9 @@ class DDMTrainingCoordinator:
                 'optimizer': self.router.optimizer.state_dict(),
                 'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
             }, router_path)
-            self.logger.info(f"Saved router to {router_path}")
+            logger.info(f"Saved router to {router_path}")
         except Exception as e:
-            self.logger.error(f"Failed to save router: {str(e)}")
+            logger.error(f"Failed to save router: {str(e)}")
         
         # Save experts
         for expert_idx, expert in self.experts.items():
@@ -964,9 +1053,9 @@ class DDMTrainingCoordinator:
                     'optimizer': expert.optimizer.state_dict(),
                     'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
                 }, expert_path)
-                self.logger.info(f"Saved expert {expert_idx} to {expert_path}")
+                logger.info(f"Saved expert {expert_idx} to {expert_path}")
             except Exception as e:
-                self.logger.error(f"Failed to save expert {expert_idx}: {str(e)}")
+                logger.error(f"Failed to save expert {expert_idx}: {str(e)}")
         
         # Save coordinator checkpoint
         try:
@@ -977,13 +1066,13 @@ class DDMTrainingCoordinator:
                 'expert_states': {idx: expert.state_dict() for idx, expert in self.experts.items()},
                 'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
             }, coordinator_path)
-            self.logger.info(f"Saved coordinator checkpoint to {coordinator_path}")
+            logger.info(f"Saved coordinator checkpoint to {coordinator_path}")
         except Exception as e:
-            self.logger.error(f"Failed to save coordinator checkpoint: {str(e)}")
+            logger.error(f"Failed to save coordinator checkpoint: {str(e)}")
     
     def train_distilled_model(self):
         """Train distilled model from experts"""
-        self.logger.info("Starting model distillation")
+        logger.info("Starting model distillation")
         
         try:
             # Initialize distiller
@@ -1003,9 +1092,9 @@ class DDMTrainingCoordinator:
             distill_path = os.path.join(self.config.checkpoint_dir, "distilled_model.pt")
             distiller.save(distill_path)
             
-            self.logger.info(f"Distilled model saved to {distill_path}")
+            logger.info(f"Distilled model saved to {distill_path}")
         except Exception as e:
-            self.logger.error(f"Error during distillation: {str(e)}")
+            logger.error(f"Error during distillation: {str(e)}")
     
     def __del__(self):
         """Clean up resources"""

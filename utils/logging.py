@@ -50,9 +50,6 @@ def setup_logger(name=None, level=logging.INFO, log_file=None):
         
     return logger
 
-# Create a default global logger that can be imported
-logger = setup_logger("DDM")
-
 def setup_distributed_logger(name=None, level=logging.INFO, log_file=None, rank=0):
     """
     Set up a logger that only logs on the specified rank
@@ -350,4 +347,7 @@ def log_training_end(logger, start_time, rank=0):
     logger.info("=" * 80)
     logger.info("Training complete")
     logger.info(f"Total training time: {int(hours)}h {int(minutes)}m {int(seconds)}s")
-    logger.info("=" * 80) 
+    logger.info("=" * 80)
+
+# Create a default global logger that can be imported - NOW AT THE END OF THE FILE
+logger = setup_logger("DDM") 

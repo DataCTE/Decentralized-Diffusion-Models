@@ -6,6 +6,7 @@ import torch.distributed
 import datetime
 import time
 import sys
+import logging
 
 
 from config import DDMConfig
@@ -16,8 +17,13 @@ from utils.logging import setup_logger, init_wandb
 from utils.distributed import is_main_process, get_rank, synchronize
 from utils.expert_cache import ExpertCacheManager
 
-# Setup root logger
-logger = None
+# Setup a basic logger early to prevent null reference errors
+# This will be replaced with a properly configured logger in main()
+logger = logging.getLogger("DDMTraining")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(handler)
 
 # Add a direct console print function for immediate feedback regardless of logger
 def console_print(message, force=False):
@@ -127,7 +133,11 @@ def main():
         log_file = os.path.join(getattr(config, 'log_dir', 'logs'), f"train-{timestamp}.log")
         print(f"Log file will be saved at: {log_file}")
     
-    # Setup root logger
+    # Replace the early global logger with the properly configured one
+    # Remove existing handlers to avoid duplicate messages
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    # Setup new logger with file and console output
     logger = setup_logger("DDMTraining", log_file=log_file)
     logger.info("Starting Decentralized Diffusion Models training")
     
