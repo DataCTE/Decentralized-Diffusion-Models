@@ -7,27 +7,34 @@ from tqdm import tqdm
 import logging
 import time
 import torch.distributed as dist
+from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
 class ClusterManager:
     """Handles dataset clustering following the paper's approach"""
-    def __init__(self, local_rank=0):
+    def __init__(self, local_rank=0, dataset_path=None, config=None):
         self.local_rank = local_rank
         self.device = torch.device(f"cuda:{local_rank}")
+        self.dataset_path = dataset_path
+        self.config = config
         
         # Initialize DINO for feature extraction
+        if self.local_rank == 0:
+            logger.info("Initializing DINOv2 vision encoder")
+        
         self.dino = self._init_vision_encoder()
         
         # Clustering components
-        self.fine_clusterer = MiniBatchKMeans(n_clusters=1024)
-        self.coarse_clusterer = MiniBatchKMeans(n_clusters=8)
+        self.fine_clusterer = None
+        self.coarse_clusterer = None
         self.cluster_labels = None  # Add cluster storage
+        
+        if self.local_rank == 0:
+            logger.info(f"ClusterManager initialized on device cuda:{self.local_rank}")
         
     def _init_vision_encoder(self):
         """Initialize DINOv2 for feature extraction"""
-        if self.local_rank == 0:
-            logger.info("Initializing DINOv2 vision encoder")
         model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=True)
         
         # Set to evaluation mode and freeze parameters
@@ -143,28 +150,62 @@ class ClusterManager:
             raise RuntimeError("Clusters not initialized. Call perform_clustering() first")
         return self.cluster_labels
 
-    def perform_clustering(self, dataloader):
-        """Paper's two-stage clustering procedure from Section 3.2"""
+    def perform_clustering(self, dataloader=None):
+        """Centralized clustering pipeline that handles all clustering steps"""
+        start_time = time.time()
+        
+        # If no dataloader provided, create one using dataset_path
+        if dataloader is None:
+            if self.dataset_path is None or self.config is None:
+                raise ValueError("dataset_path and config must be provided if dataloader is None")
+                
+            if self.local_rank == 0:
+                logger.info(f"Creating feature extraction dataset from {self.dataset_path}")
+                
+            # Import here to avoid circular imports
+            from data.dataset import FeatureDataset
+            
+            feature_dataset = FeatureDataset(self.dataset_path, self.config)
+            
+            if self.local_rank == 0:
+                logger.info(f"Creating feature dataloader with batch size {self.config.feature_batch_size}")
+                logger.info(f"Using {self.config.feature_workers} worker threads per GPU")
+                
+            dataloader = DataLoader(
+                feature_dataset,
+                batch_size=self.config.feature_batch_size,
+                num_workers=self.config.feature_workers,
+                pin_memory=True
+            )
+            
+            if self.local_rank == 0:
+                logger.info(f"Starting clustering process with dynamically created dataloader")
+        
         # Stage 1: Extract features and create fine clusters
         if self.local_rank == 0:
             logger.info("Starting DINOv2 feature extraction")
+        
         features = self.extract_features(dataloader)
         
         # Paper's dynamic cluster count based on dataset size
         n_samples = features.shape[0]
         n_fine_clusters = min(1024, n_samples // 100)
-        n_coarse_clusters = 8
+        n_coarse_clusters = min(8, n_fine_clusters)  # Ensure coarse <= fine
 
+        if self.local_rank == 0:
+            logger.info(f"Clustering {n_samples:,} samples into {n_fine_clusters} fine clusters")
+        
         # Initialize fresh clusterers
         self.fine_clusterer = MiniBatchKMeans(n_clusters=n_fine_clusters)
         self.coarse_clusterer = MiniBatchKMeans(n_clusters=n_coarse_clusters)
 
         # Fit fine clusters with progress
         if self.local_rank == 0:
-            logger.info(f"Clustering {n_samples:,} samples into {n_fine_clusters} fine clusters")
             with tqdm(total=100, desc="Fine clustering", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
                 self.fine_clusterer.fit(features)
                 pbar.update(100)
+        else:
+            self.fine_clusterer.fit(features)
         
         # Stage 2: Cluster fine centroids into coarse groups
         fine_centroids = self.fine_clusterer.cluster_centers_
@@ -173,6 +214,8 @@ class ClusterManager:
             with tqdm(total=100, desc="Coarse clustering", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
                 self.coarse_clusterer.fit(fine_centroids)
                 pbar.update(100)
+        else:
+            self.coarse_clusterer.fit(fine_centroids)
 
         # Map samples to coarse clusters with progress
         if self.local_rank == 0:
@@ -186,10 +229,16 @@ class ClusterManager:
             
             self.cluster_labels = self.coarse_clusterer.labels_[fine_labels]
         else:
-            self.cluster_labels = None
+            # Just get labels for all at once on non-main processes
+            fine_labels = self.fine_clusterer.predict(features)
+            self.cluster_labels = self.coarse_clusterer.labels_[fine_labels]
             
         # Broadcast labels to all processes
         self.cluster_labels = self._broadcast_labels(self.cluster_labels)
+        
+        if self.local_rank == 0:
+            total_clustering_time = time.time() - start_time
+            logger.info(f"Entire clustering process completed in {total_clustering_time/60:.1f} minutes")
         
         return self.cluster_labels 
         
@@ -241,4 +290,70 @@ class ClusterManager:
             # Single process case
             if self.local_rank == 0:
                 logger.info(f"Single process mode - no broadcasting needed")
-            return labels if labels is not None else np.array([], dtype=np.int64) 
+            return labels if labels is not None else np.array([], dtype=np.int64)
+            
+    def perform_reclustering(self, dataloader=None):
+        """Perform reclustering during training to adapt to distribution shifts"""
+        if self.local_rank == 0:
+            logger.info("Starting dynamic reclustering process")
+            
+        if dataloader is None:
+            if self.dataset_path is None or self.config is None:
+                raise ValueError("dataset_path and config must be provided if dataloader is None")
+                
+            # Import here to avoid circular imports
+            from data.dataset import FeatureDataset
+            
+            feature_dataset = FeatureDataset(self.dataset_path, self.config)
+            dataloader = DataLoader(
+                feature_dataset,
+                batch_size=self.config.feature_batch_size,
+                num_workers=self.config.feature_workers,
+                pin_memory=True
+            )
+            
+        # Extract new features
+        if self.local_rank == 0:
+            logger.info("Extracting updated features for reclustering")
+            
+        features = self.extract_features(dataloader)
+        
+        # Save old clusters for reference
+        old_clusters = self.cluster_labels.copy() if self.cluster_labels is not None else None
+        
+        # Run clustering with current features
+        if self.local_rank == 0:
+            logger.info("Updating cluster assignments based on new features")
+            
+        new_clusters = self.perform_clustering(dataloader)
+        
+        # Return both old and new cluster assignments
+        return old_clusters, new_clusters
+        
+    def get_cluster_mapping(self, old_clusters, new_clusters):
+        """Map old cluster IDs to new cluster IDs based on maximum overlap"""
+        if old_clusters is None or new_clusters is None:
+            return {}
+            
+        # Create overlap matrix
+        n_old = max(old_clusters) + 1
+        n_new = max(new_clusters) + 1
+        overlap = np.zeros((n_old, n_new), dtype=int)
+        
+        # Count overlaps
+        for old, new in zip(old_clusters, new_clusters):
+            overlap[old, new] += 1
+            
+        # Create mapping from old to new
+        mapping = {}
+        for old_idx in range(n_old):
+            if old_idx in np.unique(old_clusters):
+                # Get the new cluster with maximum overlap
+                new_idx = np.argmax(overlap[old_idx])
+                mapping[old_idx] = new_idx
+                
+        if self.local_rank == 0:
+            logger.info(f"Created cluster mapping from {n_old} old clusters to {n_new} new clusters")
+            logger.info(f"Mapping: {mapping}")
+            
+        return mapping 

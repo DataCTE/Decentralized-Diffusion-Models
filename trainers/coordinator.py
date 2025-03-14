@@ -97,72 +97,18 @@ class DDMTrainingCoordinator:
             logger.info(f"GPUs will be at 100% during feature extraction - this is normal")
             logger.info(f"Process steps: Extract DINOv2 features → Fine clustering → Coarse clustering")
         
-        # Create cluster manager
-        self.cluster_manager = ClusterManager(local_rank=self.rank)
-        
-        # Only perform clustering on main process
-        feature_extraction_start = time.time()
-        if self.rank == 0:
-            logger.info(f"Creating feature extraction dataset")
-            
-        feature_dataset = FeatureDataset(self.config.dataset_path, self.config)
-        
-        if self.rank == 0:
-            logger.info(f"Creating feature extraction dataloader with batch size {self.config.feature_batch_size}")
-            logger.info(f"Using {self.config.feature_workers} worker threads per GPU")
-            
-        feature_loader = DataLoader(
-            feature_dataset,
-            batch_size=self.config.feature_batch_size,
-            num_workers=self.config.feature_workers,
-            pin_memory=True
+        # Create cluster manager with dataset path and config
+        self.cluster_manager = ClusterManager(
+            local_rank=self.rank,
+            dataset_path=self.config.dataset_path,
+            config=self.config
         )
         
-        if self.rank == 0:
-            logger.info(f"Starting clustering process - this will utilize all GPUs")
-            logger.info(f"Feature extraction phase will show periodic progress updates")
-            
-        # Perform the actual clustering
-        self.cluster_manager.perform_clustering(feature_loader)
-        
-        # Calculate and log time for clustering
-        if self.rank == 0:
-            feature_time = time.time() - feature_extraction_start
-            logger.info(f"Feature extraction and clustering completed in {feature_time/60:.1f} minutes")
-        
-        # Synchronize cluster labels across nodes
-        if self.rank == 0:
-            logger.info(f"Broadcasting cluster assignments to all processes")
-            
-        cluster_labels = self.cluster_manager.get_clusters() if self.rank == 0 else None
-        cluster_labels = self._broadcast_clusters(cluster_labels)
-        self.cluster_manager.cluster_labels = cluster_labels
+        # Centralized clustering call - this handles everything including dataloader creation
+        self.cluster_manager.perform_clustering()
         
         if self.rank == 0:
             logger.info(f"Clustering phase complete - all processes synchronized")
-
-    def _broadcast_clusters(self, clusters):
-        """Distributed broadcast of cluster assignments"""
-        if self.rank == 0:
-            logger.info(f"Preparing to broadcast {len(clusters):,} cluster assignments")
-            clusters_tensor = torch.tensor(clusters, dtype=torch.long, device=self.device)
-            dist.broadcast(clusters_tensor, src=0)
-        else:
-            # We don't know the size in advance on other ranks
-            dataset_size = self.config.dataset_size or 0
-            clusters_tensor = torch.empty(dataset_size, 
-                                        dtype=torch.long, device=self.device)
-            dist.broadcast(clusters_tensor, src=0)
-        
-        result = clusters_tensor.cpu().numpy()
-        
-        if self.rank == 0:
-            logger.info(f"Cluster broadcast complete - {len(result):,} assignments distributed")
-            # Log distribution statistics
-            counts = np.bincount(result)
-            logger.info(f"Cluster distribution: {counts}")
-            
-        return result
 
     def init_data_loaders(self):
         """Initialize distributed data loaders with sharded validation"""
@@ -203,29 +149,46 @@ class DDMTrainingCoordinator:
             setup_time = time.time() - start_time
             logger.info(f"Data loaders initialized in {setup_time:.2f} seconds")
             logger.info(f"Each process will handle ~{len(dataset)/self.world_size:,.0f} images")
-        
-    def perform_initial_clustering(self):
-        """Paper Algorithm 1: Initial dataset clustering"""
-        # First stage: 1024 fine-grained clusters
-        feature_dataset = FeatureDataset(self.config.dataset_path, self.config)
-        feature_loader = DataLoader(feature_dataset, 
-                                  batch_size=self.config.feature_batch_size,
-                                  num_workers=self.config.feature_workers)
-        fine_features = self.cluster_manager.extract_features(feature_loader)
-        fine_clusters = self.cluster_manager.cluster_dataset(fine_features, n_clusters=1024)
-
-        # Second stage: Consolidate to coarse clusters
-        coarse_clusters = self.cluster_manager.consolidate_clusters(
-            fine_clusters, target_clusters=self.config.num_experts
-        )
-        return coarse_clusters
     
-    def sync_cluster_labels(self):
-        """Synchronize cluster labels across all processes"""
-        cluster_tensor = torch.from_numpy(self.cluster_labels).to(self.device)
-        dist.broadcast(cluster_tensor, src=0)
-        self.cluster_labels = cluster_tensor.cpu().numpy()
+    def perform_reclustering(self):
+        """Perform dynamic reclustering during training using ClusterManager"""
+        if self.rank == 0:
+            logger.info("Starting dynamic reclustering process")
+            
+        # Let ClusterManager handle all reclustering logic
+        old_clusters, new_clusters = self.cluster_manager.perform_reclustering()
         
+        # Get mapping from old to new clusters
+        cluster_mapping = self.cluster_manager.get_cluster_mapping(old_clusters, new_clusters)
+        
+        # Migrate expert parameters based on mapping
+        if self.rank == 0:
+            logger.info("Migrating expert parameters based on new clustering")
+            
+        for old_idx, new_idx in cluster_mapping.items():
+            if old_idx != new_idx:
+                if self.rank == 0:
+                    logger.info(f"Migrating expert data from {old_idx} to {new_idx}")
+                self.migrate_expert_data(old_idx, new_idx)
+        
+        # Update validation dataset assignments
+        if hasattr(self, 'val_dataset'):
+            if self.rank == 0:
+                logger.info("Updating validation dataset cluster assignments")
+            self.val_dataset.update_clusters(new_clusters)
+        
+        # Paper-recommended expert reset for empty clusters
+        for expert_idx in range(self.config.num_experts):
+            if expert_idx not in cluster_mapping.values():
+                if self.rank == 0:
+                    logger.info(f"Resetting parameters for empty expert {expert_idx}")
+                self.expert_trainers[expert_idx].reset_parameters()
+        
+        if self.rank == 0:
+            logger.info("Dynamic reclustering complete")
+        
+        return new_clusters
+    
     def init_models(self):
         """Initialize models with parameter isolation checks"""
         from trainers.expert import ExpertTrainer
@@ -290,40 +253,6 @@ class DDMTrainingCoordinator:
         """Delegate router training to RouterTrainer"""
         return self.router_trainer.train_epoch(self.router_loader)
     
-    def perform_reclustering(self):
-        """Paper Section 3.3: Dynamic reclustering"""
-        logger.info("Performing dynamic reclustering...")
-        
-        # Extract features from current dataset
-        features = self.cluster_manager.extract_features(
-            DataLoader(FeatureDataset(self.config.dataset_path, self.config),
-                     batch_size=self.config.feature_batch_size)
-        )
-        
-        # Update clusters
-        new_clusters = self.cluster_manager.cluster_dataset(features)
-        
-        # New expert data migration
-        cluster_mapping = self.cluster_manager.get_cluster_mapping(
-            self.previous_clusters, new_clusters
-        )
-        
-        # Migrate expert parameters
-        for old_idx, new_idx in cluster_mapping.items():
-            if old_idx != new_idx:
-                self.migrate_expert_data(old_idx, new_idx)
-        
-        # Update validation dataset assignments
-        self.val_dataset.update_clusters(new_clusters)
-        
-        # Paper-recommended expert reset for empty clusters
-        for new_idx in range(self.config.num_experts):
-            if new_idx not in cluster_mapping.values():
-                self.expert_trainers[new_idx].reset_parameters()
-        
-        # Update previous clusters
-        self.previous_clusters = new_clusters
-        
     def run_validation(self, step):
         """Modified validation with confidence checks"""
         fallback_count = 0
