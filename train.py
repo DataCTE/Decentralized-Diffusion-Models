@@ -14,6 +14,7 @@ from trainers.coordinator import DDMTrainingCoordinator
 # Import centralized utilities
 from utils.logging import setup_logger, init_wandb, log_metrics, log_images
 from utils.distributed import is_main_process, get_rank, get_world_size, synchronize
+from utils.expert_cache import ExpertCacheManager
 
 # Setup root logger
 logger = None
@@ -112,6 +113,17 @@ def main():
         logger.info(f"Initialized WandB logging: {run_name}")
     
     try:
+        # Initialize expert cache manager for memory-efficient expert loading
+        logger.info("Initializing Expert Cache Manager")
+        cache_manager = ExpertCacheManager(
+            config=config,
+            device=torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"),
+            max_experts_in_memory=config.max_experts_in_memory,
+            swap_strategy=config.expert_swap_strategy,
+            cpu_offload=config.expert_offload_to_cpu,
+            prefetch=config.expert_prefetch_next
+        )
+        
         # Create training coordinator
         logger.info("Creating DDM Training Coordinator")
         logger.info("This will initialize clustering, models, and data loaders")
@@ -119,7 +131,12 @@ def main():
         if is_main_process():
             logger.info("Feature extraction and clustering may take 20-30 minutes")
         
-        coordinator = DDMTrainingCoordinator(config, rank, world_size)
+        coordinator = DDMTrainingCoordinator(
+            config=config,
+            rank=rank,
+            world_size=world_size,
+            cache_manager=cache_manager
+        )
         
         # Load existing checkpoint if configured
         if hasattr(config, 'resume_from') and config.resume_from:
@@ -184,11 +201,22 @@ def main():
             
     except KeyboardInterrupt:
         logger.info("Training interrupted - saving final checkpoint")
-        coordinator.save_sharded_checkpoints(step)
+        try:
+            coordinator.save_sharded_checkpoints(step)
+        except Exception as e:
+            logger.error(f"Error saving checkpoint after interruption: {str(e)}")
     except Exception as e:
         logger.error(f"Error during training: {str(e)}", exc_info=True)
     finally:
-        # Clean up
+        # Clean up cache manager
+        if locals().get('cache_manager') is not None:
+            try:
+                cache_manager.shutdown()
+                logger.info("Expert cache manager shutdown completed")
+            except Exception as e:
+                logger.error(f"Error shutting down cache manager: {str(e)}")
+        
+        # Clean up distributed
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         

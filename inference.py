@@ -1,4 +1,4 @@
-"""Inference script for sampling from trained Decentralized Diffusion Models."""
+"""Inference for Decentralized Diffusion Models"""
 
 import os
 import torch
@@ -8,14 +8,17 @@ import numpy as np
 import datetime
 import time
 import logging
+import json
 from PIL import Image
 from queue import Queue
 from threading import Thread
 import glob
+from pathlib import Path
+from tqdm import tqdm
 
 from config import DDMConfig
-from trainers.coordinator import DDMTrainingCoordinator
-from utils.checkpoint import load_model_checkpoint
+from models.router import RouterModel
+from models.dit import ExpertDiT
 from utils.vae import VAEWrapper
 from utils.clip import CLIPTextEncoder
 from utils.visualization import tensor_to_pil, create_image_grid
@@ -23,7 +26,8 @@ from utils.distributed import is_main_process, get_rank, get_world_size, setup_d
 
 # Import centralized utilities
 from utils.logging import setup_logger, log_metrics, log_images
-from utils.sampling import ddm_sample
+from utils.sampling import ddm_sample, distilled_sample
+from utils.expert_cache import ExpertCacheManager
 
 # Initialize logger
 logger = None
@@ -109,215 +113,337 @@ def setup_environment(config):
     
     return None
 
-def load_models(config, device):
-    """Load models needed for inference"""
-    logger.info("Loading models...")
+def load_models(config, device, checkpoint_dir, cache_manager=None):
+    """
+    Load router and expert models
     
-    # Load VAE
-    vae = VAEWrapper(device, config)
-    logger.info("VAE loaded successfully")
+    Args:
+        config: Configuration object
+        device: Device to load models on
+        checkpoint_dir: Directory containing checkpoints
+        cache_manager: Optional ExpertCacheManager for efficient expert loading
+        
+    Returns:
+        router_model: Router model
+        expert_models: Dictionary of expert models
+        vae: VAE model
+        clip: CLIP model
+    """
+    # Load VAE model
+    logger.info("Loading VAE model")
+    vae = VAEWrapper(
+        vae_model=config.vae_model,
+        device=device
+    )
     
-    # Load CLIP
-    clip = CLIPTextEncoder(device, config)
-    logger.info("CLIP loaded successfully")
+    # Load CLIP model
+    logger.info("Loading CLIP model")
+    clip = CLIPTextEncoder(
+        clip_model=config.clip_model,
+        device=device
+    )
     
-    # Find the latest checkpoint if not specified
-    if not hasattr(config, 'checkpoint_path') or not config.checkpoint_path:
-        logger.info("Checkpoint path not specified, looking for latest checkpoint...")
-        checkpoints = glob.glob(os.path.join(config.checkpoint_dir, "*.pt"))
-        if not checkpoints:
-            raise ValueError(f"No checkpoints found in {config.checkpoint_dir}")
-        # Get the most recent checkpoint
-        config.checkpoint_path = max(checkpoints, key=os.path.getctime)
+    # Load router model
+    logger.info("Loading router model")
+    router_model = RouterModel(
+        config=config,
+        num_experts=config.num_experts
+    ).to(device)
     
-    logger.info(f"Using checkpoint: {config.checkpoint_path}")
-    
-    # Load the model from checkpoint
-    from models.dit import ExpertDiT
-    from models.router import RouterModel
-    
-    # Initialize models
-    router = RouterModel(config).to(device)
-    experts = []
-    
-    if hasattr(config, 'use_distilled_model') and config.use_distilled_model:
-        # Load distilled model
-        logger.info("Loading distilled model...")
-        distilled_model = ExpertDiT(config).to(device)
-        load_model_checkpoint(distilled_model, config.distilled_model_path, device=device)
-        logger.info("Distilled model loaded successfully")
-        return vae, clip, router, [distilled_model]
+    router_checkpoint = os.path.join(checkpoint_dir, "router_model.pt")
+    if os.path.exists(router_checkpoint):
+        state_dict = torch.load(router_checkpoint, map_location=device)
+        router_model.load_state_dict(state_dict)
+        logger.info(f"Loaded router model from {router_checkpoint}")
     else:
-        # Load router and experts
-        logger.info("Loading router model...")
-        load_model_checkpoint(router, config.checkpoint_path, device=device)
-        logger.info("Router loaded successfully")
-        
-        # Load experts
-        num_experts = getattr(config, 'num_experts', 8)
-        expert_paths = []
-        
-        # Find expert checkpoints
-        if hasattr(config, 'expert_paths') and config.expert_paths:
-            expert_paths = config.expert_paths
-        else:
-            # Look for expert checkpoints in the same directory
-            checkpoint_dir = os.path.dirname(config.checkpoint_path)
-            for i in range(num_experts):
-                expert_path = os.path.join(checkpoint_dir, f"expert_{i}_*.pt")
-                matches = glob.glob(expert_path)
-                if matches:
-                    expert_paths.append(max(matches, key=os.path.getctime))
-                else:
-                    logger.warning(f"No checkpoint found for expert {i}")
-        
-        # Load each expert
-        for path in expert_paths:
-            expert = ExpertDiT(config).to(device)
-            load_model_checkpoint(expert, path, device=device)
-            experts.append(expert)
-            
-        logger.info(f"Loaded {len(experts)} experts successfully")
-        return vae, clip, router, experts
+        logger.warning(f"Router checkpoint {router_checkpoint} not found")
+    
+    # Create dictionary to hold expert models
+    expert_models = {}
+    
+    # Load expert models (lazily if cache manager is provided)
+    if cache_manager is None:
+        # Without cache manager, load all experts at once
+        for expert_idx in range(config.num_experts):
+            expert_checkpoint = os.path.join(checkpoint_dir, f"expert_{expert_idx}.pt")
+            if os.path.exists(expert_checkpoint):
+                logger.info(f"Loading expert {expert_idx}")
+                expert_model = ExpertDiT(config).to(device)
+                state_dict = torch.load(expert_checkpoint, map_location=device)
+                expert_model.load_state_dict(state_dict)
+                expert_models[expert_idx] = expert_model
+            else:
+                logger.warning(f"Expert checkpoint {expert_checkpoint} not found")
+    else:
+        # With cache manager, just verify checkpoints exist and create loader functions
+        for expert_idx in range(config.num_experts):
+            expert_checkpoint = os.path.join(checkpoint_dir, f"expert_{expert_idx}.pt")
+            if os.path.exists(expert_checkpoint):
+                # Create a builder function for this expert
+                def create_expert_builder(idx, checkpoint_path):
+                    def builder(_):
+                        logger.info(f"Loading expert {idx} with cache manager")
+                        expert_model = ExpertDiT(config).to(device)
+                        state_dict = torch.load(checkpoint_path, map_location=device)
+                        expert_model.load_state_dict(state_dict)
+                        return expert_model
+                    return builder
+                
+                # Store the builder in the expert_models dictionary
+                expert_models[expert_idx] = create_expert_builder(expert_idx, expert_checkpoint)
+            else:
+                logger.warning(f"Expert checkpoint {expert_checkpoint} not found")
+    
+    return router_model, expert_models, vae, clip
 
-def run_inference(config, log_queue=None):
-    """Run inference using loaded models"""
-    # Set device
-    device = torch.device(f"cuda:{get_rank()}" if torch.cuda.is_available() else "cpu")
+def load_distilled_model(config, device, checkpoint_path):
+    """
+    Load distilled model if available
     
-    # Load models
-    vae, clip, router, experts = load_models(config, device)
-    
-    # Get inference parameters from config
-    batch_size = getattr(config, 'inference_batch_size', 1)
-    steps = getattr(config, 'inference_steps', 50)
-    guidance_scale = getattr(config, 'cfg_scale', 7.5)
-    top_k = getattr(config, 'inference_top_k', 1)
-    seed = getattr(config, 'seed', int(time.time()))
-    
-    # Get prompts from config
-    if hasattr(config, 'inference_prompts') and config.inference_prompts:
-        prompts = config.inference_prompts
-        if isinstance(prompts, str):
-            prompts = [prompts]
-    else:
-        prompts = ["a photo of a cat"]
-    
-    # Number of samples per prompt
-    num_samples = getattr(config, 'num_samples_per_prompt', 1)
-    total_samples = len(prompts) * num_samples
-    
-    # Log inference settings
-    logger.info(f"Running inference with:")
-    logger.info(f"  - Batch size: {batch_size}")
-    logger.info(f"  - Steps: {steps}")
-    logger.info(f"  - CFG scale: {guidance_scale}")
-    logger.info(f"  - Top-k experts: {top_k}")
-    logger.info(f"  - Seed: {seed}")
-    logger.info(f"  - Prompts: {prompts}")
-    logger.info(f"  - Samples per prompt: {num_samples}")
-    
-    # Set seed for reproducibility
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    # Create output directory with timestamp
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_dir = os.path.join(config.sample_dir, f"samples_{timestamp}")
-    if is_main_process():
-        os.makedirs(output_dir, exist_ok=True)
-    
-    # Inference loop
-    start_time = time.time()
-    sample_count = 0
-    
-    for prompt_idx, prompt in enumerate(prompts):
-        logger.info(f"Generating samples for prompt [{prompt_idx+1}/{len(prompts)}]: '{prompt}'")
+    Args:
+        config: Configuration object
+        device: Device to load model on
+        checkpoint_path: Path to distilled model checkpoint
         
-        # Encode prompt with CLIP
-        text_embeddings, uncond_embeddings = clip.encode_with_uncond([prompt])
+    Returns:
+        distilled_model: Distilled model or None if not available
+    """
+    if not os.path.exists(checkpoint_path):
+        logger.warning(f"Distilled model checkpoint not found: {checkpoint_path}")
+        return None
+    
+    try:
+        logger.info(f"Loading distilled model from {checkpoint_path}")
+        distilled_model = ExpertDiT(config).to(device)
         
-        for sample_idx in range(num_samples):
-            # Get latent shape
-            sample_shape = (
-                batch_size,
-                config.latent_channels,
-                config.image_size // 8,
-                config.image_size // 8
-            )
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            distilled_model.load_state_dict(checkpoint['model_state_dict'])
+        elif 'ema_state_dict' in checkpoint:
+            # Prefer EMA model if available
+            distilled_model.load_state_dict(checkpoint['ema_state_dict'])
+        else:
+            # Assume direct state dict
+            distilled_model.load_state_dict(checkpoint)
             
-            # Sample from model
-            try:
-                logger.info(f"Sampling batch {sample_idx+1}/{num_samples} for prompt: '{prompt}'")
-                batch_start = time.time()
+        logger.info("Distilled model loaded successfully")
+        return distilled_model
+    except Exception as e:
+        logger.error(f"Error loading distilled model: {str(e)}")
+        return None
+
+def load_prompts(prompts_file=None):
+    """
+    Load text prompts for inference
+    
+    Args:
+        prompts_file: Optional path to JSON file containing prompts
+        
+    Returns:
+        prompts: List of text prompts
+    """
+    default_prompts = [
+        "A photo of a cat in a garden",
+        "A painting of a mountain landscape",
+        "A digital art of a futuristic city",
+        "A photo of a red sports car"
+    ]
+    
+    if prompts_file is None or not os.path.exists(prompts_file):
+        logger.info("Using default text prompts")
+        return default_prompts
+    
+    try:
+        with open(prompts_file, 'r') as f:
+            prompts = json.load(f)
+        
+        if not isinstance(prompts, list):
+            logger.warning("Prompts file does not contain a list, using default prompts")
+            return default_prompts
+            
+        logger.info(f"Loaded {len(prompts)} prompts from {prompts_file}")
+        return prompts
+    except Exception as e:
+        logger.error(f"Error loading prompts file: {str(e)}")
+        return default_prompts
+
+def save_images(images, output_dir, prefix="sample"):
+    """
+    Save generated images to disk
+    
+    Args:
+        images: List of PIL images
+        output_dir: Directory to save images in
+        prefix: Prefix for image filenames
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for i, image in enumerate(images):
+        image_path = os.path.join(output_dir, f"{prefix}_{i:04d}.png")
+        image.save(image_path)
+    
+    logger.info(f"Saved {len(images)} images to {output_dir}")
+
+def get_expert_for_inference(expert_idx, expert_models, cache_manager=None):
+    """
+    Get expert model for inference, using cache manager if available
+    
+    Args:
+        expert_idx: Expert index
+        expert_models: Dictionary of expert models or builders
+        cache_manager: Optional ExpertCacheManager
+        
+    Returns:
+        expert_model: Expert model
+    """
+    if cache_manager is None:
+        # Direct access
+        return expert_models.get(expert_idx)
+    else:
+        # Use cache manager to retrieve expert
+        if expert_idx not in expert_models:
+            return None
+            
+        # Check if the value is a function (builder) or model
+        if callable(expert_models[expert_idx]) and not isinstance(expert_models[expert_idx], torch.nn.Module):
+            # It's a builder function
+            builder = expert_models[expert_idx]
+            return cache_manager.get_expert(expert_idx, builder)
+        else:
+            # It's already a model
+            return expert_models[expert_idx]
+
+def run_inference_pipeline(
+    config,
+    device,
+    checkpoint_dir,
+    output_dir,
+    prompts_file=None,
+    images_file=None,
+    batch_size=4,
+    num_steps=50,
+    cache_manager=None
+):
+    """
+    Run inference pipeline for Decentralized Diffusion Models
+    
+    Args:
+        config: Configuration object
+        device: Device to run inference on
+        checkpoint_dir: Directory containing checkpoints
+        output_dir: Directory to save outputs
+        prompts_file: Optional path to JSON file containing prompts
+        images_file: Optional path to file containing input images (not implemented)
+        batch_size: Batch size for inference
+        num_steps: Number of sampling steps
+        cache_manager: Optional ExpertCacheManager for efficient expert loading
+    """
+    # Load models
+    router_model, expert_models, vae, clip = load_models(config, device, checkpoint_dir, cache_manager)
+    
+    # Load distilled model if available
+    distilled_model = None
+    distilled_path = os.path.join(checkpoint_dir, "distilled_model_best.pt")
+    if os.path.exists(distilled_path):
+        distilled_model = load_distilled_model(config, device, distilled_path)
+    
+    # Load prompts
+    prompts = load_prompts(prompts_file)
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Process prompts in batches
+    for batch_idx in range(0, len(prompts), batch_size):
+        # Get batch of prompts
+        batch_prompts = prompts[batch_idx:batch_idx + batch_size]
+        actual_batch_size = len(batch_prompts)
+        
+        # Encode prompts with CLIP
+        logger.info(f"Encoding prompts batch {batch_idx//batch_size + 1}")
+        text_embeddings = []
+        for prompt in batch_prompts:
+            embedding = clip.encode_text(prompt)
+            text_embeddings.append(embedding)
+        
+        text_embeddings = torch.cat(text_embeddings, dim=0)
+        
+        # Create unconditional embeddings for classifier-free guidance
+        uncond_embeddings = clip.encode_text([""] * actual_batch_size)
+        
+        # Sample with DDM
+        logger.info(f"Generating images with DDM for batch {batch_idx//batch_size + 1}")
+        
+        # Define latent shape based on VAE
+        latent_shape = (actual_batch_size, config.latent_channels, 
+                        config.image_size // 8, config.image_size // 8)
+        
+        try:
+            # First try using distilled model if available
+            if distilled_model is not None:
+                logger.info("Using distilled model for sampling")
+                latents = distilled_sample(
+                    distilled_model=distilled_model,
+                    shape=latent_shape,
+                    num_steps=num_steps,
+                    prompt_embeds=text_embeddings,
+                    cfg_scale=config.cfg_scale,
+                    device=device
+                )
+            else:
+                # If no distilled model, use DDM sampling
+                logger.info("Using DDM for sampling")
+                # Load any experts to prefetch into cache if using cache manager
+                if cache_manager is not None:
+                    # Prefetch a few experts to optimize start time
+                    for idx in range(min(3, config.num_experts)):
+                        if idx in expert_models and callable(expert_models[idx]):
+                            cache_manager.queue_prefetch(idx, expert_models[idx])
                 
                 latents = ddm_sample(
-                    router=router,
-                    experts=experts,
-                    shape=sample_shape,
-                    steps=steps,
-                    top_k=top_k,
+                    router=router_model,
+                    experts=expert_models,
+                    shape=latent_shape,
+                    steps=num_steps,
+                    top_k=config.use_top_k,
                     device=device,
-                    cfg_scale=guidance_scale,
+                    cfg_scale=config.cfg_scale,
                     text_embeddings=text_embeddings,
-                    uncond_embeddings=uncond_embeddings
+                    uncond_embeddings=uncond_embeddings,
+                    eta=0.0,
+                    scheduler="cosine",
+                    verbose=True,
+                    # Pass cache_manager to the get_expert_for_inference callback
+                    callback=lambda idx: get_expert_for_inference(idx, expert_models, cache_manager)
                 )
-                
-                # Decode latents
-                logger.info("Decoding latents...")
-                images = vae.decode(latents)
-                
-                # Convert to PIL images
-                pil_images = [tensor_to_pil(img) for img in images]
-                
-                # Save individual images
-                if is_main_process():
-                    for i, img in enumerate(pil_images):
-                        # Create a filename with prompt info
-                        prompt_tag = prompt.replace(" ", "_").replace(",", "").replace(".", "")
-                        prompt_tag = "".join(c for c in prompt_tag if c.isalnum() or c == '_')
-                        prompt_tag = prompt_tag[:50]  # Limit length
-                        
-                        filename = f"{prompt_tag}_{sample_idx}_{i}.png"
-                        img_path = os.path.join(output_dir, filename)
-                        img.save(img_path)
-                        logger.info(f"Saved image to {img_path}")
-                        
-                        sample_count += 1
-                
-                # Log to wandb if configured
-                if log_queue is not None and is_main_process():
-                    log_queue.put({
-                        'images': pil_images,
-                        'prompts': [prompt] * len(pil_images),
-                        'step': sample_count
-                    })
-                
-                # Create and save a grid for this batch
-                if batch_size > 1 and is_main_process():
-                    grid = create_image_grid(pil_images)
-                    grid_filename = f"{prompt_tag}_grid_{sample_idx}.png"
-                    grid_path = os.path.join(output_dir, grid_filename)
-                    grid.save(grid_path)
-                    logger.info(f"Saved grid to {grid_path}")
-                
-                batch_time = time.time() - batch_start
-                logger.info(f"Batch completed in {batch_time:.2f}s ({batch_time / batch_size:.2f}s per image)")
-                
-            except Exception as e:
-                logger.error(f"Error during sampling: {str(e)}", exc_info=True)
+            
+            # Decode latents to images
+            logger.info("Decoding latents to images")
+            images = vae.decode_latents(latents)
+            
+            # Convert to PIL images
+            pil_images = []
+            for image in images:
+                # Convert to PIL
+                pil_image = Image.fromarray(
+                    (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                )
+                pil_images.append(pil_image)
+            
+            # Save images
+            batch_output_dir = os.path.join(output_dir, f"batch_{batch_idx//batch_size + 1}")
+            save_images(pil_images, batch_output_dir)
+            
+            # Save prompts
+            with open(os.path.join(batch_output_dir, "prompts.json"), 'w') as f:
+                prompts_dict = {i: prompt for i, prompt in enumerate(batch_prompts)}
+                json.dump(prompts_dict, f, indent=2)
+            
+        except Exception as e:
+            logger.error(f"Error during inference: {str(e)}")
+            continue
     
-    # Log completion statistics
-    total_time = time.time() - start_time
-    logger.info(f"Inference completed: {sample_count} samples generated in {total_time:.2f}s")
-    logger.info(f"Average time per sample: {total_time / max(1, sample_count):.2f}s")
-    
-    # Signal the logging thread to exit
-    if log_queue is not None and is_main_process():
-        log_queue.put(None)
-        log_queue.join()  # Wait for queue to empty
-    
-    return output_dir
+    logger.info("Inference complete")
 
 def main():
     # Load configuration
@@ -332,10 +458,20 @@ def main():
     
     try:
         # Run inference
-        output_dir = run_inference(config, log_queue)
+        run_inference_pipeline(
+            config=config,
+            device=torch.device(f"cuda:{get_rank()}" if torch.cuda.is_available() else "cpu"),
+            checkpoint_dir="checkpoints",
+            output_dir="samples",
+            prompts_file=None,
+            images_file=None,
+            batch_size=4,
+            num_steps=50,
+            cache_manager=None
+        )
         
         if is_main_process():
-            logger.info(f"All samples saved to: {output_dir}")
+            logger.info(f"All samples saved to: samples")
             
     except Exception as e:
         logger.error(f"Error during inference: {str(e)}", exc_info=True)

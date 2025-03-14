@@ -35,63 +35,99 @@ logger = setup_logger("DDMCoordinator")
 class DDMTrainingCoordinator:
     """Implements the core training logic from Section 3 of the paper"""
     
-    def __init__(self, config, rank, world_size):
+    def __init__(self, config, rank, world_size, cache_manager=None):
         """
         Initialize coordinator as per paper Section 4.1
         Args:
             config: Configuration object
             rank: Process rank (0 is main)
             world_size: Total number of processes
+            cache_manager: Optional ExpertCacheManager for efficient expert loading/unloading
         """
         self.config = config
         self.rank = rank
         self.world_size = world_size
-        self.device = torch.device(f"cuda:{rank}")
+        self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+        self.cache_manager = cache_manager
         
-        # Initialize logger
-        self.logger = setup_logger(name="DDMCoordinator", rank=rank)
-        
-        # Log starting information
-        if is_main_process():
-            log_training_start(self.logger, config)
-        
-        # Initialize WandB if specified
-        if is_main_process() and hasattr(config, 'use_wandb') and config.use_wandb:
-            self.run = init_wandb(config)
-        else:
-            self.run = None
-            
-        # Track execution state
-        self.current_step = 0
-        self.training_started = False
-        self.is_initialized = False
-        
-        # Initialize experts and router state
-        self.experts = {}  # Maps expert_idx -> ExpertTrainer
-        self.router_trainer = None
-        self.expert_loaders = {}  # Maps expert_idx -> DataLoader
-        self.router_loader = None
-        
-        # Initialize VAE and CLIP
-        self.vae = VAEWrapper(self.device, config)
-        self.clip = CLIPTextEncoder(self.device, config)
-        
-        # Initialize ExpertCacheManager
-        self.expert_cache = ExpertCacheManager(config, self.device)
-        
-        # Set up cluster manager and data loaders
+        # Initialize clustering
         self.init_cluster_manager()
+        
+        # Initialize data loaders
         self.init_data_loaders()
         
-        # Initialize models (router and experts)
+        # Initialize models
         self.init_models()
         
-        # Metrics calculator for validation
-        self.metrics = MetricCalculator(config, rank)
+        # Set up optimizers and schedulers
+        self.optimizers = {}
+        self.schedulers = {}
         
-        # Mark as initialized
-        self.is_initialized = True
-        self.logger.info("DDMTrainingCoordinator initialized successfully")
+        # Initialize router optimizer
+        self.optimizers['router'] = torch.optim.AdamW(
+            self.router.parameters(),
+            lr=config.router_learning_rate,
+            betas=config.adam_betas,
+            weight_decay=config.weight_decay
+        )
+        
+        # Initialize expert optimizers (one per expert)
+        for expert_idx in range(config.num_experts):
+            if self.is_expert_owned_by_rank(expert_idx):
+                # Only create optimizer for experts owned by this rank
+                expert = self.get_expert(expert_idx)
+                self.optimizers[f'expert_{expert_idx}'] = torch.optim.AdamW(
+                    expert.parameters(),
+                    lr=config.learning_rate,
+                    betas=config.adam_betas,
+                    weight_decay=config.weight_decay
+                )
+        
+        # Create learning rate schedulers (cosine decay)
+        warmup_steps = getattr(config, 'warmup_steps', 1000)
+        total_steps = config.num_steps
+        
+        for key, optimizer in self.optimizers.items():
+            self.schedulers[key] = torch.optim.lr_scheduler.LambdaLR(
+                optimizer,
+                lambda step: min(step / warmup_steps, 1.0) if step < warmup_steps else 
+                0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps)))
+            )
+        
+        # Initialize flow matcher for loss computation
+        self.flow_matcher = DecentralizedFlowMatcher(
+            sigma=config.sigma,
+            loss_type=config.loss_type
+        )
+        
+        # Get diffusion parameters
+        self.alphas, self.alpha_bar, _ = get_alphas_and_betas()
+        
+        # Track metrics
+        self.metrics = {
+            'step': 0,
+            'expert_loss': {},
+            'router_loss': 0.0,
+            'learning_rates': {}
+        }
+        
+        # Create AMP grad scaler for mixed precision training
+        self.grad_scaler = torch.cuda.amp.GradScaler(enabled=config.use_mixed_precision)
+        
+        # Expert data loaders and iterators
+        self.expert_iterators = {}
+        
+        logger.info(f"DDMTrainingCoordinator initialized on rank {rank}/{world_size}")
+        
+        # If we're the main process, log the configuration
+        if self.rank == 0:
+            logger.info(f"Training configuration:")
+            for key, value in vars(config).items():
+                if not key.startswith('_'):
+                    logger.info(f"  {key}: {value}")
+                    
+        # Synchronize to ensure all processes have completed initialization
+        synchronize()
         
     def init_cluster_manager(self):
         """Initialize cluster manager for expert assignment"""
@@ -190,29 +226,42 @@ class DDMTrainingCoordinator:
     
     def get_expert(self, expert_idx):
         """
-        Get an expert model by index, using cache manager for memory efficiency
+        Get expert model, loading it from disk if necessary
         
         Args:
-            expert_idx: Index of the expert
+            expert_idx: Index of the expert to retrieve
             
         Returns:
-            ExpertTrainer instance
+            Loaded expert model or None if not owned by this rank
         """
-        # Check if we own this expert
-        if expert_idx % self.world_size != self.rank:
-            raise ValueError(f"Expert {expert_idx} is not assigned to rank {self.rank}")
-        
-        # Use the cache manager to retrieve or load the expert
-        return self.expert_cache.get_expert(
-            expert_idx,
-            lambda idx: ExpertTrainer(
-                expert_idx=idx,
+        # Check if expert is owned by this rank
+        if not self.is_expert_owned_by_rank(expert_idx):
+            return None
+            
+        # If cache manager is available, use it to efficiently load the expert
+        if self.cache_manager is not None:
+            # Define expert builder function
+            def expert_builder(_):
+                logger.info(f"Building expert {expert_idx} for rank {self.rank}")
+                return ExpertTrainer(
+                    config=self.config,
+                    expert_idx=expert_idx,
+                    rank=self.rank,
+                    world_size=self.world_size
+                )
+            
+            # Use the cache manager to retrieve or load the expert
+            return self.cache_manager.get_expert(expert_idx, expert_builder)
+        else:
+            # No cache manager, create expert directly
+            # This is less memory efficient as all experts will stay in memory
+            logger.info(f"Building expert {expert_idx} for rank {self.rank} (no cache manager)")
+            return ExpertTrainer(
                 config=self.config,
-                device=self.device,
+                expert_idx=expert_idx,
                 rank=self.rank,
                 world_size=self.world_size
             )
-        )
     
     def perform_reclustering(self):
         """Perform reclustering of the dataset with optimized model migration"""
@@ -244,7 +293,7 @@ class DDMTrainingCoordinator:
             self.dataset.cluster_assignments = new_labels
             
             # Clear caches to free up memory before migration
-            self.expert_cache.clear_cache()
+            self.cache_manager.clear_cache()
             
             # Recreate per-expert data loaders
             from data.loader import create_expert_bucket_loaders
@@ -677,8 +726,21 @@ class DDMTrainingCoordinator:
     
     def __del__(self):
         """Clean up resources"""
-        if hasattr(self, 'expert_cache'):
+        if hasattr(self, 'cache_manager'):
             try:
-                self.expert_cache.shutdown()
+                self.cache_manager.shutdown()
             except:
                 pass
+
+    def is_expert_owned_by_rank(self, expert_idx):
+        """
+        Check if an expert is owned by this rank
+        
+        Args:
+            expert_idx: Index of the expert to check
+            
+        Returns:
+            True if expert is owned by this rank, False otherwise
+        """
+        # Simple sharding: expert_idx % world_size == rank
+        return expert_idx % self.world_size == self.rank
