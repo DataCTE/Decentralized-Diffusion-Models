@@ -1,6 +1,8 @@
 """Configuration for Decentralized Diffusion Models."""
 
 import os
+import time
+from utils.logging import logger
 
 class DDMConfig:
     """Configuration for Decentralized Diffusion Models"""
@@ -144,10 +146,44 @@ class DDMConfig:
 
     def _calculate_dataset_size(self):
         """Calculate dataset size from directory (only called on rank 0)"""
+        logger.info(f"Calculating dataset size from: {self.dataset_path}")
+        start_time = time.time()
+        
         if not os.path.exists(self.dataset_path):
+            logger.warning(f"Dataset path does not exist: {self.dataset_path}")
             return 0
+        
+        # Count files by extension for detailed logging
+        extensions = {'.png': 0, '.jpg': 0, '.jpeg': 0, '.webp': 0}
+        other_files = 0
+        
+        try:
+            all_files = os.listdir(self.dataset_path)
+            logger.info(f"Found {len(all_files)} total files in dataset directory")
             
-        return len([
-            f for f in os.listdir(self.dataset_path) 
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))
-        ])
+            for f in all_files:
+                lower_ext = os.path.splitext(f.lower())[1]
+                if lower_ext in extensions:
+                    extensions[lower_ext] += 1
+                else:
+                    other_files += 1
+            
+            # Count valid image files
+            valid_images = sum(extensions.values())
+            
+            # Log detailed counts
+            for ext, count in extensions.items():
+                if count > 0:
+                    logger.info(f"  {ext} files: {count}")
+            
+            if other_files > 0:
+                logger.info(f"  Other non-image files: {other_files}")
+                
+            # Log time taken
+            elapsed_time = time.time() - start_time
+            logger.info(f"Dataset size calculation completed in {elapsed_time:.2f}s, found {valid_images} valid images")
+            
+            return valid_images
+        except Exception as e:
+            logger.error(f"Error calculating dataset size: {str(e)}")
+            return 0
