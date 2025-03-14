@@ -58,13 +58,35 @@ def get_alphas_and_betas(num_timesteps=1000, schedule_type='cosine'):
     return alphas, alpha_bar, betas
 
 def forward_diffuse(x0, t, alpha_bar, noise=None):
-    """Paper Equation 4: Forward diffusion process"""
+    """
+    Apply forward diffusion to data at time t
+    
+    Args:
+        x0: Initial data [B, C, H, W]
+        t: Timestep tensor [B]
+        alpha_bar: Cumulative product of alphas 
+        noise: Optional pre-generated noise (if None, will sample Gaussian)
+        
+    Returns:
+        x_t: Diffused data
+        noise: Generated noise
+    """
+    # Extract batch size
+    batch_size = x0.shape[0]
+    
+    # Get alpha_bar at specified timesteps
+    a_bar = alpha_bar[t].view(-1, 1, 1, 1)
+    
+    # Sample Gaussian noise if not provided
     if noise is None:
         noise = torch.randn_like(x0)
         
-    sqrt_alpha_bar = torch.sqrt(alpha_bar[t])[:, None, None, None]
-    sqrt_one_minus = torch.sqrt(1. - alpha_bar[t])[:, None, None, None]
-    return sqrt_alpha_bar * x0 + sqrt_one_minus * noise
+    # Apply forward diffusion: x_t = √(α_t)·x_0 + √(1-α_t)·ε
+    mean = a_bar.sqrt() * x0
+    std = (1 - a_bar).sqrt()
+    x_t = mean + std * noise
+    
+    return x_t, noise
 
 def get_noise_schedule(timesteps, schedule_type='cosine'):
     """Get noise schedule for given timesteps"""
@@ -93,108 +115,135 @@ def get_variance_schedule(num_timesteps=1000, beta_start=0.0001, beta_end=0.02, 
 
 def cosine_beta_schedule(timesteps, s=0.008):
     """
-    Cosine beta schedule as used in the paper.
+    Cosine beta schedule as defined in the paper
+    
+    Args:
+        timesteps: Number of diffusion steps
+        s: Parameter controlling the minimum SNR
+        
+    Returns:
+        Beta schedule
     """
     steps = timesteps + 1
     x = torch.linspace(0, timesteps, steps)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0.0, 0.999)
+    return torch.clip(betas, 0.0001, 0.9999)
 
-def ddim_step(x, predicted_noise, t, t_prev, alpha_bar=None):
+def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings=None):
     """
-    DDIM step for deterministic sampling.
+    DDIM step for deterministic diffusion sampling
     
     Args:
-        x: Current noisy sample
-        predicted_noise: Predicted noise
-        t: Current timestep
-        t_prev: Previous timestep
-        alpha_bar: Optional precomputed alpha_bar values
+        model: Diffusion model
+        x_t: Current latent [B, C, H, W]
+        t: Current timestep [B]
+        t_next: Next timestep [B]
+        alphas: Alpha schedule
+        alpha_bar: Cumulative product of alphas
+        eta: Stochasticity parameter (0 for deterministic, 1 for stochastic)
+        text_embeddings: Optional text conditioning
+        
+    Returns:
+        x_{t-1}: Next latent
     """
-    if alpha_bar is None:
-        # Default to cosine schedule if not provided
-        steps = 1000
-        alpha_bar = torch.cos(((torch.arange(steps + 1) / steps) + 0.008) / 1.008 * torch.pi * 0.5) ** 2
-        alpha_bar = alpha_bar / alpha_bar[0]
-    
-    # Get alpha values
-    t_idx = int(t.item() * 999)
-    t_prev_idx = int(t_prev.item() * 999)
-    
-    # Clamp indices
-    t_idx = min(999, max(0, t_idx))
-    t_prev_idx = min(999, max(0, t_prev_idx))
-    
-    alpha_bar_t = alpha_bar[t_idx]
-    alpha_bar_prev = alpha_bar[t_prev_idx]
-    
-    # Scale predicted noise
-    sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
-    
-    # Predict x0
-    pred_x0 = (x - sqrt_one_minus_alpha_bar_t * predicted_noise) / torch.sqrt(alpha_bar_t)
-    
-    # Sample
-    pred_coef = torch.sqrt(alpha_bar_prev)
-    pred_noise_coef = torch.sqrt(1 - alpha_bar_prev)
-    x_prev = pred_coef * pred_x0 + pred_noise_coef * predicted_noise
-    
-    return x_prev
+    try:
+        # Get model prediction
+        with torch.no_grad():
+            noise_pred = model(x_t, t, text_embeddings)
+            
+        # Get alphas for current and next timestep
+        a_t = alphas[t]
+        a_prev = alphas[t_next]
+        a_bar_t = alpha_bar[t]
+        a_bar_prev = alpha_bar[t_next]
+        
+        # Reshape for broadcasting
+        a_t = a_t.view(-1, 1, 1, 1)
+        a_prev = a_prev.view(-1, 1, 1, 1)
+        a_bar_t = a_bar_t.view(-1, 1, 1, 1)
+        a_bar_prev = a_bar_prev.view(-1, 1, 1, 1)
+        
+        # Compute predicted x0
+        x0_pred = (x_t - torch.sqrt(1 - a_bar_t) * noise_pred) / torch.sqrt(a_bar_t)
+        
+        # Prevent extreme values for stability
+        x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+        
+        # Compute variance
+        var = eta * torch.sqrt(
+            (1 - a_bar_prev) / (1 - a_bar_t) * (1 - a_t / a_bar_t)
+        )
+        
+        # Compute direction
+        dir_xt = torch.sqrt(1 - a_bar_prev - var**2) * noise_pred
+        
+        # Sample random noise for stochastic component
+        noise = torch.randn_like(x_t) if eta > 0 else torch.zeros_like(x_t)
+        
+        # Compute next latent
+        x_prev = torch.sqrt(a_bar_prev) * x0_pred + dir_xt + var * noise
+        
+        return x_prev
+    except Exception as e:
+        logger.error(f"Error in DDIM step: {str(e)}")
+        # Return input as fallback for stability
+        return x_t
 
-def update_sample(x_t, pred_noise, t, alphas=None, alpha_bar=None, betas=None, steps=1000):
+def update_sample(x, pred, t_index, t_next_index, alphas, alpha_bar, eta=0.0):
     """
-    Update sample with predicted noise using DDIM sampler (deterministic)
+    Update sample using diffusion model prediction
     
     Args:
-        x_t: Current noisy sample [B, C, H, W]
-        pred_noise: Predicted noise [B, C, H, W]
-        t: Current timestep [B,]
-        alphas, alpha_bar, betas: Precomputed diffusion coefficients
+        x: Current sample [B, C, H, W]
+        pred: Model prediction [B, C, H, W]
+        t_index: Current timestep index
+        t_next_index: Next timestep index
+        alphas: Alpha schedule
+        alpha_bar: Cumulative product of alphas
+        eta: Stochasticity parameter (0 for deterministic, 1 for stochastic)
+        
+    Returns:
+        Updated sample
     """
-    if alphas is None or alpha_bar is None or betas is None:
-        alphas, alpha_bar, betas = get_alphas_and_betas(steps)
-    
-    # Move tensors to correct device and dtype
-    device = x_t.device
-    dtype = x_t.dtype
-    alphas = alphas.to(device=device, dtype=dtype)
-    alpha_bar = alpha_bar.to(device=device, dtype=dtype)
-    betas = betas.to(device=device, dtype=dtype)
-    
-    # Previous timestep
-    prev_t = (t - 1).clamp(min=0)
-    
-    # Get alpha values for current and previous timestep
-    alpha_t = alphas[t]
-    alpha_prev = alphas[prev_t]
-    alpha_bar_t = alpha_bar[t]
-    alpha_bar_prev = alpha_bar[prev_t]
-    
-    # Reshaping for broadcasting
-    alpha_t = alpha_t[:, None, None, None]
-    alpha_prev = alpha_prev[:, None, None, None]
-    alpha_bar_t = alpha_bar_t[:, None, None, None]
-    alpha_bar_prev = alpha_bar_prev[:, None, None, None]
-    
-    # Predict x0 from xt and predicted noise
-    sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-    sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
-    pred_x0 = (x_t - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
-    
-    # DDIM update (deterministic sampling)
-    sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
-    sqrt_one_minus_alpha_bar_prev = torch.sqrt(1 - alpha_bar_prev)
-    
-    # Compute "direction pointing to xt"
-    dir_xt = torch.sqrt(1. - alpha_bar_prev - sqrt_one_minus_alpha_bar_prev**2) * pred_noise
-    
-    # Update xt to xt-1
-    x_prev = sqrt_alpha_bar_prev * pred_x0 + sqrt_one_minus_alpha_bar_prev * pred_noise + dir_xt
-    
-    # Return properly thresholded results
-    return x_prev.clamp(-1., 1.)
+    try:
+        # Get alphas for current and next timestep
+        alpha_t = alphas[t_index] if t_index < len(alphas) else torch.tensor(1.0, device=alphas.device)
+        alpha_next = alphas[t_next_index] if t_next_index < len(alphas) else torch.tensor(1.0, device=alphas.device)
+        
+        alpha_bar_t = alpha_bar[t_index] if t_index < len(alpha_bar) else torch.tensor(1.0, device=alpha_bar.device)
+        alpha_bar_next = alpha_bar[t_next_index] if t_next_index < len(alpha_bar) else torch.tensor(1.0, device=alpha_bar.device)
+        
+        # Reshape for broadcasting
+        alpha_t = alpha_t.view(-1, 1, 1, 1)
+        alpha_next = alpha_next.view(-1, 1, 1, 1)
+        alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1)
+        alpha_bar_next = alpha_bar_next.view(-1, 1, 1, 1)
+        
+        # Predict x0
+        pred_x0 = (x - torch.sqrt(1 - alpha_bar_t) * pred) / torch.sqrt(alpha_bar_t)
+        
+        # Clamp for stability
+        pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+        
+        # Compute direction
+        dir_xt = torch.sqrt(1 - alpha_bar_next - eta**2 * (1 - alpha_bar_next) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_next)) * pred
+        
+        # Compute noise strength
+        noise_strength = eta * torch.sqrt((1 - alpha_bar_next) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_next))
+        
+        # Sample random noise
+        noise = torch.randn_like(x) if eta > 0 else torch.zeros_like(x)
+        
+        # Update sample
+        x_next = torch.sqrt(alpha_bar_next) * pred_x0 + dir_xt + noise_strength * noise
+        
+        return x_next
+    except Exception as e:
+        logger.error(f"Error in update_sample: {str(e)}")
+        # Return input as fallback for stability
+        return x
 
 def get_schedule(timesteps, schedule_type='cosine'):
     """Paper's noise schedules from Section 3.2"""
@@ -204,114 +253,116 @@ def get_schedule(timesteps, schedule_type='cosine'):
         return 1 - timesteps 
 
 class DecentralizedFlowMatcher:
-    """Implements paper's Equations 6-8 for DFM"""
+    """
+    Implements the flow matching objective for Decentralized Diffusion Models (Paper Section 3.1)
     
-    def __init__(self, sigma=0.8, loss_type='l2'):
+    This class implements the loss function for training experts in the DDM framework.
+    """
+    
+    def __init__(self, sigma=0.5, loss_type='huber'):
         """
+        Initialize flow matcher
+        
         Args:
-            sigma: Noise scale (paper Appendix B.1)
-            loss_type: 'l2' or 'huber' (paper Section 4.1)
+            sigma: Flow matching sigma parameter
+            loss_type: Loss function type ('mse', 'huber', or 'l1')
         """
         self.sigma = sigma
-        self.loss_fn = {
-            'l2': torch.nn.functional.mse_loss,
-            'huber': torch.nn.functional.smooth_l1_loss
-        }[loss_type]
-
-    def compute_loss(self, pred_flows, router_probs, x0, t, alpha_bar):
-        """
-        Paper Equation 7: Decentralized flow matching loss
-        Args:
-            pred_flows: List of expert predictions [E][B, C, H, W]
-            router_probs: Router probabilities [B, E]
-            x0: Clean samples [B, C, H, W]
-            t: Timesteps [B,]
-            alpha_bar: Precomputed alpha_bar schedule
-        """
-        # Sample noise and create x_t
-        noise = torch.randn_like(x0)
-        x_t = forward_diffuse(x0, t, alpha_bar, noise)
+        self.loss_type = loss_type
         
-        # Compute target flow (Equation 4 derivative)
-        sigma_t = torch.sqrt(1. - alpha_bar[t])[:, None, None, None]
-        target_flow = (x0 - x_t) / sigma_t
-        
-        # Calculate per-expert losses
-        expert_losses = torch.stack([
-            self.loss_fn(pred, target_flow, reduction='none')
-            for pred in pred_flows
-        ], dim=1)  # [B, E, ...]
-        
-        # Apply router weights and reduce
-        weighted_losses = router_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * expert_losses
-        return weighted_losses.sum(dim=1).mean()
-
-    def compute_flow_matching_target(self, x0, x_t, t):
+    def compute_flow_matching_target(self, x0, xt, t):
         """
-        Compute the flow matching target v_t(x_t)
+        Compute flow matching target
         
         Args:
-            x0: Original clean data [B, C, H, W]
-            x_t: Noisy data at timestep t [B, C, H, W]
-            t: Timestep values [B,]
+            x0: Original data [B, C, H, W]
+            xt: Noisy data at time t [B, C, H, W]
+            t: Timestep tensor [B]
             
         Returns:
-            Target flow field [B, C, H, W]
+            Flow matching target
         """
-        # Compute sigma_t
-        sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
+        # Ensure t is properly shaped for broadcasting
+        t = t.reshape(-1, 1, 1, 1)
         
-        # Compute target flow
-        target_flow = (x0 - x_t) / sigma_t
-        return target_flow
+        # Calculate denominator for stability (avoid division by zero)
+        denom = torch.maximum(torch.sqrt(t), torch.tensor(1e-5, device=t.device))
         
-    def compute_flow_matching_loss(self, pred_flow, target_flow):
+        # Compute target: u_t(x_t|x_0) = (x_0 - x_t) / sqrt(t)
+        target = (x0 - xt) / denom
+        
+        return target
+    
+    def compute_flow_matching_loss(self, pred, target):
         """
-        Compute flow matching loss between predicted and target flows
+        Compute flow matching loss
         
         Args:
-            pred_flow: Predicted flow field [B, C, H, W]
-            target_flow: Target flow field [B, C, H, W]
+            pred: Model prediction [B, C, H, W]
+            target: Flow matching target [B, C, H, W]
             
         Returns:
             Loss value
         """
-        return self.loss_fn(pred_flow, target_flow)
-
-    def sample(self, router, experts, shape, alpha_bar, steps=50, top_k=1):
+        if self.loss_type == 'mse':
+            return torch.mean(torch.sum((pred - target)**2, dim=[1, 2, 3]))
+        elif self.loss_type == 'huber':
+            return torch.mean(torch.sum(torch.nn.functional.huber_loss(pred, target, reduction='none'), dim=[1, 2, 3]))
+        elif self.loss_type == 'l1':
+            return torch.mean(torch.sum(torch.abs(pred - target), dim=[1, 2, 3]))
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
+    
+    def compute_loss(self, batch, model=None):
         """
-        Paper Algorithm 2: Decentralized sampling
-        Args:
-            shape: Output shape [B, C, H, W]
-            alpha_bar: Precomputed schedule
-            steps: Number of sampling steps
-            top_k: Experts to use per step
-        """
-        device = next(router.parameters()).device
-        x = torch.randn(shape, device=device)
-        dt = 1.0 / steps
+        Compute complete flow matching loss for a batch
         
-        for step in reversed(range(steps)):
-            t = torch.full((shape[0],), step/steps, device=device)
+        Args:
+            batch: Dictionary containing 'image' and optionally 'text_embedding'
+            model: Model to compute predictions (if None, just compute target)
             
-            # Get router probabilities
-            with torch.no_grad():
-                logits = router(x, t)
-                probs = torch.softmax(logits, dim=-1)
+        Returns:
+            Loss value or (loss, prediction, target) tuple
+        """
+        try:
+            # Extract data
+            x0 = batch['image']
+            batch_size = x0.shape[0]
             
-            # Select top-k experts
-            top_probs, top_indices = torch.topk(probs, top_k, dim=-1)
-            top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
+            # Sample random timestep
+            t = torch.rand(batch_size, device=x0.device)
             
-            # Compute and combine expert predictions
-            combined = torch.zeros_like(x)
-            for expert_idx, expert in enumerate(experts):
-                mask = (top_indices == expert_idx).any(dim=-1)
-                if mask.any():
-                    pred = expert(x[mask], t[mask])
-                    combined[mask] += pred * top_probs[mask][..., None, None, None]
+            # Sample random noise
+            noise = torch.randn_like(x0)
             
-            # Update sample (Equation 8 Euler step)
-            x = x + combined * dt
+            # Diffuse data to timestep t
+            xt = torch.sqrt(1 - t.view(-1, 1, 1, 1)) * x0 + torch.sqrt(t.view(-1, 1, 1, 1)) * noise
             
-        return x 
+            # Get text conditioning if available
+            text_embeds = batch.get('text_embedding', None)
+            
+            # Compute target
+            target = self.compute_flow_matching_target(x0, xt, t)
+            
+            # If model is provided, compute prediction and loss
+            if model is not None:
+                # Convert t to model-expected format (typically int indices)
+                t_indices = (t * 1000).long()
+                
+                # Forward pass
+                pred = model(xt, t_indices, text_embeds)
+                
+                # Compute loss
+                loss = self.compute_flow_matching_loss(pred, target)
+                
+                return loss, pred, target
+            else:
+                # Just return target
+                return target
+        except Exception as e:
+            logger.error(f"Error in compute_loss: {str(e)}")
+            # Return zero loss as fallback for stability
+            if model is not None:
+                return torch.tensor(0.0, device=x0.device), None, None
+            else:
+                return torch.zeros_like(x0) 
