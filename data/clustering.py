@@ -6,7 +6,7 @@ import torch.distributed as dist
 import numpy as np
 import time
 import logging
-from utils.feature_extractor import DINOv2FeatureExtractor
+from data.feature_extractor import DINOv2FeatureExtractor
 from sklearn.cluster import MiniBatchKMeans
 from tqdm import tqdm
 from torch.utils.data import DataLoader
