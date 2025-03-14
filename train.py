@@ -4,16 +4,15 @@ import os
 import torch
 import torch.distributed
 import datetime
-import logging
 import time
-import sys
+
 
 from config import DDMConfig
 from trainers.coordinator import DDMTrainingCoordinator
 
 # Import centralized utilities
-from utils.logging import setup_logger, init_wandb, log_metrics, log_images
-from utils.distributed import is_main_process, get_rank, get_world_size, synchronize
+from utils.logging import setup_logger, init_wandb
+from utils.distributed import is_main_process, get_rank, synchronize
 from utils.expert_cache import ExpertCacheManager
 
 # Setup root logger
@@ -179,6 +178,11 @@ def main():
                 if is_main_process():
                     logger.info(f"Step {step}: Running scheduled validation")
                 coordinator.run_validation(step)
+                
+                # Run ensemble validation to validate the DDM objective
+                if is_main_process():
+                    logger.info(f"Step {step}: Running ensemble validation")
+                coordinator.run_ensemble_validation(step)
             
             # Checkpointing
             if step % getattr(config, 'save_interval', 5000) == 0 or step == config.num_steps - 1:

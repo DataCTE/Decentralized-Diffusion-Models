@@ -4,6 +4,7 @@ import math
 import torch
 import os
 import datetime
+import torch.nn.functional as F
 
 from data.dataset import DDMDataset
 from data.clustering import ClusterManager
@@ -457,12 +458,20 @@ class DDMTrainingCoordinator:
             # Continue with newly initialized expert if migration fails
     
     def train_experts(self, step):
-        """Train expert models for one step with improved batch handling"""
+        """
+        Train expert models for one step with DFM objective from paper Section 3.2
+        
+        Args:
+            step: Current training step
+            
+        Returns:
+            Average loss across experts
+        """
         self.current_step = step
         total_loss = 0.0
         num_experts_trained = 0
         
-        # Train each expert assigned to this process in batches
+        # Train each expert assigned to this process
         for expert_idx in sorted(self.expert_loaders.keys()):
             # Skip if not assigned to this rank
             if expert_idx % self.world_size != self.rank:
@@ -497,7 +506,8 @@ class DDMTrainingCoordinator:
                     self.expert_iterators[expert_idx] = iter(loader)
                     batch = next(self.expert_iterators[expert_idx])
                     
-                # Train expert
+                # Paper Section 3.2: Train expert on its assigned cluster data
+                # Each expert specializes on a subset of the data distribution
                 loss = expert.train_step(batch)
                 total_loss += loss
                 num_experts_trained += 1
@@ -512,7 +522,15 @@ class DDMTrainingCoordinator:
         return avg_loss
             
     def train_router(self, step):
-        """Train router model for one step with improved batch handling"""
+        """
+        Train router model for one step following Algorithm 1 in the paper
+        
+        Args:
+            step: Current training step
+            
+        Returns:
+            Router loss
+        """
         self.current_step = step
         
         # Skip router training if no data loader
@@ -532,13 +550,124 @@ class DDMTrainingCoordinator:
                 self.router_iterator = iter(self.router_loader)
                 batch = next(self.router_iterator)
                 
-            # Train router
+            # Paper Section 3.3: Train router to predict cluster for each sample
+            # Router training follows Algorithm 1 in the paper
             loss = self.router_trainer.train_step(batch)
             
             return loss
         except Exception as e:
             self.logger.error(f"Error training router: {str(e)}")
             return 0.0
+    
+    def run_ensemble_validation(self, step):
+        """
+        Run validation using the complete ensemble (paper Section 3.5)
+        
+        Args:
+            step: Current step
+        """
+        if self.rank != 0:
+            return  # Only run on main process
+            
+        self.logger.info(f"Running ensemble validation at step {step}")
+        
+        # Setup validation
+        num_samples = min(16, self.config.batch_size)  # Small batch for validation
+        device = self.device
+        
+        try:
+            # Create validation batch
+            val_loader = self.create_validation_loader(batch_size=num_samples)
+            batch = next(iter(val_loader))
+            
+            images = batch["image"].to(device)
+            cluster_labels = batch["cluster"].to(device)
+            text_embeds = batch.get("text_embedding")
+            if text_embeds is not None:
+                text_embeds = text_embeds.to(device)
+                
+            # Create timesteps
+            batch_size = images.shape[0]
+            t = torch.rand(batch_size, device=device)
+            timesteps = (t * 1000).long()
+            
+            # Forward diffusion
+            noise = torch.randn_like(images)
+            alpha_t = torch.cos(t.view(-1, 1, 1, 1) * math.pi/2)
+            sigma_t = torch.sin(t.view(-1, 1, 1, 1) * math.pi/2)
+            noisy_images = alpha_t * images + sigma_t * noise
+            
+            # Get router predictions
+            router_outputs = self.router_trainer.router(noisy_images, timesteps, text_embeds)
+            router_probs = torch.softmax(router_outputs, dim=1)
+            
+            # Load all experts (for validation only)
+            all_experts = {}
+            for expert_idx in range(self.config.num_experts):
+                if expert_idx not in all_experts:
+                    # Use cache manager if available
+                    if self.cache_manager:
+                        all_experts[expert_idx] = self.cache_manager.get_expert(
+                            expert_idx,
+                            lambda idx: ExpertTrainer(
+                                config=self.config,
+                                expert_idx=idx,
+                                rank=self.rank,
+                                world_size=self.world_size
+                            )
+                        )
+                    else:
+                        all_experts[expert_idx] = ExpertTrainer(
+                            config=self.config,
+                            expert_idx=expert_idx,
+                            rank=self.rank,
+                            world_size=self.world_size
+                        )
+            
+            # Get predictions from all experts
+            expert_preds = {}
+            for expert_idx, expert in all_experts.items():
+                with torch.no_grad():
+                    expert_preds[expert_idx] = expert.expert(noisy_images, timesteps, text_embeds)
+                    
+            # Paper Section 3.4: Combine expert predictions using router weights
+            ensemble_pred = torch.zeros_like(noisy_images)
+            for expert_idx, pred in expert_preds.items():
+                weights = router_probs[:, expert_idx].view(batch_size, 1, 1, 1)
+                ensemble_pred += weights * pred
+                
+            # Compute flow matching target
+            target = self.flow_matcher.compute_flow_matching_target(images, noisy_images, t)
+            
+            # Compute metrics
+            ensemble_loss = F.mse_loss(ensemble_pred, target)
+            expert_losses = {}
+            for expert_idx, pred in expert_preds.items():
+                expert_losses[expert_idx] = F.mse_loss(pred, target).item()
+                
+            # Log metrics
+            self.logger.info(f"Ensemble validation loss: {ensemble_loss.item():.6f}")
+            for expert_idx, loss in expert_losses.items():
+                self.logger.info(f"Expert {expert_idx} validation loss: {loss:.6f}")
+                
+            # Log router accuracy
+            top1_accuracy = (router_probs.argmax(dim=1) == cluster_labels).float().mean()
+            self.logger.info(f"Router accuracy: {top1_accuracy.item():.2f}")
+            
+            # Log metrics to tracking system
+            if hasattr(self.config, 'use_wandb') and self.config.use_wandb:
+                metrics = {
+                    "val/ensemble_loss": ensemble_loss.item(),
+                    "val/router_accuracy": top1_accuracy.item(),
+                }
+                
+                for expert_idx, loss in expert_losses.items():
+                    metrics[f"val/expert_{expert_idx}_loss"] = loss
+                    
+                log_metrics(metrics, step=step)
+                
+        except Exception as e:
+            self.logger.error(f"Error in ensemble validation: {str(e)}")
     
     def run_validation(self, step):
         """Run validation for current model state"""

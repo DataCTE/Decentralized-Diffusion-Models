@@ -444,37 +444,60 @@ class RouterTrainer:
             
         return selected_experts, expert_weights
             
-    def train_step(self, x_t, t, cluster_labels, clip_embeddings=None):
+    def train_step(self, batch):
         """
-        Train the router for one step, using cluster labels as supervision
+        Train router for one step following Algorithm 1 from the paper
         
         Args:
-            x_t: Noisy data at timestep t
-            t: Timestep values
-            cluster_labels: Ground truth cluster labels
-            clip_embeddings: Optional text embeddings
+            batch: Dict with 'image', 'cluster', and optional 'text_embedding'
             
         Returns:
-            loss: Training loss
+            Loss value
         """
-        # Get router logits
-        router_logits = self.router(x_t, t, clip_embeddings)
+        # Move batch to device
+        images = batch["image"].to(self.device)
+        cluster_labels = batch["cluster"].to(self.device)
+        text_embeddings = batch.get("text_embedding", None)
+        if text_embeddings is not None:
+            text_embeddings = text_embeddings.to(self.device)
+            
+        # Create diffusion timesteps
+        batch_size = images.shape[0]
         
-        # Compute cross entropy loss
-        loss = self.criterion(router_logits, cluster_labels)
+        # Sample random timestep for each sample (uniform in [0, 1])
+        t = torch.rand(batch_size, device=self.device)
         
-        # Apply regularization to prevent overconfidence
-        if getattr(self.config, 'router_entropy_reg', 0.0) > 0:
-            probs = F.softmax(router_logits, dim=-1)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1).mean()
-            entropy_reg = getattr(self.config, 'router_entropy_reg', 0.0)
-            loss -= entropy_reg * entropy  # Encourage higher entropy (more uniform)
+        # Convert to timestep indices (t ∈ [0, 1000))
+        timesteps = (t * 1000).long()
         
-        # Update model
+        # Create noise
+        noise = torch.randn_like(images)
+        
+        # Forward diffusion
+        alpha_t = torch.cos(t.view(-1, 1, 1, 1) * torch.pi/2)
+        sigma_t = torch.sin(t.view(-1, 1, 1, 1) * torch.pi/2)
+        noisy_images = alpha_t * images + sigma_t * noise
+        
+        # Paper Algorithm 1: Train router to predict cluster for each noisy image
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            # Forward pass
+            logits = self.router(noisy_images, timesteps, text_embeddings)
+            
+            # Compute cross entropy loss
+            loss = self.criterion(logits, cluster_labels)
+            
+        # Backward and optimize
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.max_grad_norm)
-        self.optimizer.step()
-        self.lr_scheduler.step()
         
+        # Apply gradient clipping
+        if hasattr(self.config, 'max_grad_norm') and self.config.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.max_grad_norm)
+            
+        self.optimizer.step()
+        
+        # Update learning rate
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+            
         return loss.item()

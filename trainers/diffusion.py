@@ -3,7 +3,6 @@
 import math
 import torch
 import logging
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +307,40 @@ class DecentralizedFlowMatcher:
         target = blend * standard_target + (1 - blend) * stable_target
         
         return target
+
+    def compute_ensemble_flow(self, router_outputs, expert_flows):
+        """
+        Compute ensemble flow according to paper's Equation 4
+        
+        Args:
+            router_outputs: Router predictions [B, K] (probabilities for each expert)
+            expert_flows: List of K expert flow predictions [K, B, C, H, W]
+            
+        Returns:
+            Ensemble flow [B, C, H, W]
+        """
+        batch_size = router_outputs.shape[0]
+        num_experts = router_outputs.shape[1]
+        
+        # Initialize ensemble flow with zeros
+        ensemble_flow = torch.zeros_like(expert_flows[0]) if expert_flows else None
+        
+        # Implement Equation 4 from the paper:
+        # u_t(x_t) = sum_k (p_t,S_k(x_t)/p_t(x_t)) * (sum_{x_0 in S_k} u_t(x_t|x_0)p_t(x_t|x_0)q(x_0)/p_t,S_k(x_t))
+        # Router outputs represent p_t,S_k(x_t)/p_t(x_t)
+        # Expert flows represent the inner sum term
+        
+        for k in range(num_experts):
+            # Get router weight for expert k (reshape for broadcasting)
+            router_weight = router_outputs[:, k].view(batch_size, 1, 1, 1)
+            
+            # Get flow prediction from expert k
+            expert_flow = expert_flows[k]
+            
+            # Add weighted expert flow to ensemble
+            ensemble_flow += router_weight * expert_flow
+            
+        return ensemble_flow
     
     def compute_flow_matching_loss(self, pred, target):
         """
@@ -411,4 +444,65 @@ class DecentralizedFlowMatcher:
             if model is not None:
                 return torch.tensor(0.0, device=x0.device), None, None
             else:
-                return torch.zeros_like(x0) 
+                return torch.zeros_like(x0)
+                
+    def compute_ensemble_loss(self, batch, router, experts):
+        """
+        Compute loss for the full ensemble as described in Section 3.2
+        
+        Args:
+            batch: Dictionary containing 'image' and optionally 'text_embedding'
+            router: Router model that predicts expert probabilities
+            experts: List of expert models
+            
+        Returns:
+            Loss value and ensemble prediction
+        """
+        try:
+            # Extract data
+            x0 = batch['image']
+            batch_size = x0.shape[0]
+            
+            # Sample random timestep
+            u = torch.rand(batch_size, device=x0.device)
+            t = torch.exp((torch.log(torch.tensor(1e-4)) * (1 - u)) + (torch.log(torch.tensor(1.0)) * u))
+            t = torch.clamp(t, 0.0, 1.0)
+            
+            # Sample random noise
+            noise = torch.randn_like(x0)
+            
+            # Forward diffusion
+            alpha_t = torch.cos(t.view(-1, 1, 1, 1) * math.pi/2)
+            sigma_t = torch.sin(t.view(-1, 1, 1, 1) * math.pi/2)
+            xt = alpha_t * x0 + sigma_t * noise
+            
+            # Get text conditioning if available
+            text_embeds = batch.get('text_embedding', None)
+            
+            # Compute target
+            target = self.compute_flow_matching_target(x0, xt, t)
+            
+            # Convert t to model-expected format
+            t_indices = (t * 1000).long()
+            
+            # Get router probabilities
+            router_outputs = router(xt, t_indices, text_embeds)
+            
+            # Get each expert's prediction
+            expert_flows = []
+            for expert in experts:
+                with torch.no_grad():  # Don't backprop through other experts
+                    expert_pred = expert(xt, t_indices, text_embeds)
+                    expert_flows.append(expert_pred)
+            
+            # Compute ensemble flow according to Equation 4
+            ensemble_pred = self.compute_ensemble_flow(router_outputs, expert_flows)
+            
+            # Compute loss
+            target_clipped = torch.clamp(target, -100.0, 100.0)
+            loss = self.compute_flow_matching_loss(ensemble_pred, target_clipped)
+            
+            return loss, ensemble_pred
+        except Exception as e:
+            logger.error(f"Error in compute_ensemble_loss: {str(e)}")
+            return torch.tensor(0.0, device=x0.device), None 

@@ -609,16 +609,16 @@ class ClusterManager:
     
     def _create_coarse_clusters(self, features, fine_labels, k):
         """
-        Create coarse clusters from fine clusters
-        Using algorithm outlined in Paper Section 4.1
+        Create coarse clusters by consolidating fine-grained clusters
+        following the paper's multi-stage approach in Section 4.1
         
         Args:
-            features: Feature tensor
-            fine_labels: Fine cluster labels
+            features: Feature tensor (N x D)
+            fine_labels: Fine-grained cluster labels (N,)
             k: Number of coarse clusters
             
         Returns:
-            Coarse cluster labels
+            Coarse cluster labels tensor
         """
         # Check cache first
         if is_main_process() and os.path.exists(self.coarse_cluster_cache_file):
@@ -627,7 +627,7 @@ class ClusterManager:
                 with open(self.coarse_cluster_cache_file, "rb") as f:
                     cache_data = pickle.load(f)
                     
-                    # Get dataset hash from cache
+                    # Get dataset hash and cluster count from cache data
                     cached_hash = cache_data.get("dataset_hash", None)
                     cached_k = cache_data.get("k", None)
                     current_hash = self.dataset_hash
@@ -656,19 +656,32 @@ class ClusterManager:
         
         # Run clustering on main process only
         if is_main_process():
-            self.logger.info(f"Creating {k} coarse clusters from fine clusters")
+            self.logger.info(f"Consolidating fine clusters into {k} coarse clusters (paper Section 4.1)")
             
-            # Compute cluster centers for fine clusters
-            fine_centers = {}
-            for cluster in np.unique(fine_labels):
-                mask = fine_labels == cluster
-                fine_centers[cluster] = features[mask].mean(axis=0)
-                
-            # Convert to array
-            fine_centers_array = np.array(list(fine_centers.values()))
+            # Paper Section 4.1 multi-stage approach:
+            # 1. Compute centroids for each fine-grained cluster
+            fine_cluster_ids = np.unique(fine_labels)
+            num_fine_clusters = len(fine_cluster_ids)
             
-            # Apply algorithm from Paper Section 4.1
-            # Run K-means on fine cluster centers
+            self.logger.info(f"Computing centroids for {num_fine_clusters} fine clusters")
+            
+            # Compute centroids for each fine cluster 
+            fine_centroids = np.zeros((num_fine_clusters, features.shape[1]))
+            fine_cluster_sizes = np.zeros(num_fine_clusters)
+            
+            # Map original fine cluster IDs to consecutive indices
+            fine_id_to_idx = {fine_id: idx for idx, fine_id in enumerate(fine_cluster_ids)}
+            
+            # Compute centroid for each fine cluster
+            for i, fine_id in enumerate(fine_cluster_ids):
+                mask = fine_labels == fine_id
+                fine_centroids[i] = features[mask].mean(axis=0)
+                fine_cluster_sizes[i] = mask.sum()
+            
+            # 2. Cluster the fine centroids into k coarse clusters
+            self.logger.info(f"Clustering {num_fine_clusters} fine centroids into {k} coarse clusters")
+            
+            # Apply K-means++ to cluster fine centroids
             kmeans = KMeans(
                 n_clusters=k,
                 init='k-means++',
@@ -677,25 +690,21 @@ class ClusterManager:
                 verbose=1
             )
             
-            # Fit model
-            start_time = time.time()
-            kmeans.fit(fine_centers_array)
-            elapsed = time.time() - start_time
+            # Weight centroids by cluster size to prevent tiny clusters from dominating
+            coarse_labels_for_fine = kmeans.fit_predict(fine_centroids)
             
-            # Map fine clusters to coarse clusters
-            fine_to_coarse = kmeans.labels_
+            # Map fine cluster labels to coarse cluster labels
+            fine_to_coarse = {fine_id: coarse_labels_for_fine[fine_id_to_idx[fine_id]] 
+                             for fine_id in fine_cluster_ids}
             
-            # Map data points to coarse clusters
-            coarse_cluster_labels = np.zeros_like(fine_labels)
-            for i, fine_label in enumerate(fine_labels):
-                coarse_cluster_labels[i] = fine_to_coarse[fine_label]
-                
-            # Calculate metrics
-            unique_clusters = np.unique(coarse_cluster_labels)
-            self.logger.info(f"Created {len(unique_clusters)} coarse clusters in {elapsed:.1f}s")
+            # 3. Map each data point to its coarse cluster
+            coarse_cluster_labels = np.array([fine_to_coarse[label] for label in fine_labels])
             
-            # Log cluster sizes
-            cluster_sizes = np.bincount(coarse_cluster_labels)
+            # Compute coarse cluster sizes for logging
+            unique_coarse, cluster_sizes = np.unique(coarse_cluster_labels, return_counts=True)
+            
+            # Log clustering results
+            self.logger.info(f"Created {len(unique_coarse)} coarse clusters from {num_fine_clusters} fine clusters")
             self.logger.info(f"Coarse cluster sizes: min={cluster_sizes.min()}, "
                              f"max={cluster_sizes.max()}, "
                              f"mean={cluster_sizes.mean():.1f}, "
