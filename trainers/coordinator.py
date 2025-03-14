@@ -347,67 +347,73 @@ class DDMTrainingCoordinator:
             )
     
     def perform_reclustering(self):
-        """Perform reclustering of the dataset with optimized model migration"""
-        self.logger.info("Performing reclustering")
+        """
+        Perform reclustering as described in paper Section 3.6
         
-        try:
-            # Create feature dataset for reclustering
-            from data.dataset import FeatureDataset
-            feature_dataset = FeatureDataset(
-                root_dir=self.config.dataset_path,
-                config=self.config
-            )
+        This updates data partitions based on current model performance
+        and reassigns experts to clusters.
+        """
+        self.logger.info("Starting reclustering procedure")
+        
+        # Step 1: Extract features from validation set
+        features = self.cluster_manager.extract_validation_features()
+        
+        # Step 2: Perform clustering on extracted features
+        old_clusters = self.cluster_manager.get_cluster_assignments()
+        new_clusters = self.cluster_manager.update_clusters(features)
+        
+        # Step 3: Compute cluster changes
+        changed_ratio = self.cluster_manager.compute_cluster_changes(old_clusters, new_clusters)
+        self.logger.info(f"Reclustering: {changed_ratio:.2%} of data points changed clusters")
+        
+        # Step 4: Update data loaders with new clusters
+        self.dataset.update_cluster_assignments(new_clusters)
+        
+        # Step 5: Recreate expert data loaders with updated clusters
+        old_expert_loaders = self.expert_loaders
+        from data.loader import create_expert_bucket_loaders
+        self.expert_loaders = create_expert_bucket_loaders(
+            dataset=self.dataset,
+            config=self.config,
+            world_size=self.world_size,
+            rank=self.rank
+        )
+        
+        # Step 6: Reset expert iterators
+        self.expert_iterators = {}
+        
+        # Step 7: Migrate expert weights based on cluster similarity if enabled
+        if getattr(self.config, 'expert_migration_strategy', 'reset') == 'migrate':
+            # Get old experts
+            old_experts = {}
+            for expert_idx in range(self.config.num_experts):
+                if self.is_expert_owned_by_rank(expert_idx):
+                    old_experts[expert_idx] = self.get_expert(expert_idx)
             
-            # Create feature loader
-            from data.loader import create_loader
-            feature_loader = create_loader(
-                dataset=feature_dataset,
-                config=self.config,
-                is_train=False,
-                distributed=(self.world_size > 1),
-                rank=self.rank,
-                world_size=self.world_size
-            )
+            # Compute similarity matrix between old and new clusters
+            similarity_matrix = self.cluster_manager.compute_cluster_similarity(old_clusters, new_clusters)
             
-            # Perform reclustering
-            new_labels, cluster_mapping = self.cluster_manager.perform_reclustering(feature_loader)
-            
-            # Update dataset clusters
-            self.dataset.cluster_assignments = new_labels
-            
-            # Clear caches to free up memory before migration
-            self.cache_manager.clear_cache()
-            
-            # Recreate per-expert data loaders
-            from data.loader import create_expert_bucket_loaders
-            self.expert_loaders = create_expert_bucket_loaders(
-                dataset=self.dataset,
-                config=self.config,
-                world_size=self.world_size,
-                rank=self.rank
-            )
-            
-            # Create a copy of experts before migration
-            old_experts = {idx: expert for idx, expert in self.experts.items()}
-            
-            # Handle expert parameter migration
-            for old_idx, new_idx in cluster_mapping.items():
-                if old_idx != new_idx:
+            # For each new expert, find the most similar old expert
+            for new_idx in range(self.config.num_experts):
+                if self.is_expert_owned_by_rank(new_idx):
+                    # Find the most similar old expert
+                    similarities = similarity_matrix[:, new_idx]
+                    old_idx = similarities.argmax().item()
+                    
+                    # Migrate expert weights
                     self.migrate_expert_data(old_idx, new_idx, old_experts)
-            
-            # Update router data loader to reflect new clustering
-            from data.loader import create_router_loader
-            self.router_loader = create_router_loader(
-                dataset=self.dataset,
-                config=self.config,
-                world_size=self.world_size,
-                rank=self.rank
-            )
-            
-            self.logger.info("Reclustering completed successfully")
-        except Exception as e:
-            self.logger.error(f"Error during reclustering: {str(e)}")
-            # Continue with current clustering if reclustering fails
+        else:
+            # Reset expert weights
+            for expert_idx in range(self.config.num_experts):
+                if self.is_expert_owned_by_rank(expert_idx):
+                    expert = self.get_expert(expert_idx)
+                    expert.reset_parameters()
+        
+        # Step 8: Synchronize after reclustering is complete
+        self.safe_synchronize(timeout_seconds=300, name="reclustering")
+        
+        self.logger.info("Reclustering completed successfully")
+        return True
     
     def migrate_expert_data(self, old_idx, new_idx, old_experts):
         """
@@ -459,71 +465,61 @@ class DDMTrainingCoordinator:
     
     def train_experts(self, step):
         """
-        Train expert models for one step with DFM objective from paper Section 3.2
+        Train expert models according to paper Section 3.2 and 3.4
         
         Args:
             step: Current training step
             
         Returns:
-            Average loss across experts
+            Mean expert loss
         """
-        self.current_step = step
-        total_loss = 0.0
-        num_experts_trained = 0
+        expert_losses = {}
         
-        # Train each expert assigned to this process
-        for expert_idx in sorted(self.expert_loaders.keys()):
-            # Skip if not assigned to this rank
-            if expert_idx % self.world_size != self.rank:
-                continue
-                
-            # Get expert from cache
-            try:
-                expert = self.get_expert(expert_idx)
-            except Exception as e:
-                self.logger.error(f"Failed to get expert {expert_idx}: {str(e)}")
-                continue
-                
-            # Get loader for this expert
-            loader = self.expert_loaders.get(expert_idx)
-            if not loader:
-                continue
-                
-            # Get batch with error handling
-            try:
-                # Keep track of iterator
-                if not hasattr(self, 'expert_iterators'):
-                    self.expert_iterators = {}
-                    
-                # Get or create iterator
+        # Each process trains its assigned experts
+        for expert_idx in range(self.config.num_experts):
+            if self.is_expert_owned_by_rank(expert_idx):
+                # Get expert data loader iterator
                 if expert_idx not in self.expert_iterators:
-                    self.expert_iterators[expert_idx] = iter(loader)
-                    
-                # Get batch, reset iterator if needed
+                    # Initialize iterator if not exists
+                    self.expert_iterators[expert_idx] = iter(self.expert_loaders[expert_idx])
+                
                 try:
+                    # Get next batch
                     batch = next(self.expert_iterators[expert_idx])
                 except StopIteration:
-                    self.expert_iterators[expert_idx] = iter(loader)
+                    # Reset iterator and get new batch
+                    self.expert_iterators[expert_idx] = iter(self.expert_loaders[expert_idx])
                     batch = next(self.expert_iterators[expert_idx])
-                    
-                # Paper Section 3.2: Train expert on its assigned cluster data
-                # Each expert specializes on a subset of the data distribution
-                loss = expert.train_step(batch)
-                total_loss += loss
-                num_experts_trained += 1
                 
-            except Exception as e:
-                self.logger.error(f"Error training expert {expert_idx}: {str(e)}")
-                continue
+                # Get expert model
+                expert = self.get_expert(expert_idx)
+                # Set to training mode
+                expert.train()
+                
+                # Train step (Section 3.2 of the paper)
+                loss = expert.train_step(batch)
+                expert_losses[expert_idx] = loss
+                
+                # Log per-expert metrics
+                if step % self.config.log_every_n_steps == 0 and self.rank == 0:
+                    self.logger.info(f"Step {step}: Expert {expert_idx} loss: {loss:.4f}")
         
-        # Average loss across experts
-        avg_loss = total_loss / max(1, num_experts_trained)
+        # Synchronize expert losses across processes
+        all_expert_losses = {}
+        for i in range(self.config.num_experts):
+            if i in expert_losses:
+                all_expert_losses[i] = expert_losses[i]
+            else:
+                all_expert_losses[i] = 0.0
         
-        return avg_loss
+        # Calculate mean loss
+        mean_loss = sum(all_expert_losses.values()) / max(len(all_expert_losses), 1)
+        
+        return mean_loss
             
     def train_router(self, step):
         """
-        Train router model for one step following Algorithm 1 in the paper
+        Train router model according to paper Section 3.3 (Algorithm 1)
         
         Args:
             step: Current training step
@@ -531,33 +527,30 @@ class DDMTrainingCoordinator:
         Returns:
             Router loss
         """
-        self.current_step = step
+        # Only train router on rank 0
+        if self.rank != 0:
+            return 0.0
         
-        # Skip router training if no data loader
-        if not hasattr(self, 'router_loader') or not self.router_loader:
-            return 0.0
-            
-        # Get batch with error handling
+        # Get router data loader iterator
+        if not hasattr(self, 'router_iterator'):
+            self.router_iterator = iter(self.router_loader)
+        
         try:
-            # Keep track of iterator
-            if not hasattr(self, 'router_iterator'):
-                self.router_iterator = iter(self.router_loader)
-                
-            # Get batch, reset iterator if needed
-            try:
-                batch = next(self.router_iterator)
-            except StopIteration:
-                self.router_iterator = iter(self.router_loader)
-                batch = next(self.router_iterator)
-                
-            # Paper Section 3.3: Train router to predict cluster for each sample
-            # Router training follows Algorithm 1 in the paper
-            loss = self.router_trainer.train_step(batch)
-            
-            return loss
-        except Exception as e:
-            self.logger.error(f"Error training router: {str(e)}")
-            return 0.0
+            # Get next batch
+            batch = next(self.router_iterator)
+        except StopIteration:
+            # Reset iterator and get new batch
+            self.router_iterator = iter(self.router_loader)
+            batch = next(self.router_iterator)
+        
+        # Train step (Section 3.3 of the paper)
+        loss = self.router_trainer.train_step(batch)
+        
+        # Log router metrics
+        if step % self.config.log_every_n_steps == 0:
+            self.logger.info(f"Step {step}: Router loss: {loss:.4f}")
+        
+        return loss
     
     def run_ensemble_validation(self, step):
         """
