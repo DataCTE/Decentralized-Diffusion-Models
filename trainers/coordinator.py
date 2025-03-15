@@ -223,13 +223,13 @@ class DDMTrainingCoordinator:
             return True  # No need to synchronize for single-process training
         
         try:
-            # Simple barrier with timeout
-            # This handles the synchronization in a clean way
-            torch.distributed.barrier(timeout=datetime.timedelta(seconds=timeout_seconds))
+            # Simple barrier without timeout (for compatibility)
+            # Some PyTorch versions don't support timeout parameter
+            torch.distributed.barrier()
             logger.debug(f"Synchronization for '{name}' completed successfully")
             return True
         except torch.distributed.DistBackendError as e:
-            logger.error(f"Synchronization timeout after {timeout_seconds}s for '{name}': {str(e)}")
+            logger.error(f"Synchronization error for '{name}': {str(e)}")
             # Attempt recovery by continuing execution
             return False
         except Exception as e:
@@ -323,7 +323,7 @@ class DDMTrainingCoordinator:
             # Skip actual clustering and return uniform assignment
             # This will be handled by the cluster manager's default assignment
             if self.world_size > 1:
-                self.safe_synchronize(timeout_seconds=30, name="skip_clustering")
+                self.safe_synchronize(name="skip_clustering")
                 
             # Report progress
             if self.progress_callback and self.rank == 0:
@@ -413,7 +413,7 @@ class DDMTrainingCoordinator:
         
         # Synchronize after clustering
         if self.world_size > 1:
-            self.safe_synchronize(timeout_seconds=300, name="cluster_initialization")
+            self.safe_synchronize(name="cluster_initialization")
             
         # Report progress
         if self.progress_callback and self.rank == 0:
@@ -512,7 +512,7 @@ class DDMTrainingCoordinator:
                 
             # Synchronize all processes after data loading
             if self.world_size > 1:
-                self.safe_synchronize(timeout_seconds=60, name="data_loading")
+                self.safe_synchronize(name="data_loading")
                 
             # Final timing
             total_time = time.time() - init_start_time
@@ -629,7 +629,7 @@ class DDMTrainingCoordinator:
             sync_start = time.time()
             
             if self.world_size > 1:
-                self.safe_synchronize(timeout_seconds=60, name="model_initialization")
+                self.safe_synchronize(name="model_initialization")
                 
             sync_time = time.time() - sync_start
             logger.info(f"Synchronization completed in {sync_time:.2f}s")
@@ -755,7 +755,7 @@ class DDMTrainingCoordinator:
                     expert.reset_parameters()
         
         # Step 8: Synchronize after reclustering is complete
-        self.safe_synchronize(timeout_seconds=300, name="reclustering")
+        self.safe_synchronize(name="reclustering")
         
         logger.info("Reclustering completed successfully")
         return True
@@ -881,7 +881,7 @@ class DDMTrainingCoordinator:
         # Synchronize after expert training if needed
         if self.world_size > 1 and step % getattr(self.config, 'sync_every_n_steps', 10) == 0:
             sync_start = time.time()
-            self.safe_synchronize(timeout_seconds=30, name="expert_training")
+            self.safe_synchronize(name="expert_training")
             logger.info(f"Expert training synchronization completed in {time.time() - sync_start:.2f}s")
             
         return avg_loss
@@ -1428,7 +1428,7 @@ class DDMTrainingCoordinator:
         # Synchronize after saving if needed
         if self.world_size > 1:
             sync_start = time.time()
-            self.safe_synchronize(timeout_seconds=60, name="checkpoint_saving")
+            self.safe_synchronize(name="checkpoint_saving")
             sync_time = time.time() - sync_start
             logger.info(f"Checkpoint synchronization completed in {sync_time:.2f}s")
         

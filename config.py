@@ -3,6 +3,7 @@
 import os
 import time
 import json
+import torch
 from utils.logging import logger
 
 class DDMConfig:
@@ -14,6 +15,9 @@ class DDMConfig:
         self.num_heads = 16      # DiT-XL heads
         self.ffn_dim = 3072      # DiT-XL MLP ratio
         self.batch_size = 1      # Reduced from 16 to 1 to address OOM issues
+        
+        # Set default device
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"  # Default device for models
         
         # DDM specific settings
         self.num_experts = 8     # Number of expert models (paper recommends 8)

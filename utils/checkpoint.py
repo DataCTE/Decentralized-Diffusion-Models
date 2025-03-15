@@ -10,32 +10,13 @@ from utils.distributed import is_main_process, is_dist_initialized
 logger = logging.getLogger(__name__)
 
 def safe_synchronize(timeout_seconds=30):
-    """Safely synchronize with timeout to prevent deadlocks"""
+    """Safely synchronize without timeout for compatibility"""
     if not is_dist_initialized():
         return True
         
     try:
-        # Use threading for platform-independent timeout
-        import threading
-        
-        success = [False]
-        
-        def sync_fn():
-            try:
-                dist.barrier()
-                success[0] = True
-            except Exception:
-                pass
-        
-        thread = threading.Thread(target=sync_fn)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout_seconds)
-        
-        if not success[0]:
-            logger.warning(f"Synchronization timeout after {timeout_seconds}s")
-            return False
-            
+        # Simple barrier call without timeout
+        dist.barrier()
         return True
     except Exception as e:
         logger.error(f"Synchronization error: {str(e)}")
