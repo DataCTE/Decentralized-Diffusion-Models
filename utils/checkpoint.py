@@ -5,6 +5,7 @@ from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 import os
 import logging
 import time
+import json
 from utils.distributed import is_main_process, is_dist_initialized
 
 logger = logging.getLogger(__name__)
@@ -247,4 +248,70 @@ def load_model_checkpoint(model, optimizer=None, scheduler=None, path=None, is_f
             dist.broadcast(signal, src=0)
         
         safe_synchronize()
+        return None
+
+def save_coordinator_checkpoint(save_dir, state_dict):
+    """
+    Save coordinator state separately from model checkpoints
+    
+    Args:
+        save_dir: Directory to save checkpoint
+        state_dict: Dictionary of state to save
+    """
+    if not is_main_process():
+        return
+        
+    os.makedirs(save_dir, exist_ok=True)
+    checkpoint_path = os.path.join(save_dir, "coordinator_state.json")
+    
+    # Convert any non-serializable objects
+    serializable_dict = {}
+    for k, v in state_dict.items():
+        if k == 'config':
+            # Convert config object to dict 
+            if hasattr(v, '__dict__'):
+                serializable_dict[k] = v.__dict__
+            else:
+                serializable_dict[k] = str(v)  # Fall back to string representation
+        elif isinstance(v, torch.Tensor):
+            # Convert tensors to lists
+            serializable_dict[k] = v.cpu().numpy().tolist()
+        else:
+            # Keep other values as is if JSON serializable
+            try:
+                json.dumps({k: v})
+                serializable_dict[k] = v
+            except (TypeError, OverflowError):
+                serializable_dict[k] = str(v)  # Fall back to string
+    
+    # Save as JSON
+    with open(checkpoint_path, 'w') as f:
+        json.dump(serializable_dict, f, indent=4)
+        
+    logger.info(f"Saved coordinator state to {checkpoint_path}")
+    
+def load_coordinator_checkpoint(checkpoint_dir):
+    """
+    Load coordinator state from checkpoint
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoint
+        
+    Returns:
+        Dictionary of loaded state or None if not found
+    """
+    checkpoint_path = os.path.join(checkpoint_dir, "coordinator_state.json")
+    
+    if not os.path.exists(checkpoint_path):
+        logger.warning(f"Coordinator checkpoint not found at {checkpoint_path}")
+        return None
+        
+    try:
+        with open(checkpoint_path, 'r') as f:
+            state_dict = json.load(f)
+            
+        logger.info(f"Loaded coordinator state from {checkpoint_path}")
+        return state_dict
+    except Exception as e:
+        logger.error(f"Error loading coordinator checkpoint: {e}")
         return None

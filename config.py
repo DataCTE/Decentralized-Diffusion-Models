@@ -1,213 +1,148 @@
-"""Configuration for Decentralized Diffusion Models."""
+"""Configuration utilities for Decentralized Diffusion Models."""
 
 import os
-import time
-import json
-import torch
-from utils.logging import logger
+import sys
+import importlib.util
+from types import SimpleNamespace
+import logging
 
-class DDMConfig:
-    """Configuration for Decentralized Diffusion Models"""
-    def __init__(self):
-        # Model architecture
-        self.hidden_dim = 1152  # DiT-XL dimension
-        self.num_layers = 28     # DiT-XL depth
-        self.num_heads = 16      # DiT-XL heads
-        self.ffn_dim = 3072      # DiT-XL MLP ratio
-        self.batch_size = 1      # Reduced from 16 to 1 to address OOM issues
-        
-        # Set default device
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"  # Default device for models
-        
-        # DDM specific settings
-        self.num_experts = 8     # Number of expert models (paper recommends 8)
-        self.router_hidden_dim = 512  # Smaller router dimension
-        
-        # Expert Memory Management (new section)
-        self.expert_swap_strategy = "LRU"       # LRU, FIFO, or RANDOM
-        self.max_experts_in_memory = 3          # Maximum experts to keep in GPU memory
-        self.expert_offload_to_cpu = True       # Whether to offload experts to CPU
-        self.expert_prefetch_next = True        # Prefetch next predicted expert
-        self.sample_expert_cache_size = 2       # Number of experts to cache during sampling
-        
-        # Training settings
-        self.learning_rate = 1e-4
-        self.weight_decay = 0.1
-        self.adam_betas = (0.9, 0.99)
-        
-        # Memory optimization settings
-        self.use_mixed_precision = True  # Use mixed precision training (fp16)
-        self.gradient_accumulation_steps = 1  # Accumulate gradients over multiple steps
-        self.use_gradient_checkpointing = True  # Use gradient checkpointing to save memory
-        
-        # FSDP (Fully Sharded Data Parallel) settings
-        self.fsdp_sharding_strategy = "FULL_SHARD"  # Fully shard parameters, gradients, and optimizer states
-        self.fsdp_cpu_offload = True
-        self.fsdp_activation_checkpointing = True
-        self.fsdp_sync_module_states = True
-        self.fsdp_use_orig_params = True
-        self.fsdp_limit_all_gathers = True
-        self.fsdp_forward_prefetch = True
-        self.fsdp_min_num_params = 1e6  # Minimum number of parameters for a layer to be wrapped (1M)
-        self.fsdp_auto_wrap_policy = "DEFAULT"  # Default auto wrap policy
-        self.fsdp_backward_prefetch = "BACKWARD_PRE"  # Prefetch parameters before backward pass
+logger = logging.getLogger(__name__)
 
-        # Data settings
-        self.patch_size = 32
-        self.image_size = 512
-        self.dataset_path = "/home/alex/workspace/datasets/danbooru2025"  # Path to training dataset
-        self.dataset_size = self._calculate_dataset_size()  # Add this line
-        self.num_workers = 2     # DataLoader workers
-        self.pin_memory = True   # Pin memory for faster data transfer
+def get_config(config_path):
+    """Load config from a Python file."""
+    
+    # Check if file exists
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    # Load the module dynamically
+    config_name = os.path.basename(config_path).replace('.py', '')
+    spec = importlib.util.spec_from_file_location(config_name, config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    sys.modules[config_name] = config_module
+    spec.loader.exec_module(config_module)
+    
+    # Create a namespace for the config
+    config = SimpleNamespace()
+    
+    # Add all non-hidden attributes from the config module
+    for key in dir(config_module):
+        if not key.startswith('_'):
+            setattr(config, key, getattr(config_module, key))
+    
+    # Add default values for any missing required fields
+    defaults = {
+        # ===== Training parameters =====
+        'num_steps': 100000,              # Total number of training steps
+        'batch_size': 1,                 # Batch size per GPU
+        'learning_rate': 1e-4,            # Learning rate for both experts and router
+        'weight_decay': 1e-2,             # Weight decay for regularization
+        'warmup_steps': 1000,             # Learning rate warmup steps
+        'max_grad_norm': 1.0,             # Gradient clipping norm
+        'use_mixed_precision': True,      # Whether to use mixed precision training
         
-        # Enhanced Clustering Settings (new section)
-        self.clustering_method = "two_stage"    # "two_stage" (recommended), "direct", or "kmeans"
-        self.fine_clusters = 1024               # Number of fine-grained clusters (paper recommendation)
-        self.use_hierarchical_clustering = True # Use hierarchical consolidation
-        self.feature_sub_batch_size = 32        # Sub-batch size for feature extraction
-        self.feature_extraction_model = "dinov2" # "dinov2", "clip", or "custom"
-        self.use_feature_cache = True           # Cache extracted features
-        self.cluster_cache_path = "cache"       # Path to store feature and cluster caches
-        self.skip_clustering = True            # Set to True to bypass clustering for faster testing/debugging (change this value directly in this file)
+        # ===== DDM Model parameters =====
+        'num_experts': 8,                 # Should match number of GPUs
+        'hidden_size': 768,               # Hidden dimension for transformer models
+        'num_heads': 12,                  # Number of attention heads
+        'num_layers': 12,                 # Number of transformer layers
         
-        # Training settings
-        self.num_steps = 400000  
-        self.log_dir = "runs/ddm"
-        self.save_dir = "checkpoints/ddm"
-        self.checkpoint_dir = "checkpoints/ddm"  # Added to match save_dir
-        self.sample_dir = "samples/ddm"  # Directory to save generated samples
-        self.expert_steps_per_router = 1000  # Number of expert steps between router training
+        # ===== Router parameters =====
+        'router_hidden_size': 512,        # Hidden dimension for router
+        'router_num_heads': 8,            # Number of attention heads for router
+        'router_num_layers': 4,           # Number of transformer layers for router
         
-        # Improved Router Settings (new section) 
-        self.router_architecture = "efficient"  # "efficient" or "standard"
-        self.router_attention_layers = 2        # Number of attention layers in router
-        self.router_calibration_method = "temperature" # "temperature" or "platt"
-        self.router_regularization = 0.01       # Regularization for router training
-        self.router_confidence_threshold = 0.7  # Confidence threshold for expert selection
+        # ===== Dataset parameters =====
+        'dataset_path': './data',         # Path to dataset
+        'dataset_size': 100000,           # Size of dataset for uniform distribution
+        'val_size': 1000,                 # Size of validation dataset
+        'buckets': [                      # Multiple aspect ratio buckets (W, H)
+            (512, 512),                   # Square 1:1
+            (576, 448),                   # Landscape 4:3
+            (448, 576),                   # Portrait 3:4
+            (640, 384),                   # Landscape 16:9
+            (384, 640),                   # Portrait 9:16
+        ],
+        'num_workers': 4,                 # Number of workers for data loading
         
-        # Inference settings
-        self.use_top_k = 1  # Number of experts to use at inference time
-        self.inference_steps = 50  # Number of steps for sampling
-        self.inference_prompt = "1girl"  # Default prompt
-        self.use_nucleus_sampling = False  # Whether to use nucleus sampling
-        self.nucleus_threshold = 0.9  # Threshold for nucleus sampling
-        self.inference_temperature = 1.0  # Temperature for expert probabilities
+        # ===== Flow Matching parameters =====
+        'diffusion_steps': 1000,          # Number of diffusion timesteps
+        'sigma': 0.5,                     # Flow matching sigma parameter
+        'loss_type': 'huber',             # Loss function ('mse', 'huber', 'l1')
+        'beta_schedule': 'cosine',        # Noise schedule ('cosine', 'linear')
         
-        # VAE settings
-        self.vae_model = "AuraDiffusion/16ch-vae"
-        self.latent_channels = 16
+        # ===== Sampling parameters =====
+        'sampling_steps': 50,             # Diffusion sampling steps
+        'cfg_scale': 7.5,                 # Classifier-free guidance scale
+        'top_k': 1,                       # Number of experts to use per sample
+        'temperature': 1.0,               # Temperature for router softmax
+        'eta': 0.0,                       # DDIM eta parameter (0.0 = deterministic)
         
-        # CLIP settings
-        self.clip_model = "openai/clip-vit-large-patch14"
+        # ===== Output paths =====
+        'output_dir': './outputs',        # Main output directory
         
-        # Flow matching parameters
-        self.sigma = 0.8  # Flow matching noise scale
-        self.cfg_scale = 7.5  # Classifier-free guidance scale
-        self.loss_type = 'huber'  # Loss type for flow matching
-        self.nucleus_threshold = 0.9  # Added for nucleus sampling
-        self.do_distillation = True  # Added for distillation
+        # ===== Logging parameters =====
+        'log_every': 100,                 # Log training metrics every N steps
+        'save_every': 5000,               # Save checkpoint every N steps
+        'validate_every': 1000,           # Run validation every N steps
+        'generate_every': 1000,           # Generate samples every N steps
+        'sample_count': 4,                # Number of samples to generate during training
         
-        # Logging and validation
-        self.log_every_n_steps = 1  # Log every n steps
-        self.validation_interval = 1000  # Steps between validation
-        self.save_interval = 5000  # Steps between saving checkpoints
-        self.recluster_interval = 50000  # Steps between reclustering
-        self.distill_interval = 100000  # Steps between distillation
+        # ===== Distributed training =====
+        'save_from_all_ranks': False,     # Whether to save checkpoints from all ranks
         
-        # Paper-recommended hyperparameters
-        self.router_batch_size = 1  # Batch size for router training
-        self.expert_batch_size = 1  # Per-expert batch size
-        self.router_learning_rate = 3e-5   # Different from expert LR
-        self.recluster_epochs = 3          # Paper recommends 3 passes
-        self.ema_decay = 0.9999            # For model stability
-        self.max_grad_norm = 1.0           # Gradient clipping
-        self.fid_sample_size = 50000       # For meaningful FID
-        self.inception_metrics_interval = 10000  # Steps between eval
-        self.diversity_threshold = 0.75    # Novelty measurement
-        
-        # Feature extraction settings
-        self.feature_batch_size = 1
-        self.feature_workers = 4
-        self.dino_size = 518  # Size for DINO feature extraction
-        
-        # Enhanced Distillation Settings (new section)
-        self.distill_lr = 1e-5
-        self.distill_batch_size = 1
-        self.distill_epochs = 10
-        self.distill_samples = 10000  # Number of samples for distillation
-        self.distill_balance_clusters = True  # Whether to balance samples across clusters
-        self.distill_ema_decay = 0.9999  # EMA decay for distilled model
-        self.distill_loss_type = "mse"  # "mse", "huber", or "l1"
-        self.distill_warmup_ratio = 0.1  # Warmup ratio for distillation
-        
-        # Other configurations
-        self.max_loaded_experts = 3  # Paper recommends 2-3 for 8 experts
-        self.validation_topk = 1     # Paper Section 4.3 recommendation
-        self.validation_samples = 4  # Default from code 
-        
-        # Add calibration parameters
-        self.calibration_interval = 1000  # Calibrate every 1000 steps
-        self.router_confidence_threshold = 0.7  # 0.7 recommended by paper
-        self.fallback_expert_idx = 0  # Default fallback expert
+        # Changed from cluster-based parameters
+        'expert_batch_size': 1,           # Batch size per expert
+    }
+    
+    # Add defaults only if not already set
+    for key, value in defaults.items():
+        if not hasattr(config, key):
+            setattr(config, key, value)
+    
+    # Create required directories
+    os.makedirs(config.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(config.output_dir, 'checkpoints'), exist_ok=True)
+    os.makedirs(os.path.join(config.output_dir, 'samples'), exist_ok=True)
+    os.makedirs(os.path.join(config.output_dir, 'logs'), exist_ok=True)
+    
+    # Derive image_size from the first bucket if not explicitly set
+    if not hasattr(config, 'image_size') and hasattr(config, 'buckets') and config.buckets:
+        w, h = config.buckets[0]
+        config.image_size = (3, h, w)
+        logger.info(f"Derived image_size {config.image_size} from first bucket")
+    
+    return config
 
-    def _calculate_dataset_size(self):
-        """Calculate dataset size from directory (only called on rank 0)"""
-        # Check if we should use a cached value
-        cache_path = os.path.join(getattr(self, 'cache_dir', 'cache'), 'dataset_size_cache.json')
+def create_default_config():
+    """Create a default configuration."""
+    # Start with an empty config
+    config = SimpleNamespace()
+    
+    # Add all default values
+    defaults = get_config.__defaults__[0]
+    for key, value in defaults.items():
+        setattr(config, key, value)
+    
+    # Derive image_size from the first bucket
+    if hasattr(config, 'buckets') and config.buckets:
+        w, h = config.buckets[0]
+        config.image_size = (3, h, w)
+    
+    return config
+
+def save_config(config, path):
+    """Save configuration to a Python file."""
+    with open(path, 'w') as f:
+        f.write('"""Generated DDM configuration."""\n\n')
         
-        # Create cache directory if it doesn't exist
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        
-        # Try to load from cache first
-        try:
-            if os.path.exists(cache_path):
-                cache_age_days = (time.time() - os.path.getmtime(cache_path)) / (60 * 60 * 24)
-                # Use cache if it's less than 1 day old
-                if cache_age_days < 1:
-                    with open(cache_path, 'r') as f:
-                        cache_data = json.load(f)
-                        if cache_data.get('path') == self.dataset_path:
-                            logger.info(f"Using cached dataset size: {cache_data['size']} images (cache age: {cache_age_days:.1f} days)")
-                            return cache_data['size']
-        except Exception as e:
-            logger.debug(f"Could not read cache: {str(e)}")
-        
-        # If path doesn't exist, return 0
-        if not os.path.exists(self.dataset_path):
-            logger.warning(f"Dataset path does not exist: {self.dataset_path}")
-            return 0
-        
-        # Count only image files, excluding text files
-        start_time = time.time()
-        logger.info(f"Calculating dataset size from: {self.dataset_path}")
-        
-        # Define valid image extensions
-        valid_extensions = {'.png', '.jpg', '.jpeg', '.webp'}
-        count = 0
-        
-        try:
-            # Count only image files
-            for entry in os.scandir(self.dataset_path):
-                if entry.is_file():
-                    file_ext = os.path.splitext(entry.name.lower())[1]
-                    if file_ext in valid_extensions:
-                        count += 1
-            
-            elapsed_time = time.time() - start_time
-            logger.info(f"Dataset size calculation completed in {elapsed_time:.2f}s, found {count} image files")
-            
-            # Save to cache
-            try:
-                with open(cache_path, 'w') as f:
-                    json.dump({
-                        'path': self.dataset_path,
-                        'size': count,
-                        'timestamp': time.time()
-                    }, f)
-            except Exception as e:
-                logger.debug(f"Could not write cache: {str(e)}")
-            
-            return count
-        except Exception as e:
-            logger.error(f"Error calculating dataset size: {str(e)}")
-            return 0
+        for key in sorted(dir(config)):
+            if not key.startswith('_'):
+                value = getattr(config, key)
+                # Handle different types appropriately
+                if isinstance(value, str):
+                    f.write(f'{key} = "{value}"\n')
+                else:
+                    f.write(f'{key} = {value}\n')
+    
+    logger.info(f"Saved configuration to {path}")

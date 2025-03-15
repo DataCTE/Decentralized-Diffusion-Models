@@ -7,7 +7,7 @@ from trainers.diffusion import (
     get_alphas_and_betas, 
     ddim_step
 )
-import torch.nn.functional as F
+
 
 logger = logging.getLogger(__name__)
 

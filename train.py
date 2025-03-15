@@ -210,23 +210,14 @@ def main():
         progress_thread_active = True
         def progress_thread():
             last_print = time.time()
-            # Different stages depending on whether clustering is skipped
-            if getattr(config, 'skip_clustering', False):
-                console_print(f"Rank {rank}: Clustering will be skipped (skip_clustering=True)")
-                console_print(f"Rank {rank}: Using uniform distribution across {config.num_experts} experts")
-                stages = [
-                    "fast path cluster manager initialization", 
-                    "fast path data loader initialization", 
-                    "router initialization", 
-                    "expert initialization"
-                ]
-                # Fast initialization should be much quicker
-                wait_time = 10  # Report progress every 10 seconds for fast path
-            else:
-                console_print(f"Rank {rank}: Clustering will be performed (skip_clustering=False)")
-                stages = ["clustering", "router initialization", "expert initialization", "data loading"]
-                wait_time = 30  # Report progress every 30 seconds for normal path
-                
+            # Change clustering references to uniform distribution
+            console_print(f"Rank {rank}: Using uniform distribution across {config.num_experts} experts")
+            stages = [
+                "data loader initialization", 
+                "router initialization", 
+                "expert initialization"
+            ]
+            wait_time = 10
             stage_idx = 0
             while progress_thread_active:
                 current_time = time.time()
@@ -295,21 +286,6 @@ def main():
                 coordinator.log_sharded_metrics(step, expert_loss, router_loss)
                 console_print(f"Rank {rank}: Step {step}: Metrics logged", rank == 0)
             
-            # Reclustering if needed
-            if coordinator.needs_reclustering(step):
-                if is_main_process():
-                    console_print(f"Step {step}: Performing scheduled reclustering...")
-                    logger.info(f"Step {step}: Performing scheduled reclustering")
-                coordinator.perform_reclustering()
-                console_print(f"Rank {rank}: Step {step}: Reclustering complete", rank == 0)
-                
-                # Run validation after reclustering
-                if is_main_process():
-                    console_print(f"Step {step}: Running validation after reclustering...")
-                    logger.info(f"Step {step}: Running validation after reclustering")
-                coordinator.run_validation(step)
-                console_print(f"Rank {rank}: Step {step}: Post-reclustering validation complete", rank == 0)
-            
             # Regular validation
             if step % getattr(config, 'validation_interval', 1000) == 0:
                 if is_main_process():
@@ -317,13 +293,6 @@ def main():
                     logger.info(f"Step {step}: Running scheduled validation")
                 coordinator.run_validation(step)
                 console_print(f"Rank {rank}: Step {step}: Validation complete", rank == 0)
-                
-                # Run ensemble validation to validate the DDM objective
-                if is_main_process():
-                    console_print(f"Step {step}: Running ensemble validation...")
-                    logger.info(f"Step {step}: Running ensemble validation")
-                coordinator.run_ensemble_validation(step)
-                console_print(f"Rank {rank}: Step {step}: Ensemble validation complete", rank == 0)
             
             # Checkpointing
             if step % getattr(config, 'save_interval', 5000) == 0 or step == config.num_steps - 1:

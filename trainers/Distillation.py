@@ -27,7 +27,7 @@ class DiffusionDistiller:
             config: Training configuration
             experts: List of expert models
             router: Router model
-            dataset: Full dataset with cluster labels
+            dataset: Full dataset with expert assignments
             device: Device for training
             rank: Process rank
         """
@@ -158,12 +158,12 @@ class DiffusionDistiller:
                     
                     # Get predictions from the appropriate expert for each example
                     for idx in range(batch_size):
-                        # Get cluster label for this example
-                        cluster_idx = clusters[idx].item()
+                        # Get expert assignment for this example
+                        expert_idx = batch['expert'][idx].item()
                         
                         # Get the corresponding expert
                         expert = self.expert_cache.get_expert(
-                            cluster_idx,
+                            expert_idx,
                             lambda idx: self.experts[idx]
                         )
                         
@@ -306,12 +306,12 @@ class DiffusionDistiller:
                 teacher_pred = torch.zeros_like(student_pred)
                 
                 for idx in range(batch_size):
-                    # Get cluster label for this example
-                    cluster_idx = clusters[idx].item()
+                    # Get expert assignment for this example
+                    expert_idx = batch['expert'][idx].item()
                     
                     # Get the corresponding expert
                     expert = self.expert_cache.get_expert(
-                        cluster_idx,
+                        expert_idx,
                         lambda idx: self.experts[idx]
                     )
                     

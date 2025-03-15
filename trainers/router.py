@@ -7,8 +7,7 @@ from bitsandbytes.optim import AdamW8bit
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy, size_based_auto_wrap_policy
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
-from torch.nn import functional as F
-from tqdm import tqdm
+
 
 from models.router import RouterModel
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint

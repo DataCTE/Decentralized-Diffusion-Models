@@ -10,6 +10,7 @@ from collections import defaultdict
 import logging
 import time
 import glob
+import json
 
 import random
 import io
@@ -336,225 +337,147 @@ class DataValidator:
         return broadcast_object(all_valid_files, src=0)
 
 class DDMDataset(Dataset):
-    """Implementation of dataset from paper with batching by aspect ratio"""
+    """Implementation with uniform GPU-based splitting"""
     
-    def __init__(self, config, split='train', transforms=None, cluster_labels=None, hf_split=None):
+    def __init__(self, config, split='train', transforms=None, hf_split=None):
         """
-        Initialize dataset with cluster information
+        Initialize dataset with uniform GPU-based distribution
         
         Args:
             config: Config object with dataset parameters
             split: Dataset split ('train', 'val', etc.)
             transforms: Image transformations to apply
-            cluster_labels: Precomputed cluster labels for each image
             hf_split: HuggingFace dataset split name if different from 'split'
         """
         self.config = config
         self.split = split
         self.hf_split = hf_split or split
         self.transforms = transforms
-        
-        # Setup logging
         self.logger = logging.getLogger(__name__)
         
-        # Initialize path and data
+        # Initialize dataset path and storage
         self.dataset_path = getattr(config, 'dataset_path', None)
         self.image_files = []
         self.captions = []
-        self.cluster_assignments = None
-        self.bucket_indices = {}  # Maps bucket index to list of indices
-        self.bucket_assignments = {}  # Maps sample index to (bucket_idx, position)
         
-        # Load dataset
+        # Initialize GPU-based distribution parameters
+        self.num_experts = config.num_experts
+        self.expert_assignments = np.zeros(len(self.image_files), dtype=np.int32)
+        
+        # Initialize buckets and load dataset
         self._load_dataset()
-        
-        # Initialize clustering if provided
-        if cluster_labels is not None:
-            self._init_shared_clusters(cluster_labels)
-        
-        # Initialize buckets for efficient batching by aspect ratio
         self._init_buckets()
-        
-        # Initialize bucket assignments for faster lookup
         self._init_bucket_assignments()
         
-        # Log dataset stats
-        self.logger.info(f"Initialized {split} dataset with {len(self.image_files)} samples")
-        if self.cluster_assignments is not None:
-            valid_count = (self.cluster_assignments >= 0).sum()
-            self.logger.info(f"Dataset has {valid_count}/{len(self.cluster_assignments)} valid cluster assignments")
-    
-    def _load_dataset(self):
-        """Load dataset images and captions"""
-        # Use HuggingFace datasets if configured
-        if hasattr(self.config, 'use_hf_dataset') and self.config.use_hf_dataset:
-            self._load_from_huggingface()
-        else:
-            self._load_from_files()
-    
-    def _load_from_files(self):
-        """Load dataset from image files"""
-        if self.dataset_path is None:
-            raise ValueError("Dataset path not specified in config")
-            
-        # Build image list
-        split_path = os.path.join(self.dataset_path, self.split)
-        if not os.path.exists(split_path):
-            split_path = self.dataset_path  # Try using the main path if split subdirectory doesn't exist
-        
-        self.logger.info(f"Loading dataset from {split_path}")
-        start_time = time.time()
-        
-        # Get all image files with supported extensions
-        supported_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
-        self.image_files = []
-        
-        # First, count all files to estimate total
-        self.logger.info("Scanning directory for image files...")
-        file_count_start = time.time()
-        total_files_estimate = 0
-        
-        for root, _, files in os.walk(split_path):
-            for file in files:
-                if any(file.lower().endswith(ext) for ext in supported_extensions):
-                    total_files_estimate += 1
-        
-        self.logger.info(f"Found approximately {total_files_estimate} potential image files in {time.time() - file_count_start:.2f}s")
-        
-        # Now collect the actual files
-        self.logger.info("Collecting image files...")
-        collection_start = time.time()
-        processed_dirs = 0
-        for root, _, files in os.walk(split_path):
-            dir_files = 0
-            for file in files:
-                if any(file.lower().endswith(ext) for ext in supported_extensions):
-                    self.image_files.append(os.path.join(root, file))
-                    dir_files += 1
-            
-            if dir_files > 0:
-                processed_dirs += 1
-                self.logger.debug(f"Found {dir_files} images in {root}")
-        
-        collection_time = time.time() - collection_start
-        speed = len(self.image_files) / collection_time if collection_time > 0 else 0
-        self.logger.info(f"Collected {len(self.image_files)} images from {processed_dirs} directories in {collection_time:.2f}s "
-                        f"({speed:.1f} files/sec)")
-        
-        # Sort for reproducibility
-        self.logger.info("Sorting image files for reproducibility...")
-        sort_start = time.time()
-        self.image_files.sort()
-        self.logger.info(f"Sorted {len(self.image_files)} files in {time.time() - sort_start:.2f}s")
-        
-        # Load captions if available (plain text files with same name as images)
-        self.logger.info("Loading captions...")
-        caption_start = time.time()
-        self.captions = []
-        caption_count = 0
-        last_update_time = time.time()
-        update_interval = 2.0  # Update progress every 2 seconds
-        
-        for i, img_path in enumerate(self.image_files):
-            caption_path = os.path.splitext(img_path)[0] + '.txt'
-            if os.path.exists(caption_path):
-                try:
-                    with open(caption_path, 'r', encoding='utf-8') as f:
-                        caption = f.read().strip()
-                    caption_count += 1
-                except:
-                    caption = ""
-            else:
-                caption = ""
-            self.captions.append(caption)
-            
-            # Show progress periodically for large datasets
-            current_time = time.time()
-            if len(self.image_files) > 1000 and (current_time - last_update_time > update_interval or i == len(self.image_files) - 1):
-                progress = (i + 1) / len(self.image_files) * 100
-                elapsed = current_time - caption_start
-                remaining = elapsed / (i + 1) * (len(self.image_files) - i - 1) if i > 0 else 0
-                
-                self.logger.info(f"Caption loading progress: {progress:.1f}% ({i+1}/{len(self.image_files)}) - "
-                                f"Found {caption_count} captions - "
-                                f"Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s")
-                last_update_time = current_time
-        
-        caption_time = time.time() - caption_start
-        total_time = time.time() - start_time
-        
-        self.logger.info(f"Loaded {caption_count}/{len(self.image_files)} captions in {caption_time:.2f}s")
-        self.logger.info(f"Dataset loading completed in {total_time:.2f}s")
-    
-    def _load_from_huggingface(self):
-        """Load dataset from HuggingFace datasets"""
-        try:
-            from datasets import load_dataset
-            
-            # Load dataset
-            dataset_name = getattr(self.config, 'hf_dataset_name', None)
-            if dataset_name is None:
-                raise ValueError("HuggingFace dataset name not specified in config")
-                
-            # Load dataset split
-            dataset = load_dataset(dataset_name, split=self.hf_split)
-            
-            # Get image and caption columns
-            image_column = getattr(self.config, 'hf_image_column', 'image')
-            caption_column = getattr(self.config, 'hf_caption_column', 'caption')
-            
-            # Extract images and captions
-            for item in dataset:
-                # For HF datasets, we'll store the dataset index instead of file path
-                self.image_files.append(item[image_column])
-                
-                if caption_column in item:
-                    self.captions.append(item[caption_column])
-                else:
-                    self.captions.append("")
-        except Exception as e:
-            self.logger.error(f"Failed to load HuggingFace dataset: {e}")
-            raise
-    
-    def _init_shared_clusters(self, cluster_labels):
-        """
-        Initialize cluster assignments from ClusterManager
-        
-        Args:
-            cluster_labels: Pre-computed cluster labels
-        """
-        # Check input
-        if cluster_labels is None:
-            self.logger.warning("Received None for cluster_labels")
-            # Initialize with -1 (unassigned)
-            self.cluster_assignments = np.full(len(self.image_files), -1)
-            return
-        
-        # Check length match
-        if len(cluster_labels) != len(self.image_files):
-            self.logger.warning(f"Cluster labels length ({len(cluster_labels)}) does not match dataset length ({len(self.image_files)})")
-            
-            # Create placeholder for actual dataset length
-            self.cluster_assignments = np.full(len(self.image_files), -1)
-            
-            # Copy available labels
-            if len(cluster_labels) < len(self.image_files):
-                # Fewer labels than images, copy what we have and leave the rest unassigned
-                self.cluster_assignments[:len(cluster_labels)] = cluster_labels
-                self.logger.warning(f"Only {len(cluster_labels)}/{len(self.image_files)} samples have cluster assignments")
-            else:
-                # More labels than images, truncate
-                self.cluster_assignments = cluster_labels[:len(self.image_files)]
-                self.logger.warning(f"Truncated {len(cluster_labels) - len(self.image_files)} excess cluster labels")
-        else:
-            # Equal lengths, perfect match
-            self.cluster_assignments = cluster_labels
+        # Uniformly distribute samples across experts
+        self._distribute_samples()
 
+    def _distribute_samples(self):
+        """Uniformly distribute samples across experts using modulo operation"""
+        self.expert_assignments = np.array(
+            [i % self.num_experts for i in range(len(self.image_files))],
+            dtype=np.int32
+        )
+        self.logger.info(f"Uniformly distributed {len(self.image_files)} samples across {self.num_experts} experts")
+
+    def _load_dataset(self):
+        """Load dataset files and captions"""
+        # Check if we should completely bypass loading for fast path
+        if getattr(self.config, 'skip_clustering', False):
+            self.logger.info("Fast path: Skipping real dataset loading entirely with skip_clustering=True")
+            # Return immediately without loading anything
+            return
+            
+        # Continue with normal dataset loading
+        if not self.dataset_path:
+            raise ValueError("Dataset path must be provided")
+            
+        # Check if dataset path exists
+        if not os.path.exists(self.dataset_path):
+            self.logger.error(f"Dataset path {self.dataset_path} does not exist")
+            raise FileNotFoundError(f"Dataset path {self.dataset_path} does not exist")
+            
+        # Load images recursively for local datasets
+        self.logger.info(f"Loading dataset from {self.dataset_path}")
+        
+        # Determine how to load based on dataset path
+        if os.path.isdir(self.dataset_path):
+            # Local directory - scan for image files recursively
+            self.image_files = []
+            valid_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
+            
+            # File scan with progress tracking
+            for root, _, files in os.walk(self.dataset_path):
+                for file in files:
+                    if any(file.lower().endswith(ext) for ext in valid_extensions):
+                        self.image_files.append(os.path.join(root, file))
+                        
+                # Show progress periodically
+                if len(self.image_files) % 100000 == 0 and len(self.image_files) > 0:
+                    self.logger.info(f"Found {len(self.image_files)} images so far...")
+                    
+            # Sort for reproducibility
+            self.image_files.sort()
+            
+            # Load any caption files if they exist
+            captions_path = os.path.join(self.dataset_path, 'captions.json')
+            if os.path.exists(captions_path):
+                self.logger.info(f"Loading captions from {captions_path}")
+                try:
+                    with open(captions_path, 'r') as f:
+                        captions_data = json.load(f)
+                        
+                    # Format depends on the file structure, adjust as needed
+                    if isinstance(captions_data, dict):
+                        # Dict mapping file paths to captions
+                        self.captions = []
+                        for file_path in self.image_files:
+                            file_name = os.path.basename(file_path)
+                            caption = captions_data.get(file_name, "")
+                            self.captions.append(caption)
+                    elif isinstance(captions_data, list):
+                        # List of captions matching image file order
+                        self.captions = captions_data
+                        
+                    self.logger.info(f"Loaded {len(self.captions)} captions")
+                except Exception as e:
+                    self.logger.warning(f"Failed to load captions: {e}")
+                    
+        else:
+            # HuggingFace dataset or other format - handle appropriately
+            try:
+                from datasets import load_dataset
+                self.logger.info(f"Loading HuggingFace dataset from {self.dataset_path}")
+                
+                # Load dataset with appropriate split
+                dataset = load_dataset(self.dataset_path, split=self.hf_split)
+                
+                # Determine image and caption columns
+                image_column = getattr(self.config, 'image_column', 'image')
+                caption_column = getattr(self.config, 'caption_column', 'caption')
+                
+                # Store images and captions
+                self.image_files = dataset[image_column]
+                if caption_column in dataset.column_names:
+                    self.captions = dataset[caption_column]
+                    
+                self.logger.info(f"Loaded {len(self.image_files)} samples from HuggingFace dataset")
+                
+            except Exception as e:
+                self.logger.error(f"Failed to load dataset {self.dataset_path}: {e}")
+                raise
+                
+        # Log dataset size
+        self.logger.info(f"Loaded {len(self.image_files)} images for {self.split} split")
+        if len(self.captions) > 0:
+            self.logger.info(f"Found captions for {len(self.captions)} images")
+    
     def _init_buckets(self):
         """Initialize buckets for aspect ratio batching"""
         # Get bucket specifications from config
         if hasattr(self.config, 'buckets'):
             buckets = self.config.buckets
+            self.logger.info(f"Using {len(buckets)} buckets from config: {buckets}")
         else:
             # Default buckets: square, 4:3, 3:4, 16:9, 9:16
             buckets = [
@@ -564,8 +487,33 @@ class DDMDataset(Dataset):
                 (320, 192),   # 16:9 landscape
                 (192, 320),   # 9:16 portrait
             ]
+            self.logger.info(f"Using default buckets: {buckets}")
         
-        # Process images and assign to buckets
+        # FAST PATH: If skip_clustering=True, create simplified bucket assignments
+        if getattr(self.config, 'skip_clustering', False):
+            # Distribute samples evenly across buckets
+            self.logger.info(f"Fast path: Creating uniform bucket assignments")
+            
+            # Initialize buckets
+            self.buckets = buckets
+            bucket_indices = {i: [] for i in range(len(buckets))}
+            
+            # Round-robin assignment to buckets
+            for idx in range(len(self.image_files)):
+                bucket_idx = idx % len(buckets)
+                bucket_indices[bucket_idx].append(idx)
+                
+            self.bucket_indices = bucket_indices
+            
+            # Log bucket distribution
+            for i, (w, h) in enumerate(buckets):
+                count = len(bucket_indices[i])
+                percent = count / len(self.image_files) * 100 if len(self.image_files) > 0 else 0
+                self.logger.info(f"Bucket {i} ({w}x{h}): {count} images ({percent:.1f}%)")
+                
+            return
+        
+        # NORMAL PATH: Process images and assign to buckets based on aspect ratio
         bucket_indices = {i: [] for i in range(len(buckets))}
         
         self.logger.info(f"Assigning {len(self.image_files)} images to {len(buckets)} aspect ratio buckets")
@@ -608,8 +556,8 @@ class DDMDataset(Dataset):
                     speed = (idx + 1) / elapsed if elapsed > 0 else 0
                     
                     self.logger.info(f"Bucket assignment progress: {progress:.1f}% ({idx+1}/{total_images}) - "
-                                     f"Speed: {speed:.1f} images/sec - "
-                                     f"Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s")
+                                   f"Speed: {speed:.1f} images/sec - "
+                                   f"Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s")
                     last_update_time = current_time
                 
             except Exception as e:
@@ -630,7 +578,7 @@ class DDMDataset(Dataset):
             self.logger.info(f"Bucket {i} ({w}x{h}): {count} images ({percent:.1f}%)")
         
         self.logger.info(f"Bucket assignment completed in {elapsed:.2f}s - " 
-                         f"Processed {total_images} images at {total_images/elapsed:.1f} images/sec")
+                       f"Processed {total_images} images at {total_images/elapsed:.1f} images/sec")
     
     def _init_bucket_assignments(self):
         """Initialize bucket assignments for efficient batching"""
@@ -644,65 +592,69 @@ class DDMDataset(Dataset):
         """Get dataset length"""
         return len(self.image_files)
     
-    def __getitem__(self, idx):
-        """Get dataset item with clustering information"""
-        # Get image path
-        img_path = self.image_files[idx]
-        
-        # Load and transform image
-        try:
-            if isinstance(img_path, str) and os.path.exists(img_path):
-                # Regular file path
-                img = Image.open(img_path).convert('RGB')
-            else:
-                # HuggingFace dataset image or other format
-                img = img_path.convert('RGB') if hasattr(img_path, 'convert') else img_path
-                
-            # Get bucket assignment
-            if idx in self.bucket_assignments:
-                bucket_idx, _ = self.bucket_assignments[idx]
-                target_size = self.buckets[bucket_idx]
-            else:
-                # Default to square if no bucket assignment
-                target_size = (256, 256)
-                
-            # Apply transforms if provided
-            if self.transforms is not None:
-                img = self.transforms(img, target_size=target_size)
-            else:
-                # Basic resize if no transforms provided
-                img = transforms.Compose([
-                    transforms.Resize(target_size),
-                    transforms.ToTensor(),
-                ])(img)
-                
-        except Exception as e:
-            # Return a blank tensor on error
-            self.logger.warning(f"Error loading image {img_path}: {e}")
-            img = torch.zeros((3, 256, 256), dtype=torch.float32)
-        
-        # Get caption
-        caption = self.captions[idx] if idx < len(self.captions) else ""
-        
-        # Get cluster label if available
-        if self.cluster_assignments is not None and idx < len(self.cluster_assignments):
-            cluster = int(self.cluster_assignments[idx])
+    def _default_transform(self, img, bucket_idx=None):
+        """Apply default transformations based on bucket dimensions"""
+        # Get target dimensions from bucket if provided
+        if bucket_idx is not None and 0 <= bucket_idx < len(self.buckets):
+            width, height = self.buckets[bucket_idx]
         else:
-            cluster = -1  # -1 indicates no cluster
+            # Fallback to default image size
+            _, height, width = self.config.image_size
+        
+        # Resize image to target dimensions
+        if isinstance(img, Image.Image):
+            # PIL Image
+            img = resize_image(img, (width, height))
+            img = transforms.ToTensor()(img)
+        elif isinstance(img, torch.Tensor):
+            # Already a tensor, resize with torch functions
+            if img.shape[-2] != height or img.shape[-1] != width:
+                img = torch.nn.functional.interpolate(
+                    img.unsqueeze(0), 
+                    size=(height, width), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).squeeze(0)
+        
+        # Normalize
+        img = normalize(img)
+        return img
+        
+    def __getitem__(self, idx):
+        """Get dataset item by index"""
+        try:
+            img_path = self.image_files[idx]
             
-        # Return as dict for flexibility
-        return {
-            "image": img,
-            "caption": caption,
-            "cluster": cluster,
-            "index": idx,
-            "path": img_path if isinstance(img_path, str) else f"sample_{idx}"
-        }
-        
-    def update_cluster_assignments(self, cluster_labels):
-        """Update cluster assignments with new labels"""
-        self._init_shared_clusters(cluster_labels)
-        
+            # Get bucket assignment
+            bucket_idx, position = self.bucket_assignments.get(idx, (0, 0))
+            
+            # Load image
+            try:
+                img = Image.open(img_path).convert('RGB')
+            except Exception as e:
+                width, height = self.buckets[bucket_idx]
+                img = Image.new('RGB', (width, height))
+                self.logger.warning(f"Failed to load image {img_path}: {e}")
+                
+            # Apply transformations
+            if self.transforms:
+                img = self.transforms(img)
+            else:
+                img = self._default_transform(img, bucket_idx)
+                
+            # Get caption if available
+            caption = self.captions[idx] if idx < len(self.captions) else ""
+            
+            return {
+                'image': img,
+                'caption': caption,
+                'path': img_path,
+                'expert': self.expert_assignments[idx],
+                'bucket': (bucket_idx, position)
+            }
+        except Exception as e:
+            self.logger.error(f"Error processing image at index {idx}: {str(e)}")
+            
     def get_bucket_sampler(self, batch_size=32, shuffle=True, drop_last=True):
         """
         Create a batched sampler that maintains aspect ratio grouping
@@ -779,84 +731,6 @@ class DDMDataset(Dataset):
                 return self.total_batches
                 
         return BucketBatchSampler(self.bucket_indices, batch_size, shuffle, drop_last)
-
-class FeatureDataset(Dataset):
-    """Dataset for extracting features for clustering"""
-    
-    def __init__(self, root_dir, config=None):
-        """
-        Initialize dataset for feature extraction
-        
-        Args:
-            root_dir: Directory containing images
-            config: Configuration object
-        """
-        self.root_dir = root_dir
-        self.config = config
-        
-        # Initialize logger
-        self.logger = setup_distributed_logger(name="FeatureDataset", rank=get_rank())
-        
-        # Get image size from config or use default
-        if config is not None:
-            self.image_size = getattr(config, 'feature_image_size', 224)
-        else:
-            self.image_size = 224
-            
-        # Initialize file paths
-        self.image_files = DataValidator.validate_images(root_dir)
-        self.valid_indices = []
-        
-        if len(self.image_files) == 0:
-            raise ValueError(f"No valid images found in {root_dir}")
-            
-        self.logger.info(f"Found {len(self.image_files)} valid images in {root_dir}")
-            
-        # Set transform for feature extraction
-        self.transform = transforms.Compose([
-            transforms.Resize(self.image_size, interpolation=PIL.Image.BILINEAR),
-            transforms.CenterCrop(self.image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-    
-    def __len__(self):
-        """Return the number of valid images"""
-        return len(self.image_files)
-        
-    def __getitem__(self, idx):
-        """Get a dataset item for feature extraction"""
-        # Get image path
-        path = self.image_files[idx]
-        
-        # Load image
-        try:
-            image = Image.open(path).convert('RGB')
-        except Exception as e:
-            self.logger.warning(f"Failed to load image {path}: {str(e)}")
-            # Return a small black image as fallback
-            image = Image.new('RGB', (64, 64), color=0)
-            
-        # Apply transforms if specified
-        if self.transform:
-            image = self.transform(image)
-        else:
-            # Resize using centralized transform
-            image = resize_image(image, (self.image_size, self.image_size))
-            
-            # Convert to tensor and normalize
-            if isinstance(image, Image.Image):
-                image = torch.tensor(np.array(image)).permute(2, 0, 1).float() / 255.0
-                image = normalize(image)
-            
-        # Create return dictionary
-        result = {
-            'image': image,
-            'path': path,
-            'idx': idx
-        }
-        
-        return result
 
 class BucketBatchSampler:
     """Sampler that creates batches from image buckets of similar aspect ratios"""
@@ -941,16 +815,16 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     
     for idx in range(len(dataset)):
         item = dataset[idx]
-        cluster_idx = item['cluster']
+        expert_idx = item['expert']
         
         # Skip unassigned samples
-        if cluster_idx < 0:
+        if expert_idx < 0:
             continue
             
-        if cluster_idx not in expert_indices:
-            expert_indices[cluster_idx] = []
+        if expert_idx not in expert_indices:
+            expert_indices[expert_idx] = []
             
-        expert_indices[cluster_idx].append(idx)
+        expert_indices[expert_idx].append(idx)
         
     # Create bucket indices for each expert
     expert_bucket_indices = {}

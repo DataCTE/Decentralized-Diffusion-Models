@@ -183,11 +183,6 @@ class ExpertTrainer(BaseTrainer):
                 if self.rank == 0 and torch.rand(1).item() < 0.01:  # Log occasionally
                     logger.debug(f"Expert {self.expert_idx} grad norm: {grad_norm:.4f}, clip: {clip_coef < 1}")
         
-        # Apply affinity masking if configured
-        if self.config.use_affinity_mask:
-            mask = (batch['cluster'] == self.expert_idx).float()
-            loss = mask * loss + (1-mask) * loss.detach()
-        
         # Finish optimization
         scaler.step(self.optimizer)
         scaler.update()
