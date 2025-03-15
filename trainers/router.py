@@ -50,7 +50,8 @@ class RouterTrainer:
         self.router = wrap_model_with_fsdp(
             base_router,
             config,
-            param_init_fn=lambda m: m.to_empty(device=torch.cuda.current_device(), recurse=False)
+            param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
+            rank=rank
         )
         
         if rank == 0:
@@ -59,7 +60,7 @@ class RouterTrainer:
         # Paper-recommended optimizer settings
         self.optimizer = AdamW8bit(
             self.router.parameters(),
-            lr=config.router_learning_rate,
+            lr=getattr(config, 'router_learning_rate', 1e-4),
             weight_decay=config.weight_decay
         )
         self.criterion = nn.CrossEntropyLoss()

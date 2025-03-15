@@ -90,6 +90,9 @@ DEFAULT_CONFIG = {
     'fsdp_backward_prefetch': "BACKWARD_PRE",
     'fsdp_auto_wrap_policy': "LAMBDA",
     'fsdp_min_num_params': 1e6,
+    'router_learning_rate': 1e-4,
+    'fsdp_use_orig_params': True,
+    'fsdp_limit_all_gathers': True,
 }
 
 def get_config(config_path):

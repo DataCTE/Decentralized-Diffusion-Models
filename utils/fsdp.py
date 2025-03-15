@@ -292,7 +292,7 @@ def get_fsdp_defaults():
         "use_orig_params": True
     }
 
-def create_fsdp_config(config, sharding_strategy="FULL_SHARD"):
+def create_fsdp_config(config, sharding_strategy="FULL_SHARD", rank=0):
     """Paper's sharding strategies with config overrides"""
     defaults = get_fsdp_defaults()
     return {
@@ -303,7 +303,7 @@ def create_fsdp_config(config, sharding_strategy="FULL_SHARD"):
             "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
             "NO_SHARD": ShardingStrategy.NO_SHARD
         }[sharding_strategy],
-        "device_id": torch.cuda.current_device()
+        "device_id": torch.device(f"cuda:{rank}")
     }
 
 def create_mixed_precision_config(config):

@@ -55,6 +55,7 @@ class DDMTrainingCoordinator:
         self.progress_callback = progress_callback
         self.cache_manager = cache_manager
         self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+        torch.cuda.set_device(self.device)
         
         # Parallel initialization components
         self._init_parallel_components()
