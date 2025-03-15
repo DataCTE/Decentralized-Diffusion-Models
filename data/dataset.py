@@ -93,7 +93,7 @@ class DataValidator:
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Smaller GPU batches for memory-constrained systems
-                gpu_batch_size = 128
+                gpu_batch_size = 256
                 futures = [executor.submit(cls._process_batch, batch, min_size)
                          for batch in chunks(all_files, gpu_batch_size)]
                 
@@ -133,7 +133,7 @@ class DataValidator:
         
         try:
             # Process images with size normalization
-            sub_batch_size = 128
+            sub_batch_size = 256
             target_size = (min_size, min_size)  # Standardize validation size
             
             for i in range(0, len(file_batch), sub_batch_size):
