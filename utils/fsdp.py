@@ -17,7 +17,7 @@ from torch.distributed.fsdp.wrap import (
     lambda_auto_wrap_policy
 )
 from torch.distributed.fsdp import StateDictType
-from models.router import SelfAttentionBlock
+
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ def get_auto_wrap_policy(config):
             transformer_layer_cls={DiTBlock}
         )
     elif policy_name == 'LAMBDA':
-        # Add lambda policy for router's attention blocks
+        from models.router import SelfAttentionBlock
         return functools.partial(
             lambda_auto_wrap_policy,
             lambda_fn=lambda m: isinstance(m, SelfAttentionBlock)
@@ -325,22 +325,6 @@ def create_mixed_precision_config(config):
                 buffer_dtype=torch.float16
             )
     return None
-
-def get_auto_wrap_policy(config):
-    """Get auto wrap policy based on config"""
-    if hasattr(config, 'fsdp_auto_wrap_policy'):
-        if config.fsdp_auto_wrap_policy == "SIZE_BASED":
-            min_params = getattr(config, 'fsdp_min_num_params', 1e6)
-            return size_based_auto_wrap_policy(min_num_params=min_params)
-        elif config.fsdp_auto_wrap_policy == "TRANSFORMER":
-            from transformers.models.gpt2.modeling_gpt2 import GPT2Block
-            from transformers.models.bert.modeling_bert import BertLayer
-            # Add any other transformer layers that might be used
-            transformer_layer_cls = [GPT2Block, BertLayer]
-            return transformer_auto_wrap_policy(transformer_layer_cls=transformer_layer_cls)
-    
-    # Default to size-based policy
-    return lambda_auto_wrap_policy
 
 def get_backward_prefetch(config):
     """Get backward prefetch setting based on config"""
