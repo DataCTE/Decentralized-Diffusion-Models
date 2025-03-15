@@ -88,7 +88,7 @@ DEFAULT_CONFIG = {
     'fsdp_sharding_strategy': "FULL_SHARD",
     'fsdp_cpu_offload': False,
     'fsdp_backward_prefetch': "BACKWARD_PRE",
-    'fsdp_auto_wrap_policy': "DEFAULT",
+    'fsdp_auto_wrap_policy': "LAMBDA",
     'fsdp_min_num_params': 1e6,
 }
 

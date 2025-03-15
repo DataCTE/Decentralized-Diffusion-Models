@@ -17,6 +17,7 @@ from torch.distributed.fsdp.wrap import (
     lambda_auto_wrap_policy
 )
 from torch.distributed.fsdp import StateDictType
+from models.router import SelfAttentionBlock
 
 logger = logging.getLogger(__name__)
 
@@ -76,13 +77,16 @@ def get_auto_wrap_policy(config):
             min_num_params=min_params
         )
     elif policy_name == 'TRANSFORMER':
-        # Import model-specific layers for transformer wrapping
         from models.dit import DiTBlock
         return functools.partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                DiTBlock,  # Wrap DiT blocks
-            }
+            transformer_layer_cls={DiTBlock}
+        )
+    elif policy_name == 'LAMBDA':
+        # Add lambda policy for router's attention blocks
+        return functools.partial(
+            lambda_auto_wrap_policy,
+            lambda_fn=lambda m: isinstance(m, SelfAttentionBlock)
         )
     else:
         logger.warning(f"Unknown auto wrap policy: {policy_name}, using SIZE_BASED")
