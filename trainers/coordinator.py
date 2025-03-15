@@ -34,7 +34,7 @@ def debug_print(message, rank=None, force=False):
 class DDMTrainingCoordinator:
     """Coordinator for Decentralized Diffusion Models with uniform data distribution"""
     
-    def __init__(self, config, rank, world_size, progress_callback=None):
+    def __init__(self, config, rank, world_size, cache_manager=None, progress_callback=None):
         """
         Initialize coordinator for decentralized diffusion
         
@@ -42,6 +42,7 @@ class DDMTrainingCoordinator:
             config: Configuration object
             rank: Process rank (0 is main)
             world_size: Total number of processes
+            cache_manager: Optional cache manager
             progress_callback: Optional callback function to report initialization progress
         """
         init_start_time = time.time()
@@ -52,6 +53,7 @@ class DDMTrainingCoordinator:
         self.rank = rank
         self.world_size = world_size
         self.progress_callback = progress_callback
+        self.cache_manager = cache_manager
         
         # Set device
         if torch.cuda.is_available():
