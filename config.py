@@ -53,7 +53,7 @@ def get_config(config_path):
         'router_num_layers': 4,           # Number of transformer layers for router
         
         # ===== Dataset parameters =====
-        'dataset_path': './data',         # Path to dataset
+        'dataset_path': '/home/alex/workspace/datasets/danbooru2025',         # Path to dataset
         'dataset_size': 100000,           # Size of dataset for uniform distribution
         'val_size': 1000,                 # Size of validation dataset
         'buckets': [                      # Multiple aspect ratio buckets (W, H)
