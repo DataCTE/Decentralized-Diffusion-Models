@@ -92,10 +92,10 @@ class DDMTrainingCoordinator:
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
     
     def _init_data_loaders(self):
-        """Initialize data loaders with uniform distribution across experts"""
+        """Initialize data loaders with uniform distribution"""
         debug_print(f"Creating data loaders on rank {self.rank}", self.rank, force=True)
         
-        # Initialize the dataset with proper parameters
+        # Initialize the dataset
         train_dataset = DDMDataset(
             config=self.config,
             split='train'
@@ -104,8 +104,7 @@ class DDMTrainingCoordinator:
         # Create validation dataset
         val_dataset = DDMDataset(
             config=self.config,
-            split='val',
-            # Use built-in uniform distribution from dataset
+            split='val'
         )
         
         # Create distributed samplers if in distributed training

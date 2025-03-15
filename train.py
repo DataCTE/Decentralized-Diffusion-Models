@@ -196,13 +196,13 @@ def main():
         
         # Create training coordinator
         console_print(f"Rank {rank}: Creating DDM Training Coordinator - this may take several minutes...")
-        console_print(f"Rank {rank}: Will initialize clustering, models, and data loaders")
+        console_print(f"Rank {rank}: Will initialize models and data loaders")
         logger.info("Creating DDM Training Coordinator")
-        logger.info("This will initialize clustering, models, and data loaders")
+        logger.info("This will initialize models and data loaders")
         
         if is_main_process():
-            console_print("Feature extraction and clustering may take 20-30 minutes, please be patient...")
-            logger.info("Feature extraction and clustering may take 20-30 minutes")
+            console_print("Model initialization may take several minutes...")
+            logger.info("Model initialization may take several minutes")
         
         # Add progress indicators during coordinator initialization
         init_start_time = time.time()
@@ -217,8 +217,6 @@ def main():
         progress_thread_active = True
         def progress_thread():
             last_print = time.time()
-            # Change clustering references to uniform distribution
-            console_print(f"Rank {rank}: Using uniform distribution across {config.num_experts} experts")
             stages = [
                 "data loader initialization", 
                 "router initialization", 
