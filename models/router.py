@@ -56,8 +56,8 @@ class RouterModel(nn.Module):
         # Attention blocks (simplified compared to the DiT)
         self.blocks = nn.ModuleList([
             SelfAttentionBlock(
-                config.router_hidden_size, 
-                config.num_heads // 2  # Use fewer attention heads
+                config.router_hidden_size,
+                config.router_num_heads  # Use direct head count instead of num_heads//2
             )
             for _ in range(2)  # Paper recommends 2 blocks for router
         ])

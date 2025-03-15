@@ -68,7 +68,7 @@ DEFAULT_CONFIG = {
     'output_dir': './outputs',
     
     # ===== Logging parameters =====
-    'log_every': 100,
+    'log_every': 1,
     'save_every': 5000,
     'validate_every': 1000,
     'generate_every': 1000,
