@@ -71,14 +71,10 @@ class DDMTrainingCoordinator:
     
     def _init_parallel_components(self):
         """Initialize critical components with async dataset loading"""
-        from tqdm.auto import tqdm
-        import concurrent.futures
-
-        # Create progress context manager only on main process
         pbar = None
         if self.rank == 0:
             pbar = tqdm(
-                total=3,  # Data loaders, router, expert indices
+                total=2,  # Reduced from 3 to 2 (router and experts only)
                 desc="Initializing Components",
                 dynamic_ncols=True,
                 bar_format="{l_bar}{bar:20}{r_bar}"
@@ -86,11 +82,13 @@ class DDMTrainingCoordinator:
 
         # Use ThreadPoolExecutor for better resource management
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            # Submit tasks
+            # Submit data loading separately without tracking
+            data_future = executor.submit(self._init_data_loaders)
+            
+            # Only track these two components in progress bar
             futures = {
                 executor.submit(self._init_router): "router",
-                executor.submit(self._init_expert_indices): "experts",
-                executor.submit(self._init_data_loaders): "data"
+                executor.submit(self._init_expert_indices): "experts"
             }
 
             try:
@@ -104,6 +102,9 @@ class DDMTrainingCoordinator:
             finally:
                 if pbar is not None:
                     pbar.close()
+            
+            # Ensure data loading completes before continuing
+            data_future.result()
     
     def _init_data_loaders(self):
         """Initialize data loaders with uniform distribution"""

@@ -87,15 +87,15 @@ def create_loader(dataset, config, is_train=True, distributed=False, rank=0, wor
             for _ in loader:
                 break
             
-        # Progress bar only on main process
+        # Add conditional for progress bar
         pbar = None
-        if rank == 0:
+        if rank == 0 and not getattr(config, 'silent_loader', False):
             pbar = tqdm(
                 desc="Loading Data",
                 unit="batch",
                 dynamic_ncols=True,
                 bar_format="{l_bar}{bar:20}{r_bar}",
-                disable=not is_train  # Only show for training
+                disable=not is_train
             )
 
         # Wrap the DataLoader iterator
