@@ -11,7 +11,7 @@ from datetime import datetime
 
 # Import core components
 from trainers.coordinator import DDMTrainingCoordinator
-from utils.config import get_config
+from config import get_config
 from utils.logging import setup_logger, log_training_start
 from utils.checkpoint import load_coordinator_checkpoint
 from utils.expert_cache import ExpertCacheManager
