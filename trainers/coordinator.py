@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import threading
 from tqdm.auto import tqdm
+import concurrent.futures
 
 # Import needed components
 from trainers.router import RouterTrainer
@@ -69,8 +70,10 @@ class DDMTrainingCoordinator:
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
     
     def _init_parallel_components(self):
-        """Initialize critical components in parallel with proper progress handling"""
-        
+        """Initialize critical components with async dataset loading"""
+        from tqdm.auto import tqdm
+        import concurrent.futures
+
         # Create progress context manager only on main process
         pbar = None
         if self.rank == 0:
@@ -80,37 +83,27 @@ class DDMTrainingCoordinator:
                 dynamic_ncols=True,
                 bar_format="{l_bar}{bar:20}{r_bar}"
             )
-        
-        # Wrap thread targets with progress updates
-        def wrapped_init(target):
-            def wrapper():
-                try:
-                    target()
+
+        # Use ThreadPoolExecutor for better resource management
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # Submit tasks
+            futures = {
+                executor.submit(self._init_router): "router",
+                executor.submit(self._init_expert_indices): "experts",
+                executor.submit(self._init_data_loaders): "data"
+            }
+
+            try:
+                # Process completion with progress updates
+                for future in concurrent.futures.as_completed(futures):
+                    component = futures[future]
+                    future.result()  # Raise exceptions if any
                     if pbar is not None:
                         pbar.update(1)
-                except Exception as e:
-                    if pbar is not None:
-                        pbar.close()
-                    raise
-            return wrapper
-        
-        threads = [
-            threading.Thread(target=wrapped_init(self._init_data_loaders)),
-            threading.Thread(target=wrapped_init(self._init_router)), 
-            threading.Thread(target=wrapped_init(self._init_expert_indices))
-        ]
-        
-        # Start all threads
-        for t in threads:
-            t.start()
-        
-        # Handle completion
-        try:
-            for t in threads:
-                t.join()
-        finally:
-            if pbar is not None:
-                pbar.close()
+                        pbar.set_postfix_str(f"Completed: {component}")
+            finally:
+                if pbar is not None:
+                    pbar.close()
     
     def _init_data_loaders(self):
         """Initialize data loaders with uniform distribution"""
