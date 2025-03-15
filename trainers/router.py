@@ -14,7 +14,7 @@ from torch.distributed.fsdp.wrap import (
 
 
 
-from models.router import RouterModel
+from models.router import RouterModel, SelfAttentionBlock
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 
 def get_sharding_strategy(name: str) -> ShardingStrategy:
@@ -39,7 +39,10 @@ def get_auto_wrap_policy(config):
         return size_based_auto_wrap_policy(
             min_num_params=getattr(config, 'fsdp_min_num_params', 1e6)
         )
-    return lambda_auto_wrap_policy
+    # Provide a default lambda function for the policy
+    return lambda_auto_wrap_policy(
+        lambda_fn=lambda m: isinstance(m, SelfAttentionBlock)
+    )
 
 class RouterTrainer:
     """Trainer for the router model in DDM"""
