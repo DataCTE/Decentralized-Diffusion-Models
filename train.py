@@ -4,11 +4,10 @@
 import os
 import torch
 import logging
-import datetime
+from datetime import datetime, timedelta
 from tqdm import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from datetime import datetime
 
 # Import core components
 from trainers.coordinator import DDMTrainingCoordinator
@@ -21,7 +20,7 @@ def setup_distributed():
     """Initialize distributed training environment"""
     dist.init_process_group(
         backend='nccl',
-        timeout=datetime.timedelta(minutes=15)
+        timeout=timedelta(minutes=15)
     )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
