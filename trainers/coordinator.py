@@ -212,11 +212,14 @@ class DDMTrainingCoordinator:
                 if not key.startswith('_'):
                     logger.info(f"  {key}: {value}")
                     
-        # Synchronize to ensure all processes have completed initialization
-        debug_print(f"Waiting for synchronization across all processes", rank)
-        sync_start = time.time()
-        synchronize()
-        debug_print(f"All processes synchronized in {time.time() - sync_start:.2f}s", rank)
+        # Synchronize to ensure all processes have completed initialization - but skip when clustering is skipped
+        if not self.is_clustering_skipped:
+            debug_print(f"Waiting for synchronization across all processes", rank)
+            sync_start = time.time()
+            synchronize()
+            debug_print(f"All processes synchronized in {time.time() - sync_start:.2f}s", rank)
+        else:
+            debug_print(f"Skipping final synchronization with skip_clustering=True", rank, force=True)
         
     def safe_synchronize(self, name="operation"):
         """
@@ -228,9 +231,15 @@ class DDMTrainingCoordinator:
         if self.world_size <= 1:
             return True  # No need to synchronize for single-process training
             
-        # Fast path for initialization operations when clustering is skipped
-        if self.is_clustering_skipped and name in ["skip_clustering", "cluster_initialization", "data_loading"]:
-            logger.debug(f"Fast synchronization for '{name}' when skip_clustering=True")
+        # Fast path: Skip ALL synchronization when skip_clustering=True to avoid any potential deadlocks
+        if self.is_clustering_skipped:
+            logger.debug(f"Bypassing synchronization for '{name}' because skip_clustering=True")
+            debug_print(f"Skipping synchronization for '{name}' with skip_clustering=True", self.rank, force=True)
+            return True
+        
+        # Previous fast path code is kept but will not be used when skip_clustering=True
+        if name in ["skip_clustering", "cluster_initialization", "data_loading"]:
+            logger.debug(f"Fast synchronization for '{name}'")
             try:
                 # Log before barrier to identify which process is waiting
                 debug_print(f"Entering fast sync barrier for '{name}'", self.rank, force=True)
@@ -338,7 +347,7 @@ class DDMTrainingCoordinator:
             # Fast path: Create a simple ClusterManager without clustering
             debug_print(f"Fast-path initializing ClusterManager with skip_clustering=True on rank {self.rank}", self.rank, force=True)
             
-            # Create a simple ClusterManager without clustering
+            # Create a simple ClusterManager without clustering - no synchronization required
             self.cluster_manager = ClusterManager(
                 config=self.config,
                 feature_extractor=None
@@ -350,16 +359,14 @@ class DDMTrainingCoordinator:
                 # Report progress
                 if self.progress_callback:
                     self.progress_callback("Creating uniform distribution (skipping clustering)", 15)
-                
-            # Quick synchronization when skipping clustering
-            if self.world_size > 1:
-                debug_print(f"Quick synchronization for skip_clustering on rank {self.rank}", self.rank, force=True)
-                self.safe_synchronize(name="skip_clustering")
-                
+            
+            # Completely bypass synchronization when clustering is skipped
+            # DO NOT add any synchronization points here to avoid hanging
+            
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Clustering skipped", 20)
-                
+            
             debug_print(f"Fast-path ClusterManager initialization complete on rank {self.rank}", self.rank, force=True)
             
             return None
@@ -553,8 +560,8 @@ class DDMTrainingCoordinator:
                 logger.info(f"Dataset has {len(self.dataset)} samples assigned to {num_clusters} clusters")
                 logger.info(f"Created {len(self.expert_loaders)} expert loaders and 1 router loader")
                 
-            # Synchronize all processes after data loading - use a shorter timeout if skipping clustering
-            if self.world_size > 1:
+            # Synchronize all processes after data loading - but skip when clustering is skipped
+            if self.world_size > 1 and not self.is_clustering_skipped:
                 self.safe_synchronize(name="data_loading")
                 
             # Final timing
@@ -671,11 +678,11 @@ class DDMTrainingCoordinator:
             initialized_experts = list(self.experts.keys())
             logger.info(f"Rank {self.rank} initialized experts: {initialized_experts}")
             
-            # Synchronize model initialization across processes
+            # Synchronize model initialization across processes - but skip when clustering is skipped
             logger.info(f"Synchronizing model initialization on rank {self.rank}")
             sync_start = time.time()
             
-            if self.world_size > 1:
+            if self.world_size > 1 and not self.is_clustering_skipped:
                 self.safe_synchronize(name="model_initialization")
                 
             sync_time = time.time() - sync_start

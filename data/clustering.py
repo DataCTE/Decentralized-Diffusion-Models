@@ -1224,15 +1224,20 @@ class ClusterManager:
         Returns:
             np.ndarray: Cluster labels
         """
-        # Fast path for skip_clustering - avoid any unnecessary checks
+        # Fast path for skip_clustering - avoid any unnecessary checks or synchronization
         if getattr(self.config, 'skip_clustering', False):
             # If we already have labels, return them
             if self.cluster_labels is not None:
                 return self.cluster_labels
                 
             # Otherwise create uniform distribution directly
+            # Using a completely barrier-free path
             self.logger.info("Fast path: Creating uniform distribution (skip_clustering=True)")
-            return self.create_uniform_distribution()
+            dataset_size = getattr(self.config, 'dataset_size', 10000)
+            num_clusters = getattr(self.config, 'num_experts', 8)
+            labels = np.arange(dataset_size) % num_clusters
+            self.cluster_labels = labels
+            return labels
                 
         # Normal path for regular clustering
         if self.cluster_labels is None:
@@ -1631,7 +1636,8 @@ class ClusterManager:
         self.cluster_labels = labels
         
         # In distributed setting, ensure all processes have the same labels
-        if is_distributed:
+        # BUT completely skip any synchronization when skip_clustering=True
+        if is_distributed and not self.uniform_distribution:
             # Broadcast labels only if necessary
             self.cluster_labels = broadcast_numpy_array(labels)
         
