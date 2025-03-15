@@ -39,9 +39,9 @@ def get_auto_wrap_policy(config):
         return size_based_auto_wrap_policy(
             min_num_params=getattr(config, 'fsdp_min_num_params', 1e6)
         )
-    # Update lambda to accept FSDP's expected parameters
+    # Use correct signature with ignored parameters
     return lambda_auto_wrap_policy(
-        lambda_fn=lambda module, recurse, nonwrapped_numel: isinstance(module, SelfAttentionBlock)
+        lambda_fn=lambda module, *args, **kwargs: isinstance(module, SelfAttentionBlock)
     )
 
 class RouterTrainer:
