@@ -66,7 +66,7 @@ class DataValidator:
 
     @classmethod
     def _process_batches(cls, all_files, min_size, batch_size):
-        """Process files with enhanced GPU progress tracking"""
+        """Optimized batch processing with memory-aware progress tracking"""
         valid_files = []
         invalid_files = []
         pbar = None
@@ -82,14 +82,20 @@ class DataValidator:
                     postfix={
                         'valid': 0,
                         'invalid': 0,
-                        'rate': '0 img/s'
+                        'rate': '0 img/s',
+                        'mem': f"{torch.cuda.memory_allocated()/1e9:.1f}GB"
                     },
                     position=0
                 )
 
-            with ThreadPoolExecutor(max_workers=min(4, os.cpu_count())) as executor:
+            # Reduce concurrent workers for GPU batches
+            max_workers = min(2, os.cpu_count())
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Smaller GPU batches for memory-constrained systems
+                gpu_batch_size = 64
                 futures = [executor.submit(cls._process_batch, batch, min_size)
-                         for batch in chunks(all_files, batch_size)]
+                         for batch in chunks(all_files, gpu_batch_size)]
                 
                 for future in as_completed(futures):
                     batch_valid, batch_invalid = future.result()
@@ -98,54 +104,71 @@ class DataValidator:
                     cls._invalid_files_cache.update(batch_invalid)
                     
                     if pbar:
-                        # Update metrics
+                        # Update metrics with memory usage
                         pbar.update(len(batch_valid) + len(batch_invalid))
                         pbar.set_postfix({
                             'valid': len(valid_files),
                             'invalid': len(invalid_files),
-                            'rate': f"{pbar.format_dict['rate']} img/s"
+                            'rate': f"{pbar.format_dict['rate']} img/s",
+                            'mem': f"{torch.cuda.memory_allocated()/1e9:.1f}GB"
                         })
                         
         finally:
             if pbar:
                 pbar.close()
-                # Log final validation stats
+                # Log final validation stats with memory info
                 valid_pct = (len(valid_files)/len(all_files))*100
-                logger.info(f"Validation complete: {len(valid_files)} valid ({valid_pct:.1f}%)"
-                          f" | {len(invalid_files)} invalid")
+                logger.info(f"Validation complete: {len(valid_files)} valid ({valid_pct:.1f}%) | "
+                          f"{len(invalid_files)} invalid | "
+                          f"Peak memory: {torch.cuda.max_memory_allocated()/1e9:.1f}GB")
                 
         return valid_files
 
     @classmethod
     def _process_batch(cls, file_batch, min_size):
-        """Pure GPU validation pipeline"""
+        """Memory-optimized GPU validation pipeline"""
         valid_files = []
         invalid_files = []
-        
-        # Convert min_size to GPU tensor
         min_size_tensor = torch.tensor(min_size, device=cls._device, dtype=torch.int32)
         
         try:
-            # Batch load with GPU-only pipeline
-            tensors = [cls._load_image_tensor(fpath).to(cls._device) for fpath in file_batch]
-            
-            # Vectorized GPU checks
-            valid_mask = torch.stack([
-                (t.shape[-2] >= min_size_tensor) &
-                (t.shape[-1] >= min_size_tensor) &
-                (t.min() >= 0) &
-                (t.max() <= 1) &
-                ~torch.isnan(t).any() &
-                ~torch.isinf(t).any()
-                for t in tensors
-            ])
-            
-            # Filter using GPU mask
-            valid_files = [f for f, m in zip(file_batch, valid_mask.cpu().numpy()) if m]
-            invalid_files = [f for f, m in zip(file_batch, valid_mask.cpu().numpy()) if not m]
-            
-        except RuntimeError as e:  # Catch GPU memory errors
-            logger.warning(f"GPU batch failed: {str(e)}")
+            # Process images in smaller sub-batches
+            sub_batch_size = 32  # Adjusted for 24GB VRAM
+            for i in range(0, len(file_batch), sub_batch_size):
+                sub_files = file_batch[i:i+sub_batch_size]
+                tensors = []
+                
+                # Load with explicit memory management
+                for fpath in sub_files:
+                    try:
+                        tensor = cls._load_image_tensor(fpath).to(cls._device)
+                        tensors.append(tensor)
+                    except Exception as e:
+                        invalid_files.append(fpath)
+                
+                if tensors:
+                    # Stack tensors with pinned memory
+                    batch_tensor = torch.cat(tensors).pin_memory()
+                    
+                    # Vectorized GPU checks
+                    valid_mask = (
+                        (batch_tensor.shape[-2] >= min_size_tensor) &
+                        (batch_tensor.shape[-1] >= min_size_tensor) &
+                        (batch_tensor.min(dim=1)[0] >= 0).all(dim=(1,2)) &
+                        (batch_tensor.max(dim=1)[0] <= 1).all(dim=(1,2)) &
+                        ~torch.isnan(batch_tensor).any(dim=(1,2,3)) &
+                        ~torch.isinf(batch_tensor).any(dim=(1,2,3))
+                    )
+                    
+                    # Split results and release memory
+                    valid_files.extend([f for f, m in zip(sub_files, valid_mask.cpu()) if m])
+                    invalid_files.extend([f for f, m in zip(sub_files, valid_mask.cpu()) if not m])
+                    del batch_tensor, tensors
+                    
+                torch.cuda.empty_cache()
+
+        except RuntimeError as e:
+            logger.warning(f"GPU validation failed: {str(e)}")
             invalid_files.extend(file_batch)
             
         return valid_files, invalid_files
