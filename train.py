@@ -9,7 +9,7 @@ import sys
 import logging
 
 
-from config import DDMConfig
+from config import get_config, create_default_config
 from trainers.coordinator import DDMTrainingCoordinator
 
 # Import centralized utilities
@@ -120,7 +120,7 @@ def main():
     
     # Load configuration
     print("Loading configuration...")
-    config = DDMConfig()
+    config = create_default_config()
     print("Configuration loaded")
     
     # Setup logging
