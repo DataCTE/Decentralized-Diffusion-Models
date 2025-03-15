@@ -25,6 +25,8 @@ from utils.distributed import synchronize
 # Setup logging
 logger = logging.getLogger(__name__)
 
+import math  # For BucketBatchSampler
+
 class DataValidator:
     """GPU-accelerated image validation with distributed caching"""
     
@@ -32,7 +34,7 @@ class DataValidator:
     _invalid_files_cache = set()
     _lock = threading.Lock()
     _device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+    
     @classmethod
     def validate_images(cls, root_dir, extensions=None, min_size=256, batch_size=1000):
         """Main entry point for image validation with batched processing"""
@@ -42,7 +44,7 @@ class DataValidator:
         with cls._lock:
             if cache_key in cls._valid_files_cache:
                 return cls._valid_files_cache[cache_key]
-
+            
             if not is_main_process():
                 return cls._broadcast_result(cache_key)
 
@@ -51,7 +53,7 @@ class DataValidator:
             
             cls._cache_results(cache_key, valid_files, len(all_files))
             return cls._broadcast_result(cache_key)
-
+    
     @staticmethod
     def _discover_files(root_dir, extensions):
         """Find image files with GPU-optimized path discovery"""
@@ -63,72 +65,38 @@ class DataValidator:
         return sorted(files)
 
     @classmethod
-    def _process_batches(cls, all_files, min_size, batch_size):
-        """Process files with managed progress tracking"""
+    def _process_batch(cls, file_batch, min_size):
+        """Pure GPU validation pipeline"""
         valid_files = []
-        pbar = None
+        invalid_files = []
+        
+        # Convert min_size to GPU tensor
+        min_size_tensor = torch.tensor(min_size, device=cls._device, dtype=torch.int32)
         
         try:
-            if is_main_process():
-                pbar = tqdm(
-                    total=len(all_files), 
-                    desc="Validating Images", 
-                    unit="img",
-                    dynamic_ncols=True,
-                    bar_format="{l_bar}{bar:20}{r_bar}",
-                    position=0  # Main progress bar at top
-                )
-
-            with ThreadPoolExecutor() as executor:
-                futures = [executor.submit(cls._process_batch, batch, min_size)
-                         for batch in chunks(all_files, batch_size)]
-                
-                for future in as_completed(futures):
-                    batch_valid, batch_invalid = future.result()
-                    valid_files.extend(batch_valid)
-                    cls._invalid_files_cache.update(batch_invalid)
-                    
-                    if pbar:
-                        pbar.update(len(batch_valid) + len(batch_invalid))
-                        
-        finally:
-            if pbar:
-                pbar.close()
-                
-        return valid_files
-
-    @classmethod
-    def _process_batch(cls, file_batch, min_size):
-        """Validate batch using GPU-accelerated checks"""
-        batch_valid, batch_invalid = [], []
-        
-        for fpath in file_batch:
-            if fpath in cls._invalid_files_cache:
-                batch_invalid.append(fpath)
-                continue
-                
-            try:
-                # GPU-accelerated validation pipeline
-                with torch.no_grad():
-                    # Stage 1: Fast metadata check
-                    with Image.open(fpath) as img:
-                        if img.mode not in ('RGB', 'RGBA') or \
-                           img.width < min_size or \
-                           img.height < min_size:
-                            raise ValueError("Invalid metadata")
-
-                    # Stage 2: GPU-based integrity check
-                    tensor = cls._load_image_tensor(fpath).to(cls._device)
-                    if not cls._gpu_integrity_check(tensor):
-                        raise ValueError("GPU validation failed")
-
-                batch_valid.append(fpath)
-                
-            except Exception as e:
-                cls._invalid_files_cache.add(fpath)
-                batch_invalid.append(fpath)
-                
-        return batch_valid, batch_invalid
+            # Batch load with GPU-only pipeline
+            tensors = [cls._load_image_tensor(fpath).to(cls._device) for fpath in file_batch]
+            
+            # Vectorized GPU checks
+            valid_mask = torch.stack([
+                (t.shape[-2] >= min_size_tensor) &
+                (t.shape[-1] >= min_size_tensor) &
+                (t.min() >= 0) &
+                (t.max() <= 1) &
+                ~torch.isnan(t).any() &
+                ~torch.isinf(t).any()
+                for t in tensors
+            ])
+            
+            # Filter using GPU mask
+            valid_files = [f for f, m in zip(file_batch, valid_mask.cpu().numpy()) if m]
+            invalid_files = [f for f, m in zip(file_batch, valid_mask.cpu().numpy()) if not m]
+            
+        except RuntimeError as e:  # Catch GPU memory errors
+            logger.warning(f"GPU batch failed: {str(e)}")
+            invalid_files.extend(file_batch)
+            
+        return valid_files, invalid_files
 
     @classmethod
     def _load_image_tensor(cls, fpath):
@@ -140,7 +108,7 @@ class DataValidator:
                 return transforms.ToTensor()(img).unsqueeze(0)
         except Exception as e:
             raise RuntimeError(f"GPU loading failed: {str(e)}")
-
+        
     @classmethod
     def _gpu_integrity_check(cls, tensor):
         """GPU-accelerated image validation checks"""
@@ -213,11 +181,18 @@ class DDMDataset(Dataset):
         self._init_gpu_buckets()
         self._distribute_samples_gpu()
 
+        # Store bucket sizes as GPU tensors
+        self.bucket_dims = torch.tensor(
+            config.buckets, 
+            device=self.device,
+            dtype=torch.int32
+        )
+
     def _load_dataset(self):
         """GPU-accelerated dataset loading pipeline"""
         if not self.config.dataset_path:
             raise ValueError("Dataset path must be provided")
-
+            
         # Use GPU-optimized file discovery
         self.image_files = DataValidator.validate_images(
             self.config.dataset_path,
@@ -308,37 +283,37 @@ class DDMDataset(Dataset):
             else:
                 self._loader_pbar = None
 
-        # Get metadata from GPU cache
+        # Get target size directly from GPU tensor
         bucket_idx = self.bucket_assignments[idx]
-        target_size = self.buckets[bucket_idx].cpu().numpy()
+        target_h = self.bucket_dims[bucket_idx, 1]
+        target_w = self.bucket_dims[bucket_idx, 0]
         
-        # Load image with GPU-optimized pipeline
+        # Keep all tensors on GPU
         try:
-            tensor = self._load_image_tensor(idx, target_size)
+            tensor = self._load_image_tensor(idx, (target_w, target_h))
             return {
-                'image': tensor.to(self.device),
+                'image': tensor,
                 'expert': self.expert_assignments[idx],
                 'bucket': bucket_idx
             }
         except Exception as e:
-            return self._handle_error_case(target_size)
+            return self._handle_error_case((target_w, target_h))
 
     def _load_image_tensor(self, idx, target_size):
-        """GPU-optimized image loading and processing"""
-        # Stage 1: Fast GPU decode
-        tensor = DataValidator._load_image_tensor(self.image_files[idx])
+        """Pure GPU image pipeline"""
+        # Direct GPU load with tensor-based resizing
+        tensor = DataValidator._load_image_tensor(self.image_files[idx]).to(self.device)
         
-        # Stage 2: GPU-based resizing
+        # GPU-native size check
         if tensor.shape[-2:] != torch.Size(target_size):
             tensor = torch.nn.functional.interpolate(
-                tensor, 
+                tensor.unsqueeze(0),
                 size=tuple(target_size),
                 mode='bilinear',
                 align_corners=False
-            )
-        
-        # Stage 3: GPU normalization
-        return normalize(tensor.squeeze(0))
+            ).squeeze(0)
+            
+        return normalize(tensor)
 
     def _handle_error_case(self, target_size):
         """Generate error placeholder on GPU"""
@@ -347,7 +322,7 @@ class DDMDataset(Dataset):
             'expert': torch.tensor(-1, device=self.device),
             'bucket': torch.tensor(-1, device=self.device)
         }
-
+    
     def __len__(self):
         """Get dataset length"""
         return len(self.image_files)
@@ -412,7 +387,7 @@ class BucketBatchSampler(torch.utils.data.Sampler):
             self.batch_counts[i] = count
             
         self.total_batches = torch.sum(self.batch_counts).item()
-
+        
     def __iter__(self):
         # Generate batches using GPU-accelerated operations
         all_batches = []
@@ -436,7 +411,7 @@ class BucketBatchSampler(torch.utils.data.Sampler):
             all_batches = [all_batches[i] for i in perm.cpu().numpy()]
             
         return iter(all_batches)
-
+            
     def __len__(self):
         return self.total_batches
 
@@ -496,5 +471,5 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         expert_loaders[expert_idx] = loader
         logger.info(f"Created GPU-optimized loader for expert {expert_idx} "
                    f"with {len(sampler)} batches on {device}")
-
+        
     return expert_loaders 
