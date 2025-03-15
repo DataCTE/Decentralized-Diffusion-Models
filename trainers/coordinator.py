@@ -6,6 +6,7 @@ import datetime
 import time
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import threading
 
 # Import needed components
 from trainers.expert import ExpertTrainer
@@ -54,42 +55,33 @@ class DDMTrainingCoordinator:
         self.world_size = world_size
         self.progress_callback = progress_callback
         self.cache_manager = cache_manager
+        self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
         
-        # Set device
-        if torch.cuda.is_available():
-            self.device = torch.device(f"cuda:{rank}")
-        else:
-            self.device = torch.device("cpu")
+        # Parallel initialization components
+        self._init_parallel_components()
         
-        debug_print(f"Using device: {self.device}", rank, force=True)
+        # Defer non-critical initialization
+        self.flow_matcher = None  # Will be created on first training step
         
-        # Initialize components
-        self.vae = None
-        self.text_encoder = None
-        self.router = None
-        self.experts = {}
-        self.train_loader = None
-        self.val_loader = None
-        
-        # Initialize data loaders
-        self._init_data_loaders()
-        
-        # Initialize models
-        self._init_models()
-        
-        # Initialize flow matcher for loss calculation
-        self.flow_matcher = DecentralizedFlowMatcher(
-            sigma=getattr(self.config, 'sigma', 0.5),
-            loss_type=getattr(self.config, 'loss_type', 'huber')
-        )
-        
-        # Report progress
-        if self.progress_callback and self.rank == 0:
-            self.progress_callback("Initialization complete", 100)
-        
-        # Log initialization completion
+        # Final initialization sync
         total_init_time = time.time() - init_start_time
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
+    
+    def _init_parallel_components(self):
+        """Initialize critical components in parallel"""
+        threads = [
+            threading.Thread(target=self._init_data_loaders),
+            threading.Thread(target=self._init_router),
+            threading.Thread(target=self._init_expert_indices)
+        ]
+        
+        # Start all threads
+        for t in threads:
+            t.start()
+        
+        # Wait for completion
+        for t in threads:
+            t.join()
     
     def _init_data_loaders(self):
         """Initialize data loaders with uniform distribution"""
@@ -149,60 +141,23 @@ class DDMTrainingCoordinator:
         
         debug_print(f"Created data loaders with {len(train_dataset)} training samples on rank {self.rank}", self.rank, force=True)
     
-    def _init_models(self):
-        """Initialize model components for DDM"""
-        debug_print(f"Initializing models on rank {self.rank}", self.rank, force=True)
-        
-        # Get expert indices for this rank
-        expert_indices = []
-        for expert_idx in range(self.config.num_experts):
-            if expert_idx % self.world_size == self.rank:
-                expert_indices.append(expert_idx)
-                
-        logger.info(f"Rank {self.rank} will create {len(expert_indices)} experts")
-        
-        # Create router using RouterTrainer
+    def _init_expert_indices(self):
+        """Determine expert assignments without model creation"""
+        self.expert_indices = [
+            idx for idx in range(self.config.num_experts)
+            if idx % self.world_size == self.rank
+        ]
+        logger.info(f"Rank {self.rank} will manage {len(self.expert_indices)} experts")
+    
+    def _init_router(self):
+        """Initialize router with async FSDP wrapping"""
         logger.info(f"Creating router on rank {self.rank}")
-        router_start_time = time.time()
-        
         self.router = RouterTrainer(
             config=self.config,
             device=self.device,
             rank=self.rank,
             world_size=self.world_size
         )
-        
-        router_time = time.time() - router_start_time
-        logger.info(f"Router created in {router_time:.2f}s")
-        
-        # Create experts using ExpertTrainer
-        logger.info(f"Creating expert models for rank {self.rank}")
-        experts_start_time = time.time()
-        
-        # Create each expert for this rank
-        for expert_idx in expert_indices:
-            logger.info(f"Creating expert {expert_idx} on rank {self.rank}")
-            expert_start_time = time.time()
-            
-            self.experts[expert_idx] = ExpertTrainer(
-                expert_idx=expert_idx,
-                config=self.config,
-                device=self.device,
-                rank=self.rank,
-                world_size=self.world_size
-            )
-            
-            expert_time = time.time() - expert_start_time
-            logger.info(f"Expert {expert_idx} created in {expert_time:.2f}s")
-        
-        experts_time = time.time() - experts_start_time
-        logger.info(f"Created {len(self.experts)} experts in {experts_time:.2f}s")
-        
-        # Log GPU memory usage
-        if torch.cuda.is_available():
-            mem_allocated = torch.cuda.memory_allocated(self.device) / (1024**3)
-            mem_reserved = torch.cuda.memory_reserved(self.device) / (1024**3)
-            logger.info(f"GPU memory usage: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
     
     def train(self, num_steps=None):
         """Run training for specified number of steps, following DDM approach"""
@@ -210,6 +165,13 @@ class DDMTrainingCoordinator:
             num_steps = self.config.num_steps
             
         logger.info(f"Starting DDM training for {num_steps} steps on rank {self.rank}")
+        
+        # Initialize flow matcher on first use
+        if self.flow_matcher is None:
+            self.flow_matcher = DecentralizedFlowMatcher(
+                sigma=getattr(self.config, 'sigma', 0.5),
+                loss_type=getattr(self.config, 'loss_type', 'huber')
+            )
         
         # Create train dataloader iterator
         train_iter = iter(self.train_loader)
@@ -236,10 +198,11 @@ class DDMTrainingCoordinator:
     
     def train_experts(self, batch):
         """Train expert models using the DDM approach"""
-        for expert_idx, expert in self.experts.items():
-            # Isolated expert training with FSDP
+        for expert_idx in self.expert_indices:
+            # Get expert from cache manager
+            expert = self.cache_manager.get_expert(expert_idx)
             expert.train_step(batch)
-        
+    
     def train_router(self, batch):
         """Train router model using cluster labels as supervision"""
         # Distributed router training
@@ -272,7 +235,7 @@ class DDMTrainingCoordinator:
         os.makedirs(sample_dir, exist_ok=True)
         
         # Collect all experts for sampling
-        experts_dict = {expert_idx: expert for expert_idx, expert in self.experts.items()}
+        experts_dict = {expert_idx: self.cache_manager.get_expert(expert_idx) for expert_idx in self.expert_indices}
         
         # Use proper DDM sampling from trainers/sampling.py
         try:
@@ -341,10 +304,6 @@ class DDMTrainingCoordinator:
         
         # Save router using its save_checkpoint method
         self.router.save_checkpoint(checkpoint_dir, step)
-        
-        # Save experts using their save_checkpoint methods
-        for expert_idx, expert in self.experts.items():
-            expert.save_checkpoint(checkpoint_dir, step)
             
         # Save coordinator state
         save_coordinator_checkpoint(
@@ -370,11 +329,5 @@ class DDMTrainingCoordinator:
             router_path = os.path.join(checkpoint_dir, 'router.pt')
             if os.path.exists(router_path):
                 self.router.load_checkpoint(router_path)
-            
-        # Load experts using their load_checkpoint methods
-        for expert_idx, expert in self.experts.items():
-            expert_path = os.path.join(checkpoint_dir, f'expert_{expert_idx}.pt')
-            if os.path.exists(expert_path):
-                expert.load_checkpoint(expert_path)
                     
         return step
