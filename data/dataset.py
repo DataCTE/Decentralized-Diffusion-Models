@@ -89,7 +89,7 @@ class DataValidator:
                 )
 
             # Reduce concurrent workers for GPU batches
-            max_workers = min(2, os.cpu_count())
+            max_workers = min(4, os.cpu_count())
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Smaller GPU batches for memory-constrained systems
