@@ -93,7 +93,7 @@ class DataValidator:
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Smaller GPU batches for memory-constrained systems
-                gpu_batch_size = 64
+                gpu_batch_size = 128
                 futures = [executor.submit(cls._process_batch, batch, min_size)
                          for batch in chunks(all_files, gpu_batch_size)]
                 
