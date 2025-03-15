@@ -4,6 +4,7 @@
 import os
 import torch
 import logging
+import datetime
 from tqdm import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -18,7 +19,10 @@ from utils.expert_cache import ExpertCacheManager
 
 def setup_distributed():
     """Initialize distributed training environment"""
-    dist.init_process_group(backend='nccl', timeout=datetime.timedelta(minutes=15))
+    dist.init_process_group(
+        backend='nccl',
+        timeout=datetime.timedelta(minutes=15)
+    )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     return rank, world_size
