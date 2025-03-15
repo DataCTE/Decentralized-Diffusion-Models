@@ -12,7 +12,6 @@ import glob
 
 import io
 import torchvision.transforms as transforms
-import torchvision.io
 from tqdm.auto import tqdm
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 import math  # For BucketBatchSampler
 
 class DataValidator:
-    """Optimized GPU validation with multi-GPU support"""
+    """GPU-accelerated image validation with distributed caching"""
     
     _valid_files_cache = {}
     _invalid_files_cache = set()
@@ -127,28 +126,57 @@ class DataValidator:
 
     @classmethod
     def _process_batch(cls, file_batch, min_size):
-        """Massively parallel GPU validation pipeline"""
+        """Fixed GPU validation without tensor pinning"""
         valid_files = []
         invalid_files = []
         min_size_tensor = torch.tensor(min_size, device=cls._device, dtype=torch.int32)
         
         try:
-            # Use all available GPUs for parallel processing
-            num_gpus = torch.cuda.device_count()
-            chunk_size = len(file_batch) // num_gpus
-            chunks = [file_batch[i*chunk_size:(i+1)*chunk_size] for i in range(num_gpus)]
+            # Process images with size normalization
+            sub_batch_size = 32
+            target_size = (min_size, min_size)  # Standardize validation size
             
-            # Parallel processing across GPUs
-            results = []
-            for gpu_id, gpu_chunk in enumerate(chunks):
-                with torch.cuda.device(gpu_id):
-                    results.append(cls._process_gpu_chunk(gpu_chunk, min_size_tensor, gpu_id))
-            
-            # Aggregate results from all GPUs
-            for gpu_valid, gpu_invalid in results:
-                valid_files.extend(gpu_valid)
-                invalid_files.extend(gpu_invalid)
+            for i in range(0, len(file_batch), sub_batch_size):
+                sub_files = file_batch[i:i+sub_batch_size]
+                tensors = []
                 
+                for fpath in sub_files:
+                    try:
+                        # Load and resize to minimum size first
+                        tensor = cls._load_image_tensor(fpath, target_size).to(cls._device)
+                        tensors.append(tensor)
+                    except Exception as e:
+                        invalid_files.append(fpath)
+                
+                if tensors:
+                    try:
+                        # Verify tensor dimensions before stacking
+                        shapes = [t.shape for t in tensors]
+                        if len(set(shapes)) > 1:
+                            raise ValueError(f"Mixed tensor shapes in batch: {set(shapes)}")
+                            
+                        batch_tensor = torch.cat(tensors)
+                        
+                        # Vectorized checks
+                        valid_mask = (
+                            (batch_tensor.shape[-2] >= min_size_tensor) &
+                            (batch_tensor.shape[-1] >= min_size_tensor) &
+                            (batch_tensor.min(dim=1)[0] >= 0).all(dim=(1,2)) &
+                            (batch_tensor.max(dim=1)[0] <= 1).all(dim=(1,2)) &
+                            ~torch.isnan(batch_tensor).any(dim=(1,2,3)) &
+                            ~torch.isinf(batch_tensor).any(dim=(1,2,3))
+                        )
+                        
+                        valid_files.extend([f for f, m in zip(sub_files, valid_mask.cpu()) if m])
+                        invalid_files.extend([f for f, m in zip(sub_files, valid_mask.cpu()) if not m])
+                        
+                    except Exception as e:
+                        logger.warning(f"Batch validation failed: {str(e)}")
+                        invalid_files.extend(sub_files)
+                    
+                    del batch_tensor, tensors
+                    torch.cuda.empty_cache()
+
         except RuntimeError as e:
             logger.warning(f"GPU validation failed: {str(e)}")
             invalid_files.extend(file_batch)
@@ -156,63 +184,16 @@ class DataValidator:
         return valid_files, invalid_files
 
     @classmethod
-    def _process_gpu_chunk(cls, chunk, min_size_tensor, gpu_id):
-        """Process a chunk of files on a specific GPU"""
-        valid = []
-        invalid = []
-        target_size = (min_size_tensor.item(), min_size_tensor.item())
-        
-        # Batch load all images first
-        tensors = []
-        for fpath in chunk:
-            try:
-                tensor = cls._load_image_tensor(fpath, target_size).to(f'cuda:{gpu_id}')
-                tensors.append(tensor)
-            except Exception as e:
-                invalid.append(fpath)
-        
-        if tensors:
-            try:
-                # Use tensor cores with mixed precision
-                with torch.cuda.amp.autocast():
-                    batch_tensor = torch.stack(tensors)
-                    
-                    # Vectorized checks using bitwise operations
-                    valid_mask = (
-                        (batch_tensor.shape[-2] >= min_size_tensor) &
-                        (batch_tensor.shape[-1] >= min_size_tensor) &
-                        (batch_tensor.min(dim=1, keepdim=True)[0] >= 0).all(dim=(2,3)) &
-                        (batch_tensor.max(dim=1, keepdim=True)[0] <= 1).all(dim=(2,3)) &
-                        ~torch.isnan(batch_tensor).any(dim=(1,2,3)) &
-                        ~torch.isinf(batch_tensor).any(dim=(1,2,3))
-                    ).flatten()
-
-                    valid.extend([f for f, m in zip(chunk, valid_mask.cpu()) if m])
-                    invalid.extend([f for f, m in zip(chunk, valid_mask.cpu()) if not m])
-                    
-            except Exception as e:
-                invalid.extend(chunk)
-            
-            del batch_tensor
-            torch.cuda.empty_cache()
-            
-        return valid, invalid
-
-    @classmethod
     def _load_image_tensor(cls, fpath, target_size=None):
-        """Ultra-fast image loading with torchvision"""
+        """Size-normalized GPU image loading"""
         try:
-            # Use torchvision's optimized image loader
-            img = torchvision.io.read_file(fpath)
-            tensor = torchvision.io.decode_image(img, torchvision.io.ImageReadMode.RGB)
-            
-            if target_size:
-                tensor = torchvision.transforms.functional.resize(tensor, target_size, 
-                                                                interpolation=torchvision.transforms.InterpolationMode.BILINEAR)
-            
-            return tensor.float().div(255).unsqueeze(0)  # Normalize to [0,1]
+            with open(fpath, 'rb') as f:
+                img = Image.open(io.BytesIO(f.read())).convert('RGB')  # Force RGB
+                if target_size:
+                    img = img.resize(target_size, Image.BILINEAR)
+                return transforms.ToTensor()(img).unsqueeze(0)
         except Exception as e:
-            raise RuntimeError(f"Image load failed: {str(e)}")
+            raise RuntimeError(f"GPU loading failed: {str(e)}")
         
     @classmethod
     def _gpu_integrity_check(cls, tensor):
