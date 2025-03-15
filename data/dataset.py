@@ -126,62 +126,66 @@ class DataValidator:
 
     @classmethod
     def _process_batch(cls, file_batch, min_size):
-        """Fixed GPU validation without tensor pinning"""
+        """Optimized GPU validation with fast dimension pre-check"""
         valid_files = []
         invalid_files = []
-        min_size_tensor = torch.tensor(min_size, device=cls._device, dtype=torch.int32)
         
-        try:
-            # Process images with size normalization
-            sub_batch_size = 32
-            target_size = (min_size, min_size)  # Standardize validation size
+        # Fast dimension check first using multiprocessing
+        with ThreadPoolExecutor(max_workers=8) as precheck_exec:
+            futures = {precheck_exec.submit(cls._fast_dimension_check, fpath, min_size): fpath 
+                      for fpath in file_batch}
             
-            for i in range(0, len(file_batch), sub_batch_size):
-                sub_files = file_batch[i:i+sub_batch_size]
-                tensors = []
-                
-                for fpath in sub_files:
-                    try:
-                        # Load and resize to minimum size first
-                        tensor = cls._load_image_tensor(fpath, target_size).to(cls._device)
-                        tensors.append(tensor)
-                    except Exception as e:
+            for future in as_completed(futures):
+                fpath = futures[future]
+                try:
+                    if not future.result():
                         invalid_files.append(fpath)
-                
-                if tensors:
-                    try:
-                        # Verify tensor dimensions before stacking
-                        shapes = [t.shape for t in tensors]
-                        if len(set(shapes)) > 1:
-                            raise ValueError(f"Mixed tensor shapes in batch: {set(shapes)}")
-                            
-                        batch_tensor = torch.cat(tensors)
-                        
-                        # Vectorized checks
-                        valid_mask = (
-                            (batch_tensor.shape[-2] >= min_size_tensor) &
-                            (batch_tensor.shape[-1] >= min_size_tensor) &
-                            (batch_tensor.min(dim=1)[0] >= 0).all(dim=(1,2)) &
-                            (batch_tensor.max(dim=1)[0] <= 1).all(dim=(1,2)) &
-                            ~torch.isnan(batch_tensor).any(dim=(1,2,3)) &
-                            ~torch.isinf(batch_tensor).any(dim=(1,2,3))
-                        )
-                        
-                        valid_files.extend([f for f, m in zip(sub_files, valid_mask.cpu()) if m])
-                        invalid_files.extend([f for f, m in zip(sub_files, valid_mask.cpu()) if not m])
-                        
-                    except Exception as e:
-                        logger.warning(f"Batch validation failed: {str(e)}")
-                        invalid_files.extend(sub_files)
-                    
-                    del batch_tensor, tensors
-                    torch.cuda.empty_cache()
+                        continue
+                except:
+                    invalid_files.append(fpath)
+                    continue
 
-        except RuntimeError as e:
-            logger.warning(f"GPU validation failed: {str(e)}")
-            invalid_files.extend(file_batch)
-            
+        # Only process potentially valid files
+        candidates = [f for f in file_batch if f not in invalid_files]
+        target_size = (min_size, min_size)
+        
+        # Process remaining files in large batches
+        batch_size = 512  # Increased from 32
+        for i in range(0, len(candidates), batch_size):
+            batch = candidates[i:i+batch_size]
+            try:
+                # Batch load all images
+                tensors = [cls._load_image_tensor(f, target_size).to(cls._device) 
+                          for f in batch]
+                batch_tensor = torch.cat(tensors)
+                
+                # Vectorized validation checks
+                valid_mask = (
+                    (batch_tensor.min(dim=1)[0] >= 0).all(dim=(1,2)) &
+                    (batch_tensor.max(dim=1)[0] <= 1).all(dim=(1,2)) &
+                    ~torch.isnan(batch_tensor).any(dim=(1,2,3)) &
+                    ~torch.isinf(batch_tensor).any(dim=(1,2,3))
+                )
+                
+                valid_files.extend([f for f, m in zip(batch, valid_mask.cpu()) if m])
+                invalid_files.extend([f for f, m in zip(batch, valid_mask.cpu()) if not m])
+                
+                del batch_tensor, tensors
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                invalid_files.extend(batch)
+
         return valid_files, invalid_files
+
+    @staticmethod
+    def _fast_dimension_check(fpath, min_size):
+        """Quick check without full image load"""
+        try:
+            with Image.open(fpath) as img:
+                return img.width >= min_size and img.height >= min_size
+        except:
+            return False
 
     @classmethod
     def _load_image_tensor(cls, fpath, target_size=None):
