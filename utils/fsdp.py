@@ -337,7 +337,7 @@ def get_backward_prefetch(config):
     # Default prefetch setting
     return BackwardPrefetch.BACKWARD_PRE
 
-def wrap_model_with_fsdp(model, config, param_init_fn=None):
+def wrap_model_with_fsdp(model, config, param_init_fn=None, rank=0):
     """
     Wrap model with FSDP using configuration from config object
     
@@ -345,6 +345,7 @@ def wrap_model_with_fsdp(model, config, param_init_fn=None):
         model: Base model to wrap
         config: Configuration object with FSDP settings
         param_init_fn: Optional function to initialize parameters (for expert isolation)
+        rank: Process rank for device placement
         
     Returns:
         FSDP-wrapped model
@@ -354,8 +355,8 @@ def wrap_model_with_fsdp(model, config, param_init_fn=None):
     cpu_offload = getattr(config, 'fsdp_cpu_offload', False)
     mixed_precision = getattr(config, 'use_mixed_precision', False)
     
-    # Create FSDP configuration
-    fsdp_config = create_fsdp_config(config, sharding_strategy)
+    # Create FSDP configuration with explicit rank
+    fsdp_config = create_fsdp_config(config, sharding_strategy, rank=rank)
     
     # Add CPU offload if enabled
     if cpu_offload:
