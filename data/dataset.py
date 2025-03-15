@@ -29,6 +29,7 @@ import math  # For BucketBatchSampler
 
 import time
 import torch.distributed as dist
+import pickle
 
 class DataValidator:
     """GPU-accelerated image validation with distributed caching"""
@@ -226,46 +227,30 @@ class DataValidator:
 
     @classmethod
     def _broadcast_result(cls, cache_key):
-        """Distributed synchronization with chunked broadcasting"""
+        """Optimized single-machine broadcast with shared memory"""
         if is_main_process():
             result = cls._valid_files_cache.get(cache_key, [])
-            # Ensure main process has completed validation
-            synchronize()  
+            # Store in shared memory first
+            with open(f"/dev/shm/{cache_key}.pkl", "wb") as f:
+                pickle.dump(result, f)
+            # Signal other processes
+            dist.broadcast(torch.tensor([1], device=cls._device), src=0)
         else:
-            result = []
-
-        # Chunked broadcast implementation
-        chunk_size = 10000  # Adjust based on typical network packet size
-        if is_main_process():
-            # Broadcast chunk count first
-            total_chunks = (len(result) + chunk_size - 1) // chunk_size
-            dist.broadcast(torch.tensor([total_chunks], device=cls._device), src=0)
-            
-            # Send chunks with progress
-            for i in range(0, len(result), chunk_size):
-                chunk = result[i:i+chunk_size]
-                dist.broadcast_object_list([chunk], src=0)
-                time.sleep(0.1)  # Throttle network traffic
-        else:
-            # Receive chunk count
-            chunk_tensor = torch.tensor([0], device=cls._device)
-            dist.broadcast(chunk_tensor, src=0)
-            total_chunks = chunk_tensor.item()
-            
-            # Receive chunks
-            received = []
-            for _ in range(total_chunks):
-                chunk = ['']
-                dist.broadcast_object_list(chunk, src=0)
-                received.extend(chunk[0])
-                time.sleep(0.1)  # Match main process throttling
-
+            # Wait for main process signal
+            signal = torch.tensor([0], device=cls._device)
+            dist.broadcast(signal, src=0)
+            # Load from shared memory
+            with open(f"/dev/shm/{cache_key}.pkl", "rb") as f:
+                result = pickle.load(f)
             with cls._lock:
-                cls._valid_files_cache[cache_key] = received
-            result = received
+                cls._valid_files_cache[cache_key] = result
 
-        # Final synchronization
-        synchronize()
+        # Verify synchronization
+        sync_tensor = torch.tensor([len(result)], device=cls._device)
+        dist.all_reduce(sync_tensor, op=dist.ReduceOp.MIN)
+        if sync_tensor.item() != len(result):
+            raise RuntimeError("Broadcast synchronization failed")
+
         return result
 
 def chunks(lst, n):
