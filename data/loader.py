@@ -6,6 +6,7 @@ import os
 import torch
 from torch.utils.data import DataLoader
 from concurrent.futures import ThreadPoolExecutor
+from tqdm.auto import tqdm
 
 
 # Import centralized utilities
@@ -86,7 +87,43 @@ def create_loader(dataset, config, is_train=True, distributed=False, rank=0, wor
             for _ in loader:
                 break
             
-        return loader
+        # Progress bar only on main process
+        pbar = None
+        if rank == 0:
+            pbar = tqdm(
+                desc="Loading Data",
+                unit="batch",
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar:20}{r_bar}",
+                disable=not is_train  # Only show for training
+            )
+
+        # Wrap the DataLoader iterator
+        class ProgressLoader:
+            def __init__(self, loader):
+                self.loader = loader
+                self.iterator = None
+                
+            def __iter__(self):
+                self.iterator = iter(self.loader)
+                return self
+                
+            def __next__(self):
+                try:
+                    batch = next(self.iterator)
+                    if pbar is not None:
+                        pbar.update(1)
+                    return batch
+                except StopIteration:
+                    if pbar is not None:
+                        pbar.close()
+                    raise
+
+            def __len__(self):
+                return len(self.loader)
+
+        # Wrap with progress tracking
+        return ProgressLoader(loader)
     except Exception as e:
         logger.error(f"Loader creation failed: {str(e)}")
         raise

@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
         (640, 384),
         (384, 640),
     ],
-    'num_workers': 4,
+    'num_workers': 8,
     'pin_memory': True,
     'persistent_workers': True,
     'prefetch_factor': 2,
