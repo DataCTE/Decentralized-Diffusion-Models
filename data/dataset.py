@@ -15,6 +15,7 @@ import json
 import random
 import io
 import torchvision.transforms as transforms
+from tqdm.auto import tqdm
 
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, broadcast_object
@@ -72,7 +73,15 @@ class DataValidator:
             last_update_time = time.time()
             update_interval = 2.0  # Update progress every 2 seconds
             
-            # Check validity of each file
+            # Only show progress on main process
+            if is_main_process():
+                pbar = tqdm(
+                    total=total_files,
+                    desc="Validating Images",
+                    unit="img",
+                    dynamic_ncols=True
+                )
+            
             for i, img_path in enumerate(all_files):
                 # Skip if already known to be invalid
                 if img_path in cls._invalid_files_cache:
@@ -97,6 +106,14 @@ class DataValidator:
                                f"Valid: {len(valid_files)}, Invalid: {invalid_count} - "
                                f"Elapsed: {elapsed:.1f}s, Estimated remaining: {remaining:.1f}s")
                     last_update_time = current_time
+                
+                if is_main_process():
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        "valid": len(valid_files),
+                        "invalid": invalid_count,
+                        "speed": f"{i/(time.time()-start_time):.1f} img/s"
+                    })
             
             # Store valid files in cache
             elapsed = time.time() - start_time
@@ -290,6 +307,15 @@ class DataValidator:
         total_processed = 0
         batch_start_time = time.time()
         
+        # Main progress bar
+        if is_main_process():
+            main_pbar = tqdm(
+                total=total_files,
+                desc="Efficient Validation",
+                unit="img",
+                dynamic_ncols=True
+            )
+        
         for i in range(0, len(all_files), batch_size):
             batch = all_files[i:i+batch_size]
             current_batch_size = len(batch)
@@ -320,6 +346,14 @@ class DataValidator:
             logger.info(f"Overall progress: {progress:.1f}% ({total_processed}/{total_files}) - "
                        f"Valid so far: {len(all_valid_files)} - "
                        f"Elapsed: {elapsed:.1f}s, Estimated remaining: {remaining:.1f}s")
+            
+            if is_main_process():
+                main_pbar.update(len(batch))
+                main_pbar.set_postfix({
+                    "valid": len(all_valid_files),
+                    "invalid": len(batch) - len(valid_batch),
+                    "speed": f"{total_processed/elapsed:.1f} img/s"
+                })
                 
         # Final timing
         elapsed = time.time() - start_time
@@ -381,7 +415,7 @@ class DDMDataset(Dataset):
         self.logger.info(f"Uniformly distributed {len(self.image_files)} samples across {self.num_experts} experts")
 
     def _load_dataset(self):
-        """Load dataset files and captions"""
+        """Load dataset files with progress tracking"""
         # Check if we should completely bypass loading for fast path
         if getattr(self.config, 'skip_clustering', False):
             self.logger.info("Fast path: Skipping real dataset loading entirely with skip_clustering=True")
@@ -400,6 +434,15 @@ class DDMDataset(Dataset):
         # Load images recursively for local datasets
         self.logger.info(f"Loading dataset from {self.dataset_path}")
         
+        # Add progress bar for directory scanning
+        if is_main_process():
+            self.logger.info(f"Scanning {self.dataset_path} for images")
+            dir_pbar = tqdm(
+                desc="Discovering Images",
+                unit="file",
+                dynamic_ncols=True
+            )
+        
         # Determine how to load based on dataset path
         if os.path.isdir(self.dataset_path):
             # Local directory - scan for image files recursively
@@ -411,11 +454,9 @@ class DDMDataset(Dataset):
                 for file in files:
                     if any(file.lower().endswith(ext) for ext in valid_extensions):
                         self.image_files.append(os.path.join(root, file))
+                        if is_main_process():
+                            dir_pbar.update(1)
                         
-                # Show progress periodically
-                if len(self.image_files) % 100000 == 0 and len(self.image_files) > 0:
-                    self.logger.info(f"Found {len(self.image_files)} images so far...")
-                    
             # Sort for reproducibility
             self.image_files.sort()
             
@@ -443,6 +484,9 @@ class DDMDataset(Dataset):
                 except Exception as e:
                     self.logger.warning(f"Failed to load captions: {e}")
                     
+            if is_main_process():
+                dir_pbar.close()
+            
         else:
             # HuggingFace dataset or other format - handle appropriately
             try:
@@ -473,7 +517,7 @@ class DDMDataset(Dataset):
             self.logger.info(f"Found captions for {len(self.captions)} images")
     
     def _init_buckets(self):
-        """Initialize buckets for aspect ratio batching"""
+        """Initialize buckets with progress tracking"""
         # Get bucket specifications from config
         if hasattr(self.config, 'buckets'):
             buckets = self.config.buckets
@@ -522,6 +566,15 @@ class DDMDataset(Dataset):
         last_update_time = time.time()
         update_interval = 2.0  # Update progress every 2 seconds
         
+        # Add tqdm progress bar
+        if is_main_process():
+            bucket_pbar = tqdm(
+                total=len(self.image_files),
+                desc="Assigning Buckets",
+                unit="img",
+                dynamic_ncols=True
+            )
+        
         for idx, img_path in enumerate(self.image_files):
             try:
                 # Get image dimensions
@@ -560,6 +613,13 @@ class DDMDataset(Dataset):
                                    f"Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s")
                     last_update_time = current_time
                 
+                if is_main_process():
+                    bucket_pbar.update(1)
+                    bucket_pbar.set_postfix({
+                        "speed": f"{(idx+1)/(time.time()-start_time):.1f} img/s",
+                        "current": f"{img_path[-20:]}" if len(img_path) > 20 else img_path
+                    })
+                
             except Exception as e:
                 # Skip problematic images
                 self.logger.warning(f"Error processing image {img_path}: {e}")
@@ -579,6 +639,9 @@ class DDMDataset(Dataset):
         
         self.logger.info(f"Bucket assignment completed in {elapsed:.2f}s - " 
                        f"Processed {total_images} images at {total_images/elapsed:.1f} images/sec")
+        
+        if is_main_process():
+            bucket_pbar.close()
     
     def _init_bucket_assignments(self):
         """Initialize bucket assignments for efficient batching"""
