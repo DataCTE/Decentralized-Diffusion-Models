@@ -126,7 +126,7 @@ class DataValidator:
 
     @classmethod
     def _process_batch(cls, file_batch, min_size):
-        """Fixed-size GPU validation pipeline"""
+        """Fixed GPU validation without tensor pinning"""
         valid_files = []
         invalid_files = []
         min_size_tensor = torch.tensor(min_size, device=cls._device, dtype=torch.int32)
@@ -155,7 +155,7 @@ class DataValidator:
                         if len(set(shapes)) > 1:
                             raise ValueError(f"Mixed tensor shapes in batch: {set(shapes)}")
                             
-                        batch_tensor = torch.cat(tensors).pin_memory()
+                        batch_tensor = torch.cat(tensors)
                         
                         # Vectorized checks
                         valid_mask = (
