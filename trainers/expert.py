@@ -15,6 +15,7 @@ from data.clip import CLIPTextEncoder
 from trainers.base import BaseTrainer
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 from utils.logging import logger
+from utils.fsdp import wrap_model_with_fsdp
 
 
 
@@ -26,48 +27,15 @@ class ExpertTrainer(BaseTrainer):
         self.expert_idx = expert_idx  # Store the expert index for identification
         self.world_size = world_size
         
-        # Create base model
+        # Create base expert model
         base_expert = ExpertDiT(config).to(device)
         
-        # Configure FSDP settings based on config
-        # Sharding strategy
-        if config.fsdp_sharding_strategy == "FULL_SHARD":
-            sharding_strategy = ShardingStrategy.FULL_SHARD
-        elif config.fsdp_sharding_strategy == "SHARD_GRAD_OP":
-            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
-        else:
-            sharding_strategy = ShardingStrategy.FULL_SHARD
-            
-        # CPU offload
-        cpu_offload = CPUOffload(offload_params=config.fsdp_cpu_offload)
-        
-        # Backward prefetch
-        if config.fsdp_backward_prefetch == "BACKWARD_PRE":
-            backward_prefetch = BackwardPrefetch.BACKWARD_PRE
-        elif config.fsdp_backward_prefetch == "BACKWARD_POST":
-            backward_prefetch = BackwardPrefetch.BACKWARD_POST
-        else:
-            backward_prefetch = BackwardPrefetch.BACKWARD_PRE
-            
-        # Auto wrap policy
-        if config.fsdp_auto_wrap_policy == "DEFAULT":
-            auto_wrap_policy = lambda_auto_wrap_policy
-        elif config.fsdp_auto_wrap_policy == "SIZE_BASED":
-            auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=config.fsdp_min_num_params)
-        else:
-            auto_wrap_policy = lambda_auto_wrap_policy
-            
-        # Apply FSDP with proper isolation
-        self.expert = FSDP(
+        # Apply FSDP wrapping using the same method as router
+        self.expert = wrap_model_with_fsdp(
             base_expert,
-            device_id=torch.cuda.current_device(),
-            sharding_strategy=sharding_strategy,
-            cpu_offload=cpu_offload,
-            backward_prefetch=backward_prefetch,
-            auto_wrap_policy=auto_wrap_policy,
-            use_orig_params=True,
-            # Properly isolate parameters - don't use ignored_parameters
-            param_init_fn=lambda module: module.to_empty(device=torch.cuda.current_device(), recurse=False)
+            config,
+            param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
+            rank=rank
         )
         
         # Paper-specified optimizer settings - use Adam with FSDP
@@ -98,7 +66,7 @@ class ExpertTrainer(BaseTrainer):
             else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (config.num_steps - warmup_steps)))
         )
         
-        # Log initialization of this expert
+        # Update log message to match router style
         if rank == 0:
             print(f"Initialized SHARDED Expert {expert_idx} across {world_size} GPUs")
 
