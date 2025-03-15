@@ -7,6 +7,7 @@ import time
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import threading
+from tqdm.auto import tqdm
 
 # Import needed components
 from trainers.router import RouterTrainer
@@ -68,20 +69,48 @@ class DDMTrainingCoordinator:
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
     
     def _init_parallel_components(self):
-        """Initialize critical components in parallel"""
+        """Initialize critical components in parallel with proper progress handling"""
+        
+        # Create progress context manager only on main process
+        pbar = None
+        if self.rank == 0:
+            pbar = tqdm(
+                total=3,  # Data loaders, router, expert indices
+                desc="Initializing Components",
+                dynamic_ncols=True,
+                bar_format="{l_bar}{bar:20}{r_bar}"
+            )
+        
+        # Wrap thread targets with progress updates
+        def wrapped_init(target):
+            def wrapper():
+                try:
+                    target()
+                    if pbar is not None:
+                        pbar.update(1)
+                except Exception as e:
+                    if pbar is not None:
+                        pbar.close()
+                    raise
+            return wrapper
+        
         threads = [
-            threading.Thread(target=self._init_data_loaders),
-            threading.Thread(target=self._init_router),
-            threading.Thread(target=self._init_expert_indices)
+            threading.Thread(target=wrapped_init(self._init_data_loaders)),
+            threading.Thread(target=wrapped_init(self._init_router)), 
+            threading.Thread(target=wrapped_init(self._init_expert_indices))
         ]
         
         # Start all threads
         for t in threads:
             t.start()
         
-        # Wait for completion
-        for t in threads:
-            t.join()
+        # Handle completion
+        try:
+            for t in threads:
+                t.join()
+        finally:
+            if pbar is not None:
+                pbar.close()
     
     def _init_data_loaders(self):
         """Initialize data loaders with uniform distribution"""
