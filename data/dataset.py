@@ -187,7 +187,10 @@ class DDMDataset(Dataset):
     """GPU-optimized dataset pipeline for decentralized diffusion models"""
     
     def __init__(self, config, split='train', transforms=None, hf_split=None):
-        # Initialize GPU device reference
+        # Initialize logger first
+        self.logger = logging.getLogger(__name__)
+        
+        # Then initialize GPU device reference
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.logger.info(f"Initializing dataset on {self.device}")
         
@@ -227,7 +230,7 @@ class DDMDataset(Dataset):
             if is_main_process():
                 pbar = tqdm(
                     total=len(self.image_files),
-                    desc="📦 Caching Metadata",
+                    desc="Caching Metadata",
                     unit="img",
                     dynamic_ncols=True,
                     bar_format="{l_bar}{bar:20}{r_bar}",
@@ -286,7 +289,7 @@ class DDMDataset(Dataset):
             if is_main_process() and self.split == 'train':
                 self._loader_pbar = tqdm(
                     total=len(self),
-                    desc="🚀 Loading Batches",
+                    desc="Loading Batches",
                     unit="batch",
                     dynamic_ncols=True,
                     bar_format="{l_bar}{bar:20}{r_bar}",
@@ -309,14 +312,6 @@ class DDMDataset(Dataset):
             }
         except Exception as e:
             return self._handle_error_case(target_size)
-
-        if self._loader_pbar:
-            self._loader_pbar.update(1)
-            if self._loader_pbar.n >= len(self):
-                self._loader_pbar.close()
-                del self._loader_pbar
-                
-        return batch_data
 
     def _load_image_tensor(self, idx, target_size):
         """GPU-optimized image loading and processing"""
