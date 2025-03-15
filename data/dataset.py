@@ -65,6 +65,58 @@ class DataValidator:
         return sorted(files)
 
     @classmethod
+    def _process_batches(cls, all_files, min_size, batch_size):
+        """Process files with enhanced GPU progress tracking"""
+        valid_files = []
+        invalid_files = []
+        pbar = None
+        
+        try:
+            if is_main_process():
+                pbar = tqdm(
+                    total=len(all_files),
+                    desc="Validating (GPU)",
+                    unit="img",
+                    dynamic_ncols=True,
+                    bar_format="{l_bar}{bar:20}{r_bar}",
+                    postfix={
+                        'valid': 0,
+                        'invalid': 0,
+                        'rate': '0 img/s'
+                    },
+                    position=0
+                )
+
+            with ThreadPoolExecutor(max_workers=min(4, os.cpu_count())) as executor:
+                futures = [executor.submit(cls._process_batch, batch, min_size)
+                         for batch in chunks(all_files, batch_size)]
+                
+                for future in as_completed(futures):
+                    batch_valid, batch_invalid = future.result()
+                    valid_files.extend(batch_valid)
+                    invalid_files.extend(batch_invalid)
+                    cls._invalid_files_cache.update(batch_invalid)
+                    
+                    if pbar:
+                        # Update metrics
+                        pbar.update(len(batch_valid) + len(batch_invalid))
+                        pbar.set_postfix({
+                            'valid': len(valid_files),
+                            'invalid': len(invalid_files),
+                            'rate': f"{pbar.format_dict['rate']} img/s"
+                        })
+                        
+        finally:
+            if pbar:
+                pbar.close()
+                # Log final validation stats
+                valid_pct = (len(valid_files)/len(all_files))*100
+                logger.info(f"Validation complete: {len(valid_files)} valid ({valid_pct:.1f}%)"
+                          f" | {len(invalid_files)} invalid")
+                
+        return valid_files
+
+    @classmethod
     def _process_batch(cls, file_batch, min_size):
         """Pure GPU validation pipeline"""
         valid_files = []
