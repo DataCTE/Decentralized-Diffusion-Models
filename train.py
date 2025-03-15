@@ -96,12 +96,19 @@ def create_directories(config):
     """Create necessary directories from config"""
     console_print("Creating necessary directories...")
     if is_main_process():
-        # Create directories for logs, checkpoints, and samples
-        os.makedirs(config.log_dir, exist_ok=True)
-        os.makedirs(config.checkpoint_dir, exist_ok=True)
-        os.makedirs(config.sample_dir, exist_ok=True)
-        console_print(f"Created directories: {config.log_dir}, {config.checkpoint_dir}, {config.sample_dir}")
-        logger.info(f"Created directories: {config.log_dir}, {config.checkpoint_dir}, {config.sample_dir}")
+        # Use output_dir from config with subdirectories
+        base_dir = config.output_dir
+        os.makedirs(os.path.join(base_dir, 'logs'), exist_ok=True)
+        os.makedirs(os.path.join(base_dir, 'checkpoints'), exist_ok=True)
+        os.makedirs(os.path.join(base_dir, 'samples'), exist_ok=True)
+        
+        dirs_created = [
+            os.path.join(base_dir, 'logs'),
+            os.path.join(base_dir, 'checkpoints'), 
+            os.path.join(base_dir, 'samples')
+        ]
+        console_print(f"Created directories: {', '.join(dirs_created)}")
+        logger.info(f"Created directories: {', '.join(dirs_created)}")
     
     # Wait for main process to create directories
     console_print(f"Rank {get_rank()}: Waiting for directory creation to complete...")
