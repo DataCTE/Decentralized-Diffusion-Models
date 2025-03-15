@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     # ===== Dataset parameters =====
     'dataset_path': '/home/alex/workspace/datasets/danbooru2025',
     'dataset_size': 100000,
+    'min_size': 256,  # Minimum image dimension
     'val_size': 1000,
     'buckets': [
         (512, 512),
@@ -49,6 +50,7 @@ DEFAULT_CONFIG = {
         (640, 384),
         (384, 640),
     ],
+    'validation_batch_size': 1000,  # Add this for batched validation
     'num_workers': 8,
     'pin_memory': True,
     'persistent_workers': True,

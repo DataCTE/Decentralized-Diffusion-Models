@@ -5,14 +5,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import PIL  # Add direct import of PIL module
 from collections import defaultdict
 import logging
-import time
-import glob
-import json
 
-import random
+import glob
+
 import io
 import torchvision.transforms as transforms
 from tqdm.auto import tqdm
@@ -189,14 +186,27 @@ class DDMDataset(Dataset):
     def __init__(self, config, split='train', transforms=None, hf_split=None):
         # Initialize logger first
         self.logger = logging.getLogger(__name__)
+        self.config = config
         
+        # Validate required parameters
+        if not hasattr(config, 'min_size'):
+            raise ValueError("Configuration missing required 'min_size' parameter")
+        if not hasattr(config, 'num_experts'):
+            raise ValueError("Configuration missing required 'num_experts' parameter")
+
         # Then initialize GPU device reference
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.logger.info(f"Initializing dataset on {self.device}")
         
-        # Convert config values to GPU tensors
-        self.min_size = torch.tensor(config.min_size, device=self.device)
-        self.num_experts = torch.tensor(config.num_experts, device=self.device)
+        # Convert config values to GPU tensors with proper validation
+        self.min_size = torch.tensor(
+            getattr(config, 'min_size', 256),  # Default fallback
+            device=self.device
+        )
+        self.num_experts = torch.tensor(
+            getattr(config, 'num_experts', 8),  # Default fallback
+            device=self.device
+        )
         
         # Load dataset with GPU-accelerated validation
         self._load_dataset()
