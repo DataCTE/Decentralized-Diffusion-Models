@@ -5,12 +5,41 @@ import torch.nn as nn
 import math
 from bitsandbytes.optim import AdamW8bit
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy, size_based_auto_wrap_policy
-from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
+from torch.distributed.fsdp import CPUOffload
+from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    lambda_auto_wrap_policy
+)
+
 
 
 from models.router import RouterModel
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
+
+def get_sharding_strategy(name: str) -> ShardingStrategy:
+    """Convert sharding strategy name to enum"""
+    return {
+        "FULL_SHARD": ShardingStrategy.FULL_SHARD,
+        "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
+        "NO_SHARD": ShardingStrategy.NO_SHARD,
+        "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
+    }[name.upper()]
+
+def get_backward_prefetch(name: str) -> BackwardPrefetch:
+    """Convert backward prefetch name to enum"""
+    return {
+        "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
+        "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
+    }[name.upper()]
+
+def get_auto_wrap_policy(config):
+    """Get FSDP auto wrap policy based on config"""
+    if getattr(config, 'fsdp_auto_wrap_policy', 'DEFAULT') == "SIZE_BASED":
+        return size_based_auto_wrap_policy(
+            min_num_params=getattr(config, 'fsdp_min_num_params', 1e6)
+        )
+    return lambda_auto_wrap_policy
 
 class RouterTrainer:
     """Trainer for the router model in DDM"""
@@ -21,56 +50,35 @@ class RouterTrainer:
         self.rank = rank
         self.world_size = world_size or 1
         
-        # Create base router model
+        # Create base router model with safe config access
         base_router = RouterModel(config).to(device)
         
-        # Apply FSDP if world_size > 1
-        if self.world_size > 1:
-            # Configure FSDP settings based on config
-            # Sharding strategy
-            if config.fsdp_sharding_strategy == "FULL_SHARD":
-                sharding_strategy = ShardingStrategy.FULL_SHARD
-            elif config.fsdp_sharding_strategy == "SHARD_GRAD_OP":
-                sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
-            else:
-                sharding_strategy = ShardingStrategy.FULL_SHARD
-                
-            # CPU offload
-            cpu_offload = CPUOffload(offload_params=config.fsdp_cpu_offload)
-            
-            # Backward prefetch
-            if config.fsdp_backward_prefetch == "BACKWARD_PRE":
-                backward_prefetch = BackwardPrefetch.BACKWARD_PRE
-            elif config.fsdp_backward_prefetch == "BACKWARD_POST":
-                backward_prefetch = BackwardPrefetch.BACKWARD_POST
-            else:
-                backward_prefetch = BackwardPrefetch.BACKWARD_PRE
-                
-            # Auto wrap policy
-            if config.fsdp_auto_wrap_policy == "DEFAULT":
-                auto_wrap_policy = lambda_auto_wrap_policy
-            elif config.fsdp_auto_wrap_policy == "SIZE_BASED":
-                auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=config.fsdp_min_num_params)
-            else:
-                auto_wrap_policy = lambda_auto_wrap_policy
-            
-            # Apply FSDP to shard model across all GPUs
-            self.router = FSDP(
-                base_router,
-                device_id=torch.cuda.current_device(),
-                sharding_strategy=sharding_strategy,
-                cpu_offload=cpu_offload,
-                backward_prefetch=backward_prefetch,
-                auto_wrap_policy=auto_wrap_policy,
-                use_orig_params=True  # Allow easier parameter access
-            )
-            
-            if rank == 0:
-                print(f"Initialized SHARDED Router across {self.world_size} GPUs")
-        else:
-            # Just use the base model without FSDP
-            self.router = base_router
-            
+        # Get FSDP parameters with defaults
+        sharding_strategy = get_sharding_strategy(
+            getattr(config, 'fsdp_sharding_strategy', 'FULL_SHARD')
+        )
+        cpu_offload = CPUOffload(
+            offload_params=getattr(config, 'fsdp_cpu_offload', False)
+        )
+        backward_prefetch = get_backward_prefetch(
+            getattr(config, 'fsdp_backward_prefetch', 'BACKWARD_PRE')
+        )
+        auto_wrap_policy = get_auto_wrap_policy(config)
+        
+        # Apply FSDP wrapping
+        self.router = FSDP(
+            base_router,
+            device_id=torch.cuda.current_device(),
+            sharding_strategy=sharding_strategy,
+            cpu_offload=cpu_offload,
+            backward_prefetch=backward_prefetch,
+            auto_wrap_policy=auto_wrap_policy,
+            use_orig_params=True
+        )
+        
+        if rank == 0:
+            print(f"Initialized SHARDED Router across {self.world_size} GPUs")
+        
         # Paper-recommended optimizer settings
         self.optimizer = AdamW8bit(
             self.router.parameters(),
