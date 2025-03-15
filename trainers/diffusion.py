@@ -178,8 +178,10 @@ class DecentralizedFlowMatcher:
         Returns:
             Flow matching target ut(xt|x0)
         """
-        # Ensure t is properly shaped for broadcasting
-        t = t.reshape(-1, 1, 1, 1)
+        # Implements paper's Equation 1 with numerical stability
+        safe_t = torch.maximum(t, torch.tensor(1e-4, device=t.device))
+        denom = torch.sqrt(safe_t)
+        standard_target = (x0 - xt) / denom
         
         # Improved numerical stability - use a smooth transition for very small t
         # This prevents division by zero and excessive magnification of noise
@@ -187,16 +189,7 @@ class DecentralizedFlowMatcher:
         min_t_value = 1e-4
         
         # Compute a smooth blend factor
-        blend = torch.sigmoid((t - min_t_value) / eps)
-        
-        # For very small t, use a stable approximation
-        # For t ≈ 0, the flow should approach zero (no transport needed)
-        safe_t = torch.maximum(t, torch.tensor(min_t_value, device=t.device))
-        denom = torch.sqrt(safe_t)
-        
-        # Compute standard target: u_t(x_t|x_0) = (x_0 - x_t) / sqrt(t)
-        # This is the conditional flow from paper Equation 1
-        standard_target = (x0 - xt) / denom
+        blend = torch.sigmoid((safe_t - min_t_value) / eps)
         
         # For very small t, use zero flow
         stable_target = torch.zeros_like(standard_target)
@@ -207,30 +200,10 @@ class DecentralizedFlowMatcher:
         return target
 
     def compute_ensemble_flow(self, router_outputs, expert_flows):
-        """
-        Compute ensemble flow according to paper's Equation 4
-        
-        Args:
-            router_outputs: Router predictions [B, K] (probabilities for each expert)
-            expert_flows: List of K expert flow predictions [K, B, C, H, W]
-            
-        Returns:
-            Ensemble flow [B, C, H, W]
-        """
-        # Initialize ensemble flow with zeros
-        ensemble_flow = torch.zeros_like(expert_flows[0]) if expert_flows else None
-        
-        # Implement Equation 4 from the paper:
-        # ut(xt) = sum_k (pt,Sk(xt)/pt(xt)) * [expert flow for cluster k]
-        # where router_outputs represent pt,Sk(xt)/pt(xt)
-        for k in range(len(expert_flows)):
-            # Get router weight for expert k (reshape for broadcasting)
-            router_weight = router_outputs[:, k].view(-1, 1, 1, 1)
-            
-            # Add weighted expert flow to ensemble
-            ensemble_flow += router_weight * expert_flows[k]
-            
-        return ensemble_flow
+        """Non-clustered expert combination from paper Eq. 4"""
+        # Implements paper's Equation 4
+        router_weights = F.softmax(router_outputs / self.temperature, dim=-1)
+        return torch.einsum('bk,kbchw->bchw', router_weights, torch.stack(expert_flows))
     
     def compute_flow_matching_loss(self, pred, target):
         """

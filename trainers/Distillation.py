@@ -126,7 +126,6 @@ class DiffusionDistiller:
             for batch in pbar:
                 # Paper Section 3.6: "We select the appropriate expert for each training example based on its cluster label."
                 images = batch["image"].to(self.device)
-                clusters = batch["cluster"].to(self.device)
                 text_embeds = batch.get("text_embedding")
                 if text_embeds is not None:
                     text_embeds = text_embeds.to(self.device)
@@ -152,33 +151,46 @@ class DiffusionDistiller:
                     # Get student predictions
                     student_pred = self.distilled_model(noisy_images, timesteps, text_embeds)
                     
-                    # Paper Section 3.6: Get per-example experts based on cluster labels
-                    # This ensures each example's distillation uses the expert that specializes in it
-                    teacher_pred = torch.zeros_like(student_pred)
-                    
-                    # Get predictions from the appropriate expert for each example
-                    for idx in range(batch_size):
-                        # Get expert assignment for this example
-                        expert_idx = batch['expert'][idx].item()
-                        
-                        # Get the corresponding expert
-                        expert = self.expert_cache.get_expert(
-                            expert_idx,
-                            lambda idx: self.experts[idx]
+                    # Get router predictions for this batch
+                    with torch.no_grad():
+                        router_logits = self.router(
+                            noisy_images, 
+                            timesteps,
+                            text_embeds
                         )
+                        expert_weights = F.softmax(router_logits, dim=-1)
+                    
+                    # Select top-k experts per example
+                    topk_weights, topk_indices = torch.topk(
+                        expert_weights, 
+                        self.config.top_k,
+                        dim=-1
+                    )
+                    
+                    # Get predictions from top-k experts
+                    teacher_pred = torch.zeros_like(student_pred)
+                    for k in range(self.config.top_k):
+                        # Get expert indices for this top-k position
+                        expert_indices = topk_indices[:, k]
                         
-                        # Get teacher prediction for this example only
-                        with torch.no_grad():
-                            # Extract this example
-                            x_idx = noisy_images[idx:idx+1]
-                            t_idx = timesteps[idx:idx+1]
-                            text_idx = text_embeds[idx:idx+1] if text_embeds is not None else None
-                            
-                            # Get expert prediction
-                            expert_pred = expert(x_idx, t_idx, text_idx)
-                            
-                            # Store in teacher predictions
-                            teacher_pred[idx:idx+1] = expert_pred
+                        # Gather predictions from relevant experts
+                        expert_preds = []
+                        for idx in range(batch_size):
+                            expert = self.expert_cache.get_expert(
+                                expert_indices[idx].item(),
+                                lambda idx: self.experts[idx]
+                            )
+                            with torch.no_grad():
+                                pred = expert(
+                                    noisy_images[idx:idx+1],
+                                    timesteps[idx:idx+1],
+                                    text_embeds[idx:idx+1] if text_embeds else None
+                                )
+                            expert_preds.append(pred)
+                        
+                        # Combine predictions using router weights
+                        expert_preds = torch.cat(expert_preds)
+                        teacher_pred += topk_weights[:, k].view(-1,1,1,1) * expert_preds
                     
                     # Compute loss
                     loss = F.mse_loss(student_pred, teacher_pred)
@@ -302,23 +314,29 @@ class DiffusionDistiller:
                 # Get student predictions from EMA model (more stable)
                 student_pred = self.ema_model(noisy_images, timesteps, text_embeds)
                 
-                # Paper Section 3.6: Get expert predictions for each example based on its cluster
-                teacher_pred = torch.zeros_like(student_pred)
+                # Get router predictions
+                router_logits = self.router(
+                    noisy_images,
+                    timesteps,
+                    text_embeds
+                )
+                expert_weights = F.softmax(router_logits, dim=-1)
                 
+                # Select top expert for validation efficiency
+                _, expert_indices = torch.max(expert_weights, dim=-1)
+                
+                # Get teacher predictions
+                teacher_pred = torch.zeros_like(student_pred)
                 for idx in range(batch_size):
-                    # Get expert assignment for this example
-                    expert_idx = batch['expert'][idx].item()
-                    
-                    # Get the corresponding expert
+                    expert_idx = expert_indices[idx].item()
                     expert = self.expert_cache.get_expert(
                         expert_idx,
                         lambda idx: self.experts[idx]
                     )
                     
-                    # Get teacher prediction for this example
                     x_idx = noisy_images[idx:idx+1]
                     t_idx = timesteps[idx:idx+1]
-                    text_idx = text_embeds[idx:idx+1] if text_embeds is not None else None
+                    text_idx = text_embeds[idx:idx+1] if text_embeds else None
                     
                     expert_pred = expert(x_idx, t_idx, text_idx)
                     teacher_pred[idx:idx+1] = expert_pred

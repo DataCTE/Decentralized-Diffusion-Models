@@ -4,8 +4,6 @@ import os
 import torch
 import datetime
 import time
-import numpy as np
-import logging
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -13,7 +11,7 @@ from torch.utils.data.distributed import DistributedSampler
 from trainers.expert import ExpertTrainer
 from trainers.router import RouterTrainer
 from trainers.sampling import ddm_sample
-from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
+from trainers.diffusion import DecentralizedFlowMatcher
 from data.dataset import DDMDataset
 from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
@@ -217,29 +215,18 @@ class DDMCoordinator:
         
         # Train loop implementing the DDM training approach
         for step in range(num_steps):
-            # Get batch (with iterator reset if needed)
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(self.train_loader)
-                batch = next(train_iter)
-                
-            # Move batch to device
-            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                    for k, v in batch.items()}
-                
-            # Train experts
-            expert_loss = self.train_experts(batch)
+            batch = next(train_iter)
             
-            # Train router
-            router_loss = self.train_router(batch)
+            # Joint training of experts and router
+            expert_loss = self.train_experts(batch)  # Updates experts
+            router_loss = self.train_router(batch)   # Updates router
             
             # Log every N steps
             if step % 100 == 0 or step == num_steps - 1:
                 logger.info(f"Step {step}/{num_steps}: Expert loss = {expert_loss:.4f}, Router loss = {router_loss:.4f}")
                 
-            # Run validation every N steps
-            if step > 0 and step % 1000 == 0:
+            # Periodic validation
+            if step % 1000 == 0:
                 self.validate(step)
                 
             # Save checkpoint every N steps
@@ -248,41 +235,14 @@ class DDMCoordinator:
     
     def train_experts(self, batch):
         """Train expert models using the DDM approach"""
-        # Skip if no experts assigned to this rank
-        if not self.experts:
-            return 0.0
-            
-        # Track losses
-        losses = []
-        
-        # Filter batch for each expert using expert assignments
         for expert_idx, expert in self.experts.items():
-            # Create mask based on expert assignments
-            expert_mask = batch['expert'] == expert_idx  # Changed from 'cluster'
-            
-            if not expert_mask.any():
-                continue  # Skip if no samples for this expert
-                
-            # Filter batch for this expert
-            expert_batch = {k: v[expert_mask] if isinstance(v, torch.Tensor) else v 
-                           for k, v in batch.items()}
-            
-            # Train this expert using its own samples
-            loss = expert.train_step(expert_batch)
-            losses.append(loss)
-            
-        # Return average loss
-        return np.mean(losses) if losses else 0.0
-    
+            # Isolated expert training with FSDP
+            expert.train_step(batch)
+        
     def train_router(self, batch):
         """Train router model using cluster labels as supervision"""
-        # Skip if no router on this rank (though we should have one on every rank)
-        if self.router is None:
-            return 0.0
-            
-        # Train router using its train_step method
-        loss = self.router.train_step(batch)
-        return loss
+        # Distributed router training
+        self.router.train_step(batch)
     
     def validate(self, step):
         """Run validation using DDM inference process"""
@@ -379,8 +339,7 @@ class DDMCoordinator:
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         # Save router using its save_checkpoint method
-        if self.router is not None:
-            self.router.save_checkpoint(checkpoint_dir, step)
+        self.router.save_checkpoint(checkpoint_dir, step)
         
         # Save experts using their save_checkpoint methods
         for expert_idx, expert in self.experts.items():
