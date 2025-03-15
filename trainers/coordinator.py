@@ -24,14 +24,14 @@ def debug_print(message, rank=None, force=False):
     """Print directly to console regardless of logger configuration"""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     if rank is not None:
-        prefix = f"[DDM-{rank}]"
+        prefix = f"[DDMT-{rank}]"
     else:
-        prefix = "[DDM]"
+        prefix = "[DDMT]"
         
     if force or (rank is not None and rank == 0) or rank is None:
         print(f"{prefix} [{timestamp}] {message}", flush=True)
 
-class DDMCoordinator:
+class DDMTrainingCoordinator:
     """Coordinator for Decentralized Diffusion Models with uniform data distribution"""
     
     def __init__(self, config, rank, world_size, progress_callback=None):
