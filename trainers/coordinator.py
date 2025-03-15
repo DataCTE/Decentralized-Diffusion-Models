@@ -303,6 +303,35 @@ class DDMTrainingCoordinator:
         """Initialize data clustering manager (Section 4.1)"""
         from data.clustering import ClusterManager
         
+        # Check if clustering should be skipped for testing/debugging
+        if getattr(self.config, 'skip_clustering', False):
+            logger.info("Skipping clustering as per configuration (skip_clustering=True)")
+            
+            # Create a simple ClusterManager without clustering
+            self.cluster_manager = ClusterManager(
+                config=self.config,
+                feature_extractor=None
+            )
+            
+            # Create uniform distribution of data into clusters (simple round-robin assignment)
+            if self.rank == 0:
+                logger.info(f"Creating uniform distribution across {self.config.num_experts} experts")
+                # Report progress
+                if self.progress_callback:
+                    self.progress_callback("Creating uniform distribution (skipping clustering)", 15)
+                
+            # Skip actual clustering and return uniform assignment
+            # This will be handled by the cluster manager's default assignment
+            if self.world_size > 1:
+                self.safe_synchronize(timeout_seconds=30, name="skip_clustering")
+                
+            # Report progress
+            if self.progress_callback and self.rank == 0:
+                self.progress_callback("Clustering skipped", 20)
+                
+            return None
+            
+        # If not skipping, proceed with normal clustering
         # Create feature extractor based on config
         logger.info(f"Initializing clustering manager with {self.config.num_experts} experts")
         init_start_time = time.time()
@@ -310,7 +339,7 @@ class DDMTrainingCoordinator:
         # Log progress
         if self.progress_callback and self.rank == 0:
             self.progress_callback("Starting cluster manager initialization", 5)
-            
+        
         # Create dataset for feature extraction
         logger.info(f"Creating feature extraction dataset from {self.config.dataset_path}")
         dataset_start_time = time.time()

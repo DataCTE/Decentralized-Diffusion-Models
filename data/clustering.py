@@ -48,41 +48,32 @@ class ClusterManager:
         # Initialize feature extractor if not provided
         self.feature_extractor = feature_extractor
         if self.feature_extractor is None:
-            self.feature_extractor = self._initialize_feature_extractor()
-            
-        # Initialize storage for features and clusters
+            try:
+                self._init_vision_encoder()
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize vision encoder: {e}")
+                self.feature_extractor = None
+        
+        # Initialize storage
         self.features = None
-        self.centroids = None
+        self.image_paths = None
         self.cluster_labels = None
-        self.cluster_sizes = None
-        self.expert_assignment = None  # Maps each cluster to an expert
+        self.uniform_distribution = getattr(self.config, 'skip_clustering', False)
         
-        # Create cache directory
-        self.cache_dir = os.path.join(
-            getattr(config, 'cache_dir', 'cache'),
-            'clustering'
-        )
-        os.makedirs(self.cache_dir, exist_ok=True)
-        
-        # Initialize vision encoder
-        self._init_vision_encoder()
-        
-        # Create cache directories
+        # Set up cache directories
+        self.cache_dir = getattr(config, 'cluster_cache_path', 'cache')
         self.feature_cache_dir = os.path.join(self.cache_dir, 'features')
         self.feature_chunks_dir = os.path.join(self.feature_cache_dir, 'chunks')
+        self.cluster_cache_dir = os.path.join(self.cache_dir, 'clusters')
         
-        # Cluster cache
-        self.kmeans_cache_dir = os.path.join(self.cache_dir, 'clusters')
-        self.fine_cluster_cache_file = os.path.join(self.kmeans_cache_dir, 'fine_clusters.pkl')
-        self.coarse_cluster_cache_file = os.path.join(self.kmeans_cache_dir, 'coarse_clusters.pkl')
+        os.makedirs(self.feature_cache_dir, exist_ok=True)
+        os.makedirs(self.feature_chunks_dir, exist_ok=True)
+        os.makedirs(self.cluster_cache_dir, exist_ok=True)
+        os.makedirs(os.path.join(
+            self.cache_dir, 
+            'visualization'
+        ), exist_ok=True)
         
-        # Create cache directories if main process
-        if is_main_process():
-            os.makedirs(self.cache_dir, exist_ok=True)
-            os.makedirs(self.feature_cache_dir, exist_ok=True)
-            os.makedirs(self.feature_chunks_dir, exist_ok=True)
-            os.makedirs(self.kmeans_cache_dir, exist_ok=True)
-            
         # Wait for directories to be created
         synchronize()
         
@@ -1178,6 +1169,16 @@ class ClusterManager:
         Returns:
             np.ndarray: Cluster labels
         """
+        # If clustering was skipped and we have no labels yet, create uniform distribution
+        if self.cluster_labels is None:
+            if getattr(self.config, 'skip_clustering', False):
+                self.logger.info("Creating uniform distribution as clustering was skipped")
+                return self.create_uniform_distribution()
+            else:
+                self.logger.warning("Cluster labels not available. Run generate_clusters first.")
+                # Return empty array as fallback
+                return np.array([])
+                
         return self.cluster_labels
         
     def get_cluster_stats(self):
@@ -1540,3 +1541,30 @@ class ClusterManager:
         self.logger.info(f"Total clustering process completed in {total_time:.2f}s")
         
         return labels, centroids, locals().get(algorithm, None)  # Return local variable with algorithm name 
+
+    def create_uniform_distribution(self, dataset_size=None):
+        """
+        Create a uniform distribution of data points to clusters
+        
+        Args:
+            dataset_size: Number of data points (optional)
+            
+        Returns:
+            np.ndarray: Uniform cluster assignments (round-robin)
+        """
+        if dataset_size is None:
+            # Try to get dataset size from config or use a reasonable default
+            dataset_size = getattr(self.config, 'dataset_size', 10000)
+            self.logger.warning(f"No dataset size provided, using value from config: {dataset_size}")
+            
+        num_clusters = getattr(self.config, 'num_experts', 8)
+        self.logger.info(f"Creating uniform distribution for {dataset_size} samples across {num_clusters} clusters")
+        
+        # Simple round-robin assignment
+        labels = np.arange(dataset_size) % num_clusters
+        
+        # Store the labels
+        self.cluster_labels = labels
+        
+        self.logger.info(f"Created uniform distribution with {len(np.unique(labels))} clusters")
+        return labels 

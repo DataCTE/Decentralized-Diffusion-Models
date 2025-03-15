@@ -64,6 +64,7 @@ class DDMConfig:
         self.feature_extraction_model = "dinov2" # "dinov2", "clip", or "custom"
         self.use_feature_cache = True           # Cache extracted features
         self.cluster_cache_path = "cache"       # Path to store feature and cluster caches
+        self.skip_clustering = True            # Set to True to bypass clustering for faster testing/debugging (change this value directly in this file)
         
         # Training settings
         self.num_steps = 400000  
