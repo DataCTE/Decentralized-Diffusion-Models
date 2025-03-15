@@ -210,11 +210,27 @@ def main():
         progress_thread_active = True
         def progress_thread():
             last_print = time.time()
-            stages = ["clustering", "router initialization", "expert initialization", "data loading"]
+            # Different stages depending on whether clustering is skipped
+            if getattr(config, 'skip_clustering', False):
+                console_print(f"Rank {rank}: Clustering will be skipped (skip_clustering=True)")
+                console_print(f"Rank {rank}: Using uniform distribution across {config.num_experts} experts")
+                stages = [
+                    "fast path cluster manager initialization", 
+                    "fast path data loader initialization", 
+                    "router initialization", 
+                    "expert initialization"
+                ]
+                # Fast initialization should be much quicker
+                wait_time = 10  # Report progress every 10 seconds for fast path
+            else:
+                console_print(f"Rank {rank}: Clustering will be performed (skip_clustering=False)")
+                stages = ["clustering", "router initialization", "expert initialization", "data loading"]
+                wait_time = 30  # Report progress every 30 seconds for normal path
+                
             stage_idx = 0
             while progress_thread_active:
                 current_time = time.time()
-                if current_time - last_print > 30:
+                if current_time - last_print > wait_time:
                     elapsed = current_time - init_start_time
                     stage = stages[min(stage_idx, len(stages)-1)]
                     console_print(f"Still initializing: {stage} (elapsed: {elapsed:.1f}s)")

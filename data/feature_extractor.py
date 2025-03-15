@@ -137,15 +137,29 @@ class FeatureExtractor:
 
 class DINOv2FeatureExtractor(FeatureExtractor):
     """Implements paper's feature extraction using DINOv2"""
-    def __init__(self, device=None):
+    def __init__(self, device=None, variant="large"):
         super().__init__(device)
+        self.variant = variant
         self.model = self._init_dinov2()
         self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
         self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
         
     def _init_dinov2(self):
         """Load DINOv2 model with paper-recommended settings"""
-        model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg').to(self.device)
+        # Map variant names to actual model names
+        variant_map = {
+            "small": "dinov2_vits14",
+            "base": "dinov2_vitb14",
+            "large": "dinov2_vitl14",
+            "giant": "dinov2_vitg14",
+            # Default to large with regnet backbone for best features
+            "large_reg": "dinov2_vitl14_reg",
+        }
+        
+        # Default to large_reg if variant not found
+        model_name = variant_map.get(self.variant.lower(), "dinov2_vitl14_reg")
+        
+        model = torch.hub.load('facebookresearch/dinov2', model_name).to(self.device)
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)

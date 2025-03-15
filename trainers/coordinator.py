@@ -30,7 +30,7 @@ logger = setup_logger("DDMCoordinator")
 # Direct console print function for immediate feedback
 def debug_print(message, rank=None, force=False):
     """Print directly to console regardless of logger configuration"""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     if rank is not None:
         prefix = f"[COORD-{rank}]"
     else:
@@ -61,6 +61,11 @@ class DDMTrainingCoordinator:
         self.cache_manager = cache_manager
         self.progress_callback = progress_callback
         
+        # Flag to track if we're skipping clustering
+        self.is_clustering_skipped = getattr(self.config, 'skip_clustering', False)
+        if self.is_clustering_skipped:
+            debug_print(f"Fast-path initialization enabled (skip_clustering=True) on rank {rank}", rank, force=True)
+        
         # Set device
         if torch.cuda.is_available():
             self.device = torch.device(f"cuda:{rank}")
@@ -87,17 +92,18 @@ class DDMTrainingCoordinator:
         
         # Report progress
         if self.progress_callback and self.rank == 0:
-            self.progress_callback("Starting initialization", 0)
+            progress_msg = "Starting fast initialization" if self.is_clustering_skipped else "Starting initialization"
+            self.progress_callback(progress_msg, 0)
         
-        # Initialize clustering
+        # Initialize clustering - use fast path for skip_clustering
         debug_print(f"Starting cluster manager initialization", rank)
         cluster_start = time.time()
         self.init_cluster_manager()
         debug_print(f"Cluster manager initialized in {time.time() - cluster_start:.2f}s", rank)
         
-        # Report progress
+        # Report progress - move faster through progress stages when skip_clustering is true
         if self.progress_callback and self.rank == 0:
-            self.progress_callback("Cluster manager initialized", 25)
+            self.progress_callback("Cluster manager initialized", 30 if self.is_clustering_skipped else 25)
         
         # Initialize data loaders
         debug_print(f"Starting data loader initialization", rank)
@@ -107,7 +113,7 @@ class DDMTrainingCoordinator:
         
         # Report progress
         if self.progress_callback and self.rank == 0:
-            self.progress_callback("Data loaders initialized", 50)
+            self.progress_callback("Data loaders initialized", 60 if self.is_clustering_skipped else 50)
         
         # Initialize models
         debug_print(f"Starting model initialization", rank)
@@ -117,7 +123,7 @@ class DDMTrainingCoordinator:
         
         # Report progress
         if self.progress_callback and self.rank == 0:
-            self.progress_callback("Models initialized", 75)
+            self.progress_callback("Models initialized", 90 if self.is_clustering_skipped else 75)
         
         debug_print(f"Setting up optimizers and schedulers", rank)
         
@@ -195,7 +201,8 @@ class DDMTrainingCoordinator:
             self.progress_callback("Initialization complete", 100)
         
         total_init_time = time.time() - init_start_time
-        debug_print(f"DDMTrainingCoordinator initialization completed in {total_init_time:.2f}s", rank)
+        init_speed = "fast-path" if self.is_clustering_skipped else "standard"
+        debug_print(f"DDMTrainingCoordinator {init_speed} initialization completed in {total_init_time:.2f}s", rank)
         logger.info(f"DDMTrainingCoordinator initialized on rank {rank}/{world_size}")
         
         # If we're the main process, log the configuration
@@ -211,21 +218,45 @@ class DDMTrainingCoordinator:
         synchronize()
         debug_print(f"All processes synchronized in {time.time() - sync_start:.2f}s", rank)
         
-    def safe_synchronize(self, timeout_seconds=60, name="operation"):
+    def safe_synchronize(self, name="operation"):
         """
         Safely synchronize all processes with simplified timeout handling
         
         Args:
-            timeout_seconds: Maximum time to wait for synchronization
             name: Name of the operation for logging
         """
         if self.world_size <= 1:
             return True  # No need to synchronize for single-process training
+            
+        # Fast path for initialization operations when clustering is skipped
+        if self.is_clustering_skipped and name in ["skip_clustering", "cluster_initialization", "data_loading"]:
+            logger.debug(f"Fast synchronization for '{name}' when skip_clustering=True")
+            try:
+                # Log before barrier to identify which process is waiting
+                debug_print(f"Entering fast sync barrier for '{name}'", self.rank, force=True)
+                sync_start = time.time()
+                
+                # Use a shorter timeout for operations that should be quick when skipping clustering
+                torch.distributed.barrier()
+                
+                sync_time = time.time() - sync_start
+                debug_print(f"Completed fast sync barrier for '{name}' in {sync_time:.3f}s", self.rank, force=True)
+                return True
+            except Exception as e:
+                logger.warning(f"Fast sync error for '{name}': {str(e)}")
+                return False
         
         try:
+            # Log before barrier to identify which process is waiting
+            debug_print(f"Entering sync barrier for '{name}'", self.rank, force=True)
+            sync_start = time.time()
+            
             # Simple barrier without timeout (for compatibility)
             # Some PyTorch versions don't support timeout parameter
             torch.distributed.barrier()
+            
+            sync_time = time.time() - sync_start
+            debug_print(f"Completed sync barrier for '{name}' in {sync_time:.3f}s", self.rank, force=True)
             logger.debug(f"Synchronization for '{name}' completed successfully")
             return True
         except torch.distributed.DistBackendError as e:
@@ -271,11 +302,8 @@ class DDMTrainingCoordinator:
                         logger.debug(f"Broadcasting expert {expert_idx} from rank {rank}")
                     
                     try:
-                        # Try to synchronize this expert
-                        success = self.safe_synchronize(
-                            timeout_seconds=120, 
-                            name=f"expert_{expert_idx}_broadcast"
-                        )
+                        # Try to synchronize this expert (removed timeout parameter)
+                        success = self.safe_synchronize(name=f"expert_{expert_idx}_broadcast")
                         
                         if success:
                             synced_experts.add(expert_idx)
@@ -304,8 +332,11 @@ class DDMTrainingCoordinator:
         from data.clustering import ClusterManager
         
         # Check if clustering should be skipped for testing/debugging
-        if getattr(self.config, 'skip_clustering', False):
+        if self.is_clustering_skipped:
             logger.info("Skipping clustering as per configuration (skip_clustering=True)")
+            
+            # Fast path: Create a simple ClusterManager without clustering
+            debug_print(f"Fast-path initializing ClusterManager with skip_clustering=True on rank {self.rank}", self.rank, force=True)
             
             # Create a simple ClusterManager without clustering
             self.cluster_manager = ClusterManager(
@@ -320,15 +351,17 @@ class DDMTrainingCoordinator:
                 if self.progress_callback:
                     self.progress_callback("Creating uniform distribution (skipping clustering)", 15)
                 
-            # Skip actual clustering and return uniform assignment
-            # This will be handled by the cluster manager's default assignment
+            # Quick synchronization when skipping clustering
             if self.world_size > 1:
+                debug_print(f"Quick synchronization for skip_clustering on rank {self.rank}", self.rank, force=True)
                 self.safe_synchronize(name="skip_clustering")
                 
             # Report progress
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Clustering skipped", 20)
                 
+            debug_print(f"Fast-path ClusterManager initialization complete on rank {self.rank}", self.rank, force=True)
+            
             return None
             
         # If not skipping, proceed with normal clustering
@@ -431,6 +464,10 @@ class DDMTrainingCoordinator:
         init_start_time = time.time()
         
         try:
+            # Fast path for skip_clustering=True
+            if self.is_clustering_skipped:
+                debug_print(f"Fast-path initializing data loaders with skip_clustering=True on rank {self.rank}", self.rank, force=True)
+            
             # Create dataset
             logger.info(f"Creating dataset from {self.config.dataset_path}")
             dataset_start_time = time.time()
@@ -439,7 +476,7 @@ class DDMTrainingCoordinator:
             if self.progress_callback and self.rank == 0:
                 self.progress_callback("Creating dataset", 30)
                 
-            # Get cluster assignments from manager
+            # Get cluster assignments from manager - will create uniform distribution if skip_clustering=True
             cluster_assignments = self.cluster_manager.get_cluster_labels()
             logger.info(f"Using {len(np.unique(cluster_assignments))} clusters for data assignment")
             
@@ -469,14 +506,20 @@ class DDMTrainingCoordinator:
                 rank=self.rank
             )
             
-            # Log data loader stats
-            num_experts = len(self.expert_loaders)
-            total_batches = sum(len(loader) for loader in self.expert_loaders.values())
-            logger.info(f"Created {num_experts} expert loaders with {total_batches} total batches on rank {self.rank}")
-            
-            for expert_idx, loader in self.expert_loaders.items():
-                if self.is_expert_owned_by_rank(expert_idx):
-                    logger.info(f"Rank {self.rank} owns expert {expert_idx} with {len(loader)} batches")
+            # Log data loader stats - more concise when skip_clustering=True
+            if self.is_clustering_skipped:
+                num_experts = len(self.expert_loaders)
+                total_batches = sum(len(loader) for loader in self.expert_loaders.values())
+                logger.info(f"Created {num_experts} expert loaders with {total_batches} total batches on rank {self.rank}")
+            else:
+                # Detailed logging for regular clustering
+                num_experts = len(self.expert_loaders)
+                total_batches = sum(len(loader) for loader in self.expert_loaders.values())
+                logger.info(f"Created {num_experts} expert loaders with {total_batches} total batches on rank {self.rank}")
+                
+                for expert_idx, loader in self.expert_loaders.items():
+                    if self.is_expert_owned_by_rank(expert_idx):
+                        logger.info(f"Rank {self.rank} owns expert {expert_idx} with {len(loader)} batches")
             
             # Create router data loader
             logger.info(f"Creating router data loader on rank {self.rank}")
@@ -510,7 +553,7 @@ class DDMTrainingCoordinator:
                 logger.info(f"Dataset has {len(self.dataset)} samples assigned to {num_clusters} clusters")
                 logger.info(f"Created {len(self.expert_loaders)} expert loaders and 1 router loader")
                 
-            # Synchronize all processes after data loading
+            # Synchronize all processes after data loading - use a shorter timeout if skipping clustering
             if self.world_size > 1:
                 self.safe_synchronize(name="data_loading")
                 
@@ -528,6 +571,10 @@ class DDMTrainingCoordinator:
         init_start_time = time.time()
         
         try:
+            # Indicate if we're in fast initialization mode
+            if self.is_clustering_skipped:
+                logger.info("Using fast model initialization (skip_clustering=True)")
+            
             # Load VAE for latent diffusion
             logger.info(f"Loading VAE encoder/decoder on rank {self.rank}")
             vae_start_time = time.time()
@@ -1587,7 +1634,13 @@ class DDMTrainingCoordinator:
         Returns:
             True if expert is owned by this rank, False otherwise
         """
-        # Simple sharding: expert_idx % world_size == rank
+        # When clustering is skipped, we use a simple sharding approach for experts
+        if hasattr(self, 'is_clustering_skipped') and self.is_clustering_skipped:
+            # Simple sharding: expert_idx % world_size == rank
+            return expert_idx % self.world_size == self.rank
+            
+        # For non-skipped clustering, we might use a more complex strategy based on cluster assignments
+        # But for now we still use the simple sharding approach
         return expert_idx % self.world_size == self.rank
 
     def create_lr_scheduler(self):

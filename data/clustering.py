@@ -45,6 +45,36 @@ class ClusterManager:
         # Initialize logger
         self.logger = setup_distributed_logger(name="ClusterManager", rank=get_rank())
         
+        # Check if clustering should be skipped
+        self.uniform_distribution = getattr(self.config, 'skip_clustering', False)
+        
+        # Fast path for skip_clustering=True - avoid unnecessary initializations
+        if self.uniform_distribution:
+            self.logger.info("Fast path: Initializing ClusterManager with skip_clustering=True")
+            
+            # Skip feature extractor initialization entirely
+            self.feature_extractor = None
+            self.vision_encoder = None
+            
+            # Initialize storage with minimal setup
+            self.features = None
+            self.image_paths = None
+            self.cluster_labels = None
+            
+            # Set up minimal directories for cache consistency 
+            self.cache_dir = getattr(config, 'cluster_cache_path', 'cache')
+            os.makedirs(self.cache_dir, exist_ok=True)
+            
+            # Skip all other initializations
+            self.fine_kmeans = None
+            self.coarse_kmeans = None
+            self.fine_cluster_labels = None
+            self.coarse_cluster_labels = None
+            self.dataset_hash = None
+            
+            return
+            
+        # Regular initialization path for actual clustering
         # Initialize feature extractor if not provided
         self.feature_extractor = feature_extractor
         if self.feature_extractor is None:
@@ -58,7 +88,6 @@ class ClusterManager:
         self.features = None
         self.image_paths = None
         self.cluster_labels = None
-        self.uniform_distribution = getattr(self.config, 'skip_clustering', False)
         
         # Set up cache directories
         self.cache_dir = getattr(config, 'cluster_cache_path', 'cache')
@@ -118,18 +147,32 @@ class ClusterManager:
     
     def _init_vision_encoder(self):
         """Initialize vision model for feature extraction"""
+        # Skip initialization if clustering is being skipped
+        if getattr(self.config, 'skip_clustering', False):
+            self.logger.info("Skipping vision encoder initialization as clustering is skipped")
+            self.vision_encoder = None
+            return
+            
         model_name = getattr(self.config, 'feature_extractor', 'dinov2')
         
-        if model_name == 'dinov2':
-            self.logger.info("Initializing DINOv2 feature extractor")
-            self.vision_encoder = DINOv2FeatureExtractor(
-                variant=getattr(self.config, 'dinov2_variant', 'small'),
-                device=self.config.device
-            )
-        else:
-            raise ValueError(f"Unknown feature extractor: {model_name}")
-            
-        self.logger.info(f"Initialized vision encoder: {model_name}")
+        try:
+            if model_name == 'dinov2':
+                self.logger.info("Initializing DINOv2 feature extractor")
+                variant = getattr(self.config, 'dinov2_variant', 'small')
+                self.logger.info(f"Using DINOv2 variant: {variant}")
+                
+                from data.feature_extractor import DINOv2FeatureExtractor
+                self.vision_encoder = DINOv2FeatureExtractor(
+                    variant=variant,
+                    device=self.config.device
+                )
+            else:
+                raise ValueError(f"Unknown feature extractor: {model_name}")
+                
+            self.logger.info(f"Initialized vision encoder: {model_name}")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize vision encoder: {e}")
+            self.vision_encoder = None
         
     def compute_dataset_hash(self, image_paths):
         """
@@ -450,6 +493,18 @@ class ClusterManager:
         Returns:
             Cluster assignments for each datapoint
         """
+        # Fast path for skip_clustering=True
+        if getattr(self.config, 'skip_clustering', False):
+            self.logger.info("Fast path: skip_clustering=True, directly creating uniform distribution")
+            # Get dataset size from dataloader if available
+            if dataloader is not None:
+                dataset_size = len(dataloader.dataset)
+            else:
+                dataset_size = getattr(self.config, 'dataset_size', 10000)
+            
+            # Generate uniform distribution immediately
+            return self.create_uniform_distribution(dataset_size=dataset_size)
+            
         if k is None:
             k = getattr(self.config, 'num_experts', 8)
         
@@ -1169,15 +1224,21 @@ class ClusterManager:
         Returns:
             np.ndarray: Cluster labels
         """
-        # If clustering was skipped and we have no labels yet, create uniform distribution
+        # Fast path for skip_clustering - avoid any unnecessary checks
+        if getattr(self.config, 'skip_clustering', False):
+            # If we already have labels, return them
+            if self.cluster_labels is not None:
+                return self.cluster_labels
+                
+            # Otherwise create uniform distribution directly
+            self.logger.info("Fast path: Creating uniform distribution (skip_clustering=True)")
+            return self.create_uniform_distribution()
+                
+        # Normal path for regular clustering
         if self.cluster_labels is None:
-            if getattr(self.config, 'skip_clustering', False):
-                self.logger.info("Creating uniform distribution as clustering was skipped")
-                return self.create_uniform_distribution()
-            else:
-                self.logger.warning("Cluster labels not available. Run generate_clusters first.")
-                # Return empty array as fallback
-                return np.array([])
+            self.logger.warning("Cluster labels not available. Run generate_clusters first.")
+            # Return empty array as fallback
+            return np.array([])
                 
         return self.cluster_labels
         
@@ -1552,19 +1613,27 @@ class ClusterManager:
         Returns:
             np.ndarray: Uniform cluster assignments (round-robin)
         """
+        # Fast path for testing/debugging
+        is_distributed = get_world_size() > 1
+        
         if dataset_size is None:
             # Try to get dataset size from config or use a reasonable default
             dataset_size = getattr(self.config, 'dataset_size', 10000)
-            self.logger.warning(f"No dataset size provided, using value from config: {dataset_size}")
+            self.logger.info(f"Using dataset size from config: {dataset_size}")
             
         num_clusters = getattr(self.config, 'num_experts', 8)
         self.logger.info(f"Creating uniform distribution for {dataset_size} samples across {num_clusters} clusters")
         
-        # Simple round-robin assignment
+        # Simple round-robin assignment - most efficient implementation
         labels = np.arange(dataset_size) % num_clusters
         
         # Store the labels
         self.cluster_labels = labels
         
-        self.logger.info(f"Created uniform distribution with {len(np.unique(labels))} clusters")
+        # In distributed setting, ensure all processes have the same labels
+        if is_distributed:
+            # Broadcast labels only if necessary
+            self.cluster_labels = broadcast_numpy_array(labels)
+        
+        self.logger.info(f"Created uniform distribution with {num_clusters} clusters")
         return labels 
