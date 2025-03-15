@@ -21,6 +21,7 @@ DEFAULT_CONFIG = {
     
     # ===== DDM Model parameters =====
     'num_experts': 8,
+    'latent_channels': 16,
     'hidden_size': 768,
     'num_heads': 12,
     'num_layers': 12,
@@ -29,6 +30,12 @@ DEFAULT_CONFIG = {
     'router_hidden_size': 512,
     'router_num_heads': 8,
     'router_num_layers': 4,
+    'router': {
+        'input_dim': 768,  # Should match your text encoder output dimension
+        'hidden_dim': 512,
+        'output_dim': 8,   # Should match number of experts
+        'num_layers': 3
+    },
     
     # ===== Dataset parameters =====
     'dataset_path': '/home/alex/workspace/datasets/danbooru2025',

@@ -9,7 +9,6 @@ from torch.utils.data.distributed import DistributedSampler
 import threading
 
 # Import needed components
-from trainers.expert import ExpertTrainer
 from trainers.router import RouterTrainer
 from trainers.sampling import ddm_sample
 from trainers.diffusion import DecentralizedFlowMatcher
