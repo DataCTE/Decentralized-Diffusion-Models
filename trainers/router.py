@@ -39,7 +39,7 @@ def get_auto_wrap_policy(config):
         return size_based_auto_wrap_policy(
             min_num_params=getattr(config, 'fsdp_min_num_params', 1e6)
         )
-    # Provide a default lambda function for the policy
+    # Wrap router's attention blocks
     return lambda_auto_wrap_policy(
         lambda_fn=lambda m: isinstance(m, SelfAttentionBlock)
     )
