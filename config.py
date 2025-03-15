@@ -50,6 +50,9 @@ DEFAULT_CONFIG = {
         (384, 640),
     ],
     'num_workers': 4,
+    'pin_memory': True,
+    'persistent_workers': True,
+    'prefetch_factor': 2,
     
     # ===== Flow Matching parameters =====
     'diffusion_steps': 1000,
