@@ -71,6 +71,10 @@ DEFAULT_CONFIG = {
     
     # Changed from cluster-based parameters
     'expert_batch_size': 1,
+    
+    # ===== Expert Cache parameters =====
+    'max_experts_in_memory': 2,  # Number of experts to keep in GPU memory
+    'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
 }
 
 def get_config(config_path):
