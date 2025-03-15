@@ -133,7 +133,7 @@ class DataValidator:
         
         try:
             # Process images with size normalization
-            sub_batch_size = 64
+            sub_batch_size = 128
             target_size = (min_size, min_size)  # Standardize validation size
             
             for i in range(0, len(file_batch), sub_batch_size):
