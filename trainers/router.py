@@ -5,17 +5,14 @@ import torch.nn as nn
 import math
 from bitsandbytes.optim import AdamW8bit
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-    lambda_auto_wrap_policy
-)
 
 
 
 from models.router import RouterModel, SelfAttentionBlock
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
+from utils.fsdp import get_auto_wrap_policy as get_fsdp_policy
+from utils.fsdp import wrap_model_with_fsdp
 
 def get_sharding_strategy(name: str) -> ShardingStrategy:
     """Convert sharding strategy name to enum"""
@@ -34,15 +31,8 @@ def get_backward_prefetch(name: str) -> BackwardPrefetch:
     }[name.upper()]
 
 def get_auto_wrap_policy(config):
-    """Get FSDP auto wrap policy based on config"""
-    if getattr(config, 'fsdp_auto_wrap_policy', 'DEFAULT') == "SIZE_BASED":
-        return size_based_auto_wrap_policy(
-            min_num_params=getattr(config, 'fsdp_min_num_params', 1e6)
-        )
-    # Use correct signature with ignored parameters
-    return lambda_auto_wrap_policy(
-        lambda_fn=lambda module, *args, **kwargs: isinstance(module, SelfAttentionBlock)
-    )
+    """Get FSDP auto wrap policy using centralized utility"""
+    return get_fsdp_policy(config)
 
 class RouterTrainer:
     """Trainer for the router model in DDM"""
@@ -56,27 +46,11 @@ class RouterTrainer:
         # Create base router model with safe config access
         base_router = RouterModel(config).to(device)
         
-        # Get FSDP parameters with defaults
-        sharding_strategy = get_sharding_strategy(
-            getattr(config, 'fsdp_sharding_strategy', 'FULL_SHARD')
-        )
-        cpu_offload = CPUOffload(
-            offload_params=getattr(config, 'fsdp_cpu_offload', False)
-        )
-        backward_prefetch = get_backward_prefetch(
-            getattr(config, 'fsdp_backward_prefetch', 'BACKWARD_PRE')
-        )
-        auto_wrap_policy = get_auto_wrap_policy(config)
-        
         # Apply FSDP wrapping
-        self.router = FSDP(
+        self.router = wrap_model_with_fsdp(
             base_router,
-            device_id=torch.cuda.current_device(),
-            sharding_strategy=sharding_strategy,
-            cpu_offload=cpu_offload,
-            backward_prefetch=backward_prefetch,
-            auto_wrap_policy=auto_wrap_policy,
-            use_orig_params=True
+            config,
+            param_init_fn=lambda m: m.to_empty(device=torch.cuda.current_device(), recurse=False)
         )
         
         if rank == 0:
