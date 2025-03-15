@@ -33,42 +33,42 @@ class RouterModel(nn.Module):
         # Embedding layer
         self.embedder = nn.Conv2d(
             config.latent_channels, 
-            config.router_hidden_dim,
+            config.router_hidden_size,
             kernel_size=config.patch_size,
             stride=config.patch_size
         )
         
         # Efficient spatial attention pooling
         self.spatial_attention = nn.Sequential(
-            nn.Conv2d(config.router_hidden_dim, config.router_hidden_dim // 4, kernel_size=1),
+            nn.Conv2d(config.router_hidden_size, config.router_hidden_size // 4, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(config.router_hidden_dim // 4, 1, kernel_size=1),
+            nn.Conv2d(config.router_hidden_size // 4, 1, kernel_size=1),
             nn.Softmax(dim=(2, 3))  # Spatial softmax
         )
         
         # Timestep embedding
         self.time_embedder = nn.Sequential(
-            nn.Linear(1, config.router_hidden_dim // 2),
+            nn.Linear(1, config.router_hidden_size // 2),
             nn.GELU(),
-            nn.Linear(config.router_hidden_dim // 2, config.router_hidden_dim)
+            nn.Linear(config.router_hidden_size // 2, config.router_hidden_size)
         )
         
         # Attention blocks (simplified compared to the DiT)
         self.blocks = nn.ModuleList([
             SelfAttentionBlock(
-                config.router_hidden_dim, 
+                config.router_hidden_size, 
                 config.num_heads // 2  # Use fewer attention heads
             )
             for _ in range(2)  # Paper recommends 2 blocks for router
         ])
         
         # Class token for classification
-        self.cls_token = nn.Parameter(torch.randn(1, 1, config.router_hidden_dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, config.router_hidden_size))
         
         # Final classifier
         self.classifier = nn.Sequential(
-            nn.LayerNorm(config.router_hidden_dim),
-            nn.Linear(config.router_hidden_dim, config.num_experts)
+            nn.LayerNorm(config.router_hidden_size),
+            nn.Linear(config.router_hidden_size, config.num_experts)
         )
         
         # Learnable temperature for calibration
