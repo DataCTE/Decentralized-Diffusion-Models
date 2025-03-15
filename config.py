@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
     'hidden_size': 768,
     'num_heads': 12,
     'num_layers': 12,
+    'patch_size': 16,
     
     # ===== Router parameters =====
     'router_hidden_size': 512,
