@@ -8,18 +8,13 @@ from PIL import Image
 from collections import defaultdict
 import logging
 import time  # Add missing time module import
-
 import glob
-
 import io
 import torchvision.transforms as transforms
 from tqdm.auto import tqdm
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# Import centralized utilities
-from utils.distributed import is_main_process, broadcast_object, get_rank, get_local_rank, get_world_size
-from utils.logging import setup_distributed_logger
+import torch.distributed as dist
+from torch.distributed import broadcast_object
+from utils.distributed import is_main_process, get_rank, get_local_rank, get_world_size
 from data.transforms import resize_image, normalize
 
 
@@ -61,23 +56,67 @@ class DDMDataset(Dataset):
         self.device = 'cpu'
 
     def _load_dataset(self):
-        """Load dataset metadata without distributed operations"""
+        """Single-pass dataset loading with integrated validation"""
         self.image_files = []
         self.caption_files = []
         self.dim_cache = []
+        invalid_entries = []
         
-        # Simple file discovery without MPI/rank dependencies
-        for ext in self.image_extensions:
-            for img_path in glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True):
-                caption_path = os.path.splitext(img_path)[0] + self.caption_ext
-                if os.path.exists(caption_path):
-                    self.image_files.append(img_path)
-                    self.caption_files.append(caption_path)
-                    # Get dimensions without loading full image
-                    with Image.open(img_path) as img:
-                        self.dim_cache.append(img.size)  # Store as (W, H)
+        # Use main process for initial scanning
+        if is_main_process():
+            pbar = tqdm(desc="Scanning dataset", unit="file")
+            
+            for ext in self.image_extensions:
+                for img_path in glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True):
+                    caption_path = os.path.splitext(img_path)[0] + self.caption_ext
+                    
+                    try:
+                        # Validate file pair and load image in one pass
+                        with Image.open(img_path) as img:
+                            # Quick format check
+                            img.getdata()[0]  # Force partial decode
+                            width, height = img.size
+                            
+                            if width >= self.min_size and height >= self.min_size:
+                                self.image_files.append(img_path)
+                                self.caption_files.append(caption_path)
+                                self.dim_cache.append((width, height))
+                                pbar.update(1)
+                                
+                    except (IOError, OSError, Image.DecompressionBombError, Image.UnidentifiedImageError) as e:
+                        invalid_entries.append(img_path)
+                    except Exception as e:
+                        invalid_entries.append(img_path)
+            
+            pbar.close()
+            logger.info(f"Found {len(self.image_files)} valid pairs, skipped {len(invalid_entries)} invalid files")
+
+        # Distributed synchronization
+        if dist.is_initialized():
+            self._distributed_sync()
+
+        # Final validation checks
+        if len(self.image_files) == 0:
+            raise RuntimeError("No valid training samples found in dataset directory")
+
+    def _distributed_sync(self):
+        """Efficient distributed synchronization of validated files"""
+        if is_main_process():
+            # Broadcast compressed dataset info
+            data_to_sync = {
+                'image_files': self.image_files,
+                'caption_files': self.caption_files,
+                'dim_cache': np.array(self.dim_cache)
+            }
+            broadcast_object(data_to_sync, src=0)
+        else:
+            # Receive validated dataset from main
+            synced_data = broadcast_object(None, src=0)
+            self.image_files = synced_data['image_files']
+            self.caption_files = synced_data['caption_files']
+            self.dim_cache = synced_data['dim_cache'].tolist()
         
-        self._process_buckets()
+        logger.info(f"Rank {get_rank()} received {len(self.image_files)} validated files")
 
     def _process_buckets(self):
         """CPU-based bucket processing with numpy"""
@@ -344,7 +383,9 @@ class DDMDataset(Dataset):
         img = normalize(img)
         return img
         
-    
+    def get_invalid_files(self):
+        """Retrieve list of files that failed validation"""
+        return getattr(self, '_invalid_files', [])
 
 class BucketBatchSampler(torch.utils.data.Sampler):
     """GPU-optimized bucket batch sampler with tensor-based operations"""
