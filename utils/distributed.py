@@ -6,6 +6,7 @@ import pickle
 import logging
 import io
 from datetime import timedelta
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -14,15 +15,19 @@ def is_dist_initialized():
     return dist.is_initialized()
 
 def get_rank():
-    """Get current process rank"""
+    """Get the rank of the current process."""
     return dist.get_rank() if is_dist_initialized() else 0
 
+def get_local_rank():
+    """Get the local rank of the current process from the LOCAL_RANK environment variable."""
+    return int(os.environ.get('LOCAL_RANK', '0'))
+
 def get_world_size():
-    """Get total number of processes"""
+    """Get the world size (number of processes)."""
     return dist.get_world_size() if is_dist_initialized() else 1
 
 def is_main_process():
-    """Check if current process is the main process (rank 0)"""
+    """Determines if the current process is the main process."""
     return get_rank() == 0
 
 def synchronize():

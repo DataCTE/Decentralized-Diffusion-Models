@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import centralized utilities
-from utils.distributed import is_main_process, broadcast_object
+from utils.distributed import is_main_process, broadcast_object, get_rank, get_local_rank
 from utils.logging import setup_distributed_logger
 from data.transforms import resize_image, normalize
 
@@ -49,9 +49,18 @@ class DDMDataset(Dataset):
         if not hasattr(config, 'num_experts'):
             raise ValueError("Configuration missing required 'num_experts' parameter")
 
-        # Then initialize GPU device reference
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.logger.info(f"Initializing dataset on {self.device}")
+        # Get the local rank for proper device assignment
+        self.rank = get_rank()
+        self.local_rank = get_local_rank()
+        
+        # Then initialize GPU device reference with appropriate device ID
+        if torch.cuda.is_available():
+            # Use the correct GPU based on local rank
+            self.device = torch.device(f'cuda:{self.local_rank}')
+            self.logger.info(f"Rank {self.rank} using device {self.device}")
+        else:
+            self.device = torch.device('cpu')
+            self.logger.info(f"Rank {self.rank} using CPU (no CUDA available)")
         
         # Define file extensions
         self.image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
@@ -392,7 +401,9 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     - Async GPU transfers
     - Optimized worker processes
     """
-    device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
+    # Use the correct local device for this process
+    local_rank = get_local_rank()
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
     
     # Get expert assignments directly from GPU tensor
