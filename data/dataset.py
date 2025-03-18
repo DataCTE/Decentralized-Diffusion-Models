@@ -58,118 +58,76 @@ class DDMDataset(Dataset):
         self.device = 'cpu'
 
     def _load_dataset(self):
-        """Multi-threaded dataset loading with integrated validation"""
+        """GPU-accelerated dataset loading with distributed validation"""
         self.image_files = []
         self.caption_files = []
         self.dim_cache = []
-        invalid_entries = []
         
-        if is_main_process():
-            # First: Discover all potential files quickly
-            all_image_paths = []
-            for ext in self.image_extensions:
-                all_image_paths.extend(
-                    glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True)
-                )
-            
-            # Configure threading (hardcoded values)
-            num_workers = 8  # Default 16 workers
-            chunk_size = 50  # Fixed chunk size of 50 files per thread
-            
-            # Shared progress counter
-            manager = multiprocessing.Manager()
-            counter = manager.Value('i', 0)
-            lock = manager.Lock()
-            
-            # Process files in parallel
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = []
-                pbar = tqdm(total=len(all_image_paths), desc="Validating files")
-                
-                # Split work into chunks
-                for chunk in chunks(all_image_paths, chunk_size):
-                    futures.append(
-                        executor.submit(
-                            self._process_file_chunk,
-                            chunk,
-                            counter,
-                            lock
-                        )
-                    )
-                
-                # Collect results as they complete
-                for future in as_completed(futures):
-                    chunk_images, chunk_captions, chunk_dims, chunk_invalid = future.result()
-                    self.image_files.extend(chunk_images)
-                    self.caption_files.extend(chunk_captions)
-                    self.dim_cache.extend(chunk_dims)
-                    invalid_entries.extend(chunk_invalid)
-                    pbar.update(chunk_size)
-                
-                pbar.close()
+        # Discover files on all ranks
+        all_image_paths = []
+        for ext in self.image_extensions:
+            all_image_paths.extend(
+                glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True)
+            )
 
-            logger.info(f"Found {len(self.image_files)} valid pairs, skipped {len(invalid_entries)} invalid files")
+        # Split workload across GPUs
+        rank = get_rank()
+        world_size = get_world_size()
+        chunks = np.array_split(all_image_paths, world_size)
+        my_paths = chunks[rank].tolist()
 
-        # Distributed synchronization
-        if dist.is_initialized():
-            self._distributed_sync()
+        # GPU-accelerated validation
+        my_valid_images, my_valid_captions, my_valid_dims = self._gpu_validate_paths(my_paths)
 
-        if len(self.image_files) == 0:
-            raise RuntimeError("No valid training samples found in dataset directory")
+        # Gather results from all GPUs
+        all_images = [None] * world_size
+        all_captions = [None] * world_size
+        all_dims = [None] * world_size
+        dist.all_gather_object(all_images, my_valid_images)
+        dist.all_gather_object(all_captions, my_valid_captions)
+        dist.all_gather_object(all_dims, my_valid_dims)
 
-    def _process_file_chunk(self, file_paths, counter, lock):
-        """Process a chunk of files in a thread-safe manner"""
-        chunk_images = []
-        chunk_captions = []
-        chunk_dims = []
-        chunk_invalid = []
+        # Combine results
+        self.image_files = [img for sublist in all_images for img in sublist]
+        self.caption_files = [cap for sublist in all_captions for cap in sublist]
+        self.dim_cache = [dim for sublist in all_dims for dim in sublist]
+
+        logger.info(f"Rank {rank}: Collected {len(self.image_files)} total valid pairs")
+
+    def _gpu_validate_paths(self, paths):
+        """Validate files using GPU-accelerated image processing"""
+        valid_images = []
+        valid_captions = []
+        valid_dims = []
         
-        for img_path in file_paths:
+        # Use GPU-based image decoder
+        decoder = torch.classes.torchvision.GPUImageDecoder()
+        device = torch.device(f'cuda:{get_local_rank()}')
+        
+        for img_path in tqdm(paths, desc=f"GPU {get_local_rank()} validating"):
             caption_path = os.path.splitext(img_path)[0] + self.caption_ext
+            if not os.path.exists(caption_path):
+                continue
             
             try:
-                if not os.path.exists(caption_path):
-                    continue
+                # GPU-based image decoding and validation
+                with open(img_path, 'rb') as f:
+                    img_data = f.read()
                 
-                with Image.open(img_path) as img:
-                    # Quick format check
-                    img.getdata()[0]  # Force partial decode
-                    width, height = img.size
+                tensor = decoder.decode(
+                    torch.frombuffer(bytearray(img_data), dtype=torch.uint8),
+                    device=device
+                )
+                
+                if tensor.shape[1] >= self.min_size and tensor.shape[2] >= self.min_size:
+                    valid_images.append(img_path)
+                    valid_captions.append(caption_path)
+                    valid_dims.append((tensor.shape[2], tensor.shape[1]))
                     
-                    if width >= self.min_size and height >= self.min_size:
-                        chunk_images.append(img_path)
-                        chunk_captions.append(caption_path)
-                        chunk_dims.append((width, height))
-                        
-                        # Update progress safely
-                        with lock:
-                            counter.value += 1
-            
-            except (IOError, OSError, Image.DecompressionBombError, Image.UnidentifiedImageError):
-                chunk_invalid.append(img_path)
-            except Exception:
-                chunk_invalid.append(img_path)
-        
-        return chunk_images, chunk_captions, chunk_dims, chunk_invalid
-
-    def _distributed_sync(self):
-        """Efficient distributed synchronization of validated files"""
-        if is_main_process():
-            # Broadcast compressed dataset info
-            data_to_sync = {
-                'image_files': self.image_files,
-                'caption_files': self.caption_files,
-                'dim_cache': np.array(self.dim_cache)
-            }
-            broadcast_object(data_to_sync, src=0)
-        else:
-            # Receive validated dataset from main
-            synced_data = broadcast_object(None, src=0)
-            self.image_files = synced_data['image_files']
-            self.caption_files = synced_data['caption_files']
-            self.dim_cache = synced_data['dim_cache'].tolist()
-        
-        logger.info(f"Rank {get_rank()} received {len(self.image_files)} validated files")
+            except Exception as e:
+                continue
+                
+        return valid_images, valid_captions, valid_dims
 
     def _process_buckets(self):
         """CPU-based bucket processing with numpy"""
