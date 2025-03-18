@@ -72,12 +72,9 @@ class DDMDataset(Dataset):
                     glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True)
                 )
             
-            # Configure threading
-            num_workers = min(
-                getattr(self.config, 'dataset_threads', os.cpu_count()), 
-                len(all_image_paths)
-            )
-            chunk_size = max(100, len(all_image_paths) // (num_workers * 10))
+            # Configure threading (hardcoded values)
+            num_workers = getattr(self.config, 'dataset_threads', 8)  # Default 8 workers
+            chunk_size = 100  # Fixed chunk size of 100 files per thread
             
             # Shared progress counter
             manager = multiprocessing.Manager()
