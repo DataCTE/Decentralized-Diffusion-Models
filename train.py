@@ -4,10 +4,14 @@
 import os
 import torch
 import logging
+import multiprocessing
 from datetime import datetime, timedelta
 from tqdm import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Set multiprocessing start method to 'spawn'
+multiprocessing.set_start_method('spawn', force=True)
 
 # Import core components
 from trainers.coordinator import DDMTrainingCoordinator
