@@ -4,9 +4,6 @@ import torch
 from bitsandbytes.optim import AdamW8bit
 import math
 import os
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy, size_based_auto_wrap_policy
-from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch, CPUOffload
 
 from models.dit import ExpertDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
@@ -105,7 +102,7 @@ class ExpertTrainer(BaseTrainer):
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * noise
             
-           
+            # Text conditioning (paper section 4.1)
             text_embeds = self.clip.encode(batch["caption"])
             
             # Expert prediction of flow field u_t(x_t) (Equation 6)
