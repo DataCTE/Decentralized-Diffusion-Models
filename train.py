@@ -6,7 +6,7 @@ import torch
 import logging
 import multiprocessing
 from datetime import datetime, timedelta
-from tqdm import tqdm
+
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 

@@ -193,15 +193,42 @@ class DDMTrainingCoordinator:
     
     def train_experts(self, batch):
         """Train expert models using the DDM approach"""
+        total_loss = 0.0
+        
+        # Define the expert builder function that will be used to create experts when needed
+        def expert_builder_fn(expert_idx):
+            # Import the actual expert trainer class we have
+            from trainers.expert import ExpertTrainer
+            
+            # Create a new expert trainer with proper initialization 
+            expert = ExpertTrainer(
+                expert_idx=expert_idx,
+                config=self.config,
+                device=self.device,
+                rank=self.rank,
+                world_size=self.world_size
+            )
+            return expert
+        
+        # Train each expert assigned to this process
         for expert_idx in self.expert_indices:
-            # Get expert from cache manager
-            expert = self.cache_manager.get_expert(expert_idx)
-            expert.train_step(batch)
+            # Get expert from cache manager with the builder function
+            expert = self.cache_manager.get_expert(expert_idx, expert_builder_fn)
+            
+            # Perform training step and accumulate loss
+            loss = expert.train_step(batch)
+            total_loss += loss
+        
+        # Return average loss across experts
+        return total_loss / max(len(self.expert_indices), 1)
     
     def train_router(self, batch):
         """Train router model using expert assignments as supervision"""
         # Distributed router training
-        self.router.train_step(batch)
+        loss = self.router.train_step(batch)
+        
+        # Return the loss value so it can be logged
+        return loss
     
     def validate(self, step):
         """Run validation using DDM inference process"""
