@@ -203,6 +203,15 @@ class DDMDataset(Dataset):
             # Now broadcast the valid files in small batches to prevent timeouts
             self.logger.info(f"Rank {self.rank}: Broadcasting {len(valid_files)} valid files in batches of {broadcast_batch_size}")
             
+            # Add progress tracking for broadcasting phase
+            broadcast_start = time.time()
+            broadcast_pbar = tqdm(
+                total=len(valid_files),
+                desc="Broadcasting Data",
+                unit="file",
+                dynamic_ncols=True
+            )
+            
             # Broadcast in small chunks
             for i in range(0, len(valid_files), broadcast_batch_size):
                 end_idx = min(i + broadcast_batch_size, len(valid_files))
@@ -218,9 +227,12 @@ class DDMDataset(Dataset):
                 }
                 
                 try:
-                    self.logger.info(f"Rank {self.rank}: Broadcasting batch {i//broadcast_batch_size + 1}/{(len(valid_files) + broadcast_batch_size - 1) // broadcast_batch_size} with {len(batch_images)} files")
+                    batch_num = i//broadcast_batch_size + 1
+                    total_batches = (len(valid_files) + broadcast_batch_size - 1) // broadcast_batch_size
+                    self.logger.info(f"Rank {self.rank}: Broadcasting batch {batch_num}/{total_batches} ({end_idx-i} files, {i} processed so far)")
                     broadcast_object(batch_data, src=0)
                     time.sleep(0.1)  # Short sleep to prevent overwhelming receivers
+                    broadcast_pbar.update(len(batch_images))
                 except Exception as e:
                     self.logger.error(f"Rank {self.rank}: Error broadcasting batch {i//broadcast_batch_size + 1}: {str(e)}")
                     # Try again with a smaller batch if this fails
@@ -231,6 +243,10 @@ class DDMDataset(Dataset):
                         i -= broadcast_batch_size
                         broadcast_batch_size = smaller_batch_size
                         continue
+            
+            broadcast_pbar.close()
+            broadcast_time = time.time() - broadcast_start
+            self.logger.info(f"Rank {self.rank}: Broadcasting complete in {broadcast_time:.2f}s")
             
             # Send final "done" signal
             self.logger.info(f"Rank {self.rank}: Sending completion signal after {len(valid_files)} valid pairs")
@@ -303,6 +319,9 @@ class DDMDataset(Dataset):
 
     def _init_buckets(self):
         """CPU-based bucket initialization"""
+        self.logger.info(f"Rank {self.rank}: Starting bucket assignment for {len(self.image_files)} images...")
+        bucket_start = time.time()
+        
         # Calculate aspect ratios
         bucket_aspects = self.bucket_dims[:,0] / self.bucket_dims[:,1]
         image_aspects = self.dim_cache[:,0] / self.dim_cache[:,1]
@@ -311,15 +330,47 @@ class DDMDataset(Dataset):
         diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
         self.bucket_assignments = torch.argmin(diffs, dim=1)
         
-        self.logger.info(f"Bucket assignment completed: {self.bucket_dims.shape[0]} buckets")
+        # Count images per bucket for logging
+        bucket_counts = {}
+        for i in range(self.bucket_dims.shape[0]):
+            count = torch.sum(self.bucket_assignments == i).item()
+            if count > 0:
+                bucket_counts[i] = count
+        
+        bucket_time = time.time() - bucket_start
+        self.logger.info(f"Rank {self.rank}: Bucket assignment completed in {bucket_time:.2f}s - {len(bucket_counts)} buckets used")
+        
+        # Log distribution stats
+        top_buckets = sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        for bucket_idx, count in top_buckets:
+            bucket_size = tuple(self.bucket_dims[bucket_idx].tolist())
+            self.logger.info(f"Rank {self.rank}: Bucket {bucket_idx} ({bucket_size}): {count} images")
 
     def _distribute_samples(self):
         """CPU-based expert distribution"""
+        self.logger.info(f"Rank {self.rank}: Starting expert assignment for {len(self.image_files)} images...")
+        expert_start = time.time()
+        
         # Create expert assignments using modulo
         indices = torch.arange(len(self.image_files), device=self.device)
         self.expert_assignments = indices % self.num_experts
         
-        self.logger.info(f"Expert distribution completed: {self.num_experts.item()} experts")
+        # Count images per expert for logging
+        expert_counts = {}
+        for i in range(self.num_experts.item()):
+            count = torch.sum(self.expert_assignments == i).item()
+            expert_counts[i] = count
+            
+        expert_time = time.time() - expert_start
+        self.logger.info(f"Rank {self.rank}: Expert distribution completed in {expert_time:.2f}s")
+        
+        # Log distribution for this rank
+        this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
+        self.logger.info(f"Rank {self.rank}: Will process {this_rank_count} images ({this_rank_count/len(self.image_files)*100:.1f}% of dataset)")
+        
+        # Log total info
+        dataset_prep_complete = time.time()
+        self.logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
 
     def __getitem__(self, idx):
         """Get a training sample with image and caption"""
@@ -342,7 +393,49 @@ class DDMDataset(Dataset):
     def __len__(self):
         """Get dataset length"""
         return len(self.image_files)
-    
+        
+    def get_status_summary(self):
+        """Generate a user-friendly status summary of dataset processing"""
+        if not hasattr(self, 'image_files') or len(self.image_files) == 0:
+            return {
+                "status": "incomplete",
+                "message": "Dataset processing has not completed or failed",
+                "images_found": 0
+            }
+            
+        # Count buckets actually used
+        bucket_counts = {}
+        if hasattr(self, 'bucket_assignments'):
+            for i in range(self.bucket_dims.shape[0]):
+                count = torch.sum(self.bucket_assignments == i).item()
+                if count > 0:
+                    bucket_counts[i] = count
+        
+        # Count images per expert
+        expert_counts = {}
+        if hasattr(self, 'expert_assignments'):
+            for i in range(self.num_experts.item()):
+                count = torch.sum(self.expert_assignments == i).item()
+                if count > 0:
+                    expert_counts[i] = count
+        
+        # Images for this rank
+        this_rank_count = 0
+        if hasattr(self, 'expert_assignments'):
+            this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
+        
+        return {
+            "status": "complete",
+            "rank": self.rank,
+            "total_images": len(self.image_files),
+            "total_buckets": len(bucket_counts),
+            "total_experts": len(expert_counts),
+            "images_for_this_rank": this_rank_count,
+            "percent_for_this_rank": f"{this_rank_count/len(self.image_files)*100:.1f}%",
+            "top_buckets": sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:3],
+            "expert_distribution": expert_counts
+        }
+
     def _default_transform(self, img, bucket_idx=None):
         """Apply default transformations based on bucket dimensions"""
         # Get target dimensions from bucket if provided
@@ -445,6 +538,9 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
     logger.info(f"Rank {rank}: Using CPU for bucket sampler to avoid NCCL conflicts")
     
+    loader_start = time.time()
+    logger.info(f"Rank {rank}: Starting DataLoader creation for {dataset.num_experts.item()} experts")
+    
     # Get expert assignments directly from GPU tensor
     expert_assignments = dataset.expert_assignments.cpu().numpy()
     expert_indices = defaultdict(list)
@@ -453,8 +549,19 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     for idx in np.nditer(np.where(expert_assignments >= 0)):
         expert_idx = expert_assignments[idx]
         expert_indices[expert_idx].append(idx.item())
+    
+    # Log expert distribution stats
+    total_indices = sum(len(indices) for indices in expert_indices.values())
+    logger.info(f"Rank {rank}: Collected {total_indices} indices across {len(expert_indices)} active experts")
 
     expert_loaders = {}
+    expert_pbar = tqdm(
+        total=len(expert_indices),
+        desc="Creating Expert Loaders",
+        unit="expert", 
+        dynamic_ncols=True
+    )
+    
     for expert_idx, indices in expert_indices.items():
         # Create GPU-optimized bucket indices
         bucket_indices = defaultdict(list)
@@ -462,7 +569,10 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             bucket_idx = dataset.bucket_assignments[idx].item()
             bucket_indices[bucket_idx].append(idx)
         
+        logger.info(f"Rank {rank}: Expert {expert_idx} uses {len(bucket_indices)} different buckets with {len(indices)} total images")
+        
         # Create GPU-accelerated sampler
+        sampler_start = time.time()
         sampler = BucketBatchSampler(
             bucket_indices=bucket_indices,
             batch_size=config.expert_batch_size,
@@ -470,8 +580,11 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             shuffle=True,
             drop_last=True
         )
+        sampler_time = time.time() - sampler_start
+        logger.info(f"Rank {rank}: Created sampler for expert {expert_idx} in {sampler_time:.2f}s")
         
         # Configure loader with GPU optimizations
+        loader_config_start = time.time()
         loader = DataLoader(
             dataset,
             batch_sampler=sampler,
@@ -482,17 +595,27 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             multiprocessing_context='spawn' if config.num_workers > 0 else None,
             generator=torch.Generator(device='cpu')  # Always use CPU generator for consistency
         )
+        loader_config_time = time.time() - loader_config_start
         
         # Warmup pipeline (no need to load directly to GPU here)
+        warmup_start = time.time()
         try:
             for _ in range(1):
                 next(iter(loader), None)
                 break
+            warmup_time = time.time() - warmup_start
+            logger.info(f"Rank {rank}: Warmup for expert {expert_idx} completed in {warmup_time:.2f}s")
         except Exception as e:
-            logger.warning(f"Warmup failed: {str(e)}. This is non-critical and training will continue.")
+            logger.warning(f"Rank {rank}: Warmup failed for expert {expert_idx}: {str(e)}. This is non-critical and training will continue.")
         
         expert_loaders[expert_idx] = loader
-        logger.info(f"Created optimized loader for expert {expert_idx} "
-                   f"with {len(sampler)} batches")
+        logger.info(f"Rank {rank}: Created optimized loader for expert {expert_idx} "
+                   f"with {len(sampler)} batches (config: {loader_config_time:.2f}s)")
+        
+        expert_pbar.update(1)
+    
+    expert_pbar.close()
+    total_loader_time = time.time() - loader_start
+    logger.info(f"Rank {rank}: DataLoader creation complete in {total_loader_time:.2f}s - {len(expert_loaders)} expert loaders created")
         
     return expert_loaders 

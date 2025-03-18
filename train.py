@@ -39,6 +39,12 @@ def main():
     if rank == 0:
         setup_logger(config.output_dir)
         log_training_start(logging.getLogger(), config, rank)
+        
+        # Show dataset initialization message
+        print("="*50)
+        print(" Initializing dataset - this may take a few minutes")
+        print(" Progress logs will be shown during the process")
+        print("="*50)
     
     # Create expert cache manager
     cache_manager = ExpertCacheManager(
@@ -49,6 +55,9 @@ def main():
     )
 
     try:
+        # Initialize coordinator with progress tracking
+        start_time = datetime.now()
+        
         # Initialize training coordinator
         coordinator = DDMTrainingCoordinator(
             config=config,
@@ -56,6 +65,11 @@ def main():
             world_size=world_size,
             cache_manager=cache_manager
         )
+        
+        # Log dataset initialization completion time
+        init_time = datetime.now() - start_time
+        if rank == 0:
+            print(f"Dataset initialization completed in {init_time.total_seconds():.2f} seconds")
 
         # Load checkpoint if available
         if config.resume_checkpoint:

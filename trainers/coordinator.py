@@ -9,14 +9,23 @@ from torch.utils.data.distributed import DistributedSampler
 import threading
 from tqdm.auto import tqdm
 import concurrent.futures
+import logging
+import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Import needed components
 from trainers.router import RouterTrainer
 from trainers.sampling import ddm_sample
 from trainers.diffusion import DecentralizedFlowMatcher
-from data.dataset import DDMDataset
+from data.dataset import DDMDataset, create_expert_bucket_loaders
 from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
+from utils.distributed import is_main_process, get_rank, get_world_size
+from models.experts import DDMExpert
+from models.router import DDMRouter
+from utils.debug import debug_print
+from utils.checkpoint import save_checkpoint
 
 # Setup logger
 logger = setup_logger("DDMCoordinator")
@@ -121,6 +130,24 @@ class DDMTrainingCoordinator:
             config=self.config,
             split='val'
         )
+        
+        # Print dataset status summary for the user if main process
+        if is_main_process():
+            train_summary = train_dataset.get_status_summary()
+            debug_print("========== DATASET INITIALIZATION COMPLETE ==========", self.rank, force=True)
+            debug_print(f"Training dataset: {train_summary['total_images']} valid image-caption pairs", self.rank, force=True)
+            debug_print(f"Using {train_summary['total_buckets']} bucket sizes for efficient batching", self.rank, force=True)
+            debug_print(f"Distributing across {train_summary['total_experts']} expert GPUs", self.rank, force=True)
+            
+            # Show top bucket information
+            debug_print("Top 3 most common image bucket sizes:", self.rank, force=True)
+            for bucket_idx, count in train_summary['top_buckets']:
+                bucket_size = tuple(train_dataset.bucket_dims[bucket_idx].tolist())
+                debug_print(f"  • {bucket_size}: {count} images ({count/train_summary['total_images']*100:.1f}%)", self.rank, force=True)
+            
+            # Show this rank's workload
+            debug_print(f"This process (rank {self.rank}) will handle {train_summary['images_for_this_rank']} images ({train_summary['percent_for_this_rank']})", self.rank, force=True)
+            debug_print("====================================================", self.rank, force=True)
         
         # Create distributed samplers if in distributed training
         if self.world_size > 1:
