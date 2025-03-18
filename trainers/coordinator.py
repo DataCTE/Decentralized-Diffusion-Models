@@ -120,12 +120,14 @@ class DDMTrainingCoordinator:
         debug_print(f"Creating data loaders on rank {self.rank}", self.rank, force=True)
         
         # Initialize the dataset
+        debug_print(f"Loading training dataset on rank {self.rank}", self.rank, force=True)
         train_dataset = DDMDataset(
             config=self.config,
             split='train'
         )
         
         # Create validation dataset
+        debug_print(f"Loading validation dataset on rank {self.rank} (may reuse cached validation)", self.rank, force=True)
         val_dataset = DDMDataset(
             config=self.config,
             split='val'

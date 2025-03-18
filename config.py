@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
     'warmup_steps': 1000,
     'max_grad_norm': 1.0,
     'use_mixed_precision': True,
+    'resume_checkpoint': None,  # Add resume checkpoint path (None = don't resume)
     
     # ===== DDM Model parameters =====
     'num_experts': 8,
@@ -78,6 +79,8 @@ DEFAULT_CONFIG = {
     'validate_every': 1000,
     'generate_every': 1000,
     'sample_count': 4,
+    'checkpoint_interval': 5000,  # How often to save checkpoints
+    'validation_interval': 1000,  # How often to run validation
     
     # ===== Distributed training =====
     'save_from_all_ranks': False,

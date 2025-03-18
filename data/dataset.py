@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 
 import math  # For BucketBatchSampler
 
-
+# Add global cache to avoid duplicate validation
+_GLOBAL_DATASET_CACHE = {
+    "initialized": False,
+    "image_files": [],
+    "caption_files": [],
+    "dim_cache": None,
+}
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from list"""
@@ -86,6 +92,24 @@ class DDMDataset(Dataset):
 
     def _discover_and_process_files(self):
         """Find valid image-caption pairs in a single efficient pass"""
+        global _GLOBAL_DATASET_CACHE
+        
+        # If cache is already initialized by another dataset instance, use it
+        if _GLOBAL_DATASET_CACHE["initialized"] and is_main_process():
+            self.logger.info(f"Rank {self.rank}: Using cached dataset with {len(_GLOBAL_DATASET_CACHE['image_files'])} files")
+            self.image_files = _GLOBAL_DATASET_CACHE["image_files"]
+            self.caption_files = _GLOBAL_DATASET_CACHE["caption_files"]
+            self.dim_cache = _GLOBAL_DATASET_CACHE["dim_cache"]
+            
+            # If we're using the validation split, we'll need to filter later
+            return
+        elif not is_main_process() and _GLOBAL_DATASET_CACHE["initialized"]:
+            # Non-main processes also use the cache if it exists
+            self.image_files = _GLOBAL_DATASET_CACHE["image_files"]
+            self.caption_files = _GLOBAL_DATASET_CACHE["caption_files"]
+            self.dim_cache = _GLOBAL_DATASET_CACHE["dim_cache"]
+            return
+        
         if not self.config.dataset_path:
             raise ValueError("Dataset path must be provided")
         
@@ -136,6 +160,13 @@ class DDMDataset(Dataset):
                 # Convert dimensions to tensor
                 self.dim_cache = torch.tensor(all_dims, device=self.device, dtype=torch.int32)
                 self.logger.info(f"Rank {self.rank}: Successfully received {len(self.image_files)} valid image-caption pairs")
+                
+                # Update the global cache
+                _GLOBAL_DATASET_CACHE["image_files"] = self.image_files
+                _GLOBAL_DATASET_CACHE["caption_files"] = self.caption_files
+                _GLOBAL_DATASET_CACHE["dim_cache"] = self.dim_cache
+                _GLOBAL_DATASET_CACHE["initialized"] = True
+                
             except Exception as e:
                 self.logger.error(f"Rank {self.rank}: Critical error during file reception: {str(e)}")
                 raise
@@ -257,6 +288,12 @@ class DDMDataset(Dataset):
             self.caption_files = caption_files
             self.dim_cache = torch.tensor(valid_dims, device=self.device, dtype=torch.int32)
             
+            # Update the global cache
+            _GLOBAL_DATASET_CACHE["image_files"] = self.image_files
+            _GLOBAL_DATASET_CACHE["caption_files"] = self.caption_files
+            _GLOBAL_DATASET_CACHE["dim_cache"] = self.dim_cache
+            _GLOBAL_DATASET_CACHE["initialized"] = True
+            
             # Log summary
             self.logger.info(f"Rank {self.rank}: Completed with {len(valid_files)} valid image-caption pairs")
         except Exception as e:
@@ -319,6 +356,38 @@ class DDMDataset(Dataset):
 
     def _init_buckets(self):
         """CPU-based bucket initialization"""
+        # Before bucket assignment, handle train/val split if using cache
+        if self.split == 'val' and _GLOBAL_DATASET_CACHE["initialized"]:
+            # If this is the validation dataset and we're using cached data, 
+            # select only a subset for validation
+            val_size = getattr(self.config, 'val_size', 1000)
+            if val_size < len(self.image_files):
+                # Use deterministic selection to ensure consistency
+                all_indices = np.arange(len(self.image_files))
+                np.random.seed(42)  # Fixed seed for reproducibility
+                val_indices = np.random.choice(all_indices, size=val_size, replace=False)
+                
+                # Filter files for validation
+                self.image_files = [self.image_files[i] for i in val_indices]
+                self.caption_files = [self.caption_files[i] for i in val_indices]
+                self.dim_cache = self.dim_cache[val_indices]
+                self.logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for validation split")
+        elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
+            # For training, exclude validation samples if specified
+            val_size = getattr(self.config, 'val_size', 1000)
+            if val_size > 0 and val_size < len(self.image_files):
+                # Use same deterministic selection as above
+                all_indices = np.arange(len(self.image_files))
+                np.random.seed(42)  # Fixed seed for reproducibility
+                val_indices = np.random.choice(all_indices, size=val_size, replace=False)
+                train_indices = np.setdiff1d(all_indices, val_indices)
+                
+                # Filter files for training
+                self.image_files = [self.image_files[i] for i in train_indices]
+                self.caption_files = [self.caption_files[i] for i in train_indices]
+                self.dim_cache = self.dim_cache[train_indices]
+                self.logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for training split (excluded {val_size} validation files)")
+        
         self.logger.info(f"Rank {self.rank}: Starting bucket assignment for {len(self.image_files)} images...")
         bucket_start = time.time()
         
