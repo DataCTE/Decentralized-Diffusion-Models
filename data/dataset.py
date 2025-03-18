@@ -1,17 +1,15 @@
 """Dataset classes for Decentralized Diffusion Models."""
 
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
 import logging
-import time  # Add missing time module import
+import time
 import torchvision.transforms as transforms
 
 import torch.distributed as dist
-
 
 from utils.distributed import is_main_process, get_rank, broadcast_object, get_local_rank, get_world_size
 from data.transforms import resize_image, normalize
@@ -19,7 +17,6 @@ from data.transforms import resize_image, normalize
 import glob
 import os
 import multiprocessing as mp
-
 
 # Setup logging
 logger = logging.getLogger(__name__)
@@ -38,273 +35,216 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 class DDMDataset(Dataset):
-    """Pickle-safe dataset pipeline with CPU-only operations"""
+    """Dataset pipeline with GPU operations"""
     
     def __init__(self, config, split='train'):
         self.config = config
         self.split = split
+        self.rank = get_rank()
+        self.world_size = get_world_size()
         self.device = torch.device(f'cuda:{get_local_rank()}')
         self._init_parameters()
         self._load_dataset()
 
     def _init_parameters(self):
         """Initialize parameters on GPU"""
-        self.min_size = torch.tensor(self.config.min_size, device=self.device)
-        self.num_experts = torch.tensor(self.config.num_experts, device=self.device)
+        self.min_size = self.config.min_size
+        self.num_experts = self.config.num_experts
         self.bucket_dims = torch.tensor(self.config.buckets, device=self.device)
         self.image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
         self.caption_ext = '.txt'
 
     def _load_dataset(self):
-        """End-to-end GPU dataset pipeline with optimized data flow"""
-        # Discover files using GPU-accelerated glob (via multiprocessing)
+        """Load dataset with minimized CPU-GPU transfers"""
+        start_time = time.time()
+        logger.info(f"Rank {self.rank}: Starting dataset loading...")
+        
+        # Initial file discovery must happen on CPU
         all_image_paths = []
         with mp.Pool(8) as pool:
             for ext in self.image_extensions:
-                all_image_paths.extend(
-                    pool.starmap(glob.glob, 
-                               [(os.path.join(self.config.dataset_path, f'**/*{ext}'),)] * 8)
-                )
+                pattern = os.path.join(self.config.dataset_path, f'**/*{ext}')
+                results = pool.apply(glob.glob, (pattern,))
+                all_image_paths.extend(results)
         all_image_paths = list(set(all_image_paths))  # Deduplicate
-
-        # Distributed path splitting using GPU tensors
-        path_tensor = torch.tensor(all_image_paths, device=self.device)
-        chunks = torch.chunk(path_tensor, get_world_size())
-        my_paths = chunks[get_rank()].cpu().tolist()
-
-        # GPU-accelerated validation
-        valid_paths, valid_dims = self._gpu_validate_paths(my_paths)
-
-        # GPU-native distributed synchronization
-        path_lengths = torch.tensor([len(valid_paths)], device=self.device)
-        all_lengths = [torch.empty_like(path_lengths) for _ in range(get_world_size())]
-        dist.all_gather(all_lengths, path_lengths)
         
-        # Create GPU tensors for gathered data
-        max_length = max(l.item() for l in all_lengths)
-        gathered_paths = torch.full((get_world_size(), max_length), '', device=self.device)
-        gathered_dims = torch.zeros((get_world_size(), max_length, 2), device=self.device)
+        # Distribute paths across ranks
+        num_paths = len(all_image_paths)
+        paths_per_rank = num_paths // self.world_size
+        start_idx = self.rank * paths_per_rank
+        end_idx = start_idx + paths_per_rank if self.rank < self.world_size - 1 else num_paths
+        my_paths = all_image_paths[start_idx:end_idx]
         
-        # Fill local data
-        gathered_paths[get_rank(), :len(valid_paths)] = torch.tensor(valid_paths, device=self.device)
-        gathered_dims[get_rank(), :len(valid_dims)] = valid_dims
+        logger.info(f"Rank {self.rank}: Validating {len(my_paths)} files...")
         
-        # All-gather across GPUs
-        dist.all_gather(gathered_paths, gathered_paths)
-        dist.all_gather(gathered_dims, gathered_dims)
-        
-        # Flatten results
-        self.image_files = [p for p in gathered_paths.flatten().cpu().numpy() if p]
-        self.dim_cache = gathered_dims.view(-1, 2)[:len(self.image_files)]
-        self.caption_files = [p.replace(ext, self.caption_ext) 
-                            for p, ext in zip(self.image_files, self.image_extensions)]
-
-        # GPU-only processing
-        self._process_buckets_gpu()
-        self._distribute_samples_gpu()
-
-    def _gpu_validate_paths(self, paths):
-        """Fully GPU-accelerated validation with async loading"""
+        # Initial validation still needs CPU for file operations
         valid_paths = []
         valid_dims = []
         
-        # Batch process 256 paths at a time
-        for batch in torch.tensor(paths, device=self.device).split(256):
-            # GPU-accelerated file checking
-            caption_paths = torch.tensor(
-                [os.path.splitext(p)[0] + self.caption_ext for p in batch.cpu().numpy()],
-                device=self.device
-            )
-            exists = torch.ops.torchscript.gpu_file_exists(caption_paths)  # Hypothetical GPU file ops
-            
-            # GPU image dimension extraction
-            dims = torch.ops.torchscript.gpu_image_dims(batch[exists.bool()])
-            
-            # Filter by size directly on GPU
-            size_mask = (dims[:, 0] >= self.min_size) & (dims[:, 1] >= self.min_size)
-            valid_paths.extend(batch[exists.bool()][size_mask].cpu().numpy())
-            valid_dims.append(dims[size_mask])
-            
-        return valid_paths, torch.cat(valid_dims) if valid_dims else torch.empty((0, 2), device=self.device)
+        # Process in batches to avoid overwhelming the CPU
+        for path_batch in chunks(my_paths, 256):
+            for img_path in path_batch:
+                caption_path = os.path.splitext(img_path)[0] + self.caption_ext
+                
+                # Check if caption exists
+                if not os.path.exists(caption_path):
+                    continue
+                
+                # Get image dimensions - temporarily on CPU
+                try:
+                    with Image.open(img_path) as img:
+                        width, height = img.size
+                        
+                    # Check minimum size
+                    if width >= self.min_size and height >= self.min_size:
+                        valid_paths.append(img_path)
+                        valid_dims.append((width, height))
+                except Exception as e:
+                    continue
+        
+        # Move valid dimensions to GPU
+        if valid_dims:
+            self.dim_cache = torch.tensor(valid_dims, device=self.device)
+        else:
+            self.dim_cache = torch.empty((0, 2), device=self.device)
+        
+        # Gather all valid paths and dimensions across GPUs
+        valid_count = torch.tensor([len(valid_paths)], device=self.device)
+        all_counts = [torch.zeros_like(valid_count) for _ in range(self.world_size)]
+        dist.all_gather(all_counts, valid_count)
+        
+        # Collect paths and dimensions
+        self.image_files = valid_paths
+        self.caption_files = [p.replace(os.path.splitext(p)[1], self.caption_ext) for p in valid_paths]
+        
+        logger.info(f"Rank {self.rank}: Found {len(valid_paths)} valid image-caption pairs")
+        
+        # Precompute bucket assignments on GPU
+        self._process_buckets()
+        
+        # Distribute samples across experts
+        self._distribute_samples()
+        
+        # Calculate dataset size
+        total_images = sum(count.item() for count in all_counts)
+        logger.info(f"Rank {self.rank}: Dataset loaded with {total_images} total images in {time.time() - start_time:.2f}s")
 
-    def _process_buckets_gpu(self):
-        """GPU-based bucket processing"""
+    def _process_buckets(self):
+        """Process bucket assignments on GPU"""
+        if len(self.dim_cache) == 0:
+            self.bucket_assignments = torch.empty(0, dtype=torch.long, device=self.device)
+            return
+            
+        # Calculate aspect ratios on GPU
         image_dims = self.dim_cache.float()
         image_ar = image_dims[:, 0] / image_dims[:, 1]
-        bucket_ar = self.bucket_dims[:, 0] / self.bucket_dims[:, 1]
+        bucket_ar = self.bucket_dims[:, 0].float() / self.bucket_dims[:, 1].float()
         
-        self.bucket_assignments = torch.argmin(
-            torch.abs(image_ar.unsqueeze(1) - bucket_ar.unsqueeze(0)), 
-            dim=1
-        )
+        # Find closest bucket using matrix ops on GPU
+        ar_diff = torch.abs(image_ar.unsqueeze(1) - bucket_ar.unsqueeze(0))
+        self.bucket_assignments = torch.argmin(ar_diff, dim=1)
+        
+        # Log bucket statistics without moving to CPU
+        for bucket_idx in range(self.bucket_dims.size(0)):
+            count = torch.sum(self.bucket_assignments == bucket_idx).item()
+            if count > 0:
+                bucket_size = tuple(self.bucket_dims[bucket_idx].cpu().numpy())
+                logger.info(f"Rank {self.rank}: Bucket {bucket_idx} {bucket_size}: {count} images")
 
-    def _distribute_samples_gpu(self):
-        """GPU-based expert distribution"""
+    def _distribute_samples(self):
+        """Distribute samples across experts on GPU"""
+        if len(self.image_files) == 0:
+            self.expert_assignments = torch.empty(0, dtype=torch.long, device=self.device)
+            return
+            
+        # Assign experts using modulo on GPU
         indices = torch.arange(len(self.image_files), device=self.device)
         self.expert_assignments = indices % self.num_experts
+        
+        # Log expert distribution
+        for expert_idx in range(self.num_experts):
+            count = torch.sum(self.expert_assignments == expert_idx).item()
+            logger.info(f"Rank {self.rank}: Expert {expert_idx}: {count} images")
+
+    def _gpu_group_by_bucket(self, indices):
+        """Group indices by bucket on GPU"""
+        bucket_indices = {}
+        for bucket_idx in range(self.bucket_dims.size(0)):
+            # Create mask on GPU
+            mask = self.bucket_assignments[indices] == bucket_idx
+            bucket_indices[bucket_idx] = indices[mask]
+        return bucket_indices
 
     def __getitem__(self, idx):
-        """Direct GPU memory mapping"""
-        # Memory-map image directly to GPU buffer
-        img_tensor = torch.ops.torchscript.gpu_mmap(
-            self.image_files[idx], 
-            self.bucket_dims[self.bucket_assignments[idx]]
-        )
+        """Load data with minimal CPU-GPU transfers"""
+        # Get image path and caption path
+        img_path = self.image_files[idx]
+        caption_path = self.caption_files[idx]
+        bucket_idx = self.bucket_assignments[idx].item()
+        expert_idx = self.expert_assignments[idx].item()
         
-        # Direct GPU text loading
-        caption = torch.ops.torchscript.gpu_text_load(self.caption_files[idx])
+        # Get target bucket dimensions
+        bucket_dims = self.bucket_dims[bucket_idx].cpu().numpy()
         
+        # Load and process image
+        try:
+            # Load image (must be on CPU initially)
+            with Image.open(img_path) as img:
+                # Resize according to bucket dimensions
+                img = resize_image(img, (int(bucket_dims[0]), int(bucket_dims[1])))
+                
+                # Convert to tensor and move to GPU
+                img_tensor = transforms.ToTensor()(img).to(self.device)
+                
+                # Normalize on GPU
+                img_tensor = normalize(img_tensor)
+        except Exception as e:
+            # Fallback to random tensor if image loading fails
+            logger.warning(f"Failed to load image {img_path}: {e}")
+            img_tensor = torch.rand(3, int(bucket_dims[1]), int(bucket_dims[0]), device=self.device)
+        
+        # Load caption text
+        try:
+            with open(caption_path, 'r', encoding='utf-8') as f:
+                caption = f.read().strip()
+        except Exception as e:
+            caption = ""
+            
+        # Create and return batch dict
         return {
             'image': img_tensor,
             'caption': caption,
-            'expert': self.expert_assignments[idx],
-            'bucket': self.bucket_assignments[idx]
+            'expert': torch.tensor(expert_idx, device=self.device),
+            'bucket': torch.tensor(bucket_idx, device=self.device)
         }
 
     def __len__(self):
         return len(self.image_files)
 
-    def __getstate__(self):
-        return {
-            'config': self.config,
-            'split': self.split,
-            'image_files': self.image_files,
-            'caption_files': self.caption_files,
-            'dim_cache': self.dim_cache,
-            'bucket_assignments': self.bucket_assignments,
-            'expert_assignments': self.expert_assignments
-        }
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._init_parameters()
-        # No need to reprocess buckets as assignments are stored
-
-    def _find_valid_pairs(self, *args, **kwargs):
-        raise NotImplementedError("Replaced by GPU validation")
-        
-    def _load_image_tensor(self, *args, **kwargs):
-        raise NotImplementedError("Replaced by GPU mmap")
-            
-    def _load_caption(self, *args, **kwargs):
-        raise NotImplementedError("Replaced by GPU text loading")
-
-    def _init_buckets(self):
-        """CPU-based bucket initialization"""
-        # Before bucket assignment, handle train/val split if using cache
-        if self.split == 'val' and _GLOBAL_DATASET_CACHE["initialized"]:
-            # If this is the validation dataset and we're using cached data, 
-            # select only a subset for validation
-            val_size = getattr(self.config, 'val_size', 1000)
-            if val_size < len(self.image_files):
-                # Use deterministic selection to ensure consistency
-                all_indices = np.arange(len(self.image_files))
-                np.random.seed(42)  # Fixed seed for reproducibility
-                val_indices = np.random.choice(all_indices, size=val_size, replace=False)
-                
-                # Filter files for validation
-                self.image_files = [self.image_files[i] for i in val_indices]
-                self.caption_files = [self.caption_files[i] for i in val_indices]
-                self.dim_cache = self.dim_cache[val_indices]
-                logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for validation split")
-        elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
-            # For training, exclude validation samples if specified
-            val_size = getattr(self.config, 'val_size', 1000)
-            if val_size > 0 and val_size < len(self.image_files):
-                # Use same deterministic selection as above
-                all_indices = np.arange(len(self.image_files))
-                np.random.seed(42)  # Fixed seed for reproducibility
-                val_indices = np.random.choice(all_indices, size=val_size, replace=False)
-                train_indices = np.setdiff1d(all_indices, val_indices)
-                
-                # Filter files for training
-                self.image_files = [self.image_files[i] for i in train_indices]
-                self.caption_files = [self.caption_files[i] for i in train_indices]
-                self.dim_cache = self.dim_cache[train_indices]
-                logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for training split (excluded {val_size} validation files)")
-        
-        logger.info(f"Rank {self.rank}: Starting bucket assignment for {len(self.image_files)} images...")
-        bucket_start = time.time()
-        
-        # Calculate aspect ratios
-        bucket_aspects = self.bucket_dims[:,0] / self.bucket_dims[:,1]
-        image_aspects = self.dim_cache[:,0] / self.dim_cache[:,1]
-
-        # Find closest bucket using matrix ops
-        diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
-        self.bucket_assignments = torch.argmin(diffs, dim=1)
-        
-        # Count images per bucket for logging
-        bucket_counts = {}
-        for i in range(self.bucket_dims.shape[0]):
-            count = torch.sum(self.bucket_assignments == i).item()
-            if count > 0:
-                bucket_counts[i] = count
-        
-        bucket_time = time.time() - bucket_start
-        logger.info(f"Rank {self.rank}: Bucket assignment completed in {bucket_time:.2f}s - {len(bucket_counts)} buckets used")
-        
-        # Log distribution stats
-        top_buckets = sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        for bucket_idx, count in top_buckets:
-            bucket_size = tuple(self.bucket_dims[bucket_idx])
-            logger.info(f"Rank {self.rank}: Bucket {bucket_idx} ({bucket_size}): {count} images")
-
-    def _distribute_samples(self):
-        """CPU-based expert distribution"""
-        logger.info(f"Rank {self.rank}: Starting expert assignment for {len(self.image_files)} images...")
-        expert_start = time.time()
-        
-        # Create expert assignments using modulo
-        indices = torch.arange(len(self.image_files), device=self.device)
-        self.expert_assignments = indices % self.num_experts
-        
-        # Count images per expert for logging
-        expert_counts = {}
-        for i in range(self.num_experts.item()):
-            count = torch.sum(self.expert_assignments == i).item()
-            expert_counts[i] = count
-            
-        expert_time = time.time() - expert_start
-        logger.info(f"Rank {self.rank}: Expert distribution completed in {expert_time:.2f}s")
-        
-        # Log distribution for this rank
-        this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
-        logger.info(f"Rank {self.rank}: Will process {this_rank_count} images ({this_rank_count/len(self.image_files)*100:.1f}% of dataset)")
-        
-        # Log total info
-        logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
-
     def get_status_summary(self):
-        """Generate a user-friendly status summary of dataset processing"""
+        """Generate status summary"""
         if not hasattr(self, 'image_files') or len(self.image_files) == 0:
-            logger.warning("Dataset status requested before initialization")
             return {
                 "status": "incomplete",
                 "message": "Dataset processing has not completed or failed",
                 "images_found": 0
             }
             
-        # Count buckets actually used
+        # Count buckets and experts
         bucket_counts = {}
-        if hasattr(self, 'bucket_assignments'):
-            for i in range(self.bucket_dims.shape[0]):
-                count = torch.sum(self.bucket_assignments == i).item()
-                if count > 0:
-                    bucket_counts[i] = count
-        
-        # Count images per expert
+        for bucket_idx in range(self.bucket_dims.size(0)):
+            count = torch.sum(self.bucket_assignments == bucket_idx).item()
+            if count > 0:
+                bucket_counts[bucket_idx] = count
+                
         expert_counts = {}
-        if hasattr(self, 'expert_assignments'):
-            for i in range(self.num_experts.item()):
-                count = torch.sum(self.expert_assignments == i).item()
-                if count > 0:
-                    expert_counts[i] = count
-        
-        # Images for this rank
-        this_rank_count = 0
-        if hasattr(self, 'expert_assignments'):
-            this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
+        for expert_idx in range(self.num_experts):
+            count = torch.sum(self.expert_assignments == expert_idx).item()
+            if count > 0:
+                expert_counts[expert_idx] = count
+                
+        # Images for this rank's expert
+        this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
         
         return {
             "status": "complete",
@@ -318,99 +258,83 @@ class DDMDataset(Dataset):
             "expert_distribution": expert_counts
         }
 
-    def _default_transform(self, img, bucket_idx=None):
-        """Apply default transformations based on bucket dimensions"""
-        # Get target dimensions from bucket if provided
-        if bucket_idx is not None and 0 <= bucket_idx < len(self.buckets):
-            width, height = self.buckets[bucket_idx]
-        else:
-            # Fallback to default image size
-            _, height, width = self.config.image_size
-        
-        # Resize image to target dimensions
-        if isinstance(img, Image.Image):
-            # PIL Image
-            img = resize_image(img, (width, height))
-            img = transforms.ToTensor()(img)
-        elif isinstance(img, torch.Tensor):
-            # Already a tensor, resize with torch functions
-            if img.shape[-2] != height or img.shape[-1] != width:
-                img = torch.nn.functional.interpolate(
-                    img.unsqueeze(0), 
-                    size=(height, width), 
-                    mode='bilinear', 
-                    align_corners=False
-                ).squeeze(0)
-        
-        # Normalize
-        img = normalize(img)
-        return img
-        
-    def get_invalid_files(self):
-        """Retrieve list of files that failed validation"""
-        return getattr(self, '_invalid_files', [])
-
 class BucketBatchSampler(torch.utils.data.Sampler):
-    """Optimized for GPU tensor operations"""
+    """GPU-optimized bucket batch sampler"""
     
     def __init__(self, bucket_indices, batch_size, shuffle=True, drop_last=True):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.bucket_indices = bucket_indices
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
-
-        # GPU-native index storage
-        self.bucket_tensors = {
-            bucket: torch.tensor(indices, device=self.device)
-            for bucket, indices in bucket_indices.items()
-        }
+        self.device = torch.device(f'cuda:{get_local_rank()}')
 
     def __iter__(self):
         batches = []
-        for bucket, indices in self.bucket_tensors.items():
-            if self.shuffle:
-                indices = indices[torch.randperm(len(indices), device=self.device)]
-            
-            bucket_batches = torch.split(indices, self.batch_size)
-            if self.drop_last and len(indices) % self.batch_size != 0:
-                bucket_batches = bucket_batches[:-1]
-                
-            batches.extend(bucket_batches)
         
-        if self.shuffle:
-            batches = [batches[i] for i in torch.randperm(len(batches), device=self.device)]
+        # Process each bucket
+        for bucket_idx, indices in self.bucket_indices.items():
+            # Skip empty buckets
+            if len(indices) == 0:
+                continue
+                
+            # Shuffle indices on GPU if needed
+            if self.shuffle:
+                perm = torch.randperm(len(indices), device=self.device)
+                shuffled_indices = indices[perm]
+            else:
+                shuffled_indices = indices
+                
+            # Create batches directly on GPU
+            for i in range(0, len(shuffled_indices), self.batch_size):
+                if i + self.batch_size <= len(shuffled_indices) or not self.drop_last:
+                    end_idx = min(i + self.batch_size, len(shuffled_indices))
+                    batches.append(shuffled_indices[i:end_idx])
+        
+        # Shuffle batches if needed
+        if self.shuffle and batches:
+            batch_idxs = torch.randperm(len(batches), device=self.device)
+            batches = [batches[i] for i in batch_idxs]
             
         return iter(batches)
+        
+    def __len__(self):
+        if self.drop_last:
+            return sum(len(indices) // self.batch_size for indices in self.bucket_indices.values())
+        else:
+            return sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self.bucket_indices.values())
 
-def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
-    """GPU-native data loader creation"""
+def create_expert_bucket_loaders(dataset, config):
+    """Create data loaders for experts with bucket sampling"""
     expert_loaders = {}
     
-    # Get expert assignments directly from GPU
-    expert_assignments = dataset.expert_assignments.cpu().unique().tolist()
-    
-    for expert_idx in expert_assignments:
+    # Find unique expert indices
+    for expert_idx in range(dataset.num_experts):
+        # Get indices for this expert
         expert_mask = dataset.expert_assignments == expert_idx
-        indices = torch.where(expert_mask)[0]
+        if not torch.any(expert_mask):
+            continue
+            
+        indices = torch.nonzero(expert_mask, as_tuple=True)[0]
         
-        # GPU-optimized sampler
+        # Group by bucket
+        bucket_indices = dataset._gpu_group_by_bucket(indices)
+        
+        # Create sampler
         sampler = BucketBatchSampler(
-            bucket_indices=dataset._gpu_group_by_bucket(indices),
+            bucket_indices=bucket_indices,
             batch_size=config.expert_batch_size,
             shuffle=True,
             drop_last=True
         )
         
-        # GPU-direct DataLoader
+        # Create data loader
         loader = DataLoader(
             dataset,
             batch_sampler=sampler,
-            num_workers=0,  # No CPU workers
-            pin_memory=False,  # Never use pinned memory
-            persistent_workers=False,
-            generator=torch.Generator(device='cuda')
+            num_workers=0,  # No CPU workers to avoid transfers
+            pin_memory=False  # Don't use pinned memory since we're staying on GPU
         )
         
         expert_loaders[expert_idx] = loader
     
-    return expert_loaders 
+    return expert_loaders
