@@ -73,7 +73,7 @@ class DDMDataset(Dataset):
                 )
             
             # Configure threading (hardcoded values)
-            num_workers = getattr(self.config, 'dataset_threads', 8)  # Default 8 workers
+            num_workers = 16  # Default 16 workers
             chunk_size = 100  # Fixed chunk size of 100 files per thread
             
             # Shared progress counter
