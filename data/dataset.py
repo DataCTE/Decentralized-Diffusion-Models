@@ -86,13 +86,25 @@ class DDMDataset(Dataset):
         
         # Process files synchronously across nodes
         if not is_main_process():
-            # Wait for main process to complete discovery with a very long timeout
-            valid_data = broadcast_object(None, src=0, timeout=360000)  # 100 hour timeout
-            self.image_files = valid_data['images']
-            self.caption_files = valid_data['captions']
-            self.dim_cache = torch.tensor(valid_data['dimensions'], 
-                                 device=self.device,
-                                 dtype=torch.int32)
+            # Receive batch counts first
+            batch_count = broadcast_object(None, src=0)
+            
+            # Initialize storage
+            self.image_files = []
+            self.caption_files = []
+            all_dims = []
+            
+            # Receive batches of data
+            for i in range(batch_count):
+                self.logger.info(f"Receiving batch {i+1}/{batch_count}")
+                batch_data = broadcast_object(None, src=0)
+                self.image_files.extend(batch_data['images'])
+                self.caption_files.extend(batch_data['captions'])
+                all_dims.extend(batch_data['dimensions'])
+            
+            # Convert dimensions to tensor
+            self.dim_cache = torch.tensor(all_dims, device=self.device, dtype=torch.int32)
+            self.logger.info(f"Received {len(self.image_files)} valid image-caption pairs")
             return
         
         self.logger.info(f"Finding image-caption pairs in {self.config.dataset_path}")
@@ -153,14 +165,27 @@ class DDMDataset(Dataset):
         # Log summary
         self.logger.info(f"Found {len(valid_files)} valid image-caption pairs")
         
-        # Broadcast to other processes with a very long timeout
-        self.logger.info(f"Broadcasting data with extended timeout (100 hours)")
-        valid_data = {
-            'images': valid_files,
-            'captions': caption_files,
-            'dimensions': valid_dims
-        }
-        broadcast_object(valid_data, src=0, timeout=360000)  # 100 hour timeout
+        # Broadcast to other processes in batches to reduce memory pressure
+        # Calculate batches (aim for ~1000 items per batch)
+        broadcast_batch_size = 1000
+        num_batches = (len(valid_files) + broadcast_batch_size - 1) // broadcast_batch_size
+        
+        # First broadcast the number of batches
+        self.logger.info(f"Broadcasting data in {num_batches} batches")
+        broadcast_object(num_batches, src=0)
+        
+        # Then broadcast each batch
+        for i in range(num_batches):
+            start_idx = i * broadcast_batch_size
+            end_idx = min((i + 1) * broadcast_batch_size, len(valid_files))
+            
+            batch_data = {
+                'images': valid_files[start_idx:end_idx],
+                'captions': caption_files[start_idx:end_idx],
+                'dimensions': valid_dims[start_idx:end_idx]
+            }
+            broadcast_object(batch_data, src=0)
+            self.logger.info(f"Broadcast batch {i+1}/{num_batches} ({end_idx-start_idx} items)")
     
     def _find_valid_pairs(self, image_files):
         """Find valid image-caption pairs from a batch of image files"""

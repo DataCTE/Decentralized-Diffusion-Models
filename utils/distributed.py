@@ -60,28 +60,17 @@ def broadcast_object(obj, src=0, group=None, device=None, timeout=None):
     else:
         size = torch.tensor([0], dtype=torch.long, device=device)
     
-    # Set the default timeout for all communications
-    if timeout is not None:
-        # Store the original timeout
-        old_timeout = dist.get_timeout()
-        # Set the new timeout
-        dist.set_timeout(timedelta(seconds=timeout))
+    # Broadcast the size of the pickled object
+    # Note: timeout parameter is ignored in this version of PyTorch
+    dist.broadcast(size, src=src, group=group)
     
-    try:
-        # Broadcast the size of the pickled object
-        dist.broadcast(size, src=src, group=group)
-        
-        # Broadcast the pickled object
-        if get_rank() == src:
-            tensor = torch.tensor(list(data), dtype=torch.uint8, device=device)
-        else:
-            tensor = torch.empty(size.item(), dtype=torch.uint8, device=device)
-        
-        dist.broadcast(tensor, src=src, group=group)
-    finally:
-        # Restore the original timeout
-        if timeout is not None:
-            dist.set_timeout(old_timeout)
+    # Broadcast the pickled object
+    if get_rank() == src:
+        tensor = torch.tensor(list(data), dtype=torch.uint8, device=device)
+    else:
+        tensor = torch.empty(size.item(), dtype=torch.uint8, device=device)
+    
+    dist.broadcast(tensor, src=src, group=group)
     
     # If we're not the source, unpickle the object
     if get_rank() != src:
