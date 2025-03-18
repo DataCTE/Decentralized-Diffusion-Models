@@ -13,8 +13,8 @@ import io
 import torchvision.transforms as transforms
 from tqdm.auto import tqdm
 import torch.distributed as dist
-from torch.distributed import broadcast_object
-from utils.distributed import is_main_process, get_rank, get_local_rank, get_world_size
+
+from utils.distributed import is_main_process, get_rank, broadcast_object, get_local_rank, get_world_size
 from data.transforms import resize_image, normalize
 
 
