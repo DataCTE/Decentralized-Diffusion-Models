@@ -86,21 +86,35 @@ class DDMDataset(Dataset):
         
         # Process files synchronously across nodes
         if not is_main_process():
-            # Receive batch counts first
-            batch_count = broadcast_object(None, src=0)
-            
             # Initialize storage
             self.image_files = []
             self.caption_files = []
             all_dims = []
             
-            # Receive batches of data
-            for i in range(batch_count):
-                self.logger.info(f"Receiving batch {i+1}/{batch_count}")
+            # First receive total number of images
+            total_images = broadcast_object(None, src=0)
+            self.logger.info(f"Expecting to receive {total_images} images from rank 0")
+            
+            # Process in smaller batches to avoid timeouts
+            batch_size = 5000  # Smaller batch size to prevent timeouts
+            num_batches = (total_images + batch_size - 1) // batch_size
+            
+            for i in range(num_batches):
+                self.logger.info(f"Receiving batch {i+1}/{num_batches}")
                 batch_data = broadcast_object(None, src=0)
+                
+                # Check if we received a valid batch or a signal to end
+                if batch_data is None or batch_data.get('done', False):
+                    self.logger.info(f"Received end signal after {len(self.image_files)} images")
+                    break
+                
                 self.image_files.extend(batch_data['images'])
                 self.caption_files.extend(batch_data['captions'])
                 all_dims.extend(batch_data['dimensions'])
+                
+                # Periodically log progress
+                if (i+1) % 5 == 0 or (i+1) == num_batches:
+                    self.logger.info(f"Received {len(self.image_files)}/{total_images} images so far")
             
             # Convert dimensions to tensor
             self.dim_cache = torch.tensor(all_dims, device=self.device, dtype=torch.int32)
@@ -109,7 +123,7 @@ class DDMDataset(Dataset):
         
         self.logger.info(f"Finding image-caption pairs in {self.config.dataset_path}")
         
-        # Find all valid image-caption pairs directly
+        # Initialize storage for valid files
         valid_files = []
         caption_files = []
         valid_dims = []
@@ -126,6 +140,10 @@ class DDMDataset(Dataset):
             all_images = all_images[:max_files]
             self.logger.info(f"Limiting to {max_files} files for testing")
         
+        # First broadcast total number of images to process
+        total_images = len(all_images)
+        broadcast_object(total_images, src=0)
+        
         # Process files with progress tracking
         pbar = tqdm(
             total=len(all_images),
@@ -134,28 +152,53 @@ class DDMDataset(Dataset):
             dynamic_ncols=True
         )
         
-        # Process in parallel with larger batch sizes
+        # Process in smaller batches to prevent timeouts
+        batch_size = 5000  # Smaller batch size to improve responsiveness
+        
+        # Process in parallel but broadcast results in smaller chunks
         with ThreadPoolExecutor(max_workers=min(16, os.cpu_count())) as executor:
-            # Process in larger batch sizes for efficiency
-            batch_size = getattr(self.config, 'validation_batch_size', 5000)
-            futures = []
-            
-            for i in range(0, len(all_images), batch_size):
-                batch = all_images[i:min(i + batch_size, len(all_images))]
-                futures.append(executor.submit(self._find_valid_pairs, batch))
-            
-            for future in as_completed(futures):
-                batch_images, batch_captions, batch_dims = future.result()
-                valid_files.extend(batch_images)
-                caption_files.extend(batch_captions)
-                valid_dims.extend(batch_dims)
-                pbar.update(len(batch))
+            # Process images in chunks and broadcast after each chunk
+            for chunk_idx, image_chunk in enumerate(chunks(all_images, batch_size)):
+                self.logger.info(f"Processing chunk {chunk_idx+1}/{(len(all_images) + batch_size - 1) // batch_size}")
                 
-                # Periodically log progress to monitor
-                if len(valid_files) % 10000 == 0:
-                    self.logger.info(f"Found {len(valid_files)} valid pairs so far out of {pbar.n} files processed")
+                chunk_valid_files = []
+                chunk_caption_files = []
+                chunk_valid_dims = []
+                
+                # Process current batch of images
+                futures = []
+                for i in range(0, len(image_chunk), 1000):  # Process in sub-batches for parallel processing
+                    batch = image_chunk[i:min(i + 1000, len(image_chunk))]
+                    futures.append(executor.submit(self._find_valid_pairs, batch))
+                
+                # Collect results from this batch
+                for future in as_completed(futures):
+                    batch_images, batch_captions, batch_dims = future.result()
+                    chunk_valid_files.extend(batch_images)
+                    chunk_caption_files.extend(batch_captions)
+                    chunk_valid_dims.extend(batch_dims)
+                    pbar.update(len(batch))
+                
+                # Add to our total collection
+                valid_files.extend(chunk_valid_files)
+                caption_files.extend(chunk_caption_files)
+                valid_dims.extend(chunk_valid_dims)
+                
+                # Broadcast this chunk to all other processes
+                self.logger.info(f"Broadcasting chunk {chunk_idx+1} with {len(chunk_valid_files)} valid pairs")
+                batch_data = {
+                    'images': chunk_valid_files,
+                    'captions': chunk_caption_files,
+                    'dimensions': chunk_valid_dims,
+                    'done': False
+                }
+                broadcast_object(batch_data, src=0)
         
         pbar.close()
+        
+        # Broadcast final done signal
+        self.logger.info(f"Sending completion signal after {len(valid_files)} total valid pairs")
+        broadcast_object({'done': True}, src=0)
         
         # Store results
         self.image_files = valid_files
@@ -164,28 +207,6 @@ class DDMDataset(Dataset):
         
         # Log summary
         self.logger.info(f"Found {len(valid_files)} valid image-caption pairs")
-        
-        # Broadcast to other processes in batches to reduce memory pressure
-        # Calculate batches (aim for ~1000 items per batch)
-        broadcast_batch_size = 1000
-        num_batches = (len(valid_files) + broadcast_batch_size - 1) // broadcast_batch_size
-        
-        # First broadcast the number of batches
-        self.logger.info(f"Broadcasting data in {num_batches} batches")
-        broadcast_object(num_batches, src=0)
-        
-        # Then broadcast each batch
-        for i in range(num_batches):
-            start_idx = i * broadcast_batch_size
-            end_idx = min((i + 1) * broadcast_batch_size, len(valid_files))
-            
-            batch_data = {
-                'images': valid_files[start_idx:end_idx],
-                'captions': caption_files[start_idx:end_idx],
-                'dimensions': valid_dims[start_idx:end_idx]
-            }
-            broadcast_object(batch_data, src=0)
-            self.logger.info(f"Broadcast batch {i+1}/{num_batches} ({end_idx-start_idx} items)")
     
     def _find_valid_pairs(self, image_files):
         """Find valid image-caption pairs from a batch of image files"""
