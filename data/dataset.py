@@ -55,12 +55,13 @@ class DDMDataset(Dataset):
         
         # Then initialize GPU device reference with appropriate device ID
         if torch.cuda.is_available():
-            # Use the correct GPU based on local rank
-            self.device = torch.device(f'cuda:{self.local_rank}')
-            self.logger.info(f"Rank {self.rank} using device {self.device}")
+            # Use CPU for distributed data processing to avoid NCCL issues
+            # The model itself can still use GPU, this is just for dataset operations
+            self.device = torch.device('cpu')
+            self.logger.info(f"Rank {self.rank}: Using CPU for dataset processing to avoid NCCL conflicts")
         else:
             self.device = torch.device('cpu')
-            self.logger.info(f"Rank {self.rank} using CPU (no CUDA available)")
+            self.logger.info(f"Rank {self.rank}: Using CPU (no CUDA available)")
         
         # Define file extensions
         self.image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
@@ -452,9 +453,11 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     - Optimized worker processes
     """
     # Use the correct local device for this process
-    local_rank = get_local_rank()
-    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+
+    # Use CPU for bucket sampler to avoid NCCL conflicts
+    device = torch.device('cpu')
     logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
+    logger.info(f"Rank {rank}: Using CPU for bucket sampler to avoid NCCL conflicts")
     
     # Get expert assignments directly from GPU tensor
     expert_assignments = dataset.expert_assignments.cpu().numpy()
@@ -491,16 +494,19 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             persistent_workers=True,
             prefetch_factor=config.prefetch_factor if hasattr(config, 'prefetch_factor') else 2,
             multiprocessing_context='spawn' if config.num_workers > 0 else None,
-            generator=torch.Generator(device=device)
+            generator=torch.Generator(device='cpu')  # Always use CPU generator for consistency
         )
         
-        # Warmup GPU pipeline
-        if torch.cuda.is_available():
-            for _ in loader:
+        # Warmup pipeline (no need to load directly to GPU here)
+        try:
+            for _ in range(1):
+                next(iter(loader), None)
                 break
+        except Exception as e:
+            logger.warning(f"Warmup failed: {str(e)}. This is non-critical and training will continue.")
         
         expert_loaders[expert_idx] = loader
-        logger.info(f"Created GPU-optimized loader for expert {expert_idx} "
-                   f"with {len(sampler)} batches on {device}")
+        logger.info(f"Created optimized loader for expert {expert_idx} "
+                   f"with {len(sampler)} batches")
         
     return expert_loaders 

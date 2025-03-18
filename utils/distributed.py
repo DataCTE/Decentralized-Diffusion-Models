@@ -57,8 +57,8 @@ def broadcast_object(obj, src=0, group=None, device=None, timeout=None):
     # Get rank info for logging
     rank = get_rank()
     
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Force CPU usage for tensors to avoid NCCL GPU conflicts
+    device = torch.device("cpu")
     
     # Maximum number of retries for robustness
     max_retries = 3
@@ -75,8 +75,7 @@ def broadcast_object(obj, src=0, group=None, device=None, timeout=None):
             else:
                 size = torch.tensor([0], dtype=torch.long, device=device)
             
-            # Broadcast the size of the pickled object
-            # Note: timeout parameter is ignored in this version of PyTorch
+            # Broadcast the size of the pickled object using CPU tensor to avoid NCCL issues
             dist.broadcast(size, src=src, group=group)
             
             # Broadcast the pickled object
@@ -120,27 +119,36 @@ def broadcast_tensor(tensor, src=0):
     if not is_dist_initialized():
         return tensor
     
+    # Force CPU usage to avoid NCCL GPU conflicts
+    tensor_device = tensor.device if tensor is not None else None
+    
     # Create empty tensor on non-source ranks
     if get_rank() != src:
         if tensor is None:
             shape = broadcast_object((0,), src)
-            tensor = torch.empty(shape, dtype=torch.float32, device='cuda')
-        elif not tensor.is_cuda:
-            tensor = tensor.cuda()
+            tensor = torch.empty(shape, dtype=torch.float32, device='cpu')
+        else:
+            # Move to CPU for communication
+            tensor = tensor.cpu()
     else:
-        if not tensor.is_cuda:
-            tensor = tensor.cuda()
+        # Move to CPU for communication
+        if tensor is not None:
+            tensor = tensor.cpu()
     
     # Broadcast shape and metadata
     shape = broadcast_object(tensor.shape, src)
     dtype = broadcast_object(tensor.dtype, src)
     
-    # Ensure tensor is on correct device with correct shape
+    # Ensure tensor is on CPU with correct shape
     if get_rank() != src:
-        tensor = torch.empty(shape, dtype=dtype, device='cuda')
+        tensor = torch.empty(shape, dtype=dtype, device='cpu')
     
     # Broadcast tensor
     dist.broadcast(tensor, src=src)
+    
+    # Move back to original device if needed
+    if tensor_device is not None and str(tensor_device).startswith('cuda'):
+        tensor = tensor.to(tensor_device)
     
     return tensor
 

@@ -111,6 +111,30 @@ def create_fsdp_model(model, config, rank=0):
         logger.warning("Distributed not initialized, returning unwrapped model")
         return model
         
+    # Set up local GPU device
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    # Get all visible devices
+    device_count = torch.cuda.device_count()
+    
+    logger.info(f"Rank {rank}: Found {device_count} visible devices")
+    
+    if device_count == 0:
+        device = torch.device("cpu")
+        logger.warning(f"Rank {rank}: No CUDA devices found, using CPU")
+    elif device_count < world_size:
+        # If we have fewer devices than processes, use CPU tensor communication
+        # The model may still use GPU but communication will be on CPU
+        logger.warning(f"Rank {rank}: Fewer CUDA devices ({device_count}) than processes ({world_size})")
+        logger.warning(f"Rank {rank}: Using CPU for communication to avoid conflicts")
+        device = torch.device("cpu")
+    else:
+        # Use modulo to assign devices if we have enough
+        device_idx = rank % device_count
+        device = torch.device(f"cuda:{device_idx}")
+        logger.info(f"Rank {rank}: Using device cuda:{device_idx}")
+    
     # Create sharding strategy
     sharding_strategy = get_sharding_strategy(
         getattr(config, 'fsdp_sharding_strategy', 'FULL_SHARD')
@@ -133,7 +157,6 @@ def create_fsdp_model(model, config, rank=0):
     auto_wrap_policy = get_auto_wrap_policy(config)
     
     # Create parameter initialization function
-    device = torch.device(f"cuda:{rank}")
     param_init_fn = get_param_init_fn(device)
     
     # Create FSDP model
