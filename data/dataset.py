@@ -74,7 +74,7 @@ class DDMDataset(Dataset):
             
             # Configure threading (hardcoded values)
             num_workers = 16  # Default 16 workers
-            chunk_size = 100  # Fixed chunk size of 100 files per thread
+            chunk_size = 50  # Fixed chunk size of 50 files per thread
             
             # Shared progress counter
             manager = multiprocessing.Manager()
