@@ -4,6 +4,8 @@ import torch
 import torch.distributed as dist
 import pickle
 import logging
+import io
+from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -29,43 +31,62 @@ def synchronize():
         return
     dist.barrier()
 
-def broadcast_object(obj, src=0):
+def broadcast_object(obj, src=0, group=None, device=None, timeout=None):
     """
-    Broadcast a Python object from a source rank to all other processes
+    Broadcast an arbitrary Python object from src to all processes in the group.
     
     Args:
-        obj: Python object to broadcast
-        src: Source rank
+        obj: Object to broadcast (any picklable Python object)
+        src: Source rank for broadcast
+        group: Process group for communication
+        device: Device to use for tensor communication
+        timeout: Timeout in seconds for the operation (may not be supported by all backends)
     
     Returns:
-        Object on all ranks
+        The broadcast object on all ranks
     """
     if not is_dist_initialized():
         return obj
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Main process serializes object
+    # If we are the source process, pickle the object
     if get_rank() == src:
-        buffer = pickle.dumps(obj)
-        size = torch.tensor(len(buffer), dtype=torch.long, device='cuda')
+        buffer = io.BytesIO()
+        torch.save(obj, buffer)
+        data = bytearray(buffer.getvalue())
+        size = torch.tensor([len(data)], dtype=torch.long, device=device)
     else:
-        size = torch.tensor(0, dtype=torch.long, device='cuda')
+        size = torch.tensor([0], dtype=torch.long, device=device)
     
-    # Broadcast size
-    dist.broadcast(size, src=src)
+    # Set the default timeout for all communications
+    if timeout is not None:
+        # Store the original timeout
+        old_timeout = dist.get_timeout()
+        # Set the new timeout
+        dist.set_timeout(timedelta(seconds=timeout))
     
-    # Create tensor of appropriate size
-    if get_rank() == src:
-        buffer_tensor = torch.ByteTensor(list(buffer)).cuda()
-    else:
-        buffer_tensor = torch.empty(size.item(), dtype=torch.uint8, device='cuda')
+    try:
+        # Broadcast the size of the pickled object
+        dist.broadcast(size, src=src, group=group)
+        
+        # Broadcast the pickled object
+        if get_rank() == src:
+            tensor = torch.tensor(list(data), dtype=torch.uint8, device=device)
+        else:
+            tensor = torch.empty(size.item(), dtype=torch.uint8, device=device)
+        
+        dist.broadcast(tensor, src=src, group=group)
+    finally:
+        # Restore the original timeout
+        if timeout is not None:
+            dist.set_timeout(old_timeout)
     
-    # Broadcast data
-    dist.broadcast(buffer_tensor, src=src)
-    
-    # Deserialize on non-source ranks
+    # If we're not the source, unpickle the object
     if get_rank() != src:
-        buffer = buffer_tensor.cpu().numpy().tobytes()
-        obj = pickle.loads(buffer)
+        buffer = io.BytesIO(tensor.cpu().numpy().tobytes())
+        obj = torch.load(buffer)
     
     return obj
 

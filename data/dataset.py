@@ -13,23 +13,21 @@ import glob
 import io
 import torchvision.transforms as transforms
 from tqdm.auto import tqdm
-import threading
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import centralized utilities
-from utils.distributed import is_main_process, get_rank, broadcast_object
-from utils.logging import setup_logger, setup_distributed_logger
+from utils.distributed import is_main_process, broadcast_object
+from utils.logging import setup_distributed_logger
 from data.transforms import resize_image, normalize
-from utils.distributed import synchronize
+
 
 # Setup logging
 logger = logging.getLogger(__name__)
 
 import math  # For BucketBatchSampler
 
-import time
-import torch.distributed as dist
-import pickle
+
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from list"""
@@ -88,8 +86,8 @@ class DDMDataset(Dataset):
         
         # Process files synchronously across nodes
         if not is_main_process():
-            # Wait for main process to complete discovery
-            valid_data = broadcast_object(None, src=0)
+            # Wait for main process to complete discovery with a very long timeout
+            valid_data = broadcast_object(None, src=0, timeout=360000)  # 100 hour timeout
             self.image_files = valid_data['images']
             self.caption_files = valid_data['captions']
             self.dim_cache = torch.tensor(valid_data['dimensions'], 
@@ -104,11 +102,17 @@ class DDMDataset(Dataset):
         caption_files = []
         valid_dims = []
         
-        # Discover all image files
+        # Discover all image files more efficiently
         all_images = []
         for ext in self.image_extensions:
             pattern = os.path.join(self.config.dataset_path, f'**/*{ext}')
             all_images.extend(glob.glob(pattern, recursive=True))
+        
+        # Limit dataset size for testing if needed
+        max_files = getattr(self.config, 'max_files', len(all_images))
+        if max_files < len(all_images):
+            all_images = all_images[:max_files]
+            self.logger.info(f"Limiting to {max_files} files for testing")
         
         # Process files with progress tracking
         pbar = tqdm(
@@ -118,10 +122,10 @@ class DDMDataset(Dataset):
             dynamic_ncols=True
         )
         
-        # Process in parallel for better performance
-        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count())) as executor:
-            # Process in reasonable batch sizes
-            batch_size = getattr(self.config, 'validation_batch_size', 1000)
+        # Process in parallel with larger batch sizes
+        with ThreadPoolExecutor(max_workers=min(16, os.cpu_count())) as executor:
+            # Process in larger batch sizes for efficiency
+            batch_size = getattr(self.config, 'validation_batch_size', 5000)
             futures = []
             
             for i in range(0, len(all_images), batch_size):
@@ -134,6 +138,10 @@ class DDMDataset(Dataset):
                 caption_files.extend(batch_captions)
                 valid_dims.extend(batch_dims)
                 pbar.update(len(batch))
+                
+                # Periodically log progress to monitor
+                if len(valid_files) % 10000 == 0:
+                    self.logger.info(f"Found {len(valid_files)} valid pairs so far out of {pbar.n} files processed")
         
         pbar.close()
         
@@ -145,13 +153,14 @@ class DDMDataset(Dataset):
         # Log summary
         self.logger.info(f"Found {len(valid_files)} valid image-caption pairs")
         
-        # Broadcast to other processes
+        # Broadcast to other processes with a very long timeout
+        self.logger.info(f"Broadcasting data with extended timeout (100 hours)")
         valid_data = {
             'images': valid_files,
             'captions': caption_files,
             'dimensions': valid_dims
         }
-        broadcast_object(valid_data, src=0)
+        broadcast_object(valid_data, src=0, timeout=360000)  # 100 hour timeout
     
     def _find_valid_pairs(self, image_files):
         """Find valid image-caption pairs from a batch of image files"""
@@ -161,20 +170,21 @@ class DDMDataset(Dataset):
         min_size = self.min_size.item()
         
         for img_path in image_files:
-            # Check if matching caption exists
+            # Check if matching caption exists first - skip early if no caption
             caption_path = os.path.splitext(img_path)[0] + self.caption_ext
             if not os.path.exists(caption_path):
                 continue
                 
-            # Try to open image and get dimensions
+            # Only validate images that have captions
             try:
+                # Use faster image opening method - just get dimensions without loading full pixel data
                 with Image.open(img_path) as img:
                     width, height = img.size
                     if width >= min_size and height >= min_size:
                         valid_images.append(img_path)
                         valid_captions.append(caption_path)
                         valid_dims.append([width, height])
-            except:
+            except Exception:
                 # Skip any images that can't be opened
                 continue
                 
