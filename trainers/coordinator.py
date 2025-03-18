@@ -169,7 +169,7 @@ class DDMTrainingCoordinator:
             shuffle=(train_sampler is None),
             num_workers=self.config.num_workers if hasattr(self.config, 'num_workers') else 4,
             sampler=train_sampler,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=True,
             multiprocessing_context='spawn',
             persistent_workers=True if hasattr(self.config, 'num_workers') and self.config.num_workers > 0 else False
@@ -181,7 +181,7 @@ class DDMTrainingCoordinator:
             shuffle=False,
             num_workers=self.config.num_workers if hasattr(self.config, 'num_workers') else 4,
             sampler=val_sampler,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=False,
             multiprocessing_context='spawn',
             persistent_workers=True if hasattr(self.config, 'num_workers') and self.config.num_workers > 0 else False

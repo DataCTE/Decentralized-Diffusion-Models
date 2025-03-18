@@ -357,8 +357,7 @@ class DDMDataset(Dataset):
             tensor = transforms.ToTensor()(img)
             normalized = normalize(tensor)
             
-            # Return the CPU tensor - the DataLoader will handle moving to the right device
-            # with pin_memory=True, this will be more efficient than moving it here
+            # Return the CPU tensor - moving to device will happen in the model forward pass instead
             return normalized
             
     def _load_caption(self, idx):
@@ -670,7 +669,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             dataset,
             batch_sampler=sampler,
             num_workers=config.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             persistent_workers=True,
             prefetch_factor=config.prefetch_factor if hasattr(config, 'prefetch_factor') else 2,
             multiprocessing_context='spawn' if config.num_workers > 0 else None,

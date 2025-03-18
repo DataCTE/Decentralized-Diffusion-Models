@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
     ],
     'validation_batch_size': 1000,  # Add this for batched validation
     'num_workers': 8,
-    'pin_memory': True,
+    'pin_memory': False,
     'persistent_workers': True,
     'prefetch_factor': 2,
     
