@@ -344,9 +344,8 @@ class DDMDataset(Dataset):
             tensor = transforms.ToTensor()(img)
             normalized = normalize(tensor)
             
-            # GPU is only used here for actual data loading, not for processing
-            if torch.cuda.is_available():
-                return normalized.cuda()
+            # Return the CPU tensor - the DataLoader will handle moving to the right device
+            # with pin_memory=True, this will be more efficient than moving it here
             return normalized
             
     def _load_caption(self, idx):
