@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import centralized utilities
-from utils.distributed import is_main_process, broadcast_object, get_rank, get_local_rank
+from utils.distributed import is_main_process, broadcast_object, get_rank, get_local_rank, get_world_size
 from utils.logging import setup_distributed_logger
 from data.transforms import resize_image, normalize
 
@@ -101,122 +101,172 @@ class DDMDataset(Dataset):
             all_dims = []
             
             # First receive total number of images
-            total_images = broadcast_object(None, src=0)
-            self.logger.info(f"Expecting to receive {total_images} images from rank 0")
-            
-            # Process in smaller batches to avoid timeouts
-            batch_size = 5000  # Smaller batch size to prevent timeouts
-            num_batches = (total_images + batch_size - 1) // batch_size
-            
-            for i in range(num_batches):
-                self.logger.info(f"Receiving batch {i+1}/{num_batches}")
-                batch_data = broadcast_object(None, src=0)
+            try:
+                total_images = broadcast_object(None, src=0)
+                self.logger.info(f"Rank {self.rank}: Expecting to receive {total_images} images from rank 0")
                 
-                # Check if we received a valid batch or a signal to end
-                if batch_data is None or batch_data.get('done', False):
-                    self.logger.info(f"Received end signal after {len(self.image_files)} images")
-                    break
+                # Process in smaller batches to avoid timeouts
+                batch_size = 100  # Much smaller batch size to prevent timeouts and memory issues
+                num_batches = (total_images + batch_size - 1) // batch_size
                 
-                self.image_files.extend(batch_data['images'])
-                self.caption_files.extend(batch_data['captions'])
-                all_dims.extend(batch_data['dimensions'])
+                for i in range(num_batches):
+                    self.logger.info(f"Rank {self.rank}: Receiving batch {i+1}/{num_batches}")
+                    try:
+                        batch_data = broadcast_object(None, src=0)
+                        
+                        # Check if we received a valid batch or a signal to end
+                        if batch_data is None:
+                            self.logger.warning(f"Rank {self.rank}: Received None batch, skipping")
+                            continue
+                            
+                        if batch_data.get('done', False):
+                            self.logger.info(f"Rank {self.rank}: Received end signal after {len(self.image_files)} images")
+                            break
+                        
+                        batch_images = batch_data.get('images', [])
+                        batch_captions = batch_data.get('captions', [])
+                        batch_dims = batch_data.get('dimensions', [])
+                        
+                        self.image_files.extend(batch_images)
+                        self.caption_files.extend(batch_captions)
+                        all_dims.extend(batch_dims)
+                        
+                        # Acknowledge receipt of the batch by broadcasting a confirmation
+                        broadcast_object({'batch': i+1, 'received': True, 'count': len(batch_images)}, src=self.rank)
+                        
+                        # Log every batch for better monitoring
+                        self.logger.info(f"Rank {self.rank}: Received batch {i+1}/{num_batches} with {len(batch_images)} images (total: {len(self.image_files)})")
+                    except Exception as e:
+                        self.logger.error(f"Rank {self.rank}: Error receiving batch {i+1}: {str(e)}")
                 
-                # Periodically log progress
-                if (i+1) % 5 == 0 or (i+1) == num_batches:
-                    self.logger.info(f"Received {len(self.image_files)}/{total_images} images so far")
-            
-            # Convert dimensions to tensor
-            self.dim_cache = torch.tensor(all_dims, device=self.device, dtype=torch.int32)
-            self.logger.info(f"Received {len(self.image_files)} valid image-caption pairs")
+                # Convert dimensions to tensor
+                self.dim_cache = torch.tensor(all_dims, device=self.device, dtype=torch.int32)
+                self.logger.info(f"Rank {self.rank}: Successfully received {len(self.image_files)} valid image-caption pairs")
+            except Exception as e:
+                self.logger.error(f"Rank {self.rank}: Critical error during file reception: {str(e)}")
+                raise
             return
         
-        self.logger.info(f"Finding image-caption pairs in {self.config.dataset_path}")
+        self.logger.info(f"Rank {self.rank}: Finding image-caption pairs in {self.config.dataset_path}")
         
-        # Initialize storage for valid files
-        valid_files = []
-        caption_files = []
-        valid_dims = []
-        
-        # Discover all image files more efficiently
-        all_images = []
-        for ext in self.image_extensions:
-            pattern = os.path.join(self.config.dataset_path, f'**/*{ext}')
-            all_images.extend(glob.glob(pattern, recursive=True))
-        
-        # Limit dataset size for testing if needed
-        max_files = getattr(self.config, 'max_files', len(all_images))
-        if max_files < len(all_images):
-            all_images = all_images[:max_files]
-            self.logger.info(f"Limiting to {max_files} files for testing")
-        
-        # First broadcast total number of images to process
-        total_images = len(all_images)
-        broadcast_object(total_images, src=0)
-        
-        # Process files with progress tracking
-        pbar = tqdm(
-            total=len(all_images),
-            desc="Finding Valid Pairs",
-            unit="pair",
-            dynamic_ncols=True
-        )
-        
-        # Process in smaller batches to prevent timeouts
-        batch_size = 5000  # Smaller batch size to improve responsiveness
-        
-        # Process in parallel but broadcast results in smaller chunks
-        with ThreadPoolExecutor(max_workers=min(16, os.cpu_count())) as executor:
-            # Process images in chunks and broadcast after each chunk
-            for chunk_idx, image_chunk in enumerate(chunks(all_images, batch_size)):
-                self.logger.info(f"Processing chunk {chunk_idx+1}/{(len(all_images) + batch_size - 1) // batch_size}")
-                
-                chunk_valid_files = []
-                chunk_caption_files = []
-                chunk_valid_dims = []
-                
-                # Process current batch of images
+        try:
+            # Initialize storage for valid files
+            valid_files = []
+            caption_files = []
+            valid_dims = []
+            
+            # Discover all image files more efficiently
+            all_images = []
+            for ext in self.image_extensions:
+                pattern = os.path.join(self.config.dataset_path, f'**/*{ext}')
+                all_images.extend(glob.glob(pattern, recursive=True))
+            
+            # Limit dataset size for testing if needed
+            max_files = getattr(self.config, 'max_files', len(all_images))
+            if max_files < len(all_images):
+                all_images = all_images[:max_files]
+                self.logger.info(f"Rank {self.rank}: Limiting to {max_files} files for testing")
+            
+            # First broadcast total number of images we'll process
+            total_images = len(all_images)
+            self.logger.info(f"Rank {self.rank}: Broadcasting total count of {total_images} images")
+            broadcast_object(total_images, src=0)
+            
+            # Process files with progress tracking
+            pbar = tqdm(
+                total=len(all_images),
+                desc="Finding Valid Pairs",
+                unit="pair",
+                dynamic_ncols=True
+            )
+            
+            # Use extremely small batch sizes for broadcasting to prevent timeouts
+            broadcast_batch_size = 100  # Very small size to ensure reliable transmission
+            
+            # Process images first to find all valid ones
+            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count())) as executor:
                 futures = []
-                for i in range(0, len(image_chunk), 1000):  # Process in sub-batches for parallel processing
-                    batch = image_chunk[i:min(i + 1000, len(image_chunk))]
+                # Use smaller processing batch size too
+                process_batch_size = 1000
+                
+                for i in range(0, len(all_images), process_batch_size):
+                    batch = all_images[i:min(i + process_batch_size, len(all_images))]
                     futures.append(executor.submit(self._find_valid_pairs, batch))
                 
-                # Collect results from this batch
+                # Collect results 
                 for future in as_completed(futures):
-                    batch_images, batch_captions, batch_dims = future.result()
-                    chunk_valid_files.extend(batch_images)
-                    chunk_caption_files.extend(batch_captions)
-                    chunk_valid_dims.extend(batch_dims)
-                    pbar.update(len(batch))
+                    try:
+                        batch_images, batch_captions, batch_dims = future.result()
+                        valid_files.extend(batch_images)
+                        caption_files.extend(batch_captions)
+                        valid_dims.extend(batch_dims)
+                        pbar.update(process_batch_size)
+                    except Exception as e:
+                        self.logger.error(f"Rank {self.rank}: Error processing image batch: {str(e)}")
+            
+            pbar.close()
+            
+            # Now broadcast the valid files in small batches to prevent timeouts
+            self.logger.info(f"Rank {self.rank}: Broadcasting {len(valid_files)} valid files in batches of {broadcast_batch_size}")
+            
+            # Broadcast in small chunks
+            for i in range(0, len(valid_files), broadcast_batch_size):
+                end_idx = min(i + broadcast_batch_size, len(valid_files))
+                batch_images = valid_files[i:end_idx]
+                batch_captions = caption_files[i:end_idx]
+                batch_dims = valid_dims[i:end_idx]
                 
-                # Add to our total collection
-                valid_files.extend(chunk_valid_files)
-                caption_files.extend(chunk_caption_files)
-                valid_dims.extend(chunk_valid_dims)
-                
-                # Broadcast this chunk to all other processes
-                self.logger.info(f"Broadcasting chunk {chunk_idx+1} with {len(chunk_valid_files)} valid pairs")
                 batch_data = {
-                    'images': chunk_valid_files,
-                    'captions': chunk_caption_files,
-                    'dimensions': chunk_valid_dims,
+                    'images': batch_images,
+                    'captions': batch_captions,
+                    'dimensions': batch_dims,
                     'done': False
                 }
-                broadcast_object(batch_data, src=0)
+                
+                try:
+                    self.logger.info(f"Rank {self.rank}: Broadcasting batch {i//broadcast_batch_size + 1}/{(len(valid_files) + broadcast_batch_size - 1) // broadcast_batch_size} with {len(batch_images)} files")
+                    broadcast_object(batch_data, src=0)
+                    
+                    # Wait for acknowledgment from each rank to ensure synchronization
+                    for r in range(1, get_world_size()):
+                        try:
+                            ack = broadcast_object(None, src=r)
+                            if ack and ack.get('received', False):
+                                self.logger.info(f"Rank {self.rank}: Received acknowledgment from rank {r} for batch {ack.get('batch')}: {ack.get('count')} files")
+                        except Exception as e:
+                            self.logger.warning(f"Rank {self.rank}: No acknowledgment from rank {r}: {str(e)}")
+                            
+                except Exception as e:
+                    self.logger.error(f"Rank {self.rank}: Error broadcasting batch {i//broadcast_batch_size + 1}: {str(e)}")
+                    # Try again with a smaller batch if this fails
+                    if broadcast_batch_size > 10:
+                        smaller_batch_size = max(10, broadcast_batch_size // 2)
+                        self.logger.info(f"Rank {self.rank}: Reducing batch size to {smaller_batch_size} and retrying")
+                        # Adjust i to retry this batch with smaller size
+                        i -= broadcast_batch_size
+                        broadcast_batch_size = smaller_batch_size
+                        continue
+            
+            # Send final "done" signal
+            self.logger.info(f"Rank {self.rank}: Sending completion signal after {len(valid_files)} valid pairs")
+            broadcast_object({'done': True}, src=0)
+            
+            # Store results
+            self.image_files = valid_files
+            self.caption_files = caption_files
+            self.dim_cache = torch.tensor(valid_dims, device=self.device, dtype=torch.int32)
+            
+            # Log summary
+            self.logger.info(f"Rank {self.rank}: Completed with {len(valid_files)} valid image-caption pairs")
+        except Exception as e:
+            self.logger.error(f"Rank {self.rank}: Critical error in main process: {str(e)}")
+            # Try to send error signal to other processes
+            try:
+                broadcast_object({'error': True, 'message': str(e)}, src=0)
+            except:
+                pass
+            raise
         
-        pbar.close()
-        
-        # Broadcast final done signal
-        self.logger.info(f"Sending completion signal after {len(valid_files)} total valid pairs")
-        broadcast_object({'done': True}, src=0)
-        
-        # Store results
-        self.image_files = valid_files
-        self.caption_files = caption_files
-        self.dim_cache = torch.tensor(valid_dims, device=self.device, dtype=torch.int32)
-        
-        # Log summary
-        self.logger.info(f"Found {len(valid_files)} valid image-caption pairs")
-    
     def _find_valid_pairs(self, image_files):
         """Find valid image-caption pairs from a batch of image files"""
         valid_images = []

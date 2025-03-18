@@ -7,6 +7,7 @@ import logging
 import io
 from datetime import timedelta
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ def broadcast_object(obj, src=0, group=None, device=None, timeout=None):
         src: Source rank for broadcast
         group: Process group for communication
         device: Device to use for tensor communication
-        timeout: Timeout in seconds for the operation (may not be supported by all backends)
+        timeout: Timeout in seconds for the operation (ignored in this version of PyTorch)
     
     Returns:
         The broadcast object on all ranks
@@ -53,36 +54,57 @@ def broadcast_object(obj, src=0, group=None, device=None, timeout=None):
     if not is_dist_initialized():
         return obj
 
+    # Get rank info for logging
+    rank = get_rank()
+    
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # If we are the source process, pickle the object
-    if get_rank() == src:
-        buffer = io.BytesIO()
-        torch.save(obj, buffer)
-        data = bytearray(buffer.getvalue())
-        size = torch.tensor([len(data)], dtype=torch.long, device=device)
-    else:
-        size = torch.tensor([0], dtype=torch.long, device=device)
+    # Maximum number of retries for robustness
+    max_retries = 3
+    retry_delay = 1  # seconds
     
-    # Broadcast the size of the pickled object
-    # Note: timeout parameter is ignored in this version of PyTorch
-    dist.broadcast(size, src=src, group=group)
-    
-    # Broadcast the pickled object
-    if get_rank() == src:
-        tensor = torch.tensor(list(data), dtype=torch.uint8, device=device)
-    else:
-        tensor = torch.empty(size.item(), dtype=torch.uint8, device=device)
-    
-    dist.broadcast(tensor, src=src, group=group)
-    
-    # If we're not the source, unpickle the object
-    if get_rank() != src:
-        buffer = io.BytesIO(tensor.cpu().numpy().tobytes())
-        obj = torch.load(buffer)
-    
-    return obj
+    for attempt in range(max_retries):
+        try:
+            # If we are the source process, pickle the object
+            if rank == src:
+                buffer = io.BytesIO()
+                torch.save(obj, buffer)
+                data = bytearray(buffer.getvalue())
+                size = torch.tensor([len(data)], dtype=torch.long, device=device)
+            else:
+                size = torch.tensor([0], dtype=torch.long, device=device)
+            
+            # Broadcast the size of the pickled object
+            # Note: timeout parameter is ignored in this version of PyTorch
+            dist.broadcast(size, src=src, group=group)
+            
+            # Broadcast the pickled object
+            if rank == src:
+                tensor = torch.tensor(list(data), dtype=torch.uint8, device=device)
+            else:
+                tensor = torch.empty(size.item(), dtype=torch.uint8, device=device)
+            
+            dist.broadcast(tensor, src=src, group=group)
+            
+            # If we're not the source, unpickle the object
+            if rank != src:
+                buffer = io.BytesIO(tensor.cpu().numpy().tobytes())
+                obj = torch.load(buffer)
+            
+            # Successful broadcast
+            return obj
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Rank {rank}: Broadcast attempt {attempt+1} failed: {str(e)}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Rank {rank}: All broadcast attempts failed. Last error: {str(e)}")
+                raise
 
 def broadcast_tensor(tensor, src=0):
     """
