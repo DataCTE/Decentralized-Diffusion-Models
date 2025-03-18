@@ -91,11 +91,12 @@ class RouterModel(nn.Module):
             nn.init.normal_(self.classifier[-1].weight, std=0.02)
             nn.init.zeros_(self.classifier[-1].bias)
 
-    def forward(self, x, t):
+    def forward(self, x, t, text_embeddings=None):
         """
         Args:
             x: Input tensor [B, C, H, W]
             t: Timestep tensor [B,]
+            text_embeddings: Optional text embeddings for conditional generation
         Returns:
             logits: Expert logits [B, num_experts]
         """

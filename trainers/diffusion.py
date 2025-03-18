@@ -165,6 +165,7 @@ class DecentralizedFlowMatcher:
         """
         self.sigma = sigma
         self.loss_type = loss_type
+        self.temperature = 1.0  # Default temperature for router softmax
         
     def compute_flow_matching_target(self, x0, xt, t):
         """

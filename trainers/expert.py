@@ -101,11 +101,11 @@ class ExpertTrainer(BaseTrainer):
             noise = torch.randn_like(latents)
             
             # Forward process using cosine schedule (Section 3.2)
-            alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)
+            alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)[:,None,None,None]
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * noise
             
-            # Text conditioning (paper section 4.1)
+           
             text_embeds = self.clip.encode(batch["caption"])
             
             # Expert prediction of flow field u_t(x_t) (Equation 6)

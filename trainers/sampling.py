@@ -118,7 +118,7 @@ def ddm_sample(
             if expert_cache_manager is not None:
                 active_experts = {}
                 for expert_idx in selected_experts:
-                    expert = expert_cache_manager.get_expert(expert_idx)
+                    expert = expert_cache_manager.get_expert(expert_idx, lambda: experts.get(expert_idx))
                     active_experts[expert_idx] = expert
                     expert_usage[expert_idx] += 1
             else:

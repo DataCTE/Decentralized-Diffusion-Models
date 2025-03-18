@@ -6,10 +6,10 @@
 
 ## Overview
 
-This implementation provides a streamlined approach to Decentralized Diffusion Models (DDM) training without requiring data clustering. The system trains multiple expert models on random data partitions and uses a learned router for dynamic expert selection during inference.
+This implementation provides a streamlined approach to Decentralized Diffusion Models (DDM) training without requiring data clustering or DINO feature extraction. The system trains multiple expert models on random data partitions and uses a learned router for dynamic expert selection during inference.
 
 Key Features:
--  **No Clustering Needed** - Random data partitioning replaces semantic clustering
+-  **No Clustering or DINO Required** - Random data partitioning replaces semantic clustering without requiring DINOv2 features
 -  **Dynamic Expert Selection** - Router learns optimal expert combinations per-input
 -  **Efficient Inference** - Top-k expert selection reduces compute costs
 -  **Modular Design** - Add/remove experts without retraining entire system

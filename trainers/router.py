@@ -89,7 +89,7 @@ class RouterTrainer:
         
         # Get images and cluster assignments (Section 3.3)
         images = batch["image"].to(self.device)
-        clusters = batch["cluster"].to(self.device)  # k in Algorithm 1
+        clusters = batch["expert"].to(self.device)  # k in Algorithm 1
         
         # Sample random timesteps t ∈ [0, 1] (Algorithm 1)
         t = torch.rand(images.size(0), device=self.device)

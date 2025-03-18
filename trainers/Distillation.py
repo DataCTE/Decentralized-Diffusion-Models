@@ -295,7 +295,7 @@ class DiffusionDistiller:
             for batch in tqdm(val_loader, desc="Validating"):
                 # Get data
                 images = batch["image"].to(self.device)
-                clusters = batch["cluster"].to(self.device)
+                clusters = batch["expert"].to(self.device)
                 text_embeds = batch.get("text_embedding")
                 if text_embeds is not None:
                     text_embeds = text_embeds.to(self.device)

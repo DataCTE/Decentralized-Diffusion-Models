@@ -227,7 +227,7 @@ class DDMTrainingCoordinator:
             expert.train_step(batch)
     
     def train_router(self, batch):
-        """Train router model using cluster labels as supervision"""
+        """Train router model using expert assignments as supervision"""
         # Distributed router training
         self.router.train_step(batch)
     
