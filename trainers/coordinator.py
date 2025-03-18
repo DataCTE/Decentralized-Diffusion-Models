@@ -170,7 +170,9 @@ class DDMTrainingCoordinator:
             num_workers=self.config.num_workers if hasattr(self.config, 'num_workers') else 4,
             sampler=train_sampler,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
+            multiprocessing_context='spawn',
+            persistent_workers=True if hasattr(self.config, 'num_workers') and self.config.num_workers > 0 else False
         )
         
         self.val_loader = DataLoader(
@@ -180,7 +182,9 @@ class DDMTrainingCoordinator:
             num_workers=self.config.num_workers if hasattr(self.config, 'num_workers') else 4,
             sampler=val_sampler,
             pin_memory=True,
-            drop_last=False
+            drop_last=False,
+            multiprocessing_context='spawn',
+            persistent_workers=True if hasattr(self.config, 'num_workers') and self.config.num_workers > 0 else False
         )
         
         debug_print(f"Created data loaders with {len(train_dataset)} training samples on rank {self.rank}", self.rank, force=True)
@@ -203,10 +207,11 @@ class DDMTrainingCoordinator:
             world_size=self.world_size
         )
     
-    def train(self, num_steps=None):
-        """Run training for specified number of steps, following DDM approach"""
-        if num_steps is None:
-            num_steps = self.config.num_steps
+    def train(self, num_steps):
+        """Train the DDM system for the specified number of steps"""
+        if num_steps <= 0:
+            logger.warning(f"Invalid step count {num_steps}, skipping training")
+            return
             
         logger.info(f"Starting DDM training for {num_steps} steps on rank {self.rank}")
         
@@ -217,12 +222,14 @@ class DDMTrainingCoordinator:
                 loss_type=getattr(self.config, 'loss_type', 'huber')
             )
         
-        # Create train dataloader iterator
-        train_iter = iter(self.train_loader)
-        
         # Train loop implementing the DDM training approach
         for step in range(num_steps):
-            batch = next(train_iter)
+            # Get a batch by creating a fresh iterator each time to avoid pickling issues
+            try:
+                batch = next(iter(self.train_loader))
+            except Exception as e:
+                logger.error(f"Error getting batch at step {step}: {str(e)}")
+                continue
             
             # Joint training of experts and router
             expert_loss = self.train_experts(batch)  # Updates experts

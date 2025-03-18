@@ -90,6 +90,19 @@ class DDMDataset(Dataset):
         self._init_buckets()
         self._distribute_samples()
 
+    def __getstate__(self):
+        """Control what gets pickled to ensure we don't include unpicklable objects"""
+        state = self.__dict__.copy()
+        # Remove logger as it can't be pickled properly
+        state['logger'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """Restore state after unpickling"""
+        self.__dict__.update(state)
+        # Restore logger
+        self.logger = logging.getLogger(__name__)
+
     def _discover_and_process_files(self):
         """Find valid image-caption pairs in a single efficient pass"""
         global _GLOBAL_DATASET_CACHE
