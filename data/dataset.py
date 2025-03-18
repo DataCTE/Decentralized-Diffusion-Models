@@ -13,6 +13,8 @@ import io
 import torchvision.transforms as transforms
 from tqdm.auto import tqdm
 import torch.distributed as dist
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils.distributed import is_main_process, get_rank, broadcast_object, get_local_rank, get_world_size
 from data.transforms import resize_image, normalize
@@ -56,48 +58,102 @@ class DDMDataset(Dataset):
         self.device = 'cpu'
 
     def _load_dataset(self):
-        """Single-pass dataset loading with integrated validation"""
+        """Multi-threaded dataset loading with integrated validation"""
         self.image_files = []
         self.caption_files = []
         self.dim_cache = []
         invalid_entries = []
         
-        # Use main process for initial scanning
         if is_main_process():
-            pbar = tqdm(desc="Scanning dataset", unit="file")
-            
+            # First: Discover all potential files quickly
+            all_image_paths = []
             for ext in self.image_extensions:
-                for img_path in glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True):
-                    caption_path = os.path.splitext(img_path)[0] + self.caption_ext
-                    
-                    try:
-                        # Validate file pair and load image in one pass
-                        with Image.open(img_path) as img:
-                            # Quick format check
-                            img.getdata()[0]  # Force partial decode
-                            width, height = img.size
-                            
-                            if width >= self.min_size and height >= self.min_size:
-                                self.image_files.append(img_path)
-                                self.caption_files.append(caption_path)
-                                self.dim_cache.append((width, height))
-                                pbar.update(1)
-                                
-                    except (IOError, OSError, Image.DecompressionBombError, Image.UnidentifiedImageError) as e:
-                        invalid_entries.append(img_path)
-                    except Exception as e:
-                        invalid_entries.append(img_path)
+                all_image_paths.extend(
+                    glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True)
+                )
             
-            pbar.close()
+            # Configure threading
+            num_workers = min(
+                getattr(self.config, 'dataset_threads', os.cpu_count()), 
+                len(all_image_paths)
+            )
+            chunk_size = max(100, len(all_image_paths) // (num_workers * 10))
+            
+            # Shared progress counter
+            manager = multiprocessing.Manager()
+            counter = manager.Value('i', 0)
+            lock = manager.Lock()
+            
+            # Process files in parallel
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = []
+                pbar = tqdm(total=len(all_image_paths), desc="Validating files")
+                
+                # Split work into chunks
+                for chunk in chunks(all_image_paths, chunk_size):
+                    futures.append(
+                        executor.submit(
+                            self._process_file_chunk,
+                            chunk,
+                            counter,
+                            lock
+                        )
+                    )
+                
+                # Collect results as they complete
+                for future in as_completed(futures):
+                    chunk_images, chunk_captions, chunk_dims, chunk_invalid = future.result()
+                    self.image_files.extend(chunk_images)
+                    self.caption_files.extend(chunk_captions)
+                    self.dim_cache.extend(chunk_dims)
+                    invalid_entries.extend(chunk_invalid)
+                    pbar.update(chunk_size)
+                
+                pbar.close()
+
             logger.info(f"Found {len(self.image_files)} valid pairs, skipped {len(invalid_entries)} invalid files")
 
         # Distributed synchronization
         if dist.is_initialized():
             self._distributed_sync()
 
-        # Final validation checks
         if len(self.image_files) == 0:
             raise RuntimeError("No valid training samples found in dataset directory")
+
+    def _process_file_chunk(self, file_paths, counter, lock):
+        """Process a chunk of files in a thread-safe manner"""
+        chunk_images = []
+        chunk_captions = []
+        chunk_dims = []
+        chunk_invalid = []
+        
+        for img_path in file_paths:
+            caption_path = os.path.splitext(img_path)[0] + self.caption_ext
+            
+            try:
+                if not os.path.exists(caption_path):
+                    continue
+                
+                with Image.open(img_path) as img:
+                    # Quick format check
+                    img.getdata()[0]  # Force partial decode
+                    width, height = img.size
+                    
+                    if width >= self.min_size and height >= self.min_size:
+                        chunk_images.append(img_path)
+                        chunk_captions.append(caption_path)
+                        chunk_dims.append((width, height))
+                        
+                        # Update progress safely
+                        with lock:
+                            counter.value += 1
+            
+            except (IOError, OSError, Image.DecompressionBombError, Image.UnidentifiedImageError):
+                chunk_invalid.append(img_path)
+            except Exception:
+                chunk_invalid.append(img_path)
+        
+        return chunk_images, chunk_captions, chunk_dims, chunk_invalid
 
     def _distributed_sync(self):
         """Efficient distributed synchronization of validated files"""
