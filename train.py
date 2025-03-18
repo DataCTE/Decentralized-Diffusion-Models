@@ -76,34 +76,8 @@ def main():
             checkpoint_dir = os.path.join(config.output_dir, 'checkpoints', config.resume_checkpoint)
             load_coordinator_checkpoint(coordinator, checkpoint_dir)
 
-        # Main training loop
-        if rank == 0:
-            pbar = tqdm(total=config.num_steps, desc="Training DDM")
-            
-        for step in range(config.num_steps):
-            # Training step handled by coordinator
-            expert_loss, router_loss = coordinator.train_step()
-            
-            # Logging and checkpointing (only on main process)
-            if rank == 0:
-                pbar.update(1)
-                pbar.set_postfix({
-                    "expert_loss": f"{expert_loss:.4f}",
-                    "router_loss": f"{router_loss:.4f}"
-                })
-
-                # Save checkpoint periodically
-                if step % config.checkpoint_interval == 0 and step > 0:
-                    coordinator.save_checkpoint(step)
-
-                # Generate validation samples
-                if step % config.validation_interval == 0:
-                    coordinator.validate(step)
-
-        # Final save
-        if rank == 0:
-            coordinator.save_checkpoint(config.num_steps, final=True)
-            pbar.close()
+        # Call the train method directly, which already contains the main training loop
+        coordinator.train(config.num_steps)
 
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")

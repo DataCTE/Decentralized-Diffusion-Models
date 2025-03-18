@@ -175,7 +175,7 @@ class DDMDataset(Dataset):
         self.logger.info(f"Rank {self.rank}: Finding image-caption pairs in {self.config.dataset_path}")
         
         try:
-            # Initialize storage for valid files
+            # Initialize storage for valid filesdebug
             valid_files = []
             caption_files = []
             valid_dims = []
