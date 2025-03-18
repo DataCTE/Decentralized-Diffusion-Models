@@ -1,29 +1,27 @@
 """Dataset classes for Decentralized Diffusion Models."""
 
-import os
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from collections import defaultdict
+
 import logging
 import time  # Add missing time module import
-import glob
-import io
 import torchvision.transforms as transforms
-from tqdm.auto import tqdm
+
 import torch.distributed as dist
-import multiprocessing
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 from utils.distributed import is_main_process, get_rank, broadcast_object, get_local_rank, get_world_size
 from data.transforms import resize_image, normalize
 
+import glob
+import os
+
 
 # Setup logging
 logger = logging.getLogger(__name__)
-
-import math  # For BucketBatchSampler
 
 # Add global cache to avoid duplicate validation
 _GLOBAL_DATASET_CACHE = {
@@ -49,7 +47,7 @@ class DDMDataset(Dataset):
         self._load_dataset()
 
     def _init_parameters(self):
-        """Initialize all parameters on GPU"""
+        """Initialize parameters on GPU"""
         self.min_size = torch.tensor(self.config.min_size, device=self.device)
         self.num_experts = torch.tensor(self.config.num_experts, device=self.device)
         self.bucket_dims = torch.tensor(self.config.buckets, device=self.device)
@@ -57,37 +55,69 @@ class DDMDataset(Dataset):
         self.caption_ext = '.txt'
 
     def _load_dataset(self):
-        """End-to-end GPU dataset loading pipeline"""
-        # Discover and validate files using GPU kernels
-        all_paths = torch.ops.torchscript.gpu_glob(self.config.dataset_path, self.image_extensions)
-        valid_paths, self.dim_cache = torch.ops.torchscript.gpu_validate(
-            all_paths, 
-            self.min_size,
-            self.caption_ext
-        )
-        
-        # Distributed synchronization
-        self.image_files = self._gpu_all_gather(valid_paths)
-        self.caption_files = [p.replace(ext, self.caption_ext) for p, ext in zip(self.image_files, self.image_extensions)]
-        
-        # GPU-accelerated processing
+        """GPU-accelerated dataset loading without custom ops"""
+        # Discover files using parallel glob
+        all_image_paths = []
+        for ext in self.image_extensions:
+            all_image_paths.extend(
+                glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True)
+            )
+
+        # Split paths across GPUs
+        world_size = get_world_size()
+        rank = get_rank()
+        chunks = np.array_split(all_image_paths, world_size)
+        my_paths = chunks[rank].tolist()
+
+        # Parallel validation with GPU acceleration
+        valid_paths, dims = self._gpu_validate_paths(my_paths)
+
+        # Gather results from all GPUs
+        all_paths = [None] * world_size
+        all_dims = [None] * world_size
+        dist.all_gather_object(all_paths, valid_paths)
+        dist.all_gather_object(all_dims, dims)
+
+        # Combine results
+        self.image_files = [p for sublist in all_paths for p in sublist]
+        self.dim_cache = torch.cat([d.to(self.device) for d in all_dims])
+        self.caption_files = [p.replace(ext, self.caption_ext) 
+                            for p, ext in zip(self.image_files, self.image_extensions)]
+
+        # Process buckets and experts
         self._process_buckets_gpu()
         self._distribute_samples_gpu()
 
-    def _gpu_all_gather(self, tensor):
-        """GPU-optimized all_gather"""
-        world_size = get_world_size()
-        tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
-        dist.all_gather(tensor_list, tensor)
-        return torch.cat(tensor_list).cpu().numpy()
+    def _gpu_validate_paths(self, paths):
+        """Validate paths using mixed CPU/GPU processing"""
+        valid_paths = []
+        valid_dims = []
+        
+        for path in paths:
+            caption_path = os.path.splitext(path)[0] + self.caption_ext
+            if not os.path.exists(caption_path):
+                continue
+            
+            try:
+                # Load image dimensions using PIL
+                with Image.open(path) as img:
+                    width, height = img.size
+                    if width >= self.config.min_size and height >= self.config.min_size:
+                        valid_paths.append(path)
+                        valid_dims.append([width, height])
+            except Exception:
+                continue
+
+        # Convert to GPU tensor
+        dim_tensor = torch.tensor(valid_dims, device=self.device) if valid_dims else torch.empty((0, 2), device=self.device)
+        return valid_paths, dim_tensor
 
     def _process_buckets_gpu(self):
-        """Fully GPU-based bucket assignment"""
+        """GPU-based bucket processing"""
         image_dims = self.dim_cache.float()
-        image_ar = image_dims[:,0] / image_dims[:,1]
-        bucket_ar = self.bucket_dims[:,0] / self.bucket_dims[:,1]
+        image_ar = image_dims[:, 0] / image_dims[:, 1]
+        bucket_ar = self.bucket_dims[:, 0] / self.bucket_dims[:, 1]
         
-        # Batch matrix operations on GPU
         self.bucket_assignments = torch.argmin(
             torch.abs(image_ar.unsqueeze(1) - bucket_ar.unsqueeze(0)), 
             dim=1
@@ -95,13 +125,26 @@ class DDMDataset(Dataset):
 
     def _distribute_samples_gpu(self):
         """GPU-based expert distribution"""
-        self.expert_assignments = torch.arange(len(self.image_files), device=self.device) % self.num_experts
+        indices = torch.arange(len(self.image_files), device=self.device)
+        self.expert_assignments = indices % self.num_experts
 
     def __getitem__(self, idx):
-        """Direct GPU-to-GPU data loading"""
+        """GPU-accelerated data loading"""
+        # Load image to GPU directly
+        img_path = self.image_files[idx]
+        with Image.open(img_path) as img:
+            img = img.convert('RGB')
+            target_size = tuple(self.bucket_dims[self.bucket_assignments[idx]].cpu().numpy())
+            img_tensor = transforms.functional.to_tensor(img).to(self.device)
+            img_tensor = transforms.functional.resize(img_tensor, target_size[::-1])
+        
+        # Load caption
+        with open(self.caption_files[idx], 'r') as f:
+            caption = f.read().strip()
+            
         return {
-            'image': torch.ops.torchscript.gpu_mmap(self.image_files[idx], self.bucket_dims[self.bucket_assignments[idx]]),
-            'caption': torch.ops.torchscript.gpu_text_load(self.caption_files[idx]),
+            'image': img_tensor,
+            'caption': caption,
             'expert': self.expert_assignments[idx],
             'bucket': self.bucket_assignments[idx]
         }
