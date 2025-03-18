@@ -108,86 +108,36 @@ class DDMTrainingCoordinator:
             data_future.result()
     
     def _init_data_loaders(self):
-        """Initialize data loaders with uniform distribution"""
-        debug_print(f"Creating data loaders on rank {self.rank}", self.rank, force=True)
+        """Initialize data loaders with proper multiprocessing support"""
+        debug_print(f"Initializing data loaders on rank {self.rank}", self.rank)
         
-        # Initialize the dataset
-        debug_print(f"Loading training dataset on rank {self.rank}", self.rank, force=True)
-        train_dataset = DDMDataset(
-            config=self.config,
-            split='train'
-        )
+        # Shared configuration
+        loader_config = {
+            'batch_size': self.config.batch_size,
+            'num_workers': min(2, os.cpu_count()),  # Conservative worker count
+            'persistent_workers': True,
+            'pin_memory': False,
+            'multiprocessing_context': 'spawn',
+        }
         
-        # Create validation dataset
-        debug_print(f"Loading validation dataset on rank {self.rank} (may reuse cached validation)", self.rank, force=True)
-        val_dataset = DDMDataset(
-            config=self.config,
-            split='val'
-        )
-        
-        # Print dataset status summary for the user if main process
-        if is_main_process():
-            train_summary = train_dataset.get_status_summary()
-            debug_print("========== DATASET INITIALIZATION COMPLETE ==========", self.rank, force=True)
-            debug_print(f"Training dataset: {train_summary['total_images']} valid image-caption pairs", self.rank, force=True)
-            debug_print(f"Using {train_summary['total_buckets']} bucket sizes for efficient batching", self.rank, force=True)
-            debug_print(f"Distributing across {train_summary['total_experts']} expert GPUs", self.rank, force=True)
-            
-            # Show top bucket information
-            debug_print("Top 3 most common image bucket sizes:", self.rank, force=True)
-            for bucket_idx, count in train_summary['top_buckets']:
-                bucket_size = tuple(train_dataset.bucket_dims[bucket_idx].tolist())
-                debug_print(f"  • {bucket_size}: {count} images ({count/train_summary['total_images']*100:.1f}%)", self.rank, force=True)
-            
-            # Show this rank's workload
-            debug_print(f"This process (rank {self.rank}) will handle {train_summary['images_for_this_rank']} images ({train_summary['percent_for_this_rank']})", self.rank, force=True)
-            debug_print("====================================================", self.rank, force=True)
-        
-        # Create distributed samplers if in distributed training
-        if self.world_size > 1:
-            train_sampler = DistributedSampler(
-                train_dataset, 
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=True
-            )
-            
-            val_sampler = DistributedSampler(
-                val_dataset,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=False
-            )
-        else:
-            train_sampler = None
-            val_sampler = None
-        
-        # Create dataloaders
+        # Train dataset
+        train_dataset = DDMDataset(self.config, 'train')
         self.train_loader = DataLoader(
             train_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=(train_sampler is None),
-            num_workers=self.config.num_workers if hasattr(self.config, 'num_workers') else 4,
-            sampler=train_sampler,
-            pin_memory=False,
-            drop_last=True,
-            multiprocessing_context='spawn',
-            persistent_workers=True if hasattr(self.config, 'num_workers') and self.config.num_workers > 0 else False
+            shuffle=True,
+            **loader_config
         )
         
+        # Validation dataset
+        val_dataset = DDMDataset(self.config, 'val')
         self.val_loader = DataLoader(
             val_dataset,
-            batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.config.num_workers if hasattr(self.config, 'num_workers') else 4,
-            sampler=val_sampler,
-            pin_memory=False,
-            drop_last=False,
-            multiprocessing_context='spawn',
-            persistent_workers=True if hasattr(self.config, 'num_workers') and self.config.num_workers > 0 else False
+            **loader_config
         )
         
-        debug_print(f"Created data loaders with {len(train_dataset)} training samples on rank {self.rank}", self.rank, force=True)
+        # Warmup loader
+        next(iter(self.train_loader), None)
     
     def _init_expert_indices(self):
         """Determine expert assignments without model creation"""

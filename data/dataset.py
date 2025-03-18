@@ -42,282 +42,104 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 class DDMDataset(Dataset):
-    """GPU-optimized dataset pipeline for decentralized diffusion models"""
+    """Pickle-safe dataset pipeline with CPU-only operations"""
     
-    def __init__(self, config, split='train', transforms=None, hf_split=None):
-        # Initialize logger first
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, config, split='train'):
+        # Simplified initialization without any distributed references
         self.config = config
         self.split = split
-        
-        # Validate required parameters
-        if not hasattr(config, 'min_size'):
-            raise ValueError("Configuration missing required 'min_size' parameter")
-        if not hasattr(config, 'num_experts'):
-            raise ValueError("Configuration missing required 'num_experts' parameter")
+        self._init_parameters()
+        self._load_dataset()
 
-        # Get the local rank for proper device assignment
-        self.rank = get_rank()
-        self.local_rank = get_local_rank()
-        
-        # Always use CPU for dataset processing and communication
-        self.device = torch.device('cpu')
-        self.logger.info(f"Rank {self.rank}: Using CPU for dataset processing and distributed operations")
-        
-        # Define file extensions
+    def _init_parameters(self):
+        """Initialize all parameters as basic Python types"""
+        self.min_size = self.config.min_size
+        self.num_experts = self.config.num_experts
+        self.bucket_dims = [tuple(b) for b in self.config.buckets]
         self.image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
         self.caption_ext = '.txt'
+        self.device = 'cpu'
+
+    def _load_dataset(self):
+        """Load dataset metadata without distributed operations"""
+        self.image_files = []
+        self.caption_files = []
+        self.dim_cache = []
         
-        # Convert config values to tensors with proper validation
-        self.min_size = torch.tensor(
-            getattr(config, 'min_size', 256),  # Default fallback
-            device=self.device
-        )
-        self.num_experts = torch.tensor(
-            getattr(config, 'num_experts', 8),  # Default fallback
-            device=self.device
+        # Simple file discovery without MPI/rank dependencies
+        for ext in self.image_extensions:
+            for img_path in glob.glob(os.path.join(self.config.dataset_path, f'**/*{ext}'), recursive=True):
+                caption_path = os.path.splitext(img_path)[0] + self.caption_ext
+                if os.path.exists(caption_path):
+                    self.image_files.append(img_path)
+                    self.caption_files.append(caption_path)
+                    # Get dimensions without loading full image
+                    with Image.open(img_path) as img:
+                        self.dim_cache.append(img.size)  # Store as (W, H)
+        
+        self._process_buckets()
+
+    def _process_buckets(self):
+        """CPU-based bucket processing with numpy"""
+        # Convert to numpy arrays for pickle safety
+        self.dim_cache = np.array(self.dim_cache, dtype=np.int32)
+        bucket_dims = np.array(self.bucket_dims, dtype=np.int32)
+        
+        # Calculate aspect ratios
+        image_ar = self.dim_cache[:,0] / self.dim_cache[:,1]
+        bucket_ar = bucket_dims[:,0] / bucket_dims[:,1]
+        
+        # Find closest bucket for each image
+        self.bucket_assignments = np.argmin(
+            np.abs(image_ar[:,None] - bucket_ar[None,:]),
+            axis=1
         )
         
-        # Store bucket sizes as tensors
-        self.bucket_dims = torch.tensor(
-            config.buckets, 
-            device=self.device,
-            dtype=torch.int32
-        )
+        # Expert distribution
+        self.expert_assignments = np.arange(len(self.image_files)) % self.num_experts
+
+    def __getitem__(self, idx):
+        """Load data with on-the-fly tensor conversion"""
+        img_path = self.image_files[idx]
+        caption_path = self.caption_files[idx]
         
-        # Load dataset with direct file discovery (no separate validation pass)
-        self._discover_and_process_files()
-        self._init_buckets()
-        self._distribute_samples()
+        # Load image
+        with Image.open(img_path) as img:
+            img = img.convert('RGB')
+            target_size = self.bucket_dims[self.bucket_assignments[idx]]
+            img = img.resize(target_size)
+            tensor = transforms.ToTensor()(img)
+        
+        # Load caption
+        with open(caption_path, 'r') as f:
+            caption = f.read().strip()
+            
+        return {
+            'image': tensor,
+            'caption': caption,
+            'expert': self.expert_assignments[idx],
+            'bucket': self.bucket_assignments[idx]
+        }
+
+    def __len__(self):
+        return len(self.image_files)
 
     def __getstate__(self):
-        """Control what gets pickled to ensure we don't include unpicklable objects"""
-        state = self.__dict__.copy()
-        # Remove logger as it can't be pickled properly
-        state['logger'] = None
-        return state
-    
-    def __setstate__(self, state):
-        """Restore state after unpickling"""
-        self.__dict__.update(state)
-        # Restore logger
-        self.logger = logging.getLogger(__name__)
+        return {
+            'config': self.config,
+            'split': self.split,
+            'image_files': self.image_files,
+            'caption_files': self.caption_files,
+            'dim_cache': self.dim_cache,
+            'bucket_assignments': self.bucket_assignments,
+            'expert_assignments': self.expert_assignments
+        }
 
-    def _discover_and_process_files(self):
-        """Find valid image-caption pairs in a single efficient pass"""
-        global _GLOBAL_DATASET_CACHE
-        
-        # If cache is already initialized by another dataset instance, use it
-        if _GLOBAL_DATASET_CACHE["initialized"] and is_main_process():
-            self.logger.info(f"Rank {self.rank}: Using cached dataset with {len(_GLOBAL_DATASET_CACHE['image_files'])} files")
-            self.image_files = _GLOBAL_DATASET_CACHE["image_files"]
-            self.caption_files = _GLOBAL_DATASET_CACHE["caption_files"]
-            self.dim_cache = _GLOBAL_DATASET_CACHE["dim_cache"]
-            
-            # If we're using the validation split, we'll need to filter later
-            return
-        elif not is_main_process() and _GLOBAL_DATASET_CACHE["initialized"]:
-            # Non-main processes also use the cache if it exists
-            self.image_files = _GLOBAL_DATASET_CACHE["image_files"]
-            self.caption_files = _GLOBAL_DATASET_CACHE["caption_files"]
-            self.dim_cache = _GLOBAL_DATASET_CACHE["dim_cache"]
-            return
-        
-        if not self.config.dataset_path:
-            raise ValueError("Dataset path must be provided")
-        
-        # Process files synchronously across nodes
-        if not is_main_process():
-            # Initialize storage
-            self.image_files = []
-            self.caption_files = []
-            all_dims = []
-            
-            # First receive total number of images
-            try:
-                # Use CPU-only operations for distributed communication
-                total_images = broadcast_object(None, src=0)
-                self.logger.info(f"Rank {self.rank}: Expecting to receive {total_images} images from rank 0")
-                
-                # Process in smaller batches to avoid timeouts
-                batch_size = 50  # Smaller batch size to prevent timeouts and memory issues
-                num_batches = (total_images + batch_size - 1) // batch_size
-                
-                for i in range(num_batches):
-                    self.logger.info(f"Rank {self.rank}: Receiving batch {i+1}/{num_batches}")
-                    try:
-                        batch_data = broadcast_object(None, src=0)
-                        
-                        # Check if we received a valid batch or a signal to end
-                        if batch_data is None:
-                            self.logger.warning(f"Rank {self.rank}: Received None batch, skipping")
-                            continue
-                            
-                        if batch_data.get('done', False):
-                            self.logger.info(f"Rank {self.rank}: Received end signal after {len(self.image_files)} images")
-                            break
-                        
-                        batch_images = batch_data.get('images', [])
-                        batch_captions = batch_data.get('captions', [])
-                        batch_dims = batch_data.get('dimensions', [])
-                        
-                        self.image_files.extend(batch_images)
-                        self.caption_files.extend(batch_captions)
-                        all_dims.extend(batch_dims)
-                        
-                        # Simple acknowledgment without distributed communication
-                        self.logger.info(f"Rank {self.rank}: Received batch {i+1}/{num_batches} with {len(batch_images)} images (total: {len(self.image_files)})")
-                    except Exception as e:
-                        self.logger.error(f"Rank {self.rank}: Error receiving batch {i+1}: {str(e)}")
-                
-                # Convert dimensions to tensor
-                self.dim_cache = torch.tensor(all_dims, device=self.device, dtype=torch.int32)
-                self.logger.info(f"Rank {self.rank}: Successfully received {len(self.image_files)} valid image-caption pairs")
-                
-                # Update the global cache
-                _GLOBAL_DATASET_CACHE["image_files"] = self.image_files
-                _GLOBAL_DATASET_CACHE["caption_files"] = self.caption_files
-                _GLOBAL_DATASET_CACHE["dim_cache"] = self.dim_cache
-                _GLOBAL_DATASET_CACHE["initialized"] = True
-                
-            except Exception as e:
-                self.logger.error(f"Rank {self.rank}: Critical error during file reception: {str(e)}")
-                raise
-            return
-        
-        self.logger.info(f"Rank {self.rank}: Finding image-caption pairs in {self.config.dataset_path}")
-        
-        try:
-            # Initialize storage for valid filesdebug
-            valid_files = []
-            caption_files = []
-            valid_dims = []
-            
-            # Discover all image files more efficiently
-            all_images = []
-            for ext in self.image_extensions:
-                pattern = os.path.join(self.config.dataset_path, f'**/*{ext}')
-                all_images.extend(glob.glob(pattern, recursive=True))
-            
-            # Limit dataset size for testing if needed
-            max_files = getattr(self.config, 'max_files', len(all_images))
-            if max_files < len(all_images):
-                all_images = all_images[:max_files]
-                self.logger.info(f"Rank {self.rank}: Limiting to {max_files} files for testing")
-            
-            # First broadcast total number of images we'll process
-            total_images = len(all_images)
-            self.logger.info(f"Rank {self.rank}: Broadcasting total count of {total_images} images")
-            broadcast_object(total_images, src=0)
-            
-            # Process files with progress tracking
-            pbar = tqdm(
-                total=len(all_images),
-                desc="Finding Valid Pairs",
-                unit="pair",
-                dynamic_ncols=True
-            )
-            
-            # Use extremely small batch sizes for broadcasting to prevent timeouts
-            broadcast_batch_size = 50  # Very small size to ensure reliable transmission
-            
-            # Process images first to find all valid ones
-            with ThreadPoolExecutor(max_workers=min(4, os.cpu_count())) as executor:
-                futures = []
-                # Use smaller processing batch size too
-                process_batch_size = 500
-                
-                for i in range(0, len(all_images), process_batch_size):
-                    batch = all_images[i:min(i + process_batch_size, len(all_images))]
-                    futures.append(executor.submit(self._find_valid_pairs, batch))
-                
-                # Collect results 
-                for future in as_completed(futures):
-                    try:
-                        batch_images, batch_captions, batch_dims = future.result()
-                        valid_files.extend(batch_images)
-                        caption_files.extend(batch_captions)
-                        valid_dims.extend(batch_dims)
-                        pbar.update(process_batch_size)
-                    except Exception as e:
-                        self.logger.error(f"Rank {self.rank}: Error processing image batch: {str(e)}")
-            
-            pbar.close()
-            
-            # Now broadcast the valid files in small batches to prevent timeouts
-            self.logger.info(f"Rank {self.rank}: Broadcasting {len(valid_files)} valid files in batches of {broadcast_batch_size}")
-            
-            # Add progress tracking for broadcasting phase
-            broadcast_start = time.time()
-            broadcast_pbar = tqdm(
-                total=len(valid_files),
-                desc="Broadcasting Data",
-                unit="file",
-                dynamic_ncols=True
-            )
-            
-            # Broadcast in small chunks
-            for i in range(0, len(valid_files), broadcast_batch_size):
-                end_idx = min(i + broadcast_batch_size, len(valid_files))
-                batch_images = valid_files[i:end_idx]
-                batch_captions = caption_files[i:end_idx]
-                batch_dims = valid_dims[i:end_idx]
-                
-                batch_data = {
-                    'images': batch_images,
-                    'captions': batch_captions,
-                    'dimensions': batch_dims,
-                    'done': False
-                }
-                
-                try:
-                    batch_num = i//broadcast_batch_size + 1
-                    total_batches = (len(valid_files) + broadcast_batch_size - 1) // broadcast_batch_size
-                    self.logger.info(f"Rank {self.rank}: Broadcasting batch {batch_num}/{total_batches} ({end_idx-i} files, {i} processed so far)")
-                    broadcast_object(batch_data, src=0)
-                    time.sleep(0.1)  # Short sleep to prevent overwhelming receivers
-                    broadcast_pbar.update(len(batch_images))
-                except Exception as e:
-                    self.logger.error(f"Rank {self.rank}: Error broadcasting batch {i//broadcast_batch_size + 1}: {str(e)}")
-                    # Try again with a smaller batch if this fails
-                    if broadcast_batch_size > 10:
-                        smaller_batch_size = max(10, broadcast_batch_size // 2)
-                        self.logger.info(f"Rank {self.rank}: Reducing batch size to {smaller_batch_size} and retrying")
-                        # Adjust i to retry this batch with smaller size
-                        i -= broadcast_batch_size
-                        broadcast_batch_size = smaller_batch_size
-                        continue
-            
-            broadcast_pbar.close()
-            broadcast_time = time.time() - broadcast_start
-            self.logger.info(f"Rank {self.rank}: Broadcasting complete in {broadcast_time:.2f}s")
-            
-            # Send final "done" signal
-            self.logger.info(f"Rank {self.rank}: Sending completion signal after {len(valid_files)} valid pairs")
-            broadcast_object({'done': True}, src=0)
-            
-            # Store results
-            self.image_files = valid_files
-            self.caption_files = caption_files
-            self.dim_cache = torch.tensor(valid_dims, device=self.device, dtype=torch.int32)
-            
-            # Update the global cache
-            _GLOBAL_DATASET_CACHE["image_files"] = self.image_files
-            _GLOBAL_DATASET_CACHE["caption_files"] = self.caption_files
-            _GLOBAL_DATASET_CACHE["dim_cache"] = self.dim_cache
-            _GLOBAL_DATASET_CACHE["initialized"] = True
-            
-            # Log summary
-            self.logger.info(f"Rank {self.rank}: Completed with {len(valid_files)} valid image-caption pairs")
-        except Exception as e:
-            self.logger.error(f"Rank {self.rank}: Critical error in main process: {str(e)}")
-            # Try to send error signal to other processes
-            try:
-                broadcast_object({'error': True, 'message': str(e)}, src=0)
-            except:
-                pass
-            raise
-        
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._init_parameters()
+        # No need to reprocess buckets as assignments are stored
+
     def _find_valid_pairs(self, image_files):
         """Find valid image-caption pairs from a batch of image files"""
         valid_images = []
@@ -382,7 +204,7 @@ class DDMDataset(Dataset):
                 self.image_files = [self.image_files[i] for i in val_indices]
                 self.caption_files = [self.caption_files[i] for i in val_indices]
                 self.dim_cache = self.dim_cache[val_indices]
-                self.logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for validation split")
+                logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for validation split")
         elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
             # For training, exclude validation samples if specified
             val_size = getattr(self.config, 'val_size', 1000)
@@ -397,9 +219,9 @@ class DDMDataset(Dataset):
                 self.image_files = [self.image_files[i] for i in train_indices]
                 self.caption_files = [self.caption_files[i] for i in train_indices]
                 self.dim_cache = self.dim_cache[train_indices]
-                self.logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for training split (excluded {val_size} validation files)")
+                logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for training split (excluded {val_size} validation files)")
         
-        self.logger.info(f"Rank {self.rank}: Starting bucket assignment for {len(self.image_files)} images...")
+        logger.info(f"Rank {self.rank}: Starting bucket assignment for {len(self.image_files)} images...")
         bucket_start = time.time()
         
         # Calculate aspect ratios
@@ -418,17 +240,17 @@ class DDMDataset(Dataset):
                 bucket_counts[i] = count
         
         bucket_time = time.time() - bucket_start
-        self.logger.info(f"Rank {self.rank}: Bucket assignment completed in {bucket_time:.2f}s - {len(bucket_counts)} buckets used")
+        logger.info(f"Rank {self.rank}: Bucket assignment completed in {bucket_time:.2f}s - {len(bucket_counts)} buckets used")
         
         # Log distribution stats
         top_buckets = sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:5]
         for bucket_idx, count in top_buckets:
-            bucket_size = tuple(self.bucket_dims[bucket_idx].tolist())
-            self.logger.info(f"Rank {self.rank}: Bucket {bucket_idx} ({bucket_size}): {count} images")
+            bucket_size = tuple(self.bucket_dims[bucket_idx])
+            logger.info(f"Rank {self.rank}: Bucket {bucket_idx} ({bucket_size}): {count} images")
 
     def _distribute_samples(self):
         """CPU-based expert distribution"""
-        self.logger.info(f"Rank {self.rank}: Starting expert assignment for {len(self.image_files)} images...")
+        logger.info(f"Rank {self.rank}: Starting expert assignment for {len(self.image_files)} images...")
         expert_start = time.time()
         
         # Create expert assignments using modulo
@@ -442,41 +264,19 @@ class DDMDataset(Dataset):
             expert_counts[i] = count
             
         expert_time = time.time() - expert_start
-        self.logger.info(f"Rank {self.rank}: Expert distribution completed in {expert_time:.2f}s")
+        logger.info(f"Rank {self.rank}: Expert distribution completed in {expert_time:.2f}s")
         
         # Log distribution for this rank
         this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
-        self.logger.info(f"Rank {self.rank}: Will process {this_rank_count} images ({this_rank_count/len(self.image_files)*100:.1f}% of dataset)")
+        logger.info(f"Rank {self.rank}: Will process {this_rank_count} images ({this_rank_count/len(self.image_files)*100:.1f}% of dataset)")
         
         # Log total info
-        dataset_prep_complete = time.time()
-        self.logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
+        logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
 
-    def __getitem__(self, idx):
-        """Get a training sample with image and caption"""
-        # Get target size from bucket assignment
-        bucket_idx = self.bucket_assignments[idx]
-        target_h = self.bucket_dims[bucket_idx, 1]
-        target_w = self.bucket_dims[bucket_idx, 0]
-        
-        # Load image and caption
-        tensor = self._load_image_tensor(idx, (target_w, target_h))
-        caption = self._load_caption(idx)
-        
-        return {
-            'image': tensor,
-            'caption': caption,
-            'expert': self.expert_assignments[idx],
-            'bucket': bucket_idx
-        }
-
-    def __len__(self):
-        """Get dataset length"""
-        return len(self.image_files)
-        
     def get_status_summary(self):
         """Generate a user-friendly status summary of dataset processing"""
         if not hasattr(self, 'image_files') or len(self.image_files) == 0:
+            logger.warning("Dataset status requested before initialization")
             return {
                 "status": "incomplete",
                 "message": "Dataset processing has not completed or failed",
@@ -615,7 +415,6 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
 
     # Use CPU for bucket sampler to avoid NCCL conflicts
     device = torch.device('cpu')
-    logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
     logger.info(f"Rank {rank}: Using CPU for bucket sampler to avoid NCCL conflicts")
     
     loader_start = time.time()
