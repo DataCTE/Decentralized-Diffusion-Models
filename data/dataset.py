@@ -53,21 +53,15 @@ class DDMDataset(Dataset):
         self.rank = get_rank()
         self.local_rank = get_local_rank()
         
-        # Then initialize GPU device reference with appropriate device ID
-        if torch.cuda.is_available():
-            # Use CPU for distributed data processing to avoid NCCL issues
-            # The model itself can still use GPU, this is just for dataset operations
-            self.device = torch.device('cpu')
-            self.logger.info(f"Rank {self.rank}: Using CPU for dataset processing to avoid NCCL conflicts")
-        else:
-            self.device = torch.device('cpu')
-            self.logger.info(f"Rank {self.rank}: Using CPU (no CUDA available)")
+        # Always use CPU for dataset processing and communication
+        self.device = torch.device('cpu')
+        self.logger.info(f"Rank {self.rank}: Using CPU for dataset processing and distributed operations")
         
         # Define file extensions
         self.image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
         self.caption_ext = '.txt'
         
-        # Convert config values to GPU tensors with proper validation
+        # Convert config values to tensors with proper validation
         self.min_size = torch.tensor(
             getattr(config, 'min_size', 256),  # Default fallback
             device=self.device
@@ -77,7 +71,7 @@ class DDMDataset(Dataset):
             device=self.device
         )
         
-        # Store bucket sizes as GPU tensors
+        # Store bucket sizes as tensors
         self.bucket_dims = torch.tensor(
             config.buckets, 
             device=self.device,
@@ -86,8 +80,8 @@ class DDMDataset(Dataset):
         
         # Load dataset with direct file discovery (no separate validation pass)
         self._discover_and_process_files()
-        self._init_gpu_buckets()
-        self._distribute_samples_gpu()
+        self._init_buckets()
+        self._distribute_samples()
 
     def _discover_and_process_files(self):
         """Find valid image-caption pairs in a single efficient pass"""
@@ -103,11 +97,12 @@ class DDMDataset(Dataset):
             
             # First receive total number of images
             try:
+                # Use CPU-only operations for distributed communication
                 total_images = broadcast_object(None, src=0)
                 self.logger.info(f"Rank {self.rank}: Expecting to receive {total_images} images from rank 0")
                 
                 # Process in smaller batches to avoid timeouts
-                batch_size = 100  # Much smaller batch size to prevent timeouts and memory issues
+                batch_size = 50  # Smaller batch size to prevent timeouts and memory issues
                 num_batches = (total_images + batch_size - 1) // batch_size
                 
                 for i in range(num_batches):
@@ -132,10 +127,7 @@ class DDMDataset(Dataset):
                         self.caption_files.extend(batch_captions)
                         all_dims.extend(batch_dims)
                         
-                        # Acknowledge receipt of the batch by broadcasting a confirmation
-                        broadcast_object({'batch': i+1, 'received': True, 'count': len(batch_images)}, src=self.rank)
-                        
-                        # Log every batch for better monitoring
+                        # Simple acknowledgment without distributed communication
                         self.logger.info(f"Rank {self.rank}: Received batch {i+1}/{num_batches} with {len(batch_images)} images (total: {len(self.image_files)})")
                     except Exception as e:
                         self.logger.error(f"Rank {self.rank}: Error receiving batch {i+1}: {str(e)}")
@@ -182,13 +174,13 @@ class DDMDataset(Dataset):
             )
             
             # Use extremely small batch sizes for broadcasting to prevent timeouts
-            broadcast_batch_size = 100  # Very small size to ensure reliable transmission
+            broadcast_batch_size = 50  # Very small size to ensure reliable transmission
             
             # Process images first to find all valid ones
-            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count())) as executor:
+            with ThreadPoolExecutor(max_workers=min(4, os.cpu_count())) as executor:
                 futures = []
                 # Use smaller processing batch size too
-                process_batch_size = 1000
+                process_batch_size = 500
                 
                 for i in range(0, len(all_images), process_batch_size):
                     batch = all_images[i:min(i + process_batch_size, len(all_images))]
@@ -227,16 +219,7 @@ class DDMDataset(Dataset):
                 try:
                     self.logger.info(f"Rank {self.rank}: Broadcasting batch {i//broadcast_batch_size + 1}/{(len(valid_files) + broadcast_batch_size - 1) // broadcast_batch_size} with {len(batch_images)} files")
                     broadcast_object(batch_data, src=0)
-                    
-                    # Wait for acknowledgment from each rank to ensure synchronization
-                    for r in range(1, get_world_size()):
-                        try:
-                            ack = broadcast_object(None, src=r)
-                            if ack and ack.get('received', False):
-                                self.logger.info(f"Rank {self.rank}: Received acknowledgment from rank {r} for batch {ack.get('batch')}: {ack.get('count')} files")
-                        except Exception as e:
-                            self.logger.warning(f"Rank {self.rank}: No acknowledgment from rank {r}: {str(e)}")
-                            
+                    time.sleep(0.1)  # Short sleep to prevent overwhelming receivers
                 except Exception as e:
                     self.logger.error(f"Rank {self.rank}: Error broadcasting batch {i//broadcast_batch_size + 1}: {str(e)}")
                     # Try again with a smaller batch if this fails
@@ -297,43 +280,45 @@ class DDMDataset(Dataset):
         return valid_images, valid_captions, valid_dims
         
     def _load_image_tensor(self, idx, target_size):
-        """Load image efficiently for training"""
+        """Load image efficiently for training - GPU usage only for final tensor"""
         with open(self.image_files[idx], 'rb') as f:
             img = Image.open(io.BytesIO(f.read())).convert('RGB')
             if target_size:
                 img = img.resize(target_size, Image.BILINEAR)
-            tensor = transforms.ToTensor()(img).to(self.device)
-            return normalize(tensor)
+                
+            # Process on CPU then only transfer final tensor to GPU if needed
+            tensor = transforms.ToTensor()(img)
+            normalized = normalize(tensor)
+            
+            # GPU is only used here for actual data loading, not for processing
+            if torch.cuda.is_available():
+                return normalized.cuda()
+            return normalized
             
     def _load_caption(self, idx):
         """Load caption for the given image index"""
         with open(self.caption_files[idx], 'r', encoding='utf-8') as f:
             return f.read().strip()
 
-    def _init_gpu_buckets(self):
-        """GPU-accelerated bucket initialization"""
-        # Convert buckets to GPU tensor
-        self.buckets = torch.tensor(self.config.buckets, 
-                                  device=self.device,
-                                  dtype=torch.float32)
-        
-        # Calculate aspect ratios on GPU
-        bucket_aspects = self.buckets[:,0] / self.buckets[:,1]
+    def _init_buckets(self):
+        """CPU-based bucket initialization"""
+        # Calculate aspect ratios
+        bucket_aspects = self.bucket_dims[:,0] / self.bucket_dims[:,1]
         image_aspects = self.dim_cache[:,0] / self.dim_cache[:,1]
 
-        # Find closest bucket using GPU matrix ops
+        # Find closest bucket using matrix ops
         diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
         self.bucket_assignments = torch.argmin(diffs, dim=1)
         
-        self.logger.info(f"GPU bucket assignment completed: {self.buckets.shape[0]} buckets")
+        self.logger.info(f"Bucket assignment completed: {self.bucket_dims.shape[0]} buckets")
 
-    def _distribute_samples_gpu(self):
-        """GPU-accelerated expert distribution"""
-        # Create expert assignments using modulo on GPU
+    def _distribute_samples(self):
+        """CPU-based expert distribution"""
+        # Create expert assignments using modulo
         indices = torch.arange(len(self.image_files), device=self.device)
         self.expert_assignments = indices % self.num_experts
         
-        self.logger.info(f"GPU expert distribution completed: {self.num_experts} experts")
+        self.logger.info(f"Expert distribution completed: {self.num_experts.item()} experts")
 
     def __getitem__(self, idx):
         """Get a training sample with image and caption"""

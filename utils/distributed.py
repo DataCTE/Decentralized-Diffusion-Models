@@ -57,53 +57,43 @@ def broadcast_object(obj, src=0, group=None, device=None, timeout=None):
     # Get rank info for logging
     rank = get_rank()
     
-    # Force CPU usage for tensors to avoid NCCL GPU conflicts
-    device = torch.device("cpu")
+    # Check the backend type
+    backend = dist.get_backend()
     
-    # Maximum number of retries for robustness
-    max_retries = 3
-    retry_delay = 1  # seconds
+    # For NCCL backend, we must use CUDA tensors
+    if backend == 'nccl' and torch.cuda.is_available():
+        device = torch.device(f"cuda:{get_local_rank()}")
+    else:
+        # For gloo or other backends, use CPU
+        device = torch.device("cpu")
     
-    for attempt in range(max_retries):
-        try:
-            # If we are the source process, pickle the object
-            if rank == src:
-                buffer = io.BytesIO()
-                torch.save(obj, buffer)
-                data = bytearray(buffer.getvalue())
-                size = torch.tensor([len(data)], dtype=torch.long, device=device)
-            else:
-                size = torch.tensor([0], dtype=torch.long, device=device)
-            
-            # Broadcast the size of the pickled object using CPU tensor to avoid NCCL issues
-            dist.broadcast(size, src=src, group=group)
-            
-            # Broadcast the pickled object
-            if rank == src:
-                tensor = torch.tensor(list(data), dtype=torch.uint8, device=device)
-            else:
-                tensor = torch.empty(size.item(), dtype=torch.uint8, device=device)
-            
-            dist.broadcast(tensor, src=src, group=group)
-            
-            # If we're not the source, unpickle the object
-            if rank != src:
-                buffer = io.BytesIO(tensor.cpu().numpy().tobytes())
-                obj = torch.load(buffer)
-            
-            # Successful broadcast
-            return obj
-            
-        except Exception as e:
-            if attempt < max_retries - 1:
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Rank {rank}: Broadcast attempt {attempt+1} failed: {str(e)}. Retrying in {retry_delay}s...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-            else:
-                logger = logging.getLogger(__name__)
-                logger.error(f"Rank {rank}: All broadcast attempts failed. Last error: {str(e)}")
-                raise
+    # If we are the source process, pickle the object
+    if rank == src:
+        buffer = io.BytesIO()
+        torch.save(obj, buffer)
+        data = bytearray(buffer.getvalue())
+        size = torch.tensor([len(data)], dtype=torch.long, device=device)
+    else:
+        size = torch.tensor([0], dtype=torch.long, device=device)
+    
+    # Broadcast the size of the pickled object
+    dist.broadcast(size, src=src, group=group)
+    
+    # Broadcast the pickled object
+    if rank == src:
+        tensor = torch.tensor(list(data), dtype=torch.uint8, device=device)
+    else:
+        tensor = torch.empty(size.item(), dtype=torch.uint8, device=device)
+    
+    dist.broadcast(tensor, src=src, group=group)
+    
+    # If we're not the source, unpickle the object
+    if rank != src:
+        buffer = io.BytesIO(tensor.cpu().numpy().tobytes())
+        obj = torch.load(buffer)
+    
+    # Return the broadcast object
+    return obj
 
 def broadcast_tensor(tensor, src=0):
     """
@@ -119,7 +109,7 @@ def broadcast_tensor(tensor, src=0):
     if not is_dist_initialized():
         return tensor
     
-    # Force CPU usage to avoid NCCL GPU conflicts
+    # Always use CPU for communication
     tensor_device = tensor.device if tensor is not None else None
     
     # Create empty tensor on non-source ranks
@@ -146,7 +136,7 @@ def broadcast_tensor(tensor, src=0):
     # Broadcast tensor
     dist.broadcast(tensor, src=src)
     
-    # Move back to original device if needed
+    # Move back to original device if needed and requested
     if tensor_device is not None and str(tensor_device).startswith('cuda'):
         tensor = tensor.to(tensor_device)
     
@@ -166,16 +156,16 @@ def broadcast_numpy_array(array, src=0):
     if not is_dist_initialized():
         return array
     
-    # Convert to tensor, broadcast, then convert back to numpy
+    # Convert to tensor (on CPU), broadcast, then convert back to numpy
     if get_rank() == src:
-        tensor = torch.from_numpy(array).cuda()
+        tensor = torch.from_numpy(array)
     else:
         tensor = None
     
     tensor = broadcast_tensor(tensor, src)
     
     # Convert back to numpy
-    return tensor.cpu().numpy()
+    return tensor.numpy()
 
 def reduce_dict(input_dict, average=True):
     """
@@ -239,9 +229,9 @@ def gather_tensor(tensor, dst=0):
     if world_size < 2:
         return [tensor]
     
-    # Ensure tensor is on CUDA
-    if not tensor.is_cuda:
-        tensor = tensor.cuda()
+    # Use CPU tensors for communication
+    tensor_device = tensor.device
+    tensor = tensor.cpu()
     
     # Create output list on destination
     if get_rank() == dst:
@@ -251,6 +241,10 @@ def gather_tensor(tensor, dst=0):
     
     # Gather
     dist.gather(tensor, gathered, dst=dst)
+    
+    # Move back to original device if needed
+    if gathered is not None and str(tensor_device).startswith('cuda'):
+        gathered = [t.to(tensor_device) for t in gathered]
     
     return gathered
 
@@ -272,15 +266,19 @@ def all_gather_tensor(tensor):
     if world_size < 2:
         return [tensor]
     
-    # Ensure tensor is on CUDA
-    if not tensor.is_cuda:
-        tensor = tensor.cuda()
-        
+    # Use CPU tensors for communication
+    tensor_device = tensor.device
+    tensor = tensor.cpu()
+    
     # Create output list
     gathered = [torch.empty_like(tensor) for _ in range(world_size)]
     
     # All-gather
     dist.all_gather(gathered, tensor)
+    
+    # Move back to original device if needed
+    if str(tensor_device).startswith('cuda'):
+        gathered = [t.to(tensor_device) for t in gathered]
     
     return gathered
 
