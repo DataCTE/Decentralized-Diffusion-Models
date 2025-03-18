@@ -7,8 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from collections import defaultdict
 import logging
-import time  # Add missing time module import
-
+import time  
 import glob
 
 import io
@@ -668,12 +667,8 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         loader = DataLoader(
             dataset,
             batch_sampler=sampler,
-            num_workers=config.num_workers,
-            pin_memory=False,
-            persistent_workers=True,
-            prefetch_factor=config.prefetch_factor if hasattr(config, 'prefetch_factor') else 2,
-            multiprocessing_context='spawn' if config.num_workers > 0 else None,
-            generator=torch.Generator(device='cpu')  # Always use CPU generator for consistency
+            num_workers=0,  # No worker processes = no pickling needed
+            pin_memory=True
         )
         loader_config_time = time.time() - loader_config_start
         

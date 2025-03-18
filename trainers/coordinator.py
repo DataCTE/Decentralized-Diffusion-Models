@@ -107,16 +107,14 @@ class DDMTrainingCoordinator:
             data_future.result()
     
     def _init_data_loaders(self):
-        """Initialize data loaders with proper multiprocessing support"""
+        """Initialize data loaders without multiprocessing to avoid pickling requirements"""
         debug_print(f"Initializing data loaders on rank {self.rank}", self.rank)
         
-        # Shared configuration
+        # Shared configuration - set num_workers=0 to disable multiprocessing
         loader_config = {
             'batch_size': self.config.batch_size,
-            'num_workers': min(2, os.cpu_count()),  # Conservative worker count
-            'persistent_workers': True,
-            'pin_memory': False,
-            'multiprocessing_context': 'spawn',
+            'num_workers': 0,  # Use single-process data loading
+            'pin_memory': False,  # This is safe to use without multiprocessing
         }
         
         # Train dataset
@@ -134,9 +132,6 @@ class DDMTrainingCoordinator:
             shuffle=False,
             **loader_config
         )
-        
-        # Warmup loader
-        next(iter(self.train_loader), None)
     
     def _init_expert_indices(self):
         """Determine expert assignments without model creation"""
