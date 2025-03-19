@@ -22,47 +22,62 @@ from utils.expert_cache import ExpertCacheManager
 
 def setup_distributed():
     """Initialize distributed training environment"""
+    # Set NCCL environment variables
+    os.environ['NCCL_DEBUG'] = 'INFO'
+    os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'  # Adjust if needed
+    os.environ['NCCL_BLOCKING_WAIT'] = '1'
+    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+    
+    # Initialize process group with longer timeout
     dist.init_process_group(
         backend='nccl',
-        timeout=timedelta(minutes=15)
+        timeout=timedelta(minutes=90)  # 90 minute timeout
     )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    return rank, world_size
-
-def main():
-    # Basic setup
-    rank, world_size = setup_distributed()
+    
+    # Set device and ensure it's properly initialized
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     
+    # Synchronize all processes before proceeding
+    torch.cuda.synchronize(device)
+    dist.barrier()
+    
+    return rank, world_size
+
+def main():
     # Load configuration
     config = get_config("config.py")
     
-    # Initialize logging only on main process
-    if rank == 0:
-        setup_logger(config.output_dir)
-        log_training_start(logging.getLogger(), config, rank)
-        
-        # Show dataset initialization message
-        print("="*50)
-        print(" Initializing dataset - this may take a few minutes")
-        print(" Progress logs will be shown during the process")
-        print("="*50)
-    
-    # Create expert cache manager
-    cache_manager = ExpertCacheManager(
-        config=config,
-        device=device,
-        max_experts=config.max_experts_in_memory,
-        cpu_offload=config.expert_offload_to_cpu
-    )
-
+    # Basic setup with error handling
     try:
-        # Initialize coordinator with progress tracking
-        start_time = datetime.now()
+        rank, world_size = setup_distributed()
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
         
-        # Initialize training coordinator
+        # Initialize logging only on main process
+        if rank == 0:
+            setup_logger(config.output_dir)
+            log_training_start(logging.getLogger(), config, rank)
+            
+            print("="*50)
+            print(" Initializing dataset - this may take a few minutes")
+            print(" Progress logs will be shown during the process")
+            print("="*50)
+        
+        # Synchronize before dataset initialization
+        dist.barrier()
+        
+        # Create expert cache manager with proper error handling
+        cache_manager = ExpertCacheManager(
+            config=config,
+            device=device,
+            max_experts=config.max_experts_in_memory,
+            cpu_offload=config.expert_offload_to_cpu
+        )
+        
+        # Initialize coordinator with progress tracking
         coordinator = DDMTrainingCoordinator(
             config=config,
             rank=rank,
@@ -70,24 +85,16 @@ def main():
             cache_manager=cache_manager
         )
         
-        # Log dataset initialization completion time
-        init_time = datetime.now() - start_time
-        if rank == 0:
-            print(f"Dataset initialization completed in {init_time.total_seconds():.2f} seconds")
-
-        # Load checkpoint if available
-        if config.resume_checkpoint:
-            checkpoint_dir = os.path.join(config.output_dir, 'checkpoints', config.resume_checkpoint)
-            load_coordinator_checkpoint(coordinator, checkpoint_dir)
-
-        # Call the train method directly, which already contains the main training loop
+        # Train with proper error handling
         coordinator.train(config.num_steps)
-
+        
     except Exception as e:
-        logging.error(f"Training failed: {str(e)}")
+        logging.error(f"Training failed on rank {rank}: {str(e)}")
         raise
     finally:
-        dist.destroy_process_group()
+        # Ensure cleanup
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

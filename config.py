@@ -52,20 +52,22 @@ DEFAULT_CONFIG = {
     'dataset_path': '/home/alex/workspace/datasets/danbooru2025',
     'dataset_size': 100000,
     'min_size': 256,  # Minimum image dimension
+    'max_size': 1024,  # Maximum image dimension
     'val_size': 1000,
     'buckets': [
-        (512, 512),
-        (576, 448),
-        (448, 576),
-        (640, 384),
-        (384, 640),
+        (512, 512),   # Square format
+        (576, 448),   # Landscape
+        (448, 576),   # Portrait
+        (640, 384),   # Wide
+        (384, 640),   # Tall
     ],
-    'validation_batch_size': 1000,  # Add this for batched validation
-    'num_workers': 8,
-    'pin_memory': False,
+    'validation_batch_size': 4,  # Reduced from 1000 to prevent OOM
+    'num_workers': 8,  # Reduced from 8 to prevent I/O bottlenecks
+    'pin_memory': False,  # Enable pin_memory for faster data transfer
     'persistent_workers': True,
     'prefetch_factor': 2,
-
+    'broadcast_batch_size': 1000,  # Control broadcast chunk size
+    
     # ===== Training parameters =====
     'adam_betas': (0.9, 0.999),
     'weight_decay': 0.01,
@@ -120,6 +122,15 @@ DEFAULT_CONFIG = {
     
     # ===== Distillation parameters =====
     'ema_decay': 0.9999,  # Exponential moving average decay factor for model weights
+    
+    # ===== Distributed Training =====
+    'nccl_timeout': 7200,  # 2 hrs timeout for NCCL operations
+    'nccl_socket_ifname': 'eth0',  # Network interface for NCCL
+    'nccl_debug': 'INFO',  # Enable NCCL debug logging
+    'nccl_blocking_wait': True,  # Use blocking wait
+    'nccl_async_error_handling': True,  # Enable async error handling
+    'batch_size_per_gpu': 1,  # Batch size per GPU
+    'gradient_accumulation_steps': 1,  # Accumulate gradients
 }
 
 def get_config(config_path):
