@@ -16,7 +16,7 @@ from trainers.diffusion import DecentralizedFlowMatcher
 from data.dataset import DDMDataset
 from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
-from data.dataset import CombinedBatchSampler, BucketBatchSampler
+from data.dataset import BucketBatchSampler
 from torch.utils.data import DataLoader 
 
 
@@ -666,8 +666,23 @@ class DDMTrainingCoordinator:
         
         # Expert learning rates - sample from first expert if available
         if hasattr(self, 'expert_indices') and self.expert_indices:
+            # Define expert builder function
+            def expert_builder_fn(expert_idx):
+                # Import the actual expert trainer class 
+                from trainers.expert import ExpertTrainer
+                
+                # Create a new expert trainer with proper initialization 
+                expert = ExpertTrainer(
+                    expert_idx=expert_idx,
+                    config=self.config,
+                    device=self.device,
+                    rank=self.rank,
+                    world_size=self.world_size
+                )
+                return expert
+            
             for expert_idx in self.expert_indices:
-                expert = self.cache_manager.get_expert(expert_idx)
+                expert = self.cache_manager.get_expert(expert_idx, expert_builder_fn)
                 if hasattr(expert, 'optimizer') and expert.optimizer:
                     for param_group in expert.optimizer.param_groups:
                         lrs[f"expert_{expert_idx}"] = param_group['lr']

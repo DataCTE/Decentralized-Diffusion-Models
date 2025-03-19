@@ -287,7 +287,7 @@ class ExpertDiT(nn.Module):
         x = self.final_layer(x, cond_vector)
         
         # Debug the shape before unpatchify
-        print(f"Before unpatchify - x shape: {x.shape}, h: {h}, w: {w}")
+        #print(f"Before unpatchify - x shape: {x.shape}, h: {h}, w: {w}")
         
         # Ensure we maintain original shape by using proper padding or interpolation
         # Instead of complex reshaping that might lose information, use a direct approach
