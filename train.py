@@ -22,26 +22,19 @@ from utils.expert_cache import ExpertCacheManager
 
 def setup_distributed():
     """Initialize distributed training environment"""
-    # Set NCCL environment variables
-    os.environ['NCCL_DEBUG'] = 'INFO'
-    os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'  # Adjust if needed
-    os.environ['NCCL_BLOCKING_WAIT'] = '1'
-    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
-    
-    # Initialize process group with longer timeout
+    # Initialize process group
     dist.init_process_group(
         backend='nccl',
-        timeout=timedelta(minutes=90)  # 90 minute timeout
+        timeout=timedelta(minutes=90)
     )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     
-    # Set device and ensure it's properly initialized
+    # Set device
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     
-    # Synchronize all processes before proceeding
-    torch.cuda.synchronize(device)
+    # Simple barrier sync
     dist.barrier()
     
     return rank, world_size
@@ -50,10 +43,8 @@ def main():
     # Load configuration
     config = get_config("config.py")
     
-    # Basic setup with error handling
     try:
         rank, world_size = setup_distributed()
-        torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
         
         # Initialize logging only on main process
@@ -66,10 +57,7 @@ def main():
             print(" Progress logs will be shown during the process")
             print("="*50)
         
-        # Synchronize before dataset initialization
-        dist.barrier()
-        
-        # Create expert cache manager with proper error handling
+        # Create expert cache manager
         cache_manager = ExpertCacheManager(
             config=config,
             device=device,
@@ -77,7 +65,7 @@ def main():
             cpu_offload=config.expert_offload_to_cpu
         )
         
-        # Initialize coordinator with progress tracking
+        # Initialize coordinator
         coordinator = DDMTrainingCoordinator(
             config=config,
             rank=rank,
@@ -85,14 +73,13 @@ def main():
             cache_manager=cache_manager
         )
         
-        # Train with proper error handling
+        # Train
         coordinator.train(config.num_steps)
         
     except Exception as e:
-        logging.error(f"Training failed on rank {rank}: {str(e)}")
+        logging.error(f"Training failed: {str(e)}")
         raise
     finally:
-        # Ensure cleanup
         if dist.is_initialized():
             dist.destroy_process_group()
 
