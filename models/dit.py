@@ -30,9 +30,19 @@ class DiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
     def forward(self, x, c):
-        # Ensure c has a batch dimension
-        if c.dim() == 1:
-            c = c.unsqueeze(0)  # Add batch dimension if missing
+        # More robust handling of conditioning vector dimensions
+        if not isinstance(c, torch.Tensor):
+            raise TypeError(f"Expected c to be a tensor, got {type(c)}")
+        
+        # Ensure c has at least 2 dimensions (batch_size, features)
+        if c.dim() == 0:  # It's a scalar tensor
+            c = c.unsqueeze(0).unsqueeze(0)  # Add batch and feature dimensions
+        elif c.dim() == 1:  # It's a 1D tensor (features only)
+            c = c.unsqueeze(0)  # Add batch dimension
+        
+        # Log shape for debugging if needed
+        if self.training and torch.distributed.get_rank() == 0 and torch.distributed.is_initialized() and torch.rand(1).item() < 0.001:
+            print(f"Conditioning tensor shape: {c.shape}")
         
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
@@ -217,6 +227,10 @@ class ExpertDiT(nn.Module):
             # We use mean pooling over the text embeddings
             text_pooled = text_embeds.mean(dim=1)  # [B, D]
             cond_vector = cond_vector + text_pooled  # [B, D]
+            
+        # Ensure conditioning vector has proper dimensions before processing blocks
+        if cond_vector.dim() == 1:
+            cond_vector = cond_vector.unsqueeze(0)
             
         # Process through transformer blocks
         for block in self.blocks:
