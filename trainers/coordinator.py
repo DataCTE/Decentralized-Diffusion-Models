@@ -53,6 +53,9 @@ class DDMTrainingCoordinator:
         # Store basic configuration
         self.config = config
         
+        # Add verbose flag with default value
+        self.verbose = getattr(config, 'verbose_training', False)
+        
         # Ensure all required configuration parameters exist
         self._ensure_config_completeness()
         
@@ -249,7 +252,11 @@ class DDMTrainingCoordinator:
     
     def train_router(self, batch):
         """Train the router with the provided batch"""
-        if self.rank == 0 and self.verbose:
+        # Remove reference to non-existent self.verbose attribute
+        # Replace with a config-based check or default to False
+        verbose = getattr(self.config, 'verbose_router_training', False)
+        
+        if self.rank == 0 and verbose:
             logger.debug("Training router...")
         
         try:
