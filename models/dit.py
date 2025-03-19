@@ -235,7 +235,13 @@ class ExpertDiT(nn.Module):
         # Process through transformer blocks
         for block in self.blocks:
             if self.use_gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, cond_vector)
+                x = torch.utils.checkpoint.checkpoint(
+                    block, 
+                    x, 
+                    cond_vector,
+                    use_reentrant=False,
+                    preserve_rng_state=False
+                )
             else:
                 x = block(x, cond_vector)
         
