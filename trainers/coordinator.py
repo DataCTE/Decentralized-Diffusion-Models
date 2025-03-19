@@ -422,19 +422,34 @@ class DDMTrainingCoordinator:
             )
             return expert
         
-        # Collect all experts for sampling - INCLUDE THE BUILDER FUNCTION
-        experts_dict = {
-            expert_idx: self.cache_manager.get_expert(expert_idx, expert_builder_fn) 
-            for expert_idx in self.expert_indices
-        }
+        # Implement expert sharing - Get access to more experts
+        # Approach: For rank 0, create additional experts beyond its assigned ones
+        experts_dict = {}
         
-        # Check for missing experts
-        all_expert_indices = list(range(self.config.num_experts))
-        missing_experts = [idx for idx in all_expert_indices if idx not in self.expert_indices]
+        # First collect local experts
+        for expert_idx in self.expert_indices:
+            experts_dict[expert_idx] = self.cache_manager.get_expert(expert_idx, expert_builder_fn)
         
-        if missing_experts and getattr(self.config, 'ensure_all_experts_for_sampling', True):
-            logger.warning(f"Missing {len(missing_experts)} experts for sampling. Using only available experts.")
-            logger.warning(f"For best results, consider running inference with a single process or implementing expert sharing.")
+        # For rank 0, also create additional experts for better sampling
+        # Define max number of experts to use for sampling
+        max_sampling_experts = min(getattr(self.config, 'max_sampling_experts', 4), self.config.num_experts)
+        
+        # Add additional experts if needed (up to max_sampling_experts)
+        if self.rank == 0 and len(experts_dict) < max_sampling_experts:
+            # Get indices of experts we need to create
+            all_expert_indices = list(range(self.config.num_experts))
+            needed_experts = sorted(all_expert_indices[:max_sampling_experts])
+            missing_experts = [idx for idx in needed_experts if idx not in self.expert_indices]
+            
+            if missing_experts:
+                logger.info(f"Creating {len(missing_experts)} additional experts for sampling: {missing_experts}")
+                for expert_idx in missing_experts:
+                    # Create expert directly (not via cache manager)
+                    try:
+                        experts_dict[expert_idx] = expert_builder_fn(expert_idx)
+                        logger.info(f"Successfully created expert {expert_idx} for sampling")
+                    except Exception as e:
+                        logger.error(f"Failed to create expert {expert_idx}: {e}")
         
         # Put experts in evaluation mode before sampling
         for expert in experts_dict.values():

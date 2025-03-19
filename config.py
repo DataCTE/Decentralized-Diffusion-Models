@@ -144,6 +144,9 @@ DEFAULT_CONFIG = {
     'wandb_log_batch_metrics': False,         # Log per-batch metrics (more overhead)
     'wandb_log_memory': False,                 # Log memory usage
     'wandb_commit_frequency': 1,   # Frequency to commit logs (N steps)
+    'max_sampling_experts': 4,  # Maximum experts to use in sampling
+    'fast_validation': True,    # Use fewer steps for validation
+    'sampling_steps': 20,       # Default number of sampling steps for validation
 }
 
 def get_config(config_path):
