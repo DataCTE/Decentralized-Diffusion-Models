@@ -4,7 +4,8 @@ import os
 import torch
 import datetime
 import time
-from torch.utils.data import DataLoader
+from collections import defaultdict
+
 from tqdm.auto import tqdm
 import concurrent.futures
 
@@ -15,6 +16,8 @@ from trainers.diffusion import DecentralizedFlowMatcher
 from data.dataset import DDMDataset
 from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
+from data.dataset import CombinedBatchSampler, BucketBatchSampler
+from torch.utils.data import DataLoader 
 
 
 
@@ -146,25 +149,61 @@ class DDMTrainingCoordinator:
         """Initialize data loaders without multiprocessing to avoid pickling requirements"""
         debug_print(f"Initializing data loaders on rank {self.rank}", self.rank)
         
-        # Shared configuration - set num_workers=0 to disable multiprocessing
+        # Shared configuration for DataLoader
         loader_config = {
-            'batch_size': self.config.batch_size,
             'num_workers': 0,  # Use single-process data loading
             'pin_memory': False,  # This is safe to use without multiprocessing
         }
         
         # Train dataset
         train_dataset = DDMDataset(self.config, 'train')
-        self.train_loader = DataLoader(
-            train_dataset,
-            shuffle=True,
-            **loader_config
-        )
         
-        # Validation dataset
+        # Create bucket indices directly from bucket_assignments
+        if hasattr(train_dataset, 'bucket_assignments'):
+            bucket_indices = defaultdict(list)
+            for idx, bucket_idx in enumerate(train_dataset.bucket_assignments.cpu().numpy()):
+                bucket_indices[int(bucket_idx)].append(idx)
+            
+            # Use our existing BucketBatchSampler
+            if bucket_indices:
+                debug_print(f"Creating BucketBatchSampler with batch size {self.config.batch_size}", self.rank)
+                batch_sampler = BucketBatchSampler(
+                    bucket_indices=bucket_indices,
+                    batch_size=self.config.batch_size,
+                    device='cpu',  # Use CPU for initial setup
+                    shuffle=True,
+                    drop_last=False
+                )
+                
+                self.train_loader = DataLoader(
+                    train_dataset,
+                    batch_sampler=batch_sampler,
+                    **loader_config
+                )
+                if self.rank == 0:
+                    logger.info(f"Created bucket-aware DataLoader with {len(bucket_indices)} buckets and batch size {self.config.batch_size}")
+            else:
+                # Fallback to simple loader with batch_size=1
+                self.train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=1,
+                    shuffle=True,
+                    **loader_config
+                )
+        else:
+            # Fallback to simple loader if bucket_assignments isn't available
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=1,
+                shuffle=True,
+                **loader_config
+            )
+        
+        # Validation dataset - always use batch_size=1 for safety
         val_dataset = DDMDataset(self.config, 'val')
         self.val_loader = DataLoader(
             val_dataset,
+            batch_size=1,
             shuffle=False,
             **loader_config
         )
@@ -506,9 +545,19 @@ class DDMTrainingCoordinator:
                 dir = getattr(self.config, 'wandb_dir', './wandb')
                 save_code = getattr(self.config, 'wandb_save_code', True)
                 
-                # Convert relevant config attributes to a dict
-                config_dict = {k: v for k, v in vars(self.config).items() 
-                              if not k.startswith('_') and not callable(v)}
+                # Convert relevant config attributes to a dict, handling non-serializable types
+                config_dict = {}
+                for k, v in vars(self.config).items():
+                    if not k.startswith('_') and not callable(v):
+                        # Handle non-serializable types
+                        try:
+                            # Test if json serializable
+                            import json
+                            json.dumps({k: v})
+                            config_dict[k] = v
+                        except (TypeError, OverflowError):
+                            # Convert to string if not serializable
+                            config_dict[k] = str(v)
                 
                 # Initialize wandb
                 wandb.init(
@@ -549,6 +598,9 @@ class DDMTrainingCoordinator:
             except Exception as e:
                 logger.warning(f"Failed to initialize wandb: {str(e)}")
                 self.wandb_enabled = False
+                # Print exception traceback for debugging
+                import traceback
+                logger.warning(traceback.format_exc())
         else:
             self.wandb_enabled = False
 

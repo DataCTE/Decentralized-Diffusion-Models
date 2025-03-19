@@ -3,8 +3,9 @@
 import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler, SubsetRandomSampler
 from PIL import Image
+import random
 from collections import defaultdict
 import logging
 import time  
@@ -543,7 +544,38 @@ class DDMDataset(Dataset):
         img = normalize(img)
         return img
         
+    def _create_bucket_samplers(self):
+        """Create bucket-specific samplers to ensure consistent shapes in each batch"""
+        self.bucket_samplers = {}
+        for bucket_idx, _ in enumerate(self.bucket_dims):
+            # Get indices of samples in this bucket
+            bucket_indices = [i for i, sample in enumerate(self.samples) 
+                             if sample.get('bucket_idx', 0) == bucket_idx]
+            
+            if bucket_indices:
+                self.bucket_samplers[bucket_idx] = SubsetRandomSampler(bucket_indices)
+        
+        logger.info(f"Created {len(self.bucket_samplers)} bucket-specific samplers")
+
+class CombinedBatchSampler(Sampler):
+    """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
+    def __init__(self, batch_samplers):
+        self.batch_samplers = batch_samplers
+        self.batch_indices = []
+        
+        # Generate all batch indices upfront
+        for sampler in self.batch_samplers:
+            self.batch_indices.extend(list(sampler))
+        
+        # Shuffle batches
+        random.shuffle(self.batch_indices)
     
+    def __iter__(self):
+        for batch in self.batch_indices:
+            yield batch
+    
+    def __len__(self):
+        return len(self.batch_indices) 
 
 class BucketBatchSampler(torch.utils.data.Sampler):
     """GPU-optimized bucket batch sampler with tensor-based operations"""
