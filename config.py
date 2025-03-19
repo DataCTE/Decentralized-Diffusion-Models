@@ -22,11 +22,19 @@ DEFAULT_CONFIG = {
     
     # ===== DDM Model parameters =====
     'num_experts': 8,
-    'latent_channels': 16,
+    'ffn_dim': 3072,    # 4x hidden_dim
     'hidden_size': 768,
+    'hidden_dim': 768,  # ExpertDiT uses hidden_dim instead of hidden_size
     'num_heads': 12,
     'num_layers': 12,
     'patch_size': 16,
+
+    # ===== VAE and CLIP parameters =====
+    'vae_model': "AuraDiffusion/16ch-vae",
+    'latent_channels': 16,  # Specific to 16ch-VAE
+    'vae_scaling_factor': 0.18215,  # Seen in data/vae.py
+    'clip_model': "openai/clip-vit-large-patch14",
+    
     
     # ===== Router parameters =====
     'router_hidden_size': 512,
@@ -56,6 +64,11 @@ DEFAULT_CONFIG = {
     'pin_memory': False,
     'persistent_workers': True,
     'prefetch_factor': 2,
+
+    # ===== Training parameters =====
+    'adam_betas': (0.9, 0.999),
+    'weight_decay': 0.01,
+    'max_grad_norm': 1.0,
     
     # ===== Flow Matching parameters =====
     'diffusion_steps': 1000,
@@ -93,6 +106,7 @@ DEFAULT_CONFIG = {
     'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
     
     # Add to DEFAULT_CONFIG
+    'use_gradient_checkpointing': True,
     'fsdp_sharding_strategy': "FULL_SHARD",
     'fsdp_cpu_offload': False,
     'fsdp_backward_prefetch': "BACKWARD_PRE",
@@ -101,6 +115,7 @@ DEFAULT_CONFIG = {
     'router_learning_rate': 1e-4,
     'fsdp_use_orig_params': True,
     'fsdp_limit_all_gathers': True,
+   
 }
 
 def get_config(config_path):

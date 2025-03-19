@@ -74,55 +74,25 @@ class DDMTrainingCoordinator:
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
     
     def _ensure_config_completeness(self):
-        """Ensure all required configuration parameters are present"""
-        # DiT model parameters (from models/dit.py)
-        if not hasattr(self.config, 'hidden_dim'):
-            self.config.hidden_dim = getattr(self.config, 'hidden_size', 768)
-            logger.info(f"Set missing config parameter 'hidden_dim' = {self.config.hidden_dim}")
+        """
+        Ensure that the config has all required parameters.
+        This is a minimal check, since most defaults are handled in config.py.
+        """
+        # Map hidden_size to hidden_dim if hidden_dim isn't present but hidden_size is
+        if not hasattr(self.config, 'hidden_dim') and hasattr(self.config, 'hidden_size'):
+            self.config.hidden_dim = self.config.hidden_size
+            logger.info(f"Mapped config.hidden_size to config.hidden_dim = {self.config.hidden_dim}")
         
-        if not hasattr(self.config, 'ffn_dim'):
+        # Set ffn_dim if not present but can be derived from hidden_dim
+        if not hasattr(self.config, 'ffn_dim') and hasattr(self.config, 'hidden_dim'):
             self.config.ffn_dim = self.config.hidden_dim * 4
-            logger.info(f"Set missing config parameter 'ffn_dim' = {self.config.ffn_dim}")
+            logger.info(f"Derived config.ffn_dim from hidden_dim = {self.config.ffn_dim}")
         
-        # Flow matcher parameters
-        if not hasattr(self.config, 'sigma'):
-            self.config.sigma = 0.5
-            logger.info(f"Set missing config parameter 'sigma' = {self.config.sigma}")
-        
-        if not hasattr(self.config, 'loss_type'):
-            self.config.loss_type = 'huber'
-            logger.info(f"Set missing config parameter 'loss_type' = {self.config.loss_type}")
-        
-        # ExpertCacheManager parameters
-        if not hasattr(self.config, 'max_experts_in_memory'):
-            self.config.max_experts_in_memory = 2
-            logger.info(f"Set missing config parameter 'max_experts_in_memory' = {self.config.max_experts_in_memory}")
-        
-        if not hasattr(self.config, 'expert_offload_to_cpu'):
-            self.config.expert_offload_to_cpu = True
-            logger.info(f"Set missing config parameter 'expert_offload_to_cpu' = {self.config.expert_offload_to_cpu}")
-        
-        # FSDP parameters for model wrapping
-        if not hasattr(self.config, 'fsdp_sharding_strategy'):
-            self.config.fsdp_sharding_strategy = "FULL_SHARD"
-            logger.info(f"Set missing config parameter 'fsdp_sharding_strategy' = {self.config.fsdp_sharding_strategy}")
-        
-        if not hasattr(self.config, 'fsdp_backward_prefetch'):
-            self.config.fsdp_backward_prefetch = "BACKWARD_PRE"
-            logger.info(f"Set missing config parameter 'fsdp_backward_prefetch' = {self.config.fsdp_backward_prefetch}")
-        
-        if not hasattr(self.config, 'use_gradient_checkpointing'):
-            self.config.use_gradient_checkpointing = True
-            logger.info(f"Set missing config parameter 'use_gradient_checkpointing' = {self.config.use_gradient_checkpointing}")
-        
-        # Training parameters
-        if not hasattr(self.config, 'adam_betas'):
-            self.config.adam_betas = (0.9, 0.999)
-            logger.info(f"Set missing config parameter 'adam_betas' = {self.config.adam_betas}")
-        
-        if not hasattr(self.config, 'use_mixed_precision'):
-            self.config.use_mixed_precision = True
-            logger.info(f"Set missing config parameter 'use_mixed_precision' = {self.config.use_mixed_precision}")
+        # Log a note about using the 16ch-VAE model
+        if hasattr(self.config, 'vae_model') and "16ch-vae" in self.config.vae_model:
+            if getattr(self.config, 'latent_channels', 0) != 16:
+                self.config.latent_channels = 16
+                logger.warning(f"Enforced latent_channels=16 for 16ch-VAE compatibility")
     
     def _init_parallel_components(self):
         """Initialize critical components with async dataset loading"""
