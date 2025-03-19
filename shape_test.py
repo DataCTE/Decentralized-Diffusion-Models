@@ -353,17 +353,127 @@ def test_training_step(device="cuda"):
         import traceback
         logger.error(traceback.format_exc())
 
+def test_sampling_pipeline(config=None, device="cuda", num_samples=16):
+    """Test the sampling pipeline with simulated data"""
+    logger.info("\n=== Testing Sampling Pipeline ===")
+    
+    if config is None:
+        config = DummyConfig()
+    
+    # Create a logger that will show detailed info
+    sampling_logger = logging.getLogger("sampling_test")
+    sampling_logger.setLevel(logging.DEBUG)
+    
+    # Define bucket dimensions and vae_scale_factor
+    bucket_size = (512, 512)  # Square format from the config buckets
+    vae_scale_factor = 8
+    latent_channels = getattr(config, 'latent_channels', 16)
+    
+    # Calculate latent dimensions
+    w, h = bucket_size
+    latent_h, latent_w = h // vae_scale_factor, w // vae_scale_factor
+    
+    # Create input shape for sampling
+    shape = (num_samples, latent_channels, latent_h, latent_w)
+    sampling_logger.info(f"Testing sampling with shape: {shape}")
+    
+    # Initialize models
+    router_model = RouterModel(config).to(device)
+    router_model.eval()
+    sampling_logger.info("Router model initialized and set to eval mode")
+    
+    # Create a single expert model for testing
+    expert_model = ExpertDiT(config).to(device)
+    expert_model.eval()
+    sampling_logger.info("Expert model initialized and set to eval mode")
+    
+    # Use a dictionary of experts
+    experts_dict = {0: expert_model}
+    
+    # Test with a single step first
+    try:
+        # Create initial noise
+        latents = torch.randn(shape, device=device)
+        sampling_logger.info(f"Created initial latents with shape {latents.shape}")
+        
+        # Process a single timestep
+        t_idx = 999  # Start from the end (pure noise)
+        t_tensor = torch.tensor([t_idx], device=device)
+        
+        # Get router prediction
+        with torch.no_grad():
+            router_logits = router_model(latents[:1], t_tensor[:1])
+        sampling_logger.info(f"Router output shape: {router_logits.shape}")
+        
+        # Test expert prediction
+        with torch.no_grad():
+            expert_output = expert_model(latents[:1], t_tensor[:1])
+        sampling_logger.info(f"Expert output shape: {expert_output.shape}")
+        
+        # Check matching shapes
+        if expert_output.shape == latents[:1].shape:
+            sampling_logger.info("✓ Expert output shape matches input latents")
+        else:
+            sampling_logger.error(f"❌ Shape mismatch: expert output {expert_output.shape} ≠ input {latents[:1].shape}")
+            
+        # Check if router produces valid probabilities
+        if router_logits.shape[1] == config.num_experts:
+            sampling_logger.info(f"✓ Router output matches number of experts: {router_logits.shape[1]}")
+        else:
+            sampling_logger.error(f"❌ Router output doesn't match experts: {router_logits.shape[1]} ≠ {config.num_experts}")
+            
+        sampling_logger.info("Basic sampling component test completed successfully!")
+            
+        # Now try to simulate full diffusion process (optional - can be heavy)
+        simulate_full_process = False
+        if simulate_full_process:
+            from trainers.sampling import ddm_sample
+            from trainers.diffusion import get_alphas_and_betas
+            
+            # Get schedule
+            steps = 10  # Use fewer steps for test
+            alphas, alpha_bar, betas = get_alphas_and_betas(steps, "cosine")
+            
+            # Move to device
+            alphas = alphas.to(device)
+            alpha_bar = alpha_bar.to(device)
+            betas = betas.to(device)
+            
+            # Simulate ddm_sample
+            for i in range(steps):
+                # Do a simulated sampling step (simplified)
+                t_idx = steps - i - 1
+                t_tensor = torch.tensor([t_idx], device=device) 
+                
+                # Get expert predictions
+                with torch.no_grad():
+                    router_logits = router_model(latents[:1], t_tensor)
+                    expert_output = expert_model(latents[:1], t_tensor)
+                
+                # Update latents (simplified)
+                latents[:1] = latents[:1] + 0.1 * expert_output
+                
+            sampling_logger.info("Full sampling process simulation completed!")
+    
+    except Exception as e:
+        sampling_logger.error(f"Error in sampling test: {str(e)}")
+        import traceback
+        sampling_logger.error(traceback.format_exc())
+        
+    return
+
 def main():
     parser = argparse.ArgumentParser(description="Test shapes in Decentralized Diffusion Models")
     parser.add_argument("--cpu", action="store_true", help="Run on CPU instead of CUDA")
     parser.add_argument("--expert", action="store_true", help="Test expert model shapes")
     parser.add_argument("--router", action="store_true", help="Test router model shapes")
     parser.add_argument("--train", action="store_true", help="Test training step")
+    parser.add_argument("--sampling", action="store_true", help="Test sampling pipeline")
     args = parser.parse_args()
     
     # Default to testing everything if no specific test is selected
-    if not (args.expert or args.router or args.train):
-        args.expert = args.router = args.train = True
+    if not (args.expert or args.router or args.train or args.sampling):
+        args.expert = args.router = args.train = args.sampling = True
     
     # Set device
     device = "cpu" if args.cpu else "cuda"
@@ -385,6 +495,10 @@ def main():
     
     if args.train:
         test_training_step(device)
+    
+    # Run sampling test
+    if args.sampling:
+        test_sampling_pipeline(config, device, num_samples=16)
     
     logger.info("Shape tests completed")
 

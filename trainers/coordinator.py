@@ -428,7 +428,7 @@ class DDMTrainingCoordinator:
             for expert_idx in self.expert_indices
         }
         
-        # Check for missing experts - add this code here
+        # Check for missing experts
         all_expert_indices = list(range(self.config.num_experts))
         missing_experts = [idx for idx in all_expert_indices if idx not in self.expert_indices]
         
@@ -499,42 +499,6 @@ class DDMTrainingCoordinator:
             # Ensure router is in evaluation mode
             if hasattr(router_model, 'eval'):
                 router_model.eval()
-            
-            # Test router with dummy input before actual sampling
-            try:
-                # Create a small dummy input with correct dimensions
-                dummy_input = torch.zeros((1, C, latent_h, latent_w), device=self.device)
-                dummy_timesteps = torch.zeros((1,), device=self.device).long()
-                
-                # Try a forward pass with router to detect any issues early
-                with torch.no_grad():
-                    logger.info("Running router test with dummy input")
-                    dummy_output = router_model(dummy_input, dummy_timesteps)
-                    logger.info(f"Router test successful. Output shape: {dummy_output.shape}")
-            except Exception as e:
-                logger.error(f"Router test failed: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-            
-            # Also test the first expert to validate it works
-            if experts_dict:
-                first_expert_idx = next(iter(experts_dict.keys()))
-                first_expert = experts_dict[first_expert_idx]
-                
-                try:
-                    with torch.no_grad():
-                        logger.info(f"Running expert {first_expert_idx} test with dummy input")
-                        if hasattr(first_expert, 'expert'):
-                            # It's an ExpertTrainer object
-                            dummy_output = first_expert.expert(dummy_input, dummy_timesteps)
-                        else:
-                            # It's a direct model
-                            dummy_output = first_expert(dummy_input, dummy_timesteps)
-                        logger.info(f"Expert test successful. Output shape: {dummy_output.shape}")
-                except Exception as e:
-                    logger.error(f"Expert test failed: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
             
             # Use consistent precision throughout sampling
             with torch.amp.autocast(device_type='cuda', enabled=use_mixed_precision):
