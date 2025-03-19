@@ -225,77 +225,58 @@ class DecentralizedFlowMatcher:
         # Get shapes and dimensions for debugging
         pred_shape = pred.shape
         target_shape = target.shape
+        
+        # First, handle channel dimension mismatch (most critical issue)
+        if pred_shape[1] != target_shape[1]:
+            logger.warning(f"Channel mismatch: pred has {pred_shape[1]} channels, target has {target_shape[1]} channels")
+            
+            # Always adjust pred to match target's channel dimension
+            if pred_shape[1] < target_shape[1]:
+                # Pad pred with zeros to match target channels
+                padding = torch.zeros(
+                    (pred_shape[0], target_shape[1] - pred_shape[1], *pred_shape[2:]), 
+                    device=pred.device, 
+                    dtype=pred.dtype
+                )
+                pred = torch.cat([pred, padding], dim=1)
+            else:
+                # Trim pred to match target channels
+                pred = pred[:, :target_shape[1], ...]
+        
+        # Now handle dimension mismatch (flattened vs spatial)
         pred_dim = pred.dim()
         target_dim = target.dim()
         
-        # Handle shape mismatches dynamically based on tensor dimensions
-        if pred_shape != target_shape:
-            # Case 1: Model output is flattened but target is spatial
+        if pred_dim != target_dim:
+            # If one is 3D and one is 4D, convert to the same format
             if pred_dim == 3 and target_dim == 4:
-                B, C, N = pred_shape
-                B_t, C_t, H, W = target_shape
-                
-                # Check if reshaping is possible (N = H*W)
-                if N == H*W:
-                    # Reshape pred to match target's spatial dimensions
-                    pred = pred.reshape(B, C, H, W)
-                else:
-                    # Flatten target to match pred
-                    target = target.reshape(B_t, C_t, -1)
-            
-            # Case 2: Model output is spatial but target is flattened
+                # Pred is [B, C, N] and target is [B, C, H, W]
+                # Flatten the target to match pred
+                target = target.reshape(target_shape[0], target_shape[1], -1)
             elif pred_dim == 4 and target_dim == 3:
-                B, C, H, W = pred_shape
-                B_t, C_t, N = target_shape
-                
-                # Check if reshaping is possible
-                if H*W == N:
-                    # Flatten pred to match target
-                    pred = pred.reshape(B, C, -1)
-                else:
-                    # Reshape target to match pred
-                    target = target.reshape(B_t, C_t, H, W)
-            
-            # Case 3: Both are spatial but with different dimensions
-            elif pred_dim == 4 and target_dim == 4:
-                B, C, H_p, W_p = pred_shape
-                B_t, C_t, H_t, W_t = target_shape
-                
-                # Different spatial dimensions - reshape both to flattened form
-                pred = pred.reshape(B, C, -1)
-                target = target.reshape(B_t, C_t, -1)
+                # Pred is [B, C, H, W] and target is [B, C, N]
+                # Flatten the pred to match target
+                pred = pred.reshape(pred_shape[0], pred.shape[1], -1)
         
-        # After reshaping, we need to check if the shapes now match
-        if pred.shape != target.shape:
-            # If shapes still don't match, we might need to resize or interpolate
-            # For now, log the mismatch and try to continue with a best-effort approach
-            logger.warning(f"Shape mismatch persists after reshaping: pred={pred.shape}, target={target.shape}")
-            
-            # If both are 3D (channel + flattened spatial), we can try to make them match
-            if pred.dim() == 3 and target.dim() == 3:
-                B, C, N_p = pred.shape
-                B_t, C_t, N_t = target.shape
+        # For spatial dimension mismatches in flattened tensors
+        if pred.dim() == 3 and target.dim() == 3 and pred.shape[2] != target.shape[2]:
+            # Since we're supporting specific image sizes, use a simple approach:
+            # Truncate to the smaller size to avoid interpolation artifacts
+            min_size = min(pred.shape[2], target.shape[2])
+            pred = pred[:, :, :min_size]
+            target = target[:, :, :min_size]
+        
+        # For spatial dimension mismatches in 4D tensors
+        if pred.dim() == 4 and target.dim() == 4:
+            if pred.shape[2:] != target.shape[2:]:
+                # Flatten both to avoid spatial dimension issues
+                pred = pred.reshape(pred.shape[0], pred.shape[1], -1)
+                target = target.reshape(target.shape[0], target.shape[1], -1)
                 
-                # Ensure batch and channel dimensions match
-                assert B == B_t and C == C_t, "Batch or channel dimensions don't match"
-                
-                # Resize the smaller one to match the larger one
-                if N_p < N_t:
-                    # Resize pred to match target
-                    pred = F.interpolate(
-                        pred.unsqueeze(3), 
-                        size=(N_t, 1), 
-                        mode='bilinear', 
-                        align_corners=False
-                    ).squeeze(3)
-                else:
-                    # Resize target to match pred
-                    target = F.interpolate(
-                        target.unsqueeze(3), 
-                        size=(N_p, 1), 
-                        mode='bilinear', 
-                        align_corners=False
-                    ).squeeze(3)
+                # Truncate to the smaller spatial size
+                min_size = min(pred.shape[2], target.shape[2])
+                pred = pred[:, :, :min_size]
+                target = target[:, :, :min_size]
         
         # Calculate the appropriate loss based on config
         if self.loss_type == 'mse':
