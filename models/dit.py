@@ -34,8 +34,11 @@ class DiTBlock(nn.Module):
         if not isinstance(c, torch.Tensor):
             raise TypeError(f"Expected c to be a tensor, got {type(c)}")
         
-        # Add debug information with rank and stage
-        debug_enabled = self.training and torch.distributed.is_initialized() and torch.rand(1).item() < 0.01
+        # Add debug information with rank and stage - FIXED ORDER OF CHECKS
+        debug_enabled = (self.training and 
+                        torch.distributed.is_initialized() and  # Check initialization first!
+                        torch.distributed.get_rank() == 0 and 
+                        torch.rand(1).item() < 0.01)
         
         if debug_enabled:
             rank = torch.distributed.get_rank()
@@ -51,9 +54,10 @@ class DiTBlock(nn.Module):
             if debug_enabled:
                 print(f"[Rank {rank}] DiTBlock expanded 1D tensor to shape: {c.shape}")
         
-        # Log shape for debugging if needed
-        if self.training and torch.distributed.get_rank() == 0 and torch.distributed.is_initialized() and torch.rand(1).item() < 0.001:
-            print(f"Conditioning tensor shape: {c.shape}")
+        # Fix this check too
+        if self.training and torch.distributed.is_initialized() and torch.rand(1).item() < 0.001:
+            if torch.distributed.get_rank() == 0:
+                print(f"Conditioning tensor shape: {c.shape}")
         
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
@@ -318,7 +322,7 @@ class ExpertDiT(nn.Module):
             return
         
         rank = 0
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized():  # Check initialization first
             rank = torch.distributed.get_rank()
         
         lines = [f"[Rank {rank}] {prefix} Tensor Shapes:"]
@@ -327,7 +331,7 @@ class ExpertDiT(nn.Module):
                 lines.append(f"  - {name}: None")
             else:
                 lines.append(f"  - {name}: {tensor.shape}")
-            
+        
         message = "\n".join(lines)
         print(message)
         
