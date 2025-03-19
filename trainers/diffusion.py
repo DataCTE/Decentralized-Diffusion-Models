@@ -182,7 +182,7 @@ class DecentralizedFlowMatcher:
         # Implements paper's Equation 1 with numerical stability
         safe_t = torch.maximum(t, torch.tensor(1e-4, device=t.device))
         denom = torch.sqrt(safe_t)
-        standard_target = (x0 - xt) / denom
+        standard_target = (x0 - xt) / denom[:, None, None, None]
         
         # Improved numerical stability - use a smooth transition for very small t
         # This prevents division by zero and excessive magnification of noise
@@ -196,7 +196,12 @@ class DecentralizedFlowMatcher:
         stable_target = torch.zeros_like(standard_target)
         
         # Smoothly blend between the two based on t value
-        target = blend * standard_target + (1 - blend) * stable_target
+        target = blend[:, None, None, None] * standard_target + (1 - blend[:, None, None, None]) * stable_target
+        
+        # Make sure target has same shape as xt
+        if target.shape != xt.shape:
+            # Reshape target to match xt
+            target = target.reshape(xt.shape)
         
         return target
 
@@ -211,12 +216,31 @@ class DecentralizedFlowMatcher:
         Compute flow matching loss following paper Section 3.4
         
         Args:
-            pred: Model prediction [B, C, H, W]
-            target: Target flow [B, C, H, W]
+            pred: Model prediction [B, C, H, W] or [B, C, N]
+            target: Target flow [B, C, H, W] or [B, C, N]
             
         Returns:
             Loss value
         """
+        # Ensure pred and target have the same shape
+        if pred.shape != target.shape:
+            # Reshape flattened representation to match the target shape
+            if pred.dim() == 3 and target.dim() == 4:
+                B, C, N = pred.shape
+                B_t, C_t, H, W = target.shape
+                
+                # Check if N = H*W (flattened spatial dimensions)
+                if N == H*W:
+                    pred = pred.reshape(B, C, H, W)
+                else:
+                    # If target is [B, C, H, W] and pred is [B, C, N] where N ≠ H*W,
+                    # reshape target to match pred
+                    target = target.reshape(B_t, C_t, -1)
+            elif pred.dim() == 4 and target.dim() == 3:
+                # If pred is [B, C, H, W] and target is [B, C, N],
+                # reshape pred to match target
+                pred = pred.reshape(pred.shape[0], pred.shape[1], -1)
+        
         # Calculate MSE, Huber, or L1 loss based on config
         if self.loss_type == 'mse':
             # MSE loss (Equation 6 in the paper)
@@ -231,7 +255,7 @@ class DecentralizedFlowMatcher:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
             
         # Reduce along spatial and channel dimensions
-        return loss.mean(dim=[1, 2, 3]).mean()
+        return loss.mean(dim=[1, 2, 3] if loss.dim() == 4 else [1, 2]).mean()
 
     def compute_loss(self, predictions, x0, t):
         """
