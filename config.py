@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     # ===== Training parameters =====
     'num_steps': 100000,
-    'batch_size': 1,
+    'batch_size': 16,
     'learning_rate': 1e-4,
     'weight_decay': 1e-2,
     'warmup_steps': 1000,
@@ -140,9 +140,10 @@ DEFAULT_CONFIG = {
     'wandb_save_code': False,                  # Save code snapshot with run
     'wandb_watch_model': 'gradients',         # Options: gradients, parameters, all, None
     'wandb_log_every': 1,                     # Log every step (not every N steps)
-    'wandb_log_artifacts': True,              # Save model checkpoints as artifacts
+    'wandb_log_artifacts': False,              # Save model checkpoints as artifacts
     'wandb_log_batch_metrics': False,         # Log per-batch metrics (more overhead)
     'wandb_log_memory': False,                 # Log memory usage
+    'wandb_commit_frequency': 1,   # Frequency to commit logs (N steps)
 }
 
 def get_config(config_path):

@@ -261,11 +261,24 @@ class DDMTrainingCoordinator:
         total_duration = time.time() - start_time
         if self.rank == 0 and self.wandb_enabled:
             import wandb
-            wandb.log({
-                "training_complete": True,
-                "total_training_duration": total_duration,
-                "steps_per_second": num_steps / total_duration
-            })
+            import threading
+            
+            # Define a thread for final logging
+            def final_log_thread():
+                try:
+                    wandb.log({
+                        "training_complete": True,
+                        "total_training_duration": total_duration,
+                        "steps_per_second": num_steps / total_duration
+                    }, commit=True)  # Use commit=True for final log
+                except Exception as e:
+                    print(f"Warning: W&B final logging error: {e}")
+            
+            # Start logging in a separate thread
+            threading.Thread(target=final_log_thread).start()
+            
+            # Flush any remaining logs
+            self.flush_wandb_logs()
     
     def train_experts(self, batch):
         """Train expert models using the DDM approach"""
@@ -519,8 +532,17 @@ class DDMTrainingCoordinator:
                     self.wandb_watch_model = watch_model
                 else:
                     self.wandb_watch_model = None
-                    
+                
+                # Print the dashboard URL prominently
+                entity_str = f"{entity}/" if entity else ""
+                dashboard_url = f"https://wandb.ai/{entity_str}{project}/runs/{wandb.run.id}"
+                
+                print("\n" + "=" * 80)
+                print(f"W&B Dashboard: {dashboard_url}")
+                print("=" * 80 + "\n")
+                
                 logger.info(f"W&B initialized: {wandb.run.name} (ID: {wandb.run.id})")
+                
             except ImportError:
                 logger.warning("wandb package not found. Install with 'pip install wandb'")
                 self.wandb_enabled = False
@@ -531,8 +553,10 @@ class DDMTrainingCoordinator:
             self.wandb_enabled = False
 
     def _log_step_metrics_to_wandb(self, step, expert_loss, router_loss, step_duration, learning_rates=None, memory_stats=None):
-        """Log per-step metrics to wandb in a non-blocking way"""
+        """Log per-step metrics to wandb in a truly non-blocking way"""
+        # Import in function scope to avoid import errors if wandb is not installed
         import wandb
+        import threading
         
         # Prepare metrics dict
         metrics = {
@@ -553,8 +577,30 @@ class DDMTrainingCoordinator:
             for name, value in memory_stats.items():
                 metrics[f"system/{name}"] = value
         
-        # Log metrics to wandb - use commit=True for immediate update
-        wandb.log(metrics, step=step)
+        # Create a thread for non-blocking logging
+        def log_thread():
+            try:
+                # Log metrics to wandb with commit=False to queue up multiple log calls
+                wandb.log(metrics, step=step, commit=False)
+            except Exception as e:
+                # Don't let logging errors crash training
+                print(f"Warning: W&B logging error: {e}")
+        
+        # Start logging in a separate thread
+        threading.Thread(target=log_thread).start()
+        
+        # Get commit frequency from config (default to 10)
+        commit_frequency = getattr(self.config, 'wandb_commit_frequency', 10)
+
+        # Every N steps, commit the logs in another thread
+        if commit_frequency > 0 and step % commit_frequency == 0:
+            def commit_thread():
+                try:
+                    wandb.log({}, commit=True)  # Empty log with commit=True to flush queue
+                except Exception as e:
+                    print(f"Warning: W&B commit error: {e}")
+            
+            threading.Thread(target=commit_thread).start()
 
     def _get_learning_rates(self):
         """Get current learning rates from all optimizers"""
@@ -597,3 +643,20 @@ class DDMTrainingCoordinator:
             # Finish the wandb run
             wandb.finish()
             logger.info("W&B logging completed and run finalized")
+
+    def flush_wandb_logs(self):
+        """Flush any pending W&B logs"""
+        if self.rank == 0 and self.wandb_enabled:
+            try:
+                import wandb
+                import threading
+                
+                def flush_thread():
+                    try:
+                        wandb.log({}, commit=True)  # Force commit any queued logs
+                    except Exception as e:
+                        print(f"Warning: W&B flush error: {e}")
+                
+                threading.Thread(target=flush_thread).start()
+            except:
+                pass
