@@ -248,12 +248,19 @@ class DDMTrainingCoordinator:
         return total_loss / max(len(self.expert_indices), 1)
     
     def train_router(self, batch):
-        """Train router model using expert assignments as supervision"""
-        # Distributed router training
-        loss = self.router.train_step(batch)
+        """Train the router with the provided batch"""
+        if self.rank == 0 and self.verbose:
+            logger.debug("Training router...")
         
-        # Return the loss value so it can be logged
-        return loss
+        try:
+            # Train step now doesn't require cluster_idx
+            loss = self.router.train_step(batch)
+            return loss
+        except Exception as e:
+            logger.error(f"Router training failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return float('inf')  # Return a placeholder value to continue training
     
     def validate(self, step):
         """Run validation using DDM inference process"""

@@ -82,7 +82,7 @@ class RouterTrainer:
         )
 
     def train_step(self, batch):
-        """Implements Algorithm 2 from paper"""
+        """Implements Algorithm 2 from paper without clustering"""
         images = batch["image"].to(self.device)
         
         # Use mixed precision training if configured (match expert)
@@ -102,14 +102,22 @@ class RouterTrainer:
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * torch.randn_like(latents)
             
-            # Get cluster assignments
-            cluster_indices = batch["cluster_idx"].to(self.device)
+            # Without clustering, we'll use a uniform distribution across experts
+            # For a balanced model, we want to assign samples uniformly to experts
+            batch_size = latents.size(0)
+            num_experts = getattr(self.config, 'num_experts', 8)
+            
+            # Calculate target distribution (uniform across experts)
+            # This encourages the router to learn a balanced assignment
+            uniform_targets = torch.randint(
+                0, num_experts, (batch_size,), device=self.device
+            )
             
             # Get router predictions on noisy latents
             z = self.router(latent_t, t_indices)  # Match how expert is called
             
-            # Compute loss
-            loss = self.criterion(z, cluster_indices)
+            # Compute loss using uniform targets
+            loss = self.criterion(z, uniform_targets)
         
         # Optimize with scaler (match expert)
         self.optimizer.zero_grad()

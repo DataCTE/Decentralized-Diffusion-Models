@@ -216,6 +216,9 @@ class ExpertDiT(nn.Module):
         # Get input dimensions
         batch_size, channels, height, width = x.shape
         
+        # Store original dimensions for later reconstruction
+        original_height, original_width = height, width
+        
         # Compute patch count after convolution
         h = height // self.patch_size
         w = width // self.patch_size
@@ -242,7 +245,6 @@ class ExpertDiT(nn.Module):
             text_embeds = self.text_projection(text_embeds)  # [B, L, D]
             
             # Apply cross-attention from image tokens to text tokens
-            # This is how text conditions the diffusion process
             attn_output, _ = self.text_cross_attention(
                 query=x,
                 key=text_embeds,
@@ -253,7 +255,6 @@ class ExpertDiT(nn.Module):
             x = x + attn_output
             
             # Create a combined conditioning vector (timestep + text)
-            # We use mean pooling over the text embeddings
             text_pooled = text_embeds.mean(dim=1)  # [B, D]
             cond_vector = cond_vector + text_pooled  # [B, D]
             
@@ -281,22 +282,53 @@ class ExpertDiT(nn.Module):
         # Final projection
         x = self.final_layer(x, cond_vector)
         
-        # MISSING: Convert from patch format back to image format
-        # Reshape from [B, H/P*W/P, P*P*C] to [B, C, H, W]
-        batch_size = x.shape[0]
-        
-        # Debug the shape
+        # Debug the shape before unpatchify
         print(f"Before unpatchify - x shape: {x.shape}, h: {h}, w: {w}")
         
-        # Ensure consistent channels by reshaping correctly
-        # First ensure we have the right dimensionality for the linear output
-        n_patches = h * w
-        x = x.reshape(batch_size, n_patches, self.patch_size**2, self.out_channels)
-        x = x.permute(0, 3, 1, 2)  # [B, C, N, P*P]
+        # Ensure we maintain original shape by using proper padding or interpolation
+        # Instead of complex reshaping that might lose information, use a direct approach
         
-        # Now unflatten the patches to recover the spatial dimensions
-        x = x.reshape(batch_size, self.out_channels, h, w, self.patch_size, self.patch_size)
-        x = x.permute(0, 1, 2, 4, 3, 5).contiguous()
-        x = x.reshape(batch_size, self.out_channels, h*self.patch_size, w*self.patch_size)
+        # First reshape to a 2D image in patch space
+        patch_channels = self.out_channels
+        
+        # Reshape to [B, h, w, patch_size*patch_size*C]
+        x = x.reshape(batch_size, h, w, self.patch_size*self.patch_size*patch_channels)
+        
+        # Permute to [B, C, h, w, patch_size, patch_size]
+        x = x.reshape(batch_size, h, w, self.patch_size, self.patch_size, patch_channels)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        
+        # Reshape to [B, C, h*patch_size, w*patch_size]
+        x = x.reshape(batch_size, patch_channels, h*self.patch_size, w*self.patch_size)
+        
+        # If dimensions don't match original, use interpolation to match original size
+        if h*self.patch_size != original_height or w*self.patch_size != original_width:
+            x = torch.nn.functional.interpolate(
+                x, 
+                size=(original_height, original_width),
+                mode='bilinear', 
+                align_corners=False
+            )
         
         return x 
+
+    def debug_tensor_shapes(self, prefix="", **tensors):
+        """Debug tensor shapes during training"""
+        if not self.training or torch.rand(1).item() > 0.01:  # Only log occasionally during training
+            return
+        
+        rank = 0
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        
+        lines = [f"[Rank {rank}] {prefix} Tensor Shapes:"]
+        for name, tensor in tensors.items():
+            if tensor is None:
+                lines.append(f"  - {name}: None")
+            else:
+                lines.append(f"  - {name}: {tensor.shape}")
+            
+        message = "\n".join(lines)
+        print(message)
+        
+        return message 
