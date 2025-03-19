@@ -126,6 +126,23 @@ DEFAULT_CONFIG = {
     # ===== Distributed Training ===== (simplified)
     'batch_size_per_gpu': 1,  # Batch size per GPU
     'gradient_accumulation_steps': 1,  # Accumulate gradients
+    
+    # ===== W&B Logging Parameters =====
+    'wandb_enabled': True,                    # Whether to use wandb for logging
+    'wandb_project': 'decentralized-diffusion', # Project name
+    'wandb_entity': None,                     # Username or team name, None for default
+    'wandb_group': None,                      # Group related runs together
+    'wandb_name': None,                       # Run name, None for auto-generated name
+    'wandb_id': None,                         # Run ID for resuming, None for new run
+    'wandb_dir': './wandb',                   # Directory for local files
+    'wandb_tags': [],                         # List of tags for the run
+    'wandb_mode': 'online',                   # Options: online, offline, disabled
+    'wandb_save_code': False,                  # Save code snapshot with run
+    'wandb_watch_model': 'gradients',         # Options: gradients, parameters, all, None
+    'wandb_log_every': 1,                     # Log every step (not every N steps)
+    'wandb_log_artifacts': True,              # Save model checkpoints as artifacts
+    'wandb_log_batch_metrics': False,         # Log per-batch metrics (more overhead)
+    'wandb_log_memory': False,                 # Log memory usage
 }
 
 def get_config(config_path):

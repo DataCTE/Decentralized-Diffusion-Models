@@ -66,6 +66,9 @@ class DDMTrainingCoordinator:
         self.device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
         torch.cuda.set_device(self.device)
         
+        # Initialize wandb - only on rank 0
+        self._init_wandb()
+        
         # Parallel initialization components
         self._init_parallel_components()
         
@@ -75,6 +78,11 @@ class DDMTrainingCoordinator:
         # Final initialization sync
         total_init_time = time.time() - init_start_time
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
+        
+        # Log initialization info to wandb
+        if self.rank == 0 and self.wandb_enabled:
+            import wandb
+            wandb.log({"initialization_time": total_init_time})
     
     def _ensure_config_completeness(self):
         """
@@ -194,7 +202,21 @@ class DDMTrainingCoordinator:
                 loss_type=getattr(self.config, 'loss_type', 'huber')
             )
         
+        # Watch models in wandb if requested and not done yet
+        if self.rank == 0 and self.wandb_enabled and hasattr(self, 'wandb_watch_model') and self.wandb_watch_model:
+            import wandb
+            # Watch the router model
+            wandb.watch(
+                self.router.router, 
+                log=self.wandb_watch_model,
+                log_freq=getattr(self.config, 'wandb_log_every', 1)
+            )
+            # We'd need to watch expert models too, but they're managed by cache_manager
+        
         # Train loop implementing the DDM training approach
+        global_step = 0  # Initialize global step counter
+        start_time = time.time()
+        
         for step in range(num_steps):
             # Get a batch by creating a fresh iterator each time to avoid pickling issues
             try:
@@ -203,9 +225,25 @@ class DDMTrainingCoordinator:
                 logger.error(f"Error getting batch at step {step}: {str(e)}")
                 continue
             
+            step_start_time = time.time()
+            
             # Joint training of experts and router
             expert_loss = self.train_experts(batch)  # Updates experts
             router_loss = self.train_router(batch)   # Updates router
+            
+            step_duration = time.time() - step_start_time
+            global_step += 1
+            
+            # Log metrics to wandb on rank 0
+            if self.rank == 0 and self.wandb_enabled:
+                self._log_step_metrics_to_wandb(
+                    step=global_step,
+                    expert_loss=expert_loss,
+                    router_loss=router_loss,
+                    step_duration=step_duration,
+                    learning_rates=self._get_learning_rates(),
+                    memory_stats=self._get_memory_stats() if getattr(self.config, 'wandb_log_memory', True) else None
+                )
             
             # Log every N steps
             if step % 100 == 0 or step == num_steps - 1:
@@ -218,6 +256,16 @@ class DDMTrainingCoordinator:
             # Save checkpoint every N steps
             if step > 0 and step % 5000 == 0:
                 self.save_checkpoint(step)
+        
+        # Log final training stats
+        total_duration = time.time() - start_time
+        if self.rank == 0 and self.wandb_enabled:
+            import wandb
+            wandb.log({
+                "training_complete": True,
+                "total_training_duration": total_duration,
+                "steps_per_second": num_steps / total_duration
+            })
     
     def train_experts(self, batch):
         """Train expert models using the DDM approach"""
@@ -278,12 +326,21 @@ class DDMTrainingCoordinator:
         logger.info(f"Running validation at step {step}")
         
         # Generate samples using DDM sampling
-        self.generate_samples(num_samples=4, step=step)
+        sample_images = self.generate_samples(num_samples=4, step=step, return_images=True)
+        
+        # Log samples to wandb
+        if self.wandb_enabled and sample_images:
+            import wandb
+            # Log images
+            wandb.log({
+                "validation/samples": [wandb.Image(img) for img in sample_images],
+                "validation/step": step
+            })
     
-    def generate_samples(self, num_samples=4, step=None, prompts=None):
+    def generate_samples(self, num_samples=4, step=None, prompts=None, return_images=False):
         """Generate samples using the DDM inference approach"""
         if self.rank != 0:
-            return
+            return None
             
         logger.info(f"Generating {num_samples} samples")
         
@@ -368,6 +425,11 @@ class DDMTrainingCoordinator:
             logger.info(f"Saved {num_samples} samples to {sample_dir}")
         except Exception as e:
             logger.error(f"Error generating samples: {e}")
+        
+        # Return images if requested
+        if return_images:
+            return samples  # This should be the tensor output from ddm_sample
+        return None
     
     def save_checkpoint(self, step):
         """Save checkpoint of all components"""
@@ -410,3 +472,128 @@ class DDMTrainingCoordinator:
                 self.router.load_checkpoint(router_path)
                     
         return step
+
+    def _init_wandb(self):
+        """Initialize Weights & Biases logging"""
+        # Only initialize on rank 0
+        self.wandb_enabled = getattr(self.config, 'wandb_enabled', False)
+        
+        if self.rank == 0 and self.wandb_enabled:
+            try:
+                import wandb
+                
+                # Get wandb config parameters with defaults
+                project = getattr(self.config, 'wandb_project', 'decentralized-diffusion')
+                entity = getattr(self.config, 'wandb_entity', None)
+                name = getattr(self.config, 'wandb_name', None)
+                run_id = getattr(self.config, 'wandb_id', None)
+                tags = getattr(self.config, 'wandb_tags', [])
+                group = getattr(self.config, 'wandb_group', None)
+                mode = getattr(self.config, 'wandb_mode', 'online')
+                dir = getattr(self.config, 'wandb_dir', './wandb')
+                save_code = getattr(self.config, 'wandb_save_code', True)
+                
+                # Convert relevant config attributes to a dict
+                config_dict = {k: v for k, v in vars(self.config).items() 
+                              if not k.startswith('_') and not callable(v)}
+                
+                # Initialize wandb
+                wandb.init(
+                    project=project,
+                    entity=entity,
+                    name=name,
+                    id=run_id,
+                    tags=tags,
+                    group=group,
+                    dir=dir,
+                    config=config_dict,
+                    mode=mode,
+                    save_code=save_code,
+                    resume="allow"
+                )
+                
+                # Watch models if requested
+                watch_model = getattr(self.config, 'wandb_watch_model', None)
+                if watch_model:
+                    # We'll watch models after they're initialized
+                    self.wandb_watch_model = watch_model
+                else:
+                    self.wandb_watch_model = None
+                    
+                logger.info(f"W&B initialized: {wandb.run.name} (ID: {wandb.run.id})")
+            except ImportError:
+                logger.warning("wandb package not found. Install with 'pip install wandb'")
+                self.wandb_enabled = False
+            except Exception as e:
+                logger.warning(f"Failed to initialize wandb: {str(e)}")
+                self.wandb_enabled = False
+        else:
+            self.wandb_enabled = False
+
+    def _log_step_metrics_to_wandb(self, step, expert_loss, router_loss, step_duration, learning_rates=None, memory_stats=None):
+        """Log per-step metrics to wandb in a non-blocking way"""
+        import wandb
+        
+        # Prepare metrics dict
+        metrics = {
+            "train/expert_loss": expert_loss,
+            "train/router_loss": router_loss,
+            "train/total_loss": expert_loss + router_loss,
+            "train/step_duration": step_duration,
+            "train/steps_per_second": 1.0 / max(step_duration, 1e-5),
+        }
+        
+        # Add learning rates if provided
+        if learning_rates:
+            for name, lr in learning_rates.items():
+                metrics[f"train/lr_{name}"] = lr
+        
+        # Add memory stats if provided
+        if memory_stats:
+            for name, value in memory_stats.items():
+                metrics[f"system/{name}"] = value
+        
+        # Log metrics to wandb - use commit=True for immediate update
+        wandb.log(metrics, step=step)
+
+    def _get_learning_rates(self):
+        """Get current learning rates from all optimizers"""
+        lrs = {}
+        
+        # Router learning rate
+        if hasattr(self.router, 'optimizer') and self.router.optimizer:
+            for param_group in self.router.optimizer.param_groups:
+                lrs["router"] = param_group['lr']
+                break
+        
+        # Expert learning rates - sample from first expert if available
+        if hasattr(self, 'expert_indices') and self.expert_indices:
+            for expert_idx in self.expert_indices:
+                expert = self.cache_manager.get_expert(expert_idx)
+                if hasattr(expert, 'optimizer') and expert.optimizer:
+                    for param_group in expert.optimizer.param_groups:
+                        lrs[f"expert_{expert_idx}"] = param_group['lr']
+                        break
+                break  # Only get rate for first expert
+        
+        return lrs
+
+    def _get_memory_stats(self):
+        """Get current GPU memory usage"""
+        stats = {}
+        try:
+            stats["gpu_allocated_gb"] = torch.cuda.memory_allocated(self.device) / 1e9
+            stats["gpu_reserved_gb"] = torch.cuda.memory_reserved(self.device) / 1e9
+            stats["gpu_max_allocated_gb"] = torch.cuda.max_memory_allocated(self.device) / 1e9
+            stats["gpu_max_reserved_gb"] = torch.cuda.max_memory_reserved(self.device) / 1e9
+        except:
+            pass
+        return stats
+
+    def cleanup(self):
+        """Clean up resources on training completion"""
+        if self.rank == 0 and self.wandb_enabled:
+            import wandb
+            # Finish the wandb run
+            wandb.finish()
+            logger.info("W&B logging completed and run finalized")
