@@ -396,6 +396,9 @@ class DDMTrainingCoordinator:
             
         logger.info(f"Generating {num_samples} samples")
         
+        # Initialize samples to None in case of errors
+        samples = None
+        
         # Create sample directory
         if step is not None:
             sample_dir = os.path.join(self.config.output_dir, 'samples', f'step_{step}')
@@ -452,9 +455,12 @@ class DDMTrainingCoordinator:
                 # Create unconditional embeddings (empty string) for classifier-free guidance
                 uncond_embeddings = self.text_encoder.encode([""] * num_samples).to(self.device)
             
+            # Access the actual router model, not the trainer
+            router_model = self.router.router if hasattr(self.router, 'router') else self.router
+            
             # Use ddm_sample from trainers/sampling.py for proper DDM sampling
             samples = ddm_sample(
-                router=self.router,
+                router=router_model,  # Use the actual model, not the trainer
                 experts=experts_dict,
                 shape=shape,
                 steps=getattr(self.config, 'sampling_steps', 50),
@@ -480,7 +486,7 @@ class DDMTrainingCoordinator:
         
         # Return images if requested
         if return_images:
-            return samples  # This should be the tensor output from ddm_sample
+            return samples  # This will now return None if an error occurred
         return None
     
     def save_checkpoint(self, step):
