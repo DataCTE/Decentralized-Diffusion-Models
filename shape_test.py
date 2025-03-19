@@ -58,6 +58,7 @@ class DummyConfig:
         # Flow matching parameters
         self.sigma = 0.5
         self.loss_type = 'huber'
+        self.max_sampling_experts = 4
         
         # FSDP parameters
         self.fsdp_sharding_strategy = "FULL_SHARD"
