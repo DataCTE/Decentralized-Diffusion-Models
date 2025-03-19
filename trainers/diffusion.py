@@ -222,26 +222,82 @@ class DecentralizedFlowMatcher:
         Returns:
             Loss value
         """
-        # Ensure pred and target have the same shape
-        if pred.shape != target.shape:
-            # Reshape flattened representation to match the target shape
-            if pred.dim() == 3 and target.dim() == 4:
-                B, C, N = pred.shape
-                B_t, C_t, H, W = target.shape
+        # Get shapes and dimensions for debugging
+        pred_shape = pred.shape
+        target_shape = target.shape
+        pred_dim = pred.dim()
+        target_dim = target.dim()
+        
+        # Handle shape mismatches dynamically based on tensor dimensions
+        if pred_shape != target_shape:
+            # Case 1: Model output is flattened but target is spatial
+            if pred_dim == 3 and target_dim == 4:
+                B, C, N = pred_shape
+                B_t, C_t, H, W = target_shape
                 
-                # Check if N = H*W (flattened spatial dimensions)
+                # Check if reshaping is possible (N = H*W)
                 if N == H*W:
+                    # Reshape pred to match target's spatial dimensions
                     pred = pred.reshape(B, C, H, W)
                 else:
-                    # If target is [B, C, H, W] and pred is [B, C, N] where N ≠ H*W,
-                    # reshape target to match pred
+                    # Flatten target to match pred
                     target = target.reshape(B_t, C_t, -1)
-            elif pred.dim() == 4 and target.dim() == 3:
-                # If pred is [B, C, H, W] and target is [B, C, N],
-                # reshape pred to match target
-                pred = pred.reshape(pred.shape[0], pred.shape[1], -1)
+            
+            # Case 2: Model output is spatial but target is flattened
+            elif pred_dim == 4 and target_dim == 3:
+                B, C, H, W = pred_shape
+                B_t, C_t, N = target_shape
+                
+                # Check if reshaping is possible
+                if H*W == N:
+                    # Flatten pred to match target
+                    pred = pred.reshape(B, C, -1)
+                else:
+                    # Reshape target to match pred
+                    target = target.reshape(B_t, C_t, H, W)
+            
+            # Case 3: Both are spatial but with different dimensions
+            elif pred_dim == 4 and target_dim == 4:
+                B, C, H_p, W_p = pred_shape
+                B_t, C_t, H_t, W_t = target_shape
+                
+                # Different spatial dimensions - reshape both to flattened form
+                pred = pred.reshape(B, C, -1)
+                target = target.reshape(B_t, C_t, -1)
         
-        # Calculate MSE, Huber, or L1 loss based on config
+        # After reshaping, we need to check if the shapes now match
+        if pred.shape != target.shape:
+            # If shapes still don't match, we might need to resize or interpolate
+            # For now, log the mismatch and try to continue with a best-effort approach
+            logger.warning(f"Shape mismatch persists after reshaping: pred={pred.shape}, target={target.shape}")
+            
+            # If both are 3D (channel + flattened spatial), we can try to make them match
+            if pred.dim() == 3 and target.dim() == 3:
+                B, C, N_p = pred.shape
+                B_t, C_t, N_t = target.shape
+                
+                # Ensure batch and channel dimensions match
+                assert B == B_t and C == C_t, "Batch or channel dimensions don't match"
+                
+                # Resize the smaller one to match the larger one
+                if N_p < N_t:
+                    # Resize pred to match target
+                    pred = F.interpolate(
+                        pred.unsqueeze(3), 
+                        size=(N_t, 1), 
+                        mode='bilinear', 
+                        align_corners=False
+                    ).squeeze(3)
+                else:
+                    # Resize target to match pred
+                    target = F.interpolate(
+                        target.unsqueeze(3), 
+                        size=(N_p, 1), 
+                        mode='bilinear', 
+                        align_corners=False
+                    ).squeeze(3)
+        
+        # Calculate the appropriate loss based on config
         if self.loss_type == 'mse':
             # MSE loss (Equation 6 in the paper)
             loss = F.mse_loss(pred, target, reduction='none')
@@ -253,9 +309,15 @@ class DecentralizedFlowMatcher:
             loss = F.l1_loss(pred, target, reduction='none')
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
-            
-        # Reduce along spatial and channel dimensions
-        return loss.mean(dim=[1, 2, 3] if loss.dim() == 4 else [1, 2]).mean()
+        
+        # Dynamically determine reduction dimensions based on tensor shape
+        if loss.dim() == 4:  # [B, C, H, W]
+            return loss.mean(dim=[1, 2, 3]).mean()
+        elif loss.dim() == 3:  # [B, C, N]
+            return loss.mean(dim=[1, 2]).mean()
+        else:
+            # Fallback for unexpected dimensions
+            return loss.mean()
 
     def compute_loss(self, predictions, x0, t):
         """
