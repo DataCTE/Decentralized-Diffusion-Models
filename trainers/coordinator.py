@@ -295,8 +295,26 @@ class DDMTrainingCoordinator:
             
         os.makedirs(sample_dir, exist_ok=True)
         
-        # Collect all experts for sampling
-        experts_dict = {expert_idx: self.cache_manager.get_expert(expert_idx) for expert_idx in self.expert_indices}
+        # Define expert builder function for cache manager
+        def expert_builder_fn(expert_idx):
+            # Import the actual expert trainer class 
+            from trainers.expert import ExpertTrainer
+            
+            # Create a new expert trainer with proper initialization 
+            expert = ExpertTrainer(
+                expert_idx=expert_idx,
+                config=self.config,
+                device=self.device,
+                rank=self.rank,
+                world_size=self.world_size
+            )
+            return expert
+        
+        # Collect all experts for sampling - INCLUDE THE BUILDER FUNCTION
+        experts_dict = {
+            expert_idx: self.cache_manager.get_expert(expert_idx, expert_builder_fn) 
+            for expert_idx in self.expert_indices
+        }
         
         # Use proper DDM sampling from trainers/sampling.py
         try:

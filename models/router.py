@@ -42,8 +42,7 @@ class RouterModel(nn.Module):
         self.spatial_attention = nn.Sequential(
             nn.Conv2d(config.router_hidden_size, config.router_hidden_size // 4, kernel_size=1),
             nn.GELU(),
-            nn.Conv2d(config.router_hidden_size // 4, 1, kernel_size=1),
-            nn.Softmax(dim=(2, 3))  # Spatial softmax
+            nn.Conv2d(config.router_hidden_size // 4, 1, kernel_size=1)
         )
         
         # Timestep embedding
@@ -105,8 +104,10 @@ class RouterModel(nn.Module):
         # Patch embedding
         x = self.embedder(x)  # [B, D, H', W']
         
-        # Spatial attention pooling
-        attn_weights = self.spatial_attention(x)  # [B, 1, H', W']
+        # Spatial attention processing with manual softmax
+        attn_features = self.spatial_attention(x)  # [B, 1, H', W']
+        attn_flat = attn_features.view(batch_size, 1, -1)
+        attn_weights = torch.softmax(attn_flat, dim=2).view_as(attn_features)
         x = (x * attn_weights).sum(dim=(2, 3))  # [B, D]
         
         # Timestep embedding

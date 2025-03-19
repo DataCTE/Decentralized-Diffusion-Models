@@ -82,44 +82,39 @@ class RouterTrainer:
         )
 
     def train_step(self, batch):
-        """Implements Algorithm 2 from paper without clustering"""
+        """Trains router with uniform distribution instead of clustering"""
         images = batch["image"].to(self.device)
         
-        # Use mixed precision training if configured (match expert)
+        # Use mixed precision training if configured
         scaler = torch.amp.GradScaler('cuda', enabled=getattr(self.config, 'use_mixed_precision', False))
-        
-        with torch.amp.autocast('cuda', enabled=getattr(self.config, 'use_mixed_precision', False)):
-            # VAE encoding - use same process as expert trainer
+        with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
+            # VAE encoding (match expert trainer flow)
             with torch.no_grad():
                 latents = self.vae.encode(images)
                 
-            # Sample random timesteps t ∈ [0, 1] - match expert
+            # Sample random timesteps t ∈ [0, 1] (match expert)
             t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
-            t = t_indices.float() / 1000.0
-                
+            t = t_indices.float() / 1000.0  # Normalize to [0, 1]
+            
             # Forward process using cosine schedule (match expert)
             alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)[:,None,None,None]
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * torch.randn_like(latents)
             
-            # Without clustering, we'll use a uniform distribution across experts
-            # For a balanced model, we want to assign samples uniformly to experts
+            # Use uniform random assignments instead of cluster_idx
             batch_size = latents.size(0)
             num_experts = getattr(self.config, 'num_experts', 8)
             
-            # Calculate target distribution (uniform across experts)
-            # This encourages the router to learn a balanced assignment
-            uniform_targets = torch.randint(
-                0, num_experts, (batch_size,), device=self.device
-            )
+            # Uniform random targets (evenly distribute samples to all experts)
+            random_targets = torch.randint(0, num_experts, (batch_size,), device=self.device)
             
-            # Get router predictions on noisy latents
-            z = self.router(latent_t, t_indices)  # Match how expert is called
+            # Get router predictions
+            logits = self.router(latent_t, t_indices)  # Note: Call directly with 2 args
             
-            # Compute loss using uniform targets
-            loss = self.criterion(z, uniform_targets)
+            # Compute loss
+            loss = self.criterion(logits, random_targets)
         
-        # Optimize with scaler (match expert)
+        # Optimize with gradient isolation
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(self.optimizer)
@@ -131,8 +126,11 @@ class RouterTrainer:
                 self.config.max_grad_norm
             )
         
+        # Finish optimization
         scaler.step(self.optimizer)
         scaler.update()
+        
+        # Update learning rate
         self.lr_scheduler.step()
         
         return loss.item()
