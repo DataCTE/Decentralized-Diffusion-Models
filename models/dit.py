@@ -79,7 +79,10 @@ class FinalLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
+        # Ensure we always output exactly out_channels
         self.linear = nn.Linear(hidden_size, patch_size**2 * out_channels)
+        self.patch_size = patch_size
+        self.out_channels = out_channels
         
         # Initialize to zero
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
@@ -94,8 +97,23 @@ class FinalLayer(nn.Module):
         # Apply modulation
         x = modulate(self.norm_final(x), shift, scale)
         
-        # Project to output
-        return self.linear(x)
+        # Project to output and ensure output dimensions are consistent
+        x = self.linear(x)  # [B, N, P*P*C]
+        
+        # Optional: Verify output shape consistency 
+        batch_size, n_tokens, features = x.shape
+        expected_features = self.patch_size**2 * self.out_channels
+        if features != expected_features:
+            print(f"Warning: Features dimension {features} doesn't match expected {expected_features}")
+            # Adjust by padding or truncating if needed
+            if features < expected_features:
+                pad_size = expected_features - features
+                padding = torch.zeros((batch_size, n_tokens, pad_size), device=x.device, dtype=x.dtype)
+                x = torch.cat([x, padding], dim=2)
+            else:
+                x = x[:, :, :expected_features]
+                
+        return x
 
 class ExpertDiT(nn.Module):
     """Implements expert model from Paper Section 3.2"""
@@ -263,6 +281,22 @@ class ExpertDiT(nn.Module):
         # Final projection
         x = self.final_layer(x, cond_vector)
         
-        # Reshape to patch-based format expected by calling function
-        # x is now [B, H/P*W/P, P*P*C]
+        # MISSING: Convert from patch format back to image format
+        # Reshape from [B, H/P*W/P, P*P*C] to [B, C, H, W]
+        batch_size = x.shape[0]
+        
+        # Debug the shape
+        print(f"Before unpatchify - x shape: {x.shape}, h: {h}, w: {w}")
+        
+        # Ensure consistent channels by reshaping correctly
+        # First ensure we have the right dimensionality for the linear output
+        n_patches = h * w
+        x = x.reshape(batch_size, n_patches, self.patch_size**2, self.out_channels)
+        x = x.permute(0, 3, 1, 2)  # [B, C, N, P*P]
+        
+        # Now unflatten the patches to recover the spatial dimensions
+        x = x.reshape(batch_size, self.out_channels, h, w, self.patch_size, self.patch_size)
+        x = x.permute(0, 1, 2, 4, 3, 5).contiguous()
+        x = x.reshape(batch_size, self.out_channels, h*self.patch_size, w*self.patch_size)
+        
         return x 

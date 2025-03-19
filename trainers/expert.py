@@ -107,10 +107,21 @@ class ExpertTrainer(BaseTrainer):
             # Expert prediction of flow field u_t(x_t) (Equation 6)
             pred_flow = self.expert(latent_t, t_indices, text_embeds)
             
+            # Debug shapes in more detail
+            print(f"Latent shape: {latents.shape}")
+            print(f"Latent_t shape: {latent_t.shape}")
+            print(f"Predicted flow shape: {pred_flow.shape}")
+            
             # The target flow field v_t(x_t) (Equation 4)
             target_flow = self.flow_matcher.compute_flow_matching_target(
                 latents, latent_t, t
             )
+            
+            print(f"Target flow shape: {target_flow.shape}")
+            
+            # More detailed error checking
+            if pred_flow.shape != target_flow.shape:
+                print(f"WARNING: Shape mismatch between prediction and target!")
             
             # Flow matching loss (Equation 7)
             loss = self.flow_matcher.compute_flow_matching_loss(

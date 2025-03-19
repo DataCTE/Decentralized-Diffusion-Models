@@ -85,27 +85,36 @@ class RouterTrainer:
         """Implements Algorithm 2 from paper"""
         images = batch["image"].to(self.device)
         
-        # MISSING STEP: VAE encoding for the router input
-        with torch.no_grad():
-            # Use the VAE to encode the images to latent space
-            xt = self.vae.encode(images)
+        # Use mixed precision training if configured (match expert)
+        scaler = torch.amp.GradScaler('cuda', enabled=getattr(self.config, 'use_mixed_precision', False))
         
-        # Sample random timesteps
-        t_indices = torch.randint(0, 1000, (images.size(0),), device=self.device)
-        t = t_indices.float() / 1000.0
+        with torch.amp.autocast('cuda', enabled=getattr(self.config, 'use_mixed_precision', False)):
+            # VAE encoding - use same process as expert trainer
+            with torch.no_grad():
+                latents = self.vae.encode(images)
+                
+            # Sample random timesteps t ∈ [0, 1] - match expert
+            t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
+            t = t_indices.float() / 1000.0
+                
+            # Forward process using cosine schedule (match expert)
+            alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)[:,None,None,None]
+            sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+            latent_t = alpha_t * latents + sigma_t * torch.randn_like(latents)
+            
+            # Get cluster assignments
+            cluster_indices = batch["cluster_idx"].to(self.device)
+            
+            # Get router predictions on noisy latents
+            z = self.router(latent_t, t_indices)  # Match how expert is called
+            
+            # Compute loss
+            loss = self.criterion(z, cluster_indices)
         
-        # Get cluster assignments
-        cluster_indices = batch["cluster_idx"].to(self.device)
-        
-        # Get router predictions
-        z = self.router(xt, t)  # Now xt is latent, not RGB
-        
-        # Compute loss
-        loss = self.criterion(z, cluster_indices)
-        
-        # Optimize
+        # Optimize with scaler (match expert)
         self.optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(self.optimizer)
         
         # Apply gradient clipping if configured
         if hasattr(self.config, 'max_grad_norm') and self.config.max_grad_norm > 0:
@@ -114,7 +123,8 @@ class RouterTrainer:
                 self.config.max_grad_norm
             )
         
-        self.optimizer.step()
+        scaler.step(self.optimizer)
+        scaler.update()
         self.lr_scheduler.step()
         
         return loss.item()
