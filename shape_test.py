@@ -11,6 +11,7 @@ import argparse
 import os
 import sys
 import logging
+import time
 
 # Configure logging
 logging.basicConfig(
@@ -353,12 +354,16 @@ def test_training_step(device="cuda"):
         import traceback
         logger.error(traceback.format_exc())
 
-def test_sampling_pipeline(config=None, device="cuda", num_samples=16):
-    """Test the sampling pipeline with simulated data"""
-    logger.info("\n=== Testing Sampling Pipeline ===")
+def test_sampling_pipeline(config=None, device="cuda", num_samples=4):
+    """Test the sampling pipeline with simulated data and expert sharing"""
+    logger.info("\n=== Testing DDM Sampling Pipeline with Expert Sharing ===")
     
     if config is None:
         config = DummyConfig()
+        # Add sampling-specific config params
+        config.max_sampling_experts = 4
+        config.fast_validation = True
+        config.sampling_steps = 20
     
     # Create a logger that will show detailed info
     sampling_logger = logging.getLogger("sampling_test")
@@ -377,88 +382,175 @@ def test_sampling_pipeline(config=None, device="cuda", num_samples=16):
     shape = (num_samples, latent_channels, latent_h, latent_w)
     sampling_logger.info(f"Testing sampling with shape: {shape}")
     
-    # Initialize models
+    # Initialize router model
     router_model = RouterModel(config).to(device)
     router_model.eval()
     sampling_logger.info("Router model initialized and set to eval mode")
     
-    # Create a single expert model for testing
-    expert_model = ExpertDiT(config).to(device)
-    expert_model.eval()
-    sampling_logger.info("Expert model initialized and set to eval mode")
+    # Track timing
+    start_time = time.time()
     
-    # Use a dictionary of experts
-    experts_dict = {0: expert_model}
+    # Create multiple expert models to simulate expert sharing
+    num_experts = min(config.num_experts, config.max_sampling_experts)
+    sampling_logger.info(f"Creating {num_experts} experts for testing expert sharing")
     
-    # Test with a single step first
+    experts_dict = {}
+    for i in range(num_experts):
+        try:
+            expert_model = ExpertDiT(config).to(device)
+            expert_model.eval()
+            experts_dict[i] = expert_model
+            sampling_logger.info(f"Expert {i} initialized and set to eval mode")
+        except Exception as e:
+            sampling_logger.error(f"Failed to create expert {i}: {str(e)}")
+    
+    sampling_logger.info(f"Created {len(experts_dict)} experts in {time.time() - start_time:.2f}s")
+    
+    # Test with optimized sampling approach
     try:
+        # Set all experts to eval mode
+        for expert in experts_dict.values():
+            expert.eval()
+        
+        # Force router to eval mode
+        router_model.eval()
+        
         # Create initial noise
         latents = torch.randn(shape, device=device)
         sampling_logger.info(f"Created initial latents with shape {latents.shape}")
         
-        # Process a single timestep
-        t_idx = 999  # Start from the end (pure noise)
-        t_tensor = torch.tensor([t_idx], device=device)
-        
-        # Get router prediction
+        # Use torch.no_grad for all test operations
         with torch.no_grad():
-            router_logits = router_model(latents[:1], t_tensor[:1])
-        sampling_logger.info(f"Router output shape: {router_logits.shape}")
-        
-        # Test expert prediction
-        with torch.no_grad():
-            expert_output = expert_model(latents[:1], t_tensor[:1])
-        sampling_logger.info(f"Expert output shape: {expert_output.shape}")
-        
-        # Check matching shapes
-        if expert_output.shape == latents[:1].shape:
-            sampling_logger.info("✓ Expert output shape matches input latents")
-        else:
-            sampling_logger.error(f"❌ Shape mismatch: expert output {expert_output.shape} ≠ input {latents[:1].shape}")
+            # First verify router and expert compatibility with simple forward pass
+            t_idx = 999  # Start from the end (pure noise)
+            t_tensor = torch.tensor([t_idx], device=device)
             
-        # Check if router produces valid probabilities
-        if router_logits.shape[1] == config.num_experts:
-            sampling_logger.info(f"✓ Router output matches number of experts: {router_logits.shape[1]}")
-        else:
-            sampling_logger.error(f"❌ Router output doesn't match experts: {router_logits.shape[1]} ≠ {config.num_experts}")
+            # Test router with batch
+            router_logits = router_model(latents[:1], t_tensor)
+            sampling_logger.info(f"Router output shape: {router_logits.shape}")
             
-        sampling_logger.info("Basic sampling component test completed successfully!")
+            # Ensure router produces probabilities that sum to 1 with softmax
+            router_probs = torch.nn.functional.softmax(router_logits, dim=-1)
+            sampling_logger.info(f"Router probabilities sum: {router_probs.sum(dim=1)}")
             
-        # Now try to simulate full diffusion process (optional - can be heavy)
-        simulate_full_process = False
-        if simulate_full_process:
-            from trainers.sampling import ddm_sample
-            from trainers.diffusion import get_alphas_and_betas
+            # Test top-k selection
+            top_k = min(2, len(experts_dict)) 
+            weights, indices = torch.topk(router_probs, top_k, dim=-1)
+            sampling_logger.info(f"Top-{top_k} expert indices: {indices}")
+            sampling_logger.info(f"Top-{top_k} expert weights: {weights}")
             
-            # Get schedule
+            # Test expert outputs with the same input
+            for expert_idx, expert in experts_dict.items():
+                if expert_idx in indices:
+                    sampling_logger.info(f"Testing expert {expert_idx}")
+                    expert_output = expert(latents[:1], t_tensor)
+                    if expert_output.shape == latents[:1].shape:
+                        sampling_logger.info(f"✓ Expert {expert_idx} output shape matches: {expert_output.shape}")
+                    else:
+                        sampling_logger.error(f"❌ Expert {expert_idx} shape mismatch: {expert_output.shape} ≠ {latents[:1].shape}")
+            
+            # Now simulate a full sampling step (combining predictions)
+            combined_pred = torch.zeros_like(latents[:1])
+            for i, idx in enumerate(indices[0]):
+                if idx.item() in experts_dict:
+                    expert = experts_dict[idx.item()]
+                    expert_pred = expert(latents[:1], t_tensor)
+                    weight = weights[0, i].view(-1, 1, 1, 1)
+                    combined_pred += weight * expert_pred
+                    
+            sampling_logger.info(f"Combined prediction shape: {combined_pred.shape}")
+            
+            # Test full sampling with streamlined steps
             steps = 10  # Use fewer steps for test
-            alphas, alpha_bar, betas = get_alphas_and_betas(steps, "cosine")
+            sampling_logger.info(f"Simulating {steps} sampling steps with expert sharing")
             
-            # Move to device
+            # Setup for sampling
+            from trainers.diffusion import get_alphas_and_betas, ddim_step
+            
+            alphas, alpha_bar, betas = get_alphas_and_betas(steps, "cosine")
             alphas = alphas.to(device)
             alpha_bar = alpha_bar.to(device)
             betas = betas.to(device)
             
-            # Simulate ddm_sample
+            # Reset latents
+            latents = torch.randn(shape, device=device)
+            
+            # Start timing full sampling
+            sampling_start = time.time()
+            
+            # Simulate the full sampling process
             for i in range(steps):
-                # Do a simulated sampling step (simplified)
+                # Current timestep
                 t_idx = steps - i - 1
-                t_tensor = torch.tensor([t_idx], device=device) 
+                t_tensor = torch.tensor([t_idx], device=device)
                 
-                # Get expert predictions
-                with torch.no_grad():
-                    router_logits = router_model(latents[:1], t_tensor)
-                    expert_output = expert_model(latents[:1], t_tensor)
+                # Get router predictions
+                router_logits = router_model(latents, t_tensor.repeat(latents.shape[0]))
+                router_probs = torch.nn.functional.softmax(router_logits, dim=-1)
                 
-                # Update latents (simplified)
-                latents[:1] = latents[:1] + 0.1 * expert_output
+                # Get top-k experts
+                weights, indices = torch.topk(router_probs, top_k, dim=-1)
+                weights = weights / weights.sum(dim=-1, keepdim=True)
                 
-            sampling_logger.info("Full sampling process simulation completed!")
-    
+                # Get unique experts needed
+                unique_experts = torch.unique(indices).cpu().tolist()
+                sampling_logger.info(f"Step {i}: Using experts {unique_experts}")
+                
+                # Run expert predictions
+                expert_predictions = {}
+                for expert_idx in unique_experts:
+                    if expert_idx in experts_dict:
+                        expert = experts_dict[expert_idx]
+                        pred = expert(latents, t_tensor.repeat(latents.shape[0]))
+                        expert_predictions[expert_idx] = pred
+                
+                # Combine expert outputs
+                combined_pred = torch.zeros_like(latents)
+                for batch_idx in range(latents.shape[0]):
+                    for i, expert_idx in enumerate(indices[batch_idx]):
+                        expert_idx = expert_idx.item()
+                        if expert_idx in expert_predictions:
+                            # Add weighted prediction for this batch item
+                            weight = weights[batch_idx, i].item()
+                            combined_pred[batch_idx] += weight * expert_predictions[expert_idx][batch_idx]
+                
+                # Apply the ddim step to update latents
+                next_t = torch.full_like(t_tensor, t_idx-1, device=device) 
+                if t_idx > 0:
+                    latents = ddim_step(
+                        lambda x_t, t, c: combined_pred,  # Use precomputed prediction
+                        latents,
+                        t_tensor.repeat(latents.shape[0]),
+                        next_t.repeat(latents.shape[0]),
+                        alphas,
+                        alpha_bar,
+                        eta=0.0
+                    )
+            
+            sampling_time = time.time() - sampling_start
+            sampling_logger.info(f"Completed {steps} sampling steps in {sampling_time:.2f}s ({steps/sampling_time:.2f} steps/s)")
+            sampling_logger.info(f"Final latents shape: {latents.shape}")
+            
+            # Memory usage info
+            if torch.cuda.is_available():
+                sampling_logger.info(f"GPU memory: {torch.cuda.memory_allocated(device)/1e9:.2f} GB allocated, {torch.cuda.memory_reserved(device)/1e9:.2f} GB reserved")
+            
+            sampling_logger.info("✓ DDM sampling simulation completed successfully!")
+            
     except Exception as e:
         sampling_logger.error(f"Error in sampling test: {str(e)}")
         import traceback
         sampling_logger.error(traceback.format_exc())
+    
+    # Clean up
+    try:
+        for expert in experts_dict.values():
+            del expert
+        del router_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except:
+        pass
         
     return
 
@@ -498,7 +590,7 @@ def main():
     
     # Run sampling test
     if args.sampling:
-        test_sampling_pipeline(config, device, num_samples=16)
+        test_sampling_pipeline(config, device, num_samples=4)
     
     logger.info("Shape tests completed")
 
