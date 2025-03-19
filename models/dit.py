@@ -30,6 +30,10 @@ class DiTBlock(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
     def forward(self, x, c):
+        # Ensure c has a batch dimension
+        if c.dim() == 1:
+            c = c.unsqueeze(0)  # Add batch dimension if missing
+        
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
         # Modulated attention
