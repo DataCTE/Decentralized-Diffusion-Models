@@ -57,6 +57,10 @@ class RouterTrainer:
         if rank == 0:
             print(f"Initialized SHARDED Router across {self.world_size} GPUs")
         
+        # Add VAE for latent encoding
+        from data.vae import VAEWrapper
+        self.vae = VAEWrapper(device, config)
+        
         # Paper-recommended optimizer settings
         self.optimizer = AdamW8bit(
             self.router.parameters(),
@@ -78,50 +82,40 @@ class RouterTrainer:
         )
 
     def train_step(self, batch):
-        """
-        Implements Algorithm 1 from paper (router training)
-        
-        This trains the router to predict which expert should handle
-        each sample, as described in Section 3.3 of the paper.
-        """
-        # Set router in training mode
-        self.router.train()
-        
-        # Get images and cluster assignments (Section 3.3)
+        """Implements Algorithm 2 from paper"""
         images = batch["image"].to(self.device)
-        clusters = batch["expert"].to(self.device)  # k in Algorithm 1
         
-        # Sample random timesteps t ∈ [0, 1] (Algorithm 1)
-        t = torch.rand(images.size(0), device=self.device)
+        # MISSING STEP: VAE encoding for the router input
+        with torch.no_grad():
+            # Use the VAE to encode the images to latent space
+            xt = self.vae.encode(images)
         
-        # Sample random noise ε ~ N(0, I) (Algorithm 1)
-        ε = torch.randn_like(images)
+        # Sample random timesteps
+        t_indices = torch.randint(0, 1000, (images.size(0),), device=self.device)
+        t = t_indices.float() / 1000.0
         
-        # Forward process using cosine schedule (Algorithm 1)
-        # xt = αt x0 + σt ε
-        αt = torch.cos(t * math.pi/2)[:,None,None,None]
-        σt = torch.sin(t * math.pi/2)[:,None,None,None]
-        xt = αt * images + σt * ε
+        # Get cluster assignments
+        cluster_indices = batch["cluster_idx"].to(self.device)
         
-        # Router prediction (Equation 5 in the paper)
-        # z = rθ(xt, t) ∈ R^|K|
-        z = self.router(xt, t)
+        # Get router predictions
+        z = self.router(xt, t)  # Now xt is latent, not RGB
         
-        # Cross-entropy loss for router (Section 3.3)
-        # LCE(z, OneHot(k))
-        loss = self.criterion(z, clusters)
+        # Compute loss
+        loss = self.criterion(z, cluster_indices)
         
-        # Optimization
+        # Optimize
         self.optimizer.zero_grad()
         loss.backward()
-        # Paper-recommended gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            self.router.parameters(), 
-            max_norm=self.config.max_grad_norm,
-            norm_type=2.0
-        )
+        
+        # Apply gradient clipping if configured
+        if hasattr(self.config, 'max_grad_norm') and self.config.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.router.parameters(), 
+                self.config.max_grad_norm
+            )
+        
         self.optimizer.step()
-        self.lr_scheduler.step()  # Update learning rate
+        self.lr_scheduler.step()
         
         return loss.item()
 
