@@ -434,12 +434,16 @@ class DDMTrainingCoordinator:
             # In real applications, you might want to sample from different buckets
             if hasattr(self.config, 'buckets') and len(self.config.buckets) > 0:
                 w, h = self.config.buckets[0]  # Get dimensions from first bucket
-                C = self.config.image_size[0]  # Get channel count
+                
+                # Use latent_channels instead of image_size[0] - this is the key change!
+                C = getattr(self.config, 'latent_channels', 16)  # Default to 16 for 16ch-VAE
+                
                 shape = (num_samples, C, h, w)
                 logger.info(f"Generating samples with dimensions {shape} from bucket 0")
             else:
-                # Fallback to image_size
-                C, H, W = self.config.image_size
+                # Fallback to image_size but ensure we use latent_channels
+                H, W = self.config.image_size[1], self.config.image_size[2]  # Only take H and W
+                C = getattr(self.config, 'latent_channels', 16)  # Get channel count from config
                 shape = (num_samples, C, H, W)
                 logger.info(f"Generating samples with dimensions {shape} from image_size")
             
