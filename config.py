@@ -123,12 +123,7 @@ DEFAULT_CONFIG = {
     # ===== Distillation parameters =====
     'ema_decay': 0.9999,  # Exponential moving average decay factor for model weights
     
-    # ===== Distributed Training =====
-    'nccl_timeout': 7200,  # 2 hrs timeout for NCCL operations
-    'nccl_socket_ifname': 'eth0',  # Network interface for NCCL
-    'nccl_debug': 'INFO',  # Enable NCCL debug logging
-    'nccl_blocking_wait': True,  # Use blocking wait
-    'nccl_async_error_handling': True,  # Enable async error handling
+    # ===== Distributed Training ===== (simplified)
     'batch_size_per_gpu': 1,  # Batch size per GPU
     'gradient_accumulation_steps': 1,  # Accumulate gradients
 }
