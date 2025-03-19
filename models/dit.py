@@ -34,11 +34,22 @@ class DiTBlock(nn.Module):
         if not isinstance(c, torch.Tensor):
             raise TypeError(f"Expected c to be a tensor, got {type(c)}")
         
+        # Add debug information with rank and stage
+        debug_enabled = self.training and torch.distributed.is_initialized() and torch.rand(1).item() < 0.01
+        
+        if debug_enabled:
+            rank = torch.distributed.get_rank()
+            print(f"[Rank {rank}] DiTBlock input tensor c shape: {c.shape}, dim: {c.dim()}, device: {c.device}")
+        
         # Ensure c has at least 2 dimensions (batch_size, features)
         if c.dim() == 0:  # It's a scalar tensor
             c = c.unsqueeze(0).unsqueeze(0)  # Add batch and feature dimensions
+            if debug_enabled:
+                print(f"[Rank {rank}] DiTBlock expanded scalar tensor to shape: {c.shape}")
         elif c.dim() == 1:  # It's a 1D tensor (features only)
             c = c.unsqueeze(0)  # Add batch dimension
+            if debug_enabled:
+                print(f"[Rank {rank}] DiTBlock expanded 1D tensor to shape: {c.shape}")
         
         # Log shape for debugging if needed
         if self.training and torch.distributed.get_rank() == 0 and torch.distributed.is_initialized() and torch.rand(1).item() < 0.001:
@@ -229,9 +240,13 @@ class ExpertDiT(nn.Module):
             cond_vector = cond_vector + text_pooled  # [B, D]
             
         # Ensure conditioning vector has proper dimensions before processing blocks
-        if cond_vector.dim() == 1:
-            cond_vector = cond_vector.unsqueeze(0)
-            
+        if cond_vector.dim() < 2 or cond_vector.shape[0] != batch_size:
+            if cond_vector.dim() == 1:
+                cond_vector = cond_vector.unsqueeze(0)
+            # Broadcast to match batch size if needed
+            if cond_vector.shape[0] == 1 and batch_size > 1:
+                cond_vector = cond_vector.expand(batch_size, -1)
+        
         # Process through transformer blocks
         for block in self.blocks:
             if self.use_gradient_checkpointing and self.training:

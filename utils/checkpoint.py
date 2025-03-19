@@ -315,3 +315,13 @@ def load_coordinator_checkpoint(checkpoint_dir):
     except Exception as e:
         logger.error(f"Error loading coordinator checkpoint: {e}")
         return None
+
+# Create a new utility function for debugging
+def debug_checkpoint_hook(module, input, output):
+    if torch.distributed.is_initialized() and torch.rand(1).item() < 0.005:
+        rank = torch.distributed.get_rank()
+        print(f"[Rank {rank}] Checkpoint hook - input shapes: {[i.shape if isinstance(i, torch.Tensor) else type(i) for i in input]}")
+        print(f"[Rank {rank}] Checkpoint hook - output shape: {output.shape if isinstance(output, torch.Tensor) else type(output)}")
+    return None
+
+# Register this hook in appropriate places

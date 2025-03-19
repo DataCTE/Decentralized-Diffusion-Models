@@ -84,9 +84,8 @@ class ExpertTrainer(BaseTrainer):
         images = batch["image"].to(self.device)
         
         # Use mixed precision training if configured
-        scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
-        
-        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
+        with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
             # VAE encoding (paper section 4.1)
             latents = self.vae.encode(images)
             
@@ -154,6 +153,11 @@ class ExpertTrainer(BaseTrainer):
         
         # Update learning rate
         self.lr_scheduler.step()
+        
+        # Add in train_step method
+        print(f"Latent shape: {latents.shape}")
+        print(f"Predicted flow shape: {pred_flow.shape}")
+        print(f"Target flow shape: {target_flow.shape}")
         
         return loss.item()
     
