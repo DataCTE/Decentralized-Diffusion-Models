@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
     'latent_channels': 16,  # Specific to 16ch-VAE
     'vae_scaling_factor': 0.18215,  # Seen in data/vae.py
     'clip_model': "openai/clip-vit-large-patch14",
+    'max_token_length': 77,  # Standard CLIP token length
     
     
     # ===== Router parameters =====
@@ -75,6 +76,7 @@ DEFAULT_CONFIG = {
     'sigma': 0.5,
     'loss_type': 'huber',
     'beta_schedule': 'cosine',
+    'flow_matching_delta': 0.1,  # Delta parameter for Huber loss
     
     # ===== Sampling parameters =====
     'sampling_steps': 50,
@@ -115,7 +117,9 @@ DEFAULT_CONFIG = {
     'router_learning_rate': 1e-4,
     'fsdp_use_orig_params': True,
     'fsdp_limit_all_gathers': True,
-   
+    
+    # ===== Distillation parameters =====
+    'ema_decay': 0.9999,  # Exponential moving average decay factor for model weights
 }
 
 def get_config(config_path):
