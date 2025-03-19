@@ -428,23 +428,57 @@ class DDMTrainingCoordinator:
             for expert_idx in self.expert_indices
         }
         
+        # Check for missing experts - add this code here
+        all_expert_indices = list(range(self.config.num_experts))
+        missing_experts = [idx for idx in all_expert_indices if idx not in self.expert_indices]
+        
+        if missing_experts and getattr(self.config, 'ensure_all_experts_for_sampling', True):
+            logger.warning(f"Missing {len(missing_experts)} experts for sampling. Using only available experts.")
+            logger.warning(f"For best results, consider running inference with a single process or implementing expert sharing.")
+        
+        # Put experts in evaluation mode before sampling
+        for expert in experts_dict.values():
+            if hasattr(expert, 'expert'):
+                expert.expert.eval()  # For ExpertTrainer objects
+            else:
+                expert.eval()  # For direct model objects
+        
+        # Validate top_k value
+        top_k = getattr(self.config, 'top_k', 1)
+        num_available_experts = len(experts_dict)
+        if top_k > num_available_experts:
+            logger.warning(f"top_k ({top_k}) is greater than available experts ({num_available_experts}). Setting top_k={num_available_experts}")
+            top_k = num_available_experts
+        
         # Use proper DDM sampling from trainers/sampling.py
         try:
+            # Determine whether to use mixed precision
+            use_mixed_precision = getattr(self.config, 'use_mixed_precision', False)
+            
             # Use the first bucket's dimensions for sampling
             # In real applications, you might want to sample from different buckets
             if hasattr(self.config, 'buckets') and len(self.config.buckets) > 0:
                 w, h = self.config.buckets[0]  # Get dimensions from first bucket
                 
-                # Use latent_channels instead of image_size[0] - this is the key change!
+                # Use latent_channels instead of image_size[0]
                 C = getattr(self.config, 'latent_channels', 16)  # Default to 16 for 16ch-VAE
                 
-                shape = (num_samples, C, h, w)
-                logger.info(f"Generating samples with dimensions {shape} from bucket 0")
+                # Adjust dimensions for VAE latent space if needed
+                vae_scale_factor = getattr(self.config, 'vae_scale_factor', 8)
+                latent_h, latent_w = h // vae_scale_factor, w // vae_scale_factor
+                
+                shape = (num_samples, C, latent_h, latent_w)
+                logger.info(f"Generating samples with dimensions {shape} (scaled from {w}x{h}) from bucket 0")
             else:
                 # Fallback to image_size but ensure we use latent_channels
                 H, W = self.config.image_size[1], self.config.image_size[2]  # Only take H and W
                 C = getattr(self.config, 'latent_channels', 16)  # Get channel count from config
-                shape = (num_samples, C, H, W)
+                
+                # Scale down for latent space
+                vae_scale_factor = getattr(self.config, 'vae_scale_factor', 8)
+                latent_h, latent_w = H // vae_scale_factor, W // vae_scale_factor
+                
+                shape = (num_samples, C, latent_h, latent_w)
                 logger.info(f"Generating samples with dimensions {shape} from image_size")
             
             # Get optional text embeddings if conditional
@@ -462,35 +496,86 @@ class DDMTrainingCoordinator:
             # Access the actual router model, not the trainer
             router_model = self.router.router if hasattr(self.router, 'router') else self.router
             
-            # Use ddm_sample from trainers/sampling.py for proper DDM sampling
-            samples = ddm_sample(
-                router=router_model,  # Use the actual model, not the trainer
-                experts=experts_dict,
-                shape=shape,
-                steps=getattr(self.config, 'sampling_steps', 50),
-                top_k=getattr(self.config, 'top_k', 1),
-                device=self.device,
-                cfg_scale=getattr(self.config, 'cfg_scale', 7.5),
-                text_embeddings=text_embeddings,
-                uncond_embeddings=uncond_embeddings,
-                eta=getattr(self.config, 'eta', 0.0),
-                scheduler=getattr(self.config, 'beta_schedule', "cosine"),
-                verbose=True,
-                temperature=getattr(self.config, 'temperature', 1.0)
-            )
+            # Ensure router is in evaluation mode
+            if hasattr(router_model, 'eval'):
+                router_model.eval()
+            
+            # Test router with dummy input before actual sampling
+            try:
+                # Create a small dummy input with correct dimensions
+                dummy_input = torch.zeros((1, C, latent_h, latent_w), device=self.device)
+                dummy_timesteps = torch.zeros((1,), device=self.device).long()
+                
+                # Try a forward pass with router to detect any issues early
+                with torch.no_grad():
+                    logger.info("Running router test with dummy input")
+                    dummy_output = router_model(dummy_input, dummy_timesteps)
+                    logger.info(f"Router test successful. Output shape: {dummy_output.shape}")
+            except Exception as e:
+                logger.error(f"Router test failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+            
+            # Also test the first expert to validate it works
+            if experts_dict:
+                first_expert_idx = next(iter(experts_dict.keys()))
+                first_expert = experts_dict[first_expert_idx]
+                
+                try:
+                    with torch.no_grad():
+                        logger.info(f"Running expert {first_expert_idx} test with dummy input")
+                        if hasattr(first_expert, 'expert'):
+                            # It's an ExpertTrainer object
+                            dummy_output = first_expert.expert(dummy_input, dummy_timesteps)
+                        else:
+                            # It's a direct model
+                            dummy_output = first_expert(dummy_input, dummy_timesteps)
+                        logger.info(f"Expert test successful. Output shape: {dummy_output.shape}")
+                except Exception as e:
+                    logger.error(f"Expert test failed: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            
+            # Use consistent precision throughout sampling
+            with torch.amp.autocast(device_type='cuda', enabled=use_mixed_precision):
+                # Use ddm_sample from trainers/sampling.py for proper DDM sampling
+                samples = ddm_sample(
+                    router=router_model,  # Use the actual model, not the trainer
+                    experts=experts_dict,
+                    shape=shape,
+                    steps=getattr(self.config, 'sampling_steps', 50),
+                    top_k=top_k,
+                    device=self.device,
+                    cfg_scale=getattr(self.config, 'cfg_scale', 7.5),
+                    text_embeddings=text_embeddings,
+                    uncond_embeddings=uncond_embeddings,
+                    eta=getattr(self.config, 'eta', 0.0),
+                    scheduler=getattr(self.config, 'beta_schedule', "cosine"),
+                    verbose=True,
+                    temperature=getattr(self.config, 'temperature', 1.0)
+                )
             
             # Save samples
-            from torchvision.utils import save_image
-            for i in range(num_samples):
-                save_image(samples[i], os.path.join(sample_dir, f'sample_{i}.png'))
+            try:
+                from torchvision.utils import save_image
+                for i in range(num_samples):
+                    # Convert to appropriate format for saving if needed
+                    sample_to_save = samples[i].float() if samples[i].dtype != torch.float32 else samples[i]
+                    save_image(sample_to_save, os.path.join(sample_dir, f'sample_{i}.png'))
                     
-            logger.info(f"Saved {num_samples} samples to {sample_dir}")
+                logger.info(f"Saved {num_samples} samples to {sample_dir}")
+            except Exception as e:
+                logger.error(f"Error saving samples: {e}")
+            
         except Exception as e:
             logger.error(f"Error generating samples: {e}")
+            import traceback
+            logger.error(traceback.format_exc())  # Add detailed traceback
         
         # Return images if requested
-        if return_images:
-            return samples  # This will now return None if an error occurred
+        if return_images and samples is not None:
+            # Ensure we return float32 tensors for consistency
+            return samples.float() if hasattr(samples, 'float') else samples
         return None
     
     def save_checkpoint(self, step):
@@ -737,3 +822,4 @@ class DDMTrainingCoordinator:
                 threading.Thread(target=flush_thread).start()
             except:
                 pass
+
