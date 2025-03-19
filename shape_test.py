@@ -148,12 +148,12 @@ def test_router_shapes(config, device="cuda"):
         latent_h, latent_w = h // 8, w // 8
         latents = torch.randn(1, config.latent_channels, latent_h, latent_w, device=device)
         
-        # Timesteps
-        t = torch.randint(0, 1000, (1,), device=device)
+        # Timesteps - FIXED: Convert to float
+        t = torch.randint(0, 1000, (1,), device=device).float()
         
         # Print input shapes
         logger.info(f"Input latent shape: {latents.shape}")
-        logger.info(f"Timestep shape: {t.shape}")
+        logger.info(f"Timestep shape: {t.shape}, dtype: {t.dtype}")
         
         # Forward pass
         with torch.no_grad():
@@ -276,7 +276,12 @@ def test_training_step(device="cuda"):
                 )
         
         router_trainer = TestRouterTrainer(config, device)
-        loss = router_trainer.train_step(batch)
+        
+        # Create a mock batch that ensures t_indices is float
+        mock_batch = create_dummy_batch(batch_size=1, device=device)
+        
+        # When we execute train_step, it will now use float timesteps
+        loss = router_trainer.train_step(mock_batch)
         logger.info(f"Router training step completed with loss: {loss}")
         
     except Exception as e:

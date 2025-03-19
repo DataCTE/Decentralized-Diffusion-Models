@@ -110,8 +110,9 @@ class RouterModel(nn.Module):
         attn_weights = torch.softmax(attn_flat, dim=2).view_as(attn_features)
         x = (x * attn_weights).sum(dim=(2, 3))  # [B, D]
         
-        # Timestep embedding
-        t_emb = self.time_embedder(t.unsqueeze(-1))  # [B, D]
+        # Timestep embedding - ensure float dtype
+        t_float = t.float() if t.dtype != torch.float32 else t
+        t_emb = self.time_embedder(t_float.unsqueeze(-1))  # [B, D]
         
         # Add timestep information
         x = x + t_emb  # [B, D]
