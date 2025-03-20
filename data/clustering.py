@@ -25,7 +25,15 @@ class DDMClustering:
             load_path = feature_path if feature_path else self.default_feature_path
             print(f"Loading features from default path: {load_path}")
             try:
-                features = torch.load(os.path.join(load_path, "train_features.pt"))
+                features = torch.load(os.path.join(load_path, "features", "train_features.pt"))
+                feature_dir = os.path.join(load_path, "features")
+                feature_files = [f for f in os.listdir(feature_dir) if f.endswith(".pt")]
+                all_features = []
+                for feature_file in tqdm(feature_files, desc="Loading feature files"):
+                    feature_path = os.path.join(feature_dir, feature_file)
+                    individual_features = torch.load(feature_path, map_location='cpu')
+                    all_features.append(individual_features)
+                features = torch.cat(all_features, dim=0)
             except FileNotFoundError:
                 raise FileNotFoundError(f"Features not provided and not found at default path: {load_path}. Please run feature extraction script or provide features directly.")
         # Stage 1: Fine-grained clustering (paper appendix B, Section 4.1)
@@ -67,4 +75,24 @@ class DDMClustering:
 
         # Assign samples to nearest coarse centroid (done in DDMDataset._distribute_samples based on these centroids)
         distances = torch.cdist(features, self.coarse_centroids.cpu())
-        return torch.argmin(distances, dim=1) 
+        cluster_assignments = torch.argmin(distances, dim=1)
+
+        # Save individual cluster assignments
+        feature_dir = os.path.join(self.default_feature_path, "features")
+        cluster_dir = os.path.join(self.default_feature_path, "clusters")
+        os.makedirs(cluster_dir, exist_ok=True)
+        feature_files = sorted([f for f in os.listdir(feature_dir) if f.endswith(".pt")])  # Ensure consistent order
+        num_files = len(feature_files)
+        assignments_per_file = len(cluster_assignments) // num_files
+        start_index = 0
+
+        for i, feature_file in enumerate(tqdm(feature_files, desc="Saving cluster assignments")):
+            end_index = start_index + assignments_per_file
+            if i == num_files - 1:  # Handle potential remainder for last file
+                end_index = len(cluster_assignments)
+            file_assignments = cluster_assignments[start_index:end_index]
+            cluster_output_path = os.path.join(cluster_dir, feature_file.replace(".pt", ".cluster.pt"))
+            torch.save(file_assignments.cpu(), cluster_output_path)
+            start_index = end_index
+
+        return cluster_assignments 

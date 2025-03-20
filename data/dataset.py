@@ -86,8 +86,8 @@ class DDMDataset(Dataset):
         )
         
         # Load precomputed features and clusters (paper section 4.1)
-        feature_path = os.path.join(config.dataset_path, f'{split}_features.pt')
-        cluster_path = os.path.join(config.dataset_path, f'{split}_clusters.pt')
+        feature_path = os.path.join(config.dataset_path, "cache", "features")
+        cluster_path = os.path.join(config.dataset_path, "cache", "clusters")
         
         if not os.path.exists(feature_path) or not os.path.exists(cluster_path):
             raise FileNotFoundError(
@@ -95,8 +95,18 @@ class DDMDataset(Dataset):
                 "Please run feature extraction and clustering first."
             )
             
-        self.features = torch.load(feature_path, map_location='cpu')
-        self.clusters = torch.load(cluster_path, map_location='cpu')
+        self.features = torch.cat([torch.load(os.path.join(feature_path, f), map_location='cpu') for f in os.listdir(feature_path) if f.endswith(".pt")])
+        self.clusters = torch.load(os.path.join(cluster_path, f'{split}_clusters.pt'), map_location='cpu')
+        
+        # Load individual cluster assignments
+        cluster_dir = cluster_path
+        cluster_files = sorted([f for f in os.listdir(cluster_dir) if f.endswith(".cluster.pt")])
+        all_clusters = []
+        for cluster_file in tqdm(cluster_files, desc="Loading cluster files"):
+            individual_cluster_path = os.path.join(cluster_dir, cluster_file)
+            individual_clusters = torch.load(individual_cluster_path, map_location='cpu')
+            all_clusters.append(individual_clusters)
+        self.clusters = torch.cat(all_clusters, dim=0)
         
         # Add clustering initialization
         from data.clustering import DDMClustering
