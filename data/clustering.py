@@ -25,17 +25,18 @@ class DDMClustering:
             load_path = feature_path if feature_path else self.default_feature_path
             print(f"Loading features from default path: {load_path}")
             try:
-                features = torch.load(os.path.join(load_path, "features", "train_features.pt"))
                 feature_dir = os.path.join(load_path, "features")
-                feature_files = [f for f in os.listdir(feature_dir) if f.endswith(".pt")]
+                feature_files = sorted([f for f in os.listdir(feature_dir) if f.endswith(".pt")])
                 all_features = []
                 for feature_file in tqdm(feature_files, desc="Loading feature files"):
                     feature_path = os.path.join(feature_dir, feature_file)
-                    individual_features = torch.load(feature_path, map_location='cpu')
+                    individual_features = torch.load(feature_path, map_location=lambda storage, loc: storage.cuda())
                     all_features.append(individual_features)
                 features = torch.cat(all_features, dim=0)
             except FileNotFoundError:
                 raise FileNotFoundError(f"Features not provided and not found at default path: {load_path}. Please run feature extraction script or provide features directly.")
+        features = features.cuda()
+
         # Stage 1: Fine-grained clustering (paper appendix B, Section 4.1)
         # "cluster these features to 1024 fine-grained centroids"
         kmeans = faiss.Kmeans(
