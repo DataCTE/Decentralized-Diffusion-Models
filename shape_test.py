@@ -44,7 +44,7 @@ def test_full_pipeline():
             
         # Save features and clusters
         torch.save(dummy_features, os.path.join(tmpdir, "train_features.pt"))
-        torch.save(dummy_dims, os.path.join(tmpdir, "train_dim_cache.pt"))
+        torch.save(dummy_dims, os.path.join(tmpdir, "dim_cache.pt"))
         torch.save(torch.randint(0,4,(4,)), os.path.join(tmpdir, "train_clusters.pt"))
         
         # Initialize dataset
