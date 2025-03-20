@@ -146,7 +146,7 @@ def test_full_pipeline():
         plt.ylabel('Loss')
         plt.tight_layout()
 
-        plot_path = os.path.join(tmpdir, "loss_curves.png")
+        plot_path = "loss_curves.png"
         plt.savefig(plot_path)
         print(f"Loss curves plot saved to: {plot_path}")
         plt.close()
