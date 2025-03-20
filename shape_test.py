@@ -42,6 +42,9 @@ def test_full_pipeline():
         for i in range(4):
             img = Image.fromarray(dummy_images[i].astype('uint8'))
             img.save(os.path.join(train_dir, f"image_{i}.png"))
+            caption_path = os.path.join(train_dir, f"image_{i}.txt")
+            with open(caption_path, 'w') as f:
+                f.write("dummy caption")
             
         # Save features and clusters
         torch.save(dummy_features, os.path.join(tmpdir, "train_features.pt"))
