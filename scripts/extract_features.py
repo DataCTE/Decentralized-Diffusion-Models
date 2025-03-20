@@ -13,7 +13,7 @@ from utils.distributed import setup_distributed, get_rank, get_world_size, is_ma
 
 def extract_features(config_path="config.py", output_dir="/workspace/Decentralized-Diffusion-Models/cache"):
     """
-    Extracts DINOv2 features for the dataset in parallel using multiple GPUs and saves them to disk.
+    Extracts DINOv2 features for the dataset in parallel using multiple GPUs and saves them to disk as individual files.
 
     Args:
         config_path (str): Path to the configuration file.
@@ -54,46 +54,41 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     model = AutoModel.from_pretrained(model_name).to(device)
     model.eval()
 
-    features_list = []
-    dims_list = []
+    # Create separate output directories for features and dimensions
+    features_dir = os.path.join(output_dir, "features")
+    dims_dir = os.path.join(output_dir, "dimensions")
 
     if is_main_process():
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(features_dir, exist_ok=True)
+        os.makedirs(dims_dir, exist_ok=True)
 
     for image_path in tqdm(partitioned_image_paths, desc=f"Rank {rank} Extracting features", position=rank, total=len(partitioned_image_paths)):
         try:
             image = Image.open(image_path).convert('RGB')
-            dims_list.append([image.width, image.height])
+            dims = torch.tensor([image.width, image.height], dtype=torch.int64)
 
             inputs = processor(images=image, return_tensors="pt").to(device)
             with torch.no_grad():
                 outputs = model(**inputs)
-                features = outputs.last_hidden_state[:, 0, :]
-                features_list.append(features.cpu())
+                features = outputs.last_hidden_state[:, 0, :].cpu() # Move features to CPU immediately
+
+            # Construct base filename from image path (remove extension and path prefix)
+            base_filename = os.path.splitext(os.path.basename(image_path))[0]
+            feature_filename = f"{base_filename}.pt"
+            dim_filename = f"{base_filename}.pt" # Use .pt extension for dimensions as well for consistency
+
+            # Save feature and dimension files
+            torch.save(features, os.path.join(features_dir, feature_filename))
+            torch.save(dims, os.path.join(dims_dir, dim_filename))
+
 
         except Exception as e:
             print(f"Rank {rank} Error processing image {image_path}: {e}")
             continue
 
-    # Gather features and dims from all ranks on rank 0
-    all_features_list = [None] * world_size
-    all_dims_list = [None] * world_size
-    features_tensor = torch.cat(features_list, dim=0) if features_list else torch.empty((0, model.config.hidden_size))
-    dims_tensor = torch.tensor(dims_list, dtype=torch.int64) if dims_list else torch.empty((0, 2), dtype=torch.int64)
-
-    dist.gather_object(features_tensor, all_features_list if rank == 0 else None, dst=0)
-    dist.gather_object(dims_tensor, all_dims_list if rank == 0 else None, dst=0)
-
     if is_main_process():
-        # Concatenate all features and dimensions on rank 0
-        all_features = torch.cat(list(filter(lambda x: x is not None and x.numel() > 0, all_features_list)))
-        all_dims = torch.cat(list(filter(lambda x: x is not None and x.numel() > 0, all_dims_list)))
-
-        # Save features and dimensions to disk
-        torch.save(all_features, os.path.join(output_dir, "train_features.pt"))
-        torch.save(all_dims, os.path.join(output_dir, "dim_cache.pt"))
-
-        print(f"Features saved to {output_dir}")
+        print(f"Features saved to {features_dir}")
+        print(f"Dimensions saved to {dims_dir}")
 
     dist.destroy_process_group()
 
