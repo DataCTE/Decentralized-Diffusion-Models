@@ -481,20 +481,17 @@ class DDMDataset(Dataset):
         self.logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
 
         # Paper-mandated cluster validation
-        cluster_sizes = [(self.expert_assignments == i).sum().item()
+        cluster_sizes = [(self.expert_assignments == i).sum().item() 
                         for i in range(self.config.num_experts)]
         min_cluster_size = min(cluster_sizes)
         max_cluster_size = max(cluster_sizes)
-
-        # Skip cluster size validation if dataset_path is a temporary directory (for shape tests)
-        if "TemporaryDirectory" in self.config.dataset_path:
-            self.logger.info("Skipping cluster size validation for shape test in temporary directory")
-        elif min_cluster_size < 1000:  # Paper's minimum cluster size
+        
+        if min_cluster_size < 1000:  # Paper's minimum cluster size
             raise ValueError(
                 f"Cluster too small (min_size={min_cluster_size}). "
                 "Consider reducing num_experts or increasing dataset size."
             )
-
+            
         size_ratio = max_cluster_size / min_cluster_size
         if size_ratio > 10:  # Paper's max imbalance
             self.logger.warning(

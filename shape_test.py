@@ -33,7 +33,7 @@ def test_full_pipeline():
         os.makedirs(train_dir, exist_ok=True)
         
         # Create dummy dataset (200 images)
-        num_dummy_images = 200
+        num_dummy_images = 2000
         dummy_images = [np.random.rand(256, 256, 3) * 255 for _ in range(num_dummy_images)]
         dummy_features = torch.randn(num_dummy_images, 1024)  # Fake DINOv2 features
         dummy_dims = torch.tensor([[256, 256] for _ in range(num_dummy_images)], dtype=torch.int64)
