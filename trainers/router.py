@@ -104,8 +104,12 @@ class RouterTrainer:
             # Get actual cluster assignments from dataset
             targets = batch["expert"].to(self.device)
             
+            # Generate dummy text embeddings for router training
+            batch_size = images.shape[0]
+            dummy_text_embeds = torch.randn(batch_size, self.config.clip_embedding_dim, device=self.device)
+
             # Get router predictions
-            logits = self.router(latent_t, t_indices)  # Note: Call directly with 2 args
+            logits = self.router(latent_t, t_indices, dummy_text_embeds)  # Pass dummy text embeddings
             
             # Compute loss
             loss = self.criterion(logits, targets)
