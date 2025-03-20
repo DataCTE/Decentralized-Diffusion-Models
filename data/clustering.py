@@ -54,7 +54,7 @@ class DDMClustering:
         )
 
         # Use hierarchical clustering on similarities
-        from fastcluster import linkage
+        from scipy.cluster.hierarchy import linkage
         Z = linkage(similarity_matrix.cpu().numpy(), method='average')
 
         # Cut the dendrogram to get coarse clusters
