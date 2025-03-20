@@ -500,7 +500,9 @@ class ExpertMMDiT(nn.Module):
                 text_mask = None # Assuming no text mask needed for now
             )
 
-        return self.final_layer(x, cond_vector) # Final layer still takes image tokens (x) and cond_vector
+        x = self.final_layer(x, cond_vector) # Final layer still takes image tokens (x) and cond_vector
+        x = self.unpatchify(x, h, w) # Unpatchify to get back to image shape
+        return x
 
     def debug_tensor_shapes(self, prefix="", **tensors):
         """Debug tensor shapes during training"""
