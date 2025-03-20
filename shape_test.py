@@ -18,7 +18,7 @@ from trainers.diffusion import DecentralizedFlowMatcher
 def test_full_pipeline():
     """End-to-end shape test of DDM pipeline with dummy data"""
     # Setup
-    config = get_config()
+    config = get_config("config.py")
     config.num_experts = 4
     config.batch_size = 2
     config.image_size = (64, 64)
