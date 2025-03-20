@@ -300,7 +300,7 @@ def configure_optimizer_for_fsdp(model, optimizer_class, **kwargs):
 def get_fsdp_defaults():
     """Paper-specified isolation defaults"""
     return {
-        "process_group": torch.distributed.new_group(backend="nccl"),  # Separate group per expert
+        "process_group": torch.distributed.new_group(backend="nccl") if torch.distributed.is_initialized() else None,
         "sync_module_states": False,  # Don't sync initial weights
         "device_id": torch.cuda.current_device(),
         "limit_all_gathers": True,
@@ -310,7 +310,7 @@ def get_fsdp_defaults():
 def create_fsdp_config(config, sharding_strategy="FULL_SHARD", rank=0):
     """Paper's sharding strategies with config overrides"""
     defaults = get_fsdp_defaults()
-    return {
+    fsdp_config = {
         **defaults,
         "sharding_strategy": {
             "FULL_SHARD": ShardingStrategy.FULL_SHARD,
@@ -320,6 +320,9 @@ def create_fsdp_config(config, sharding_strategy="FULL_SHARD", rank=0):
         }[sharding_strategy],
         "device_id": torch.device(f"cuda:{rank}")
     }
+    if defaults["process_group"] is not None:
+        fsdp_config["process_group"] = defaults["process_group"]
+    return fsdp_config
 
 def create_mixed_precision_config(config):
     """Create mixed precision config for FSDP"""
