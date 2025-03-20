@@ -105,11 +105,24 @@ class DDMDataset(Dataset):
 
         # Check if any cluster files were found
         if not cluster_files:
-            raise FileNotFoundError(
+            self.logger.warning(
                 f"No cluster assignment files (.cluster.pt) found in: {cluster_dir}. "
-                "Please ensure you have run the clustering script (`clustering.py`) "
-                "and that the `feature_cache_path` in your configuration is correct."
+                "Attempting to generate them automatically..."
             )
+            
+            # Auto-generate clusters if missing
+            self.logger.info("Running clustering process automatically...")
+            cluster_assignments = self.clusterer.cluster(features_list=self.features)
+            
+            # Verify clusters were created
+            cluster_files = sorted([f for f in os.listdir(cluster_dir) if f.endswith(".cluster.pt")])
+            if not cluster_files:
+                raise FileNotFoundError(
+                    f"Failed to auto-generate cluster files in: {cluster_dir}. "
+                    "Please run the clustering script (`clustering.py`) manually "
+                    "and ensure that the `feature_cache_path` in your configuration is correct."
+                )
+            self.logger.info(f"Successfully auto-generated {len(cluster_files)} cluster files.")
 
         all_individual_clusters_cpu = []
         for cluster_file in tqdm(cluster_files, desc="Loading cluster files"):
