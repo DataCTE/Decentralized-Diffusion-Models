@@ -8,6 +8,7 @@ import io
 from datetime import timedelta
 import os
 import time
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -294,18 +295,32 @@ def setup_distributed_printer(rank):
     __builtin__.print = print 
 
 def setup_distributed():
-    """Initialize distributed training environment"""
+    """Initialize distributed training environment, handling non-distributed cases."""
     if is_dist_initialized():
         logger.warning("Distributed is already initialized, skipping re-initialization")
         return get_rank(), get_world_size()
 
-    # Initialize process group using NCCL backend
-    dist.init_process_group(
-        backend='nccl',
-        timeout=timedelta(minutes=90) # Adjust timeout as needed
-    )
-    rank = get_rank()
-    world_size = get_world_size()
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        # Distributed training scenario (using environment variables)
+        dist.init_process_group(
+            backend='nccl',
+            timeout=timedelta(minutes=90) # Adjust timeout as needed
+        )
+        rank = get_rank()
+
+    else:
+        # Non-distributed scenario (e.g., shape test)
+        # Use file-based store for single process initialization
+        init_method = f"file://{tempfile.gettempdir()}/ddm_shape_test_rendezvous"
+        dist.init_process_group(
+            backend='gloo', # Gloo backend is suitable for CPU and single-node, multi-GPU
+            init_method=init_method,
+            world_size=1,
+            rank=0
+        )
+        rank = 0
+        world_size = 1
 
     # Set the device for current process
     torch.cuda.set_device(rank)
