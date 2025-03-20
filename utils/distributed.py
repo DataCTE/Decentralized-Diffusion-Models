@@ -292,3 +292,27 @@ def setup_distributed_printer(rank):
             builtin_print(*args, **kwargs)
             
     __builtin__.print = print 
+
+def setup_distributed():
+    """Initialize distributed training environment"""
+    if is_dist_initialized():
+        logger.warning("Distributed is already initialized, skipping re-initialization")
+        return get_rank(), get_world_size()
+
+    # Initialize process group using NCCL backend
+    dist.init_process_group(
+        backend='nccl',
+        timeout=timedelta(minutes=90) # Adjust timeout as needed
+    )
+    rank = get_rank()
+    world_size = get_world_size()
+
+    # Set the device for current process
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    # Ensure all processes are synchronized
+    dist.barrier()
+
+    logger.info(f"Initialized distributed training on rank {rank}/{world_size}")
+    return rank, world_size 
