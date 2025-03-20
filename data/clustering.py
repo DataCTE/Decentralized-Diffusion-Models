@@ -45,7 +45,6 @@ class DDMClustering:
             nredo=3,
             min_points_per_centroid=100,
             max_points_per_centroid=10000,
-            gpu_index=False
         )
         kmeans.train(features.numpy())
         self.fine_centroids = torch.from_numpy(kmeans.centroids).float()
