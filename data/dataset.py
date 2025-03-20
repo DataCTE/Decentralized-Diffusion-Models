@@ -94,6 +94,7 @@ class DDMDataset(Dataset):
                 f"Precomputed features not found at {feature_path}. "
                 "Please run feature extraction and clustering first."
             )
+        print(f"Debugging dataset.py: feature_path being checked: {feature_path}")
             
         self.features = torch.cat([torch.load(os.path.join(feature_path, f), map_location='cpu') for f in os.listdir(feature_path) if f.endswith(".pt")])
         self.clusters = torch.load(os.path.join(cluster_path, f'{split}_clusters.pt'), map_location='cpu')
