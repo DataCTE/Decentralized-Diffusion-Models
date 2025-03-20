@@ -5,7 +5,7 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from data.dataset import find_valid_image_pairs, discover_image_files
+from data.dataset import find_valid_image_pairs
 from config import get_config
 from utils.distributed import setup_distributed, get_rank, get_world_size, is_main_process
 import glob
