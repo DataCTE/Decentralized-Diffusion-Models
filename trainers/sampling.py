@@ -157,8 +157,8 @@ def ddm_sample(
                 # For unconditional generation, just use router directly
                 # Create zero text embeddings for unconditional case
                 batch_size = shape[0]
-                zero_text_emb = torch.zeros((batch_size, config.clip_embedding_dim), dtype=torch.float32, device=device) # Assuming float32 and CLIP embedding dim
-                router_logits = router(x, timestep, text_embeddings=zero_text_emb)
+                zero_text_emb_router = torch.zeros((batch_size, config.clip_embedding_dim), dtype=torch.float32, device=device) # Zero text embeddings for router
+                router_logits = router(x, timestep, text_embeddings=zero_text_emb_router)
                 router_probs = F.softmax(router_logits / temperature, dim=-1)
                 
                 if top_k > 0:
@@ -174,7 +174,7 @@ def ddm_sample(
                     # Use all experts
                     selected_experts = list(experts.keys())
                     expert_weights = router_probs
-                    
+            
             # Record expert usage
             for expert_idx in selected_experts:
                 expert_usage[expert_idx] += 1
@@ -204,7 +204,8 @@ def ddm_sample(
                     pred = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
                 else:
                     # Unconditional generation
-                    pred = expert(x, timestep, uncond_embeddings)
+                    zero_text_emb_expert = torch.zeros((batch_size, config.clip_embedding_dim), dtype=torch.float32, device=device) # Zero text embeddings for expert
+                    pred = expert(x, timestep, zero_text_emb_expert) # Pass zero text embeddings to expert
                 
                 expert_predictions[expert_idx] = pred
             
