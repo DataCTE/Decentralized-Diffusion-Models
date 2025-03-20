@@ -58,7 +58,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         discovery_start_time = time.time()
         
         # Initialize progress bar with rate display
-        with tqdm(unit='img', unit_scale=True, desc=f"Rank {rank} Discovering files") as progress_bar:
+        with tqdm(unit='img', unit_scale=True, desc=f"Rank {rank} Discovering files", position=0, leave=True) as progress_bar:
             with ThreadPoolExecutor(max_workers=8) as executor:
                 # Create futures for each extension
                 futures = [
@@ -71,6 +71,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
                     extension_image_paths = future.result()
                     image_paths.extend(extension_image_paths)
                     progress_bar.update(len(extension_image_paths))
+                    progress_bar.refresh()  # Force refresh the progress bar
 
         discovery_duration = time.time() - discovery_start_time
         print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
