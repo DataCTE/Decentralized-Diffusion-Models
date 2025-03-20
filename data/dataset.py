@@ -424,6 +424,7 @@ class DDMDataset(Dataset):
         
         # Calculate aspect ratios
         bucket_aspects = self.bucket_dims[:,0] / self.bucket_dims[:,1]
+        print(f"Shape of self.dim_cache: {self.dim_cache.shape}")
         image_aspects = self.dim_cache[:,0] / self.dim_cache[:,1]
 
         # Find closest bucket using matrix ops
