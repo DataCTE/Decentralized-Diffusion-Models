@@ -126,6 +126,8 @@ class RouterModel(nn.Module):
         
         # Add CLS token
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        print(f"Shape of cls_tokens: {cls_tokens.shape}")
+        print(f"Shape of x before cat: {x.shape}")
         x = torch.cat([cls_tokens, x], dim=1)  # [B, 2, D]
         
         # Apply transformer blocks
