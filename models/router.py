@@ -106,6 +106,7 @@ class RouterModel(nn.Module):
         # Spatial attention processing with manual softmax
         attn_features = self.spatial_attention(x)  # [B, D, H', W']
         x = attn_features.mean(dim=(2, 3))  # Global average pooling to [B, D]
+        print(f"Shape of x after pooling: {x.shape}")
         x = x.reshape(batch_size, -1)  # Ensure x is [B, D] after spatial pooling - still keep reshape for safety
         
         # Timestep embedding - ensure float dtype
