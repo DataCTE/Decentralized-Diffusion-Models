@@ -161,9 +161,10 @@ DEFAULT_CONFIG = {
     'expert_selection_strategy': 'top_k',
     'max_sampling_experts': 2,  # Maximum experts to use in sampling
     'max_experts_in_memory': 2,  # Number of experts to keep in GPU memory
+    'num_fine_clusters': 1024, # Add missing num_fine_clusters here
     
     # ===== Shape Test Controls =====
-    'bypass_cluster_validation': True, # Flag to bypass cluster size validation, set to True in shape_test.py
+    'bypass_cluster_validation': False, # Flag to bypass cluster size validation, set to True in shape_test.py
 }
 
 def get_config(config_path):
