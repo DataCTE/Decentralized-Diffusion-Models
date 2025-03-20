@@ -120,14 +120,11 @@ class RouterModel(nn.Module):
         text_emb = self.text_embed_proj(text_embeddings)  # Project text embeddings
         x = x + text_emb  # Add projected text embeddings
         
-        # Expand to sequence for transformer blocks
-        x = x.unsqueeze(1)  # [B, 1, D]
-        
         # Add CLS token
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         print(f"Shape of cls_tokens: {cls_tokens.shape}")
         print(f"Shape of x before cat: {x.shape}")
-        x = torch.cat([cls_tokens, x], dim=1)  # [B, 2, D]
+        x = torch.cat([cls_tokens.squeeze(1), x], dim=1)  # [B, 2, D] - Concatenate directly without unsqueeze
         
         # Apply transformer blocks
         for block in self.blocks:
