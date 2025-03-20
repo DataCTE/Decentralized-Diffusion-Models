@@ -116,7 +116,7 @@ def test_full_pipeline():
         # Expert training
         expert_trainer = ExpertTrainer(0, config, device, 0, 1)
         expert_loss = expert_trainer.train_step(batch)
-        assert isinstance(expert_loss.item(), float), "Expert training failed"
+        assert isinstance(expert_loss, float), "Expert training failed"
         
         # Test sampling pipeline
         shape = (2, config.latent_channels, 16, 16)
