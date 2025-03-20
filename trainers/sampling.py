@@ -223,7 +223,7 @@ def ddm_sample(
             
             # Update progress with active expert info
             if verbose and t % 5 == 0:
-                active_str = ", ".join([f"E{idx}:{expert_weights[:,idx].mean().item():.2f}" for idx in selected_experts])
+                active_str = ", ".join([f"E{selected_experts[i]}:{expert_weights[:,i].mean().item():.2f}" for i in range(len(selected_experts))])
                 progress.set_postfix({"Active": active_str})
             
             # Sample step (DDIM)
