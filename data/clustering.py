@@ -42,17 +42,25 @@ class DDMClustering:
 
         # Stage 1: Fine-grained clustering (paper appendix B, Section 4.1)
         # "cluster these features to 1024 fine-grained centroids"
+        gpu_resources = faiss.GpuResources()
+        index_flat = faiss.IndexFlatL2(features.shape[1])
+        index_gpu = faiss.index_cpu_to_gpu(gpu_resources, 0, index_flat)
+
         kmeans = faiss.Kmeans(
             features.shape[1],
             self.num_fine, # num_fine_clusters = 1024 as per paper
             niter=100,
             verbose=True,
-            gpu=True,
             spherical=True,  # Paper uses cosine similarity
             nredo=3,  # Paper recommends 3 restarts
             min_points_per_centroid=100,
             max_points_per_centroid=10000,
+            index=index_gpu
         )
+        assert kmeans.index.is_trained, "KMeans index is not trained (pre-training issue?)"
+        assert isinstance(kmeans.index, faiss.GpuIndex), "KMeans index is NOT on GPU!"
+        print(f"KMeans index is on GPU: {isinstance(kmeans.index, faiss.GpuIndex)}")
+
         kmeans.train(features)
         self.fine_centroids = torch.from_numpy(kmeans.centroids).cuda()
 
@@ -60,25 +68,22 @@ class DDMClustering:
         # "then further consolidate to k coarse centroids."
         # "We assign each data point to the nearest of the coarse centroids to produce the final set of partitions."
         # Compute similarities between fine clusters
-        similarity_matrix = torch.mm(
-            self.fine_centroids,
-            self.fine_centroids.t()
-        )
+        similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t()).cpu() # Move to CPU for hierarchical clustering
 
         # Use hierarchical clustering on similarities
         from scipy.cluster.hierarchy import linkage
-        Z = linkage(similarity_matrix.cpu().numpy(), method='average')
+        Z = linkage(similarity_matrix.cpu().numpy(), method='average') # scipy.cluster.hierarchy is CPU-based
 
         # Cut the dendrogram to get coarse clusters
         from scipy.cluster.hierarchy import fcluster
-        coarse_labels = fcluster(Z, self.num_coarse, criterion='maxclust')
+        coarse_labels = fcluster(Z, self.num_coarse, criterion='maxclust') # scipy.cluster.hierarchy is CPU-based
         self.coarse_centroids = torch.stack([
             self.fine_centroids[torch.where(torch.from_numpy(coarse_labels) == i)[0]].mean(0)
             for i in range(1, self.num_coarse+1)
-        ])
+        ]).cuda()
 
         # Assign samples to nearest coarse centroid (done in DDMDataset._distribute_samples based on these centroids)
-        distances = torch.cdist(features, self.coarse_centroids.cpu())
+        distances = torch.cdist(features, self.coarse_centroids)
         cluster_assignments = torch.argmin(distances, dim=1)
 
         # Save individual cluster assignments
