@@ -127,12 +127,15 @@ class ExpertTrainer(BaseTrainer):
             # Get this expert's parameters only
             expert_params = list(self.expert.parameters())
             
-            # Calculate norm for only this expert's gradients
-            if expert_params and expert_params[0].grad is not None:
+            # Filter out parameters with None gradients
+            grads = [p.grad.detach() for p in expert_params if p.grad is not None]
+
+            if grads:  # Check if grads list is not empty
+                # Calculate norm for only this expert's gradients
                 grad_norm = torch.norm(
                     torch.stack([
-                        torch.norm(p.grad.detach(), 2, dim=-1) 
-                        for p in expert_params if p.grad is not None
+                        torch.norm(grad, 2, dim=-1)
+                        for grad in grads
                     ]), 
                     2
                 )
@@ -143,9 +146,12 @@ class ExpertTrainer(BaseTrainer):
                     for p in expert_params:
                         if p.grad is not None:
                             p.grad.detach().mul_(clip_coef)
-                
-                if self.rank == 0 and torch.rand(1).item() < 0.01:  # Log occasionally
-                    logger.debug(f"Expert {self.expert_idx} grad norm: {grad_norm:.4f}, clip: {clip_coef < 1}")
+            else:
+                # No gradients to clip, skip clipping step
+                grad_norm = torch.tensor(0.0) # Set grad_norm to 0 if no gradients
+
+            if self.rank == 0 and torch.rand(1).item() < 0.01:  # Log occasionally
+                logger.debug(f"Expert {self.expert_idx} grad norm: {grad_norm:.4f}, clip: {clip_coef < 1}")
         
         # Finish optimization
         scaler.step(self.optimizer)
