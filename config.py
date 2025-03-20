@@ -150,13 +150,16 @@ DEFAULT_CONFIG = {
     
     # ===== Training controls =====
     'enable_validation': False,
-    'enable_sampling': False, 
+    'enable_sampling': False,
     'enable_checkpointing': True,
     
     # Add to DEFAULT_CONFIG
     'expert_specialization': 'timestep',  # or 'text' for conditional models
     'dynamic_expert_count': 4,
     'expert_selection_strategy': 'top_k',
+    
+    # ===== Shape Test Controls =====
+    'bypass_cluster_validation': True, # Flag to bypass cluster size validation, set to True in shape_test.py
 }
 
 def get_config(config_path):

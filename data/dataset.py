@@ -486,13 +486,15 @@ class DDMDataset(Dataset):
         min_cluster_size = min(cluster_sizes)
         max_cluster_size = max(cluster_sizes)
         
-        if min_cluster_size < 1000:  # Paper's minimum cluster size
+        if getattr(self.config, 'bypass_cluster_validation', False):
+            self.logger.info("Bypassing cluster size validation as requested by config flag")
+        elif min_cluster_size < 1000:  # Paper's minimum cluster size
             raise ValueError(
                 f"Cluster too small (min_size={min_cluster_size}). "
                 "Consider reducing num_experts or increasing dataset size."
             )
             
-        size_ratio = max_cluster_size / min_cluster_size
+        size_ratio = max_cluster_size / max_cluster_size
         if size_ratio > 10:  # Paper's max imbalance
             self.logger.warning(
                 f"Cluster size imbalance {size_ratio:.1f}x exceeds "

@@ -23,6 +23,7 @@ def test_full_pipeline():
     config.batch_size = 2
     config.image_size = (64, 64)
     config.latent_channels = 16
+    config.bypass_cluster_validation = True # Enable bypass for shape test
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Create temporary dataset directory
