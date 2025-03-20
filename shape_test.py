@@ -111,7 +111,7 @@ def test_full_pipeline():
         router_trainer = RouterTrainer(config, device, rank=0, world_size=1)
         batch = next(iter(DataLoader(dataset, batch_size=2)))
         router_loss = router_trainer.train_step(batch)
-        assert isinstance(router_loss.item(), float), "Router training failed"
+        assert isinstance(router_loss, float), "Router training failed"
         
         # Expert training
         expert_trainer = ExpertTrainer(0, config, device, 0, 1)
