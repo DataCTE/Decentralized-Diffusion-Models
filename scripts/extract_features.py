@@ -48,9 +48,10 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         discovery_start_time = time.time()
         image_discovery_times = [] # To store times for image discovery iterations
         processed_iterations_count = 0
+        total_discovered_images = 0 # Track total images discovered
 
         # File discovery - CPU-bound operations (glob.glob) - performed on CPU (single-threaded)
-        for ext in tqdm(image_extensions, desc=f"Rank {rank} Discovering files (by extension)"): # Progress over image extensions
+        for ext in tqdm(image_extensions, desc=f"Rank {rank} Discovering files"): # Progress over image extensions, generic description
             iteration_start_time = time.time()
             pattern = os.path.join(dataset_path, f'*{ext}') # Direct glob in dataset_path
             extension_image_paths = glob.glob(pattern) # Single-threaded glob.glob
@@ -58,14 +59,15 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
             iteration_duration = time.time() - iteration_start_time
             image_discovery_times.append(iteration_duration)
             processed_iterations_count += 1
+            total_discovered_images += len(extension_image_paths) # Accumulate discovered images
 
             if len(image_discovery_times) > 10:
                 image_discovery_times.pop(0) # Keep only last 10 times
 
-            avg_time_10_iterations = sum(image_discovery_times) / len(image_discovery_times) if image_discovery_times else 0
-            iterations_per_sec = 1 / avg_time_10_iterations if avg_time_10_iterations > 0 else 0
+            
+            images_per_sec = len(extension_image_paths) / iteration_duration if iteration_duration > 0 else 0 # Images per second for current iteration
 
-            description = f"Rank {rank} Discovering files - Avg time/iteration (last 10): {avg_time_10_iterations:.3f}s, Iterations/sec: {iterations_per_sec:.2f}"
+            description = f"Rank {rank} Discovering files - Found: {total_discovered_images}, Images/sec (iteration): {images_per_sec:.2f}" # Updated description
             tqdm.write("\r" + description, end='')
 
 
