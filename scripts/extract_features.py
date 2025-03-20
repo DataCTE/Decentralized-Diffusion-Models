@@ -15,37 +15,56 @@ from concurrent.futures import ThreadPoolExecutor, as_completed # Import for mul
 
 def extract_features(config_path="config.py", output_dir="/workspace/Decentralized-Diffusion-Models/cache"):
     """
-    Extracts DINOv2 features for the dataset in parallel using multiple GPUs and maximizes GPU utilization.
-    Includes progress bar with average time per image, explicit device placement checks, and multithreading.
-
-    Args:
-        config_path (str): Path to the configuration file.
-        output_dir (str): Directory to save the features and dimensions to.
+    Extracts DINOv2 features with multithreaded file discovery and processing for massive datasets.
     """
     rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device) # Explicitly set device for current process
-    print(f"Rank {rank}: Using device: {device}") # Print device for each rank
+    torch.cuda.set_device(device)
+    print(f"Rank {rank}: Using device: {device}")
 
     if is_main_process():
         print(f"Using {world_size} GPUs for feature extraction.")
 
     config = get_config(config_path)
-    # dataset = DDMDataset(config, split='train') # Initialize dataset to get image paths - COMPLETELY REMOVED
 
-    # Directly get image paths from the dataset directory
     image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
     image_paths = []
-    dataset_path = config.dataset_path # Use dataset_path from config
-    for ext in image_extensions:
-        image_paths.extend(glob.glob(os.path.join(dataset_path, '**', f'*{ext}'), recursive=True)) # Find all images recursively
+    dataset_path = config.dataset_path
+
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset path not found: {dataset_path}. Please check your config.py")
+
+    print(f"Rank {rank}: Starting multithreaded file discovery in {dataset_path}")
+    discovery_start_time = time.time()
+
+    # Get subdirectories for parallel globbing - limit depth to avoid excessive recursion
+    subdirs = [dataset_path]  # Start with the main dataset path
+    for root, dirs, _ in os.walk(dataset_path, maxdepth=2): # Check only first 2 levels of subdirectories
+        for dir_name in dirs:
+            subdir_path = os.path.join(root, dir_name)
+            subdirs.append(subdir_path)
+        break # No need to go deeper for subdirectory discovery
+
+    with ThreadPoolExecutor(max_workers=8) as executor: # Adjust max_workers as needed
+        futures = []
+        for search_dir in subdirs: # Search each subdirectory in parallel
+            for ext in image_extensions:
+                pattern = os.path.join(search_dir, f'*{ext}') # Non-recursive glob in subdirectories
+                future = executor.submit(glob.glob, pattern) # Run glob.glob in thread
+                futures.append(future)
+
+        for future in futures:
+            image_paths.extend(future.result()) # Collect image paths from each thread
+
+    discovery_duration = time.time() - discovery_start_time
+    print(f"Rank {rank}: Multithreaded file discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
+
 
     if not image_paths:
-        raise FileNotFoundError(f"No images found in dataset path: {dataset_path}. Please check your dataset path in config.py")
-    print(f"Found {len(image_paths)} images in dataset path: {dataset_path}")
+        raise FileNotFoundError(f"No images found in dataset path: {dataset_path}. Please check your dataset path in config.py and image formats.")
 
 
-    # Partition dataset among GPUs
+    # Partition dataset among GPUs (rest of the script remains largely the same)
     partition_size = len(image_paths) // world_size
     start_index = rank * partition_size
     end_index = start_index + partition_size
@@ -53,14 +72,12 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         end_index = len(image_paths)
     partitioned_image_paths = image_paths[start_index:end_index]
 
-    # Load DINOv2 model and processor
     model_name = "facebook/dinov2-base"
     processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device) # Move model to current GPU
+    model = AutoModel.from_pretrained(model_name).to(device)
     model.eval()
-    print(f"Rank {rank}: Model device: {next(model.parameters()).device}") # Check model device
+    print(f"Rank {rank}: Model device: {next(model.parameters()).device}")
 
-    # Create separate output directories for features and dimensions
     features_dir = os.path.join(output_dir, "features")
     dims_dir = os.path.join(output_dir, "dimensions")
 
@@ -68,15 +85,14 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         os.makedirs(features_dir, exist_ok=True)
         os.makedirs(dims_dir, exist_ok=True)
 
-    start_time = time.time() # Start timer for total duration
-    image_times = [] # List to store processing times for last 10 images
-    processed_images_count = 0 # Track total images processed for tqdm update
+    start_time = time.time()
+    image_times = []
+    processed_images_count = 0
 
-    # Use ThreadPoolExecutor for multithreading
-    with ThreadPoolExecutor(max_workers=8) as executor: # Adjust max_workers as needed
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = []
         for image_path in partitioned_image_paths:
-            future = executor.submit( # Submit task to thread pool
+            future = executor.submit(
                 process_single_image,
                 image_path,
                 processor,
@@ -87,24 +103,23 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
             )
             futures.append(future)
 
-        # Process results as they become available (in any order)
         for future in tqdm(as_completed(futures), total=len(partitioned_image_paths), desc=f"Rank {rank} Extracting features", position=rank):
-            image_process_time = future.result() # Get processing time from thread
+            image_process_time = future.result()
             image_times.append(image_process_time)
             processed_images_count += 1
 
-            if len(image_times) > 10: # Keep only last 10 times
+            if len(image_times) > 10:
                 image_times.pop(0)
 
             avg_time_10_images = sum(image_times) / len(image_times) if image_times else 0
             images_per_sec = 1 / avg_time_10_images if avg_time_10_images > 0 else 0
 
             description = f"Rank {rank} Extracting features - Avg time/image (last 10): {avg_time_10_images:.3f}s, Images/sec: {images_per_sec:.2f}"
-            tqdm.write("\r" + description, end='') # Update tqdm description
+            tqdm.write("\r" + description, end='')
 
 
     if is_main_process():
-        end_time = time.time() # End timer for total duration
+        end_time = time.time()
         total_duration = end_time - start_time
         print(f"\nTotal feature extraction time: {total_duration:.2f} seconds")
         print(f"Features saved to {features_dir}")
@@ -112,26 +127,22 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
 
     dist.destroy_process_group()
 
+
 def process_single_image(image_path, processor, model, device, features_dir, dims_dir):
-    """Processes a single image: loads, extracts features, and saves them.
-    This function is designed to be run in a separate thread.
-    """
-    image_process_start_time = time.time() # Start timer for image processing
+    image_process_start_time = time.time()
     try:
         image = Image.open(image_path).convert('RGB')
-        dims = torch.tensor([image.width, image.height], dtype=torch.int64).to(device) # Move dims to GPU
+        dims = torch.tensor([image.width, image.height], dtype=torch.int64).to(device)
 
-        inputs = processor(images=image, return_tensors="pt").to(device) # Move inputs to current GPU
+        inputs = processor(images=image, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model(**inputs)
-            features = outputs.last_hidden_state[:, 0, :] # Features remain on GPU
+            features = outputs.last_hidden_state[:, 0, :]
 
-        # Construct base filename from image path (remove extension and path prefix)
         base_filename = os.path.splitext(os.path.basename(image_path))[0]
         feature_filename = f"{base_filename}.pt"
-        dim_filename = f"{base_filename}.pt" # Use .pt extension for dimensions as well for consistency
+        dim_filename = f"{base_filename}.pt"
 
-        # Save feature and dimension files - move features to CPU only when saving
         torch.save(features.cpu(), os.path.join(features_dir, feature_filename))
         torch.save(dims.cpu(), os.path.join(dims_dir, dim_filename))
 
@@ -140,7 +151,8 @@ def process_single_image(image_path, processor, model, device, features_dir, dim
     finally:
         image_process_end_time = time.time()
         image_process_time = image_process_end_time - image_process_start_time
-        return image_process_time # Return processing time for progress tracking
+        return image_process_time
+
 
 if __name__ == "__main__":
     extract_features()
