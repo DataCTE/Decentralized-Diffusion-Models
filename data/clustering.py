@@ -2,6 +2,7 @@ import torch
 import faiss
 from tqdm import tqdm
 import os
+import cuml
 
 class DDMClustering:
     """Implements paper's two-stage clustering from Appendix B and Section 4.1"""
@@ -71,15 +72,25 @@ class DDMClustering:
         similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t()).cpu() # Move to CPU for hierarchical clustering
 
         # Use hierarchical clustering on similarities
-        from scipy.cluster.hierarchy import linkage
-        Z = linkage(similarity_matrix.cpu().numpy(), method='average') # scipy.cluster.hierarchy is CPU-based
+        # from scipy.cluster.hierarchy import linkage # CPU-based
+        # Z = linkage(similarity_matrix.cpu().numpy(), method='average') # scipy.cluster.hierarchy is CPU-based
 
         # Cut the dendrogram to get coarse clusters
-        from scipy.cluster.hierarchy import fcluster
-        coarse_labels = fcluster(Z, self.num_coarse, criterion='maxclust') # scipy.cluster.hierarchy is CPU-based
+        # from scipy.cluster.hierarchy import fcluster # CPU-based
+        # coarse_labels = fcluster(Z, self.num_coarse, criterion='maxclust') # scipy.cluster.hierarchy is CPU-based
+
+        # Use GPU-accelerated hierarchical clustering from cuML
+        similarity_matrix_gpu = similarity_matrix.cuda() # Move similarity matrix to GPU
+        agg_clustering = cuml.AgglomerativeClustering(
+            n_clusters=self.num_coarse,
+            linkage='average', # Use average linkage as in original code
+            output_type='pt' # Output as PyTorch tensor for easy integration
+        )
+        agg_clustering.fit(similarity_matrix_gpu)
+        coarse_labels = agg_clustering.labels_ # Keep labels on GPU as PyTorch tensor
         self.coarse_centroids = torch.stack([
-            self.fine_centroids[torch.where(torch.from_numpy(coarse_labels) == i)[0]].mean(0)
-            for i in range(1, self.num_coarse+1)
+            self.fine_centroids[torch.where(coarse_labels == i)[0]].mean(0) # Perform operations on GPU
+            for i in range(self.num_coarse) # Iterate through coarse clusters (0 to num_coarse-1)
         ]).cuda()
 
         # Assign samples to nearest coarse centroid (done in DDMDataset._distribute_samples based on these centroids)
