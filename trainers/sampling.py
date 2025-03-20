@@ -210,8 +210,9 @@ def ddm_sample(
                 expert_predictions[expert_idx] = pred
             
             # Combine expert predictions according to router weights (paper Equation 7)
-            combined_pred = torch.zeros_like(x)
+            combined_pred = torch.zeros(shape, device=device)
             if top_k > 0:
+                # Sparse sampling: use top-k experts (more efficient)
                 for k_idx in range(top_k): # Iterate up to top_k
                     expert_indices_k = expert_indices[:, k_idx] # Experts indices for k-th position in top-k for all batches
                     expert_weights_k = expert_weights[:, k_idx] # Weights for k-th position in top-k for all batches
@@ -220,9 +221,16 @@ def ddm_sample(
                         expert_idx = expert_indices_k[batch_index].item() # Get expert index for this batch and top_k position
                         if expert_idx in expert_predictions: # Check if expert prediction exists
                             expert_pred = expert_predictions[expert_idx] # Get prediction for this expert
-                            weight = expert_weights_k[batch_index].view(-1, 1, 1, 1) # Get weight for this batch and top_k position
+
+                            
+                            print(f"Step {t}, Batch {batch_index}: expert_pred shape={expert_pred.shape}, combined_pred shape={combined_pred.shape}")
+
+                           
+
+                            weight = expert_weights_k[batch_index].view(1, 1, 1, 1) # Get weight for this batch and top_k position
                             combined_pred[batch_index] += weight * expert_pred[batch_index] # Accumulate weighted prediction
             else:
+                # Full ensemble sampling: use all experts (more computationally expensive)
                 for expert_idx, expert_pred in expert_predictions.items():
                     weights = expert_weights[:, expert_idx].view(-1, 1, 1, 1)
                     combined_pred += weights * expert_pred
