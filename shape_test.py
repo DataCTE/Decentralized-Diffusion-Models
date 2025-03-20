@@ -35,6 +35,7 @@ def test_full_pipeline():
         # Create dummy dataset (4 images)
         dummy_images = [np.random.rand(256, 256, 3) * 255 for _ in range(4)]
         dummy_features = torch.randn(4, 1024)  # Fake DINOv2 features
+        dummy_dims = torch.tensor([[256, 256]] * 4, dtype=torch.float32)  # Add dimension cache
         
         # Save dummy data in paper's format
         for i in range(4):
@@ -43,6 +44,7 @@ def test_full_pipeline():
             
         # Save features and clusters
         torch.save(dummy_features, os.path.join(tmpdir, "train_features.pt"))
+        torch.save(dummy_dims, os.path.join(tmpdir, "dim_cache.pt"))
         torch.save(torch.randint(0,4,(4,)), os.path.join(tmpdir, "train_clusters.pt"))
         
         # Initialize dataset

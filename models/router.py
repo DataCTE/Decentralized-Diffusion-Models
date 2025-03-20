@@ -71,8 +71,8 @@ class RouterModel(nn.Module):
         )
         
         # Add temperature decay
-        self.temperature = 2.0  # Initial temperature
-        self.temp_decay = 0.99995
+        self.temperature = 2.0  # Initial temperature (paper default)
+        self.temp_decay = 0.99995  # Paper's annealing rate
         
         # Initialize weights with smaller values for stability
         self._init_weights()
