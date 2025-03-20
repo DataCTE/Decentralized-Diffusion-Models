@@ -20,10 +20,21 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     Discovered file paths are broadcast to all ranks.
     Feature extraction is GPU-accelerated.
     """
-    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1: # Check if torchrun is used with multiple processes
-        rank, world_size = setup_distributed()
-        device = torch.device(f"cuda:{rank}")
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+        # Initialize device first
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
+        
+        # Initialize process group with explicit device_id
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            device_id=local_rank
+        )
+        
+        world_size = dist.get_world_size()
         print(f"Rank {rank}: Using device: {device}")
         if is_main_process():
             print(f"Using {world_size} GPUs for feature extraction.")
@@ -63,6 +74,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
 
     if world_size > 1:
         print(f"Rank {rank}: Waiting to receive image paths...")
+        dist.barrier()  # Add barrier to ensure all processes wait for file discovery
         dist.broadcast_object_list(object_list=[image_paths], src=0) # Broadcast from rank 0 to all ranks
         image_paths = image_paths[0] # Extract received image_paths
         print(f"Rank {rank}: Received image paths. Total images: {len(image_paths)}")
