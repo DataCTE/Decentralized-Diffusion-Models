@@ -15,17 +15,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed # Import for mul
 
 def extract_features(config_path="config.py", output_dir="/workspace/Decentralized-Diffusion-Models/cache"):
     """
-    Extracts DINOv2 features with multithreaded file discovery and processing for datasets
-    where all images are in a single directory.
-    File discovery is CPU-bound and performed on CPU. Feature extraction is GPU-accelerated.
+    Extracts DINOv2 features with single-threaded CPU file discovery (rank 0 only) and GPU feature extraction.
+    File discovery is CPU-bound and performed on CPU (single-threaded) on rank 0 only.
+    Discovered file paths are broadcast to all ranks.
+    Feature extraction is GPU-accelerated.
     """
-    rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    print(f"Rank {rank}: Using device: {device}")
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1: # Check if torchrun is used with multiple processes
+        rank, world_size = setup_distributed()
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        print(f"Rank {rank}: Using device: {device}")
+        if is_main_process():
+            print(f"Using {world_size} GPUs for feature extraction.")
+    else: # Single GPU or CPU mode
+        rank, world_size = 0, 1 # Set rank and world_size for single process
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") # Use CUDA if available, else CPU
+        torch.cuda.set_device(device) if torch.cuda.is_available() else None # Set device if CUDA is available
+        print(f"Using device: {device}")
 
-    if is_main_process():
-        print(f"Using {world_size} GPUs for feature extraction.")
 
     config = get_config(config_path)
 
@@ -36,23 +43,18 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path not found: {dataset_path}. Please check your config.py")
 
-    print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound)")
-    discovery_start_time = time.time()
-    image_discovery_times = [] # To store times for image discovery iterations
-    processed_iterations_count = 0
+    if is_main_process(): # File discovery only on main process (rank 0)
+        print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound, single-threaded)")
+        discovery_start_time = time.time()
+        image_discovery_times = [] # To store times for image discovery iterations
+        processed_iterations_count = 0
 
-
-    # File discovery - CPU-bound operations (glob.glob) - performed on CPU
-    with ThreadPoolExecutor(max_workers=8) as executor: # Adjust max_workers as needed
-        futures = []
-        for ext in image_extensions:
-            pattern = os.path.join(dataset_path, f'*{ext}') # Direct glob in dataset_path
-            future = executor.submit(glob.glob, pattern) # Run glob.glob in thread
-            futures.append(future)
-
-        for future in tqdm(as_completed(futures), total=len(image_extensions), desc=f"Rank {rank} Discovering files"): # Progress over image extensions
+        # File discovery - CPU-bound operations (glob.glob) - performed on CPU (single-threaded)
+        for ext in tqdm(image_extensions, desc=f"Rank {rank} Discovering files (by extension)"): # Progress over image extensions
             iteration_start_time = time.time()
-            image_paths.extend(future.result()) # Collect image paths from each thread
+            pattern = os.path.join(dataset_path, f'*{ext}') # Direct glob in dataset_path
+            extension_image_paths = glob.glob(pattern) # Single-threaded glob.glob
+            image_paths.extend(extension_image_paths) # Collect image paths
             iteration_duration = time.time() - iteration_start_time
             image_discovery_times.append(iteration_duration)
             processed_iterations_count += 1
@@ -67,8 +69,17 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
             tqdm.write("\r" + description, end='')
 
 
-    discovery_duration = time.time() - discovery_start_time
-    print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
+        discovery_duration = time.time() - discovery_start_time
+        print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
+
+    else: # Non-main processes (ranks > 0)
+        image_paths = [None] * world_size # Initialize image_paths list to receive broadcast
+
+    if world_size > 1:
+        print(f"Rank {rank}: Waiting to receive image paths...")
+        dist.broadcast_object_list(object_list=[image_paths], src=0) # Broadcast from rank 0 to all ranks
+        image_paths = image_paths[0] # Extract received image_paths
+        print(f"Rank {rank}: Received image paths. Total images: {len(image_paths)}")
 
 
     if not image_paths:
@@ -79,9 +90,13 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     partition_size = len(image_paths) // world_size
     start_index = rank * partition_size
     end_index = start_index + partition_size
-    if rank == world_size - 1:
-        end_index = len(image_paths)
-    partitioned_image_paths = image_paths[start_index:end_index]
+    if world_size > 1: # Only partition if using multiple processes
+        if rank == world_size - 1:
+            end_index = len(image_paths)
+        partitioned_image_paths = image_paths[start_index:end_index]
+    else: # Single process - use all image paths
+        partitioned_image_paths = image_paths
+
 
     model_name = "facebook/dinov2-base"
     processor = AutoProcessor.from_pretrained(model_name)
@@ -92,7 +107,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     features_dir = os.path.join(output_dir, "features")
     dims_dir = os.path.join(output_dir, "dimensions")
 
-    if is_main_process():
+    if is_main_process(): # Only main process in distributed setup or single process
         os.makedirs(features_dir, exist_ok=True)
         os.makedirs(dims_dir, exist_ok=True)
 
@@ -129,14 +144,14 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
             tqdm.write("\r" + description, end='')
 
 
-    if is_main_process():
+    if is_main_process(): # Only main process in distributed setup or single process
         end_time = time.time()
         total_duration = end_time - start_time
         print(f"\nTotal feature extraction time: {total_duration:.2f} seconds")
         print(f"Features saved to {features_dir}")
         print(f"Dimensions saved to {dims_dir}")
-
-    dist.destroy_process_group()
+        if world_size > 1:
+            dist.destroy_process_group() # Destroy process group only in distributed mode
 
 
 def process_single_image(image_path, processor, model, device, features_dir, dims_dir):
