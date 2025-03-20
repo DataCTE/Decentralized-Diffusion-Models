@@ -3,6 +3,7 @@ import tempfile
 import torch
 import numpy as np
 from torchvision.transforms import ToTensor
+from torch.utils.data import DataLoader
 from PIL import Image
 from config import get_config
 from data.dataset import DDMDataset
