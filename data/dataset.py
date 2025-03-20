@@ -775,38 +775,3 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     logger.info(f"Rank {rank}: DataLoader creation complete in {total_loader_time:.2f}s - {len(expert_loaders)} expert loaders created")
         
     return expert_loaders 
-
-# Add this function outside the DDMDataset class
-def find_valid_image_pairs(image_files, min_size=256):
-    """
-    Find valid image files from a list of paths
-    Args:
-        image_files: List of image file paths
-        min_size: Minimum image dimension (width/height)
-    Returns:
-        Tuple of (valid_images, valid_captions, valid_dims)
-    """
-    valid_images = []
-    valid_captions = []
-    valid_dims = []
-    
-    for img_path in image_files:
-        # Check if matching caption exists first - skip early if no caption
-        caption_path = os.path.splitext(img_path)[0] + '.txt'
-        if not os.path.exists(caption_path):
-            continue
-            
-        # Only validate images that have captions
-        try:
-            # Use faster image opening method - just get dimensions without loading full pixel data
-            with Image.open(img_path) as img:
-                width, height = img.size
-                if width >= min_size and height >= min_size:
-                    valid_images.append(img_path)
-                    valid_captions.append(caption_path)
-                    valid_dims.append([width, height])
-        except Exception:
-            # Skip any images that can't be opened
-            continue
-                
-    return valid_images, valid_captions, valid_dims 
