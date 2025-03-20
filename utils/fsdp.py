@@ -385,7 +385,12 @@ def wrap_model_with_fsdp(model, config, param_init_fn=None, rank=0):
     
     # Create FSDP configuration with explicit rank
     fsdp_config = create_fsdp_config(config, sharding_strategy, rank=rank)
-    
+
+    # Override process_group to None if distributed is not initialized
+    if not torch.distributed.is_initialized():
+        fsdp_config["process_group"] = None
+        logger.info("FSDP: Distributed mode NOT initialized, overriding process_group to None for FSDP wrap.")
+
     # Add CPU offload if enabled
     if cpu_offload:
         fsdp_config["cpu_offload"] = CPUOffload(offload_params=True)
