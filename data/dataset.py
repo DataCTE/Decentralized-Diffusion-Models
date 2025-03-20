@@ -98,7 +98,7 @@ class DDMDataset(Dataset):
             
         # Load features and clusters to CPU first
         all_features_cpu = torch.cat([torch.load(os.path.join(feature_path, f), map_location='cpu') for f in os.listdir(feature_path) if f.endswith(".pt")])
-        all_clusters_cpu = torch.cat([torch.load(os.path.join(cluster_path, f'{split}_clusters.pt'), map_location='cpu')])
+        # all_clusters_cpu = torch.cat([torch.load(os.path.join(cluster_path, f'{split}_clusters.pt'), map_location='cpu')])
 
         # Load individual cluster assignments to CPU
         cluster_dir = cluster_path
@@ -116,12 +116,11 @@ class DDMDataset(Dataset):
         if num_gpus > 0:
             print(f"Distributing features and clusters across {num_gpus} GPUs")
             feature_chunks = torch.chunk(all_features_cpu, num_gpus, dim=0)
-            cluster_chunks = torch.chunk(all_clusters_cpu, num_gpus, dim=0)
-            cluster_assignment_chunks = torch.chunk(all_clusters_assignments_cpu, num_gpus, dim=0)
+            cluster_chunks = torch.chunk(all_clusters_assignments_cpu, num_gpus, dim=0)
 
             self.features = [chunk.cuda(i) for i, chunk in enumerate(feature_chunks)]
             self.clusters = [chunk.cuda(i) for i, chunk in enumerate(cluster_chunks)]
-            self.cluster_assignments_list = [chunk.cuda(i) for i, chunk in enumerate(cluster_assignment_chunks)] # Store as list of tensors
+            self.cluster_assignments_list = [chunk.cuda(i) for i, chunk in enumerate(cluster_chunks)] # Store as list of tensors
 
             # For now, use the features and clusters on the first GPU (device 0) for clustering
             # You might need to adjust DDMClustering to handle distributed features if needed
@@ -132,8 +131,7 @@ class DDMDataset(Dataset):
         else:
             print("No GPUs found, using CPU for features and clusters.")
             self.features = all_features_cpu
-            self.clusters = all_clusters_cpu
-            self.cluster_assignments = all_clusters_assignments_cpu # Use CPU tensors if no GPUs
+            self.clusters = all_clusters_assignments_cpu # Use CPU tensors if no GPUs
         
         # Add clustering initialization
         from data.clustering import DDMClustering
