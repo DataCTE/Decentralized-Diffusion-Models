@@ -77,7 +77,7 @@ def get_auto_wrap_policy(config):
             min_num_params=min_params
         )
     elif policy_name == 'TRANSFORMER':
-        from models.dit import DiTBlock
+        from models.mmdit import DiTBlock
         return functools.partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={DiTBlock}
@@ -184,7 +184,7 @@ def apply_activation_checkpointing(model, config):
         
     try:
         # Import model-specific modules for checkpointing
-        from models.dit import DiTBlock
+        from models.mmdit import DiTBlock
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
             checkpoint_wrapper,
             CheckpointImpl,

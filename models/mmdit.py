@@ -394,7 +394,7 @@ class ExpertDiT(nn.Module):
                 dim_cond = self.router_hidden_size, # Time conditioning dimension (using router_hidden_size)
                 dim_head = self.config.num_heads, # Assuming num_heads is still relevant
                 heads = self.config.num_heads, # Assuming heads is still relevant
-                ff_kwargs=dict(ff_mult=self.config.ffn_dim/self.config.hidden_dim) # Assuming ffn_dim ratio is still relevant
+                ff_kwargs=dict(mult=self.config.ffn_dim/self.config.hidden_dim) # Assuming ffn_dim ratio is still relevant
             )
             for _ in range(self.num_layers)
         ])

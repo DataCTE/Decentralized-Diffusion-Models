@@ -7,7 +7,7 @@ import os
 import logging
 from tqdm import tqdm
 
-from models.dit import ExpertDiT
+from models.mmdit import ExpertDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from utils.expert_cache import ExpertCacheManager
 
