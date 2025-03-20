@@ -3,6 +3,8 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import get_config
 from data.dataset import DDMDataset
 import torch.distributed as dist  # Import distributed library
