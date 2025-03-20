@@ -136,6 +136,7 @@ class RouterModel(nn.Module):
             
         # Get CLS token output only
         cls_output = x[:, 0]  # [B, D]
+        cls_output = cls_output.reshape(batch_size, -1) # Ensure cls_output is [B, D] before classifier
         
         # Apply classifier to get logits
         logits = self.classifier(cls_output)  # [B, num_experts]

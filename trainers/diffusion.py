@@ -183,7 +183,9 @@ class DecentralizedFlowMatcher:
         
         # Handle near-zero sigma_t cases
         mask = t < 1e-3
-        target[mask] = (x0 - xt)[mask] / t[mask].clamp(min=1e-7)
+        mask_reshaped = mask.view(-1, 1, 1, 1)
+        t_masked_reshaped = t[mask].clamp(min=1e-7).view(-1, 1, 1, 1)
+        target[mask_reshaped] = (x0 - xt)[mask_reshaped] / t_masked_reshaped
         
         return target
 
