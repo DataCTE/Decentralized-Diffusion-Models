@@ -251,6 +251,14 @@ class DDMDataset(Dataset):
                 all_images = all_images[:max_files]
                 self.logger.info(f"Rank {self.rank}: Limiting to {max_files} files for testing")
             
+            # Add progress bar for file discovery
+            pbar_discover = tqdm(
+                all_images,
+                desc=f"Rank {self.rank}: Discovering files",
+                unit="file",
+                dynamic_ncols=True
+            )
+            
             # First broadcast total number of images we'll process
             total_images = len(all_images)
             self.logger.info(f"Rank {self.rank}: Broadcasting total count of {total_images} images")
@@ -273,8 +281,8 @@ class DDMDataset(Dataset):
                 # Use smaller processing batch size too
                 process_batch_size = 500
                 
-                for i in range(0, len(all_images), process_batch_size):
-                    batch = all_images[i:min(i + process_batch_size, len(all_images))]
+                for i in range(0, len(pbar_discover), process_batch_size): # Iterate over pbar
+                    batch = list(pbar_discover)[i:min(i + process_batch_size, len(pbar_discover))] # Get batch from pbar
                     futures.append(executor.submit(self._find_valid_pairs, batch))
                 
                 # Collect results 
@@ -453,9 +461,20 @@ class DDMDataset(Dataset):
         print(f"Shape of self.dim_cache: {self.dim_cache.shape}")
         image_aspects = self.dim_cache[:,0] / self.dim_cache[:,1]
 
+        # Add progress bar for bucket assignment
+        pbar_bucket_assign = tqdm(
+            range(len(image_aspects)),
+            desc=f"Rank {self.rank}: Assigning buckets",
+            unit="image",
+            dynamic_ncols=True
+        )
+
         # Find closest bucket using matrix ops
         diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
         self.bucket_assignments = torch.argmin(diffs, dim=1)
+
+        pbar_bucket_assign.update(len(image_aspects)) # Complete progress bar
+        pbar_bucket_assign.close()
         
         # Count images per bucket for logging
         bucket_counts = {}
