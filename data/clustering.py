@@ -13,16 +13,16 @@ class DDMClustering:
         self.coarse_centroids = None
         self.default_feature_path = default_feature_path
 
-    def cluster(self, features=None, feature_path=None):
+    def cluster(self, features_list=None, feature_path=None):
         """
         Args:
-            features: Tensor of shape [N, D] containing DINOv2 features (pre-computed, see paper Section 4.1).
-                      If None, it will attempt to load features from feature_path or default_feature_path.
-            feature_path: Path to load features from if features is None. Defaults to default_feature_path if None.
+            features_list: List of Tensors, each of shape [N_i, D] containing DINOv2 features on different GPUs.
+                           If None, it will attempt to load features from feature_path or default_feature_path.
+            feature_path: Path to load features from if features_list is None. Defaults to default_feature_path if None.
         Returns:
             cluster_assignments: Tensor of shape [N] with coarse cluster IDs
         """
-        if features is None:
+        if features_list is None:
             load_path = feature_path if feature_path else self.default_feature_path
             print(f"Loading features from default path: {load_path}")
             try:
@@ -34,12 +34,14 @@ class DDMClustering:
                     individual_features = torch.load(feature_path, map_location=lambda storage, loc: storage.cuda())
                     all_features.append(individual_features)
                 features = torch.cat(all_features, dim=0)
+                features_list = [features.cuda(i % torch.cuda.device_count()) for i in range(torch.cuda.device_count())]
             except FileNotFoundError:
                 raise FileNotFoundError(f"Features not provided and not found at default path: {load_path}. Please run feature extraction script or provide features directly.")
+
         assert torch.cuda.is_available(), "CUDA is not available. Clustering cannot run on GPU."
-        features = features.cuda()
-        assert features.is_cuda, "Features tensor is not on GPU. Clustering will be slow."
-        print(f"Features are on GPU: {features.is_cuda}")
+        num_gpus = len(features_list)
+        total_features_size = sum([f.shape[0] for f in features_list])
+        print(f"Features are distributed across {num_gpus} GPUs. Total feature size: {total_features_size}")
 
         # Stage 1: Fine-grained clustering (paper appendix B, Section 4.1)
         # "cluster these features to 1024 fine-grained centroids"
@@ -52,21 +54,21 @@ class DDMClustering:
             print(f"Using {num_gpus} GPUs for FAISS KMeans.")
             for i in range(num_gpus):
                 gpu_resources.append(faiss.GpuResources())
-                index_flat = faiss.IndexFlatL2(features.shape[1])
+                index_flat = faiss.IndexFlatL2(features_list[0].shape[1])
                 indexes_gpu.append(faiss.index_cpu_to_gpu(gpu_resources[-1], i, index_flat))
             # Distribute the index across multiple GPUs
-            index_gpu = faiss.IndexShards(features.shape[1])
+            index_gpu = faiss.IndexShards(features_list[0].shape[1])
             for sub_index_gpu in indexes_gpu:
                 index_gpu.add_shard(sub_index_gpu)
             index_gpu.own_fields = True
         else:
             print("Using single GPU for FAISS KMeans.")
             gpu_resources.append(faiss.GpuResources())
-            index_flat = faiss.IndexFlatL2(features.shape[1])
+            index_flat = faiss.IndexFlatL2(features_list[0].shape[1])
             index_gpu = faiss.index_cpu_to_gpu(gpu_resources[0], 0, index_flat)
 
         kmeans = faiss.Kmeans(
-            features.shape[1],
+            features_list[0].shape[1],
             self.num_fine, # num_fine_clusters = 1024 as per paper
             niter=100,
             verbose=True,
@@ -80,7 +82,8 @@ class DDMClustering:
         assert isinstance(kmeans.index, faiss.GpuIndex), "KMeans index is NOT on GPU!"
         print(f"KMeans index is on GPU: {isinstance(kmeans.index, faiss.GpuIndex)}")
 
-        kmeans.train(features)
+        # Train KMeans on the *list* of features (implicitly distributed by IndexShards)
+        kmeans.train(torch.cat(features_list, dim=0).cuda()) # Concatenate features for training (might need to reconsider this for very large datasets)
         self.fine_centroids = torch.from_numpy(kmeans.centroids).cuda()
         assert self.fine_centroids.is_cuda, "Fine centroids are not on GPU!"
 
@@ -88,26 +91,19 @@ class DDMClustering:
         # "then further consolidate to k coarse centroids."
         # "We assign each data point to the nearest of the coarse centroids to produce the final set of partitions."
         # Compute similarities between fine clusters
-        similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t()) # Calculate similarity matrix on GPU
+        # Calculate similarity matrix on GPU (still single GPU for simplicity in this example)
+        similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t())
         assert similarity_matrix.is_cuda, "Similarity matrix is not on GPU!"
 
-        # Use hierarchical clustering on similarities
-        # from scipy.cluster.hierarchy import linkage # CPU-based
-        # Z = linkage(similarity_matrix.cpu().numpy(), method='average') # scipy.cluster.hierarchy is CPU-based
-
-        # Cut the dendrogram to get coarse clusters
-        # from scipy.cluster.hierarchy import fcluster # CPU-based
-        # coarse_labels = fcluster(Z, self.num_coarse, criterion='maxclust') # scipy.cluster.hierarchy is CPU-based
-
-        # Use GPU-accelerated hierarchical clustering from cuML
-        similarity_matrix_gpu = similarity_matrix.cuda() # Move similarity matrix to GPU
+        # Use GPU-accelerated hierarchical clustering from cuML (single GPU for now)
+        similarity_matrix_gpu = similarity_matrix.cuda() # Ensure on GPU (redundant now, but kept for clarity)
         assert similarity_matrix_gpu.is_cuda, "Similarity matrix (GPU copy) is not on GPU!"
         agg_clustering = cuml.AgglomerativeClustering(
             n_clusters=self.num_coarse,
             linkage='average', # Use average linkage as in original code
             output_type='pt' # Output as PyTorch tensor for easy integration
         )
-        agg_clustering.fit(similarity_matrix_gpu)
+        agg_clustering.fit(similarity_matrix_gpu) # Still single GPU for hierarchical clustering in this example
         coarse_labels = agg_clustering.labels_ # Keep labels on GPU as PyTorch tensor
         assert coarse_labels.is_cuda, "Coarse labels from cuML are not on GPU!"
         self.coarse_centroids = torch.stack([
@@ -117,8 +113,8 @@ class DDMClustering:
         assert self.coarse_centroids.is_cuda, "Coarse centroids are not on GPU!"
 
         # Assign samples to nearest coarse centroid (done in DDMDataset._distribute_samples based on these centroids)
-        distances = torch.cdist(features, self.coarse_centroids)
-        assert features.is_cuda and self.coarse_centroids.is_cuda, "Features or coarse_centroids are not on GPU for distance calculation!"
+        distances = torch.cdist(features_list[0], self.coarse_centroids)
+        assert features_list[0].is_cuda and self.coarse_centroids.is_cuda, "Features or coarse_centroids are not on GPU for distance calculation!"
         cluster_assignments = torch.argmin(distances, dim=1)
         assert cluster_assignments.is_cuda, "Cluster assignments are not on GPU!"
 

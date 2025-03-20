@@ -490,7 +490,7 @@ class DDMDataset(Dataset):
         expert_start = time.time()
         
         # Cluster features using paper's two-stage approach
-        cluster_assignments = self.clusterer.cluster(self.features)
+        cluster_assignments = self.clusterer.cluster(features_list=self.features)
         
         # Store expert assignments from clustering
         self.expert_assignments = cluster_assignments.to(self.device)
@@ -518,11 +518,11 @@ class DDMDataset(Dataset):
         self.logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
 
         # Paper-mandated cluster validation
-        cluster_sizes = [(self.expert_assignments == i).sum().item() 
+        cluster_sizes = [(self.expert_assignments == i).sum().item()
                         for i in range(self.config.num_experts)]
         min_cluster_size = min(cluster_sizes)
         max_cluster_size = max(cluster_sizes)
-        
+
         if getattr(self.config, 'bypass_cluster_validation', False):
             self.logger.info("Bypassing cluster size validation as requested by config flag")
         elif min_cluster_size < 1000:  # Paper's minimum cluster size
@@ -530,7 +530,7 @@ class DDMDataset(Dataset):
                 f"Cluster too small (min_size={min_cluster_size}). "
                 "Consider reducing num_experts or increasing dataset size."
             )
-            
+
         size_ratio = max_cluster_size / max_cluster_size
         if size_ratio > 10:  # Paper's max imbalance
             self.logger.warning(
