@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     
     # ===== Dataset parameters =====
     'dataset_path': '/home/alex/workspace/datasets/danbooru2025',
+    'feature_cache_path': '/home/alex/workspace/Decentralized-Diffusion-Models/cache',
     'dataset_size': 380000,
     'min_size': 256,  # Minimum image dimension
     'max_size': 1024,  # Maximum image dimension

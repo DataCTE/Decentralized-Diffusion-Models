@@ -86,8 +86,8 @@ class DDMDataset(Dataset):
         )
         
         # Load precomputed features and clusters (paper section 4.1)
-        feature_path = os.path.join(config.dataset_path, "cache", "features")
-        cluster_path = os.path.join(config.dataset_path, "cache", "clusters")
+        feature_path = os.path.join(config.feature_cache_path, "features")
+        cluster_path = os.path.join(config.feature_cache_path, "clusters")
         
         if not os.path.exists(feature_path) or not os.path.exists(cluster_path):
             raise FileNotFoundError(
