@@ -5,7 +5,6 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from data.dataset import find_valid_image_pairs
 from config import get_config
 from utils.distributed import setup_distributed, get_rank, get_world_size, is_main_process
 import glob
@@ -77,7 +76,7 @@ def handle_file_discovery(dataset_path, rank, world_size):
 
 def discover_valid_images(dataset_path):
     """Mirror dataset.py's file discovery exactly"""
-    from data.dataset import find_valid_image_pairs  # Ensure we're using the same version
+    
     
     # Match dataset.py's discovery pattern exactly
     image_files = []
