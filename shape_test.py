@@ -14,18 +14,22 @@ from trainers.sampling import ddm_sample
 from trainers.router import RouterTrainer
 from trainers.expert import ExpertTrainer
 from trainers.diffusion import DecentralizedFlowMatcher
+from utils.distributed import setup_distributed, get_rank
+from utils.fsdp import create_fsdp_model
 
 def test_full_pipeline():
-    """End-to-end shape test of DDM pipeline with dummy data"""
-    # Setup
+    """End-to-end shape test of DDM pipeline with dummy data using FSDP"""
+    # Setup distributed environment for FSDP
+    rank, world_size = setup_distributed()
+    device = torch.device(f"cuda:{rank}")
+
     config = get_config("config.py")
     config.num_experts = 4
     config.batch_size = 2
     config.image_size = (64, 64)
     config.latent_channels = 16
     config.bypass_cluster_validation = True # Enable bypass for shape test
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     # Create temporary dataset directory
     with tempfile.TemporaryDirectory() as tmpdir:
         # Setup paths
@@ -81,9 +85,14 @@ def test_full_pipeline():
 
         test_router_temperature_decay()
         
-        # Initialize models with paper's architecture
-        router = RouterModel(config).to(device)
-        experts = {i: ExpertMMDiT(config).to(device) for i in range(config.num_experts)}
+        # Initialize models with paper's architecture, now FSDP wrapped
+        base_router = RouterModel(config)
+        router = create_fsdp_model(base_router, config, rank=rank).to(device)
+
+        experts = {}
+        for i in range(config.num_experts):
+            base_expert = ExpertMMDiT(config)
+            experts[i] = create_fsdp_model(base_expert, config, rank=rank).to(device)
         
         # Test router forward pass
         dummy_latent = torch.randn(1, config.latent_channels, 16, 16, device=device)
