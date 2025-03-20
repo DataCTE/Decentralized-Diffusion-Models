@@ -15,7 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed # Import for mul
 
 def extract_features(config_path="config.py", output_dir="/workspace/Decentralized-Diffusion-Models/cache"):
     """
-    Extracts DINOv2 features with multithreaded file discovery and processing for massive datasets.
+    Extracts DINOv2 features with multithreaded file discovery and processing for datasets
+    where all images are in a single directory.
     File discovery is CPU-bound and performed on CPU. Feature extraction is GPU-accelerated.
     """
     rank, world_size = setup_distributed()
@@ -35,49 +36,39 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset path not found: {dataset_path}. Please check your config.py")
 
-    print(f"Rank {rank}: Starting multithreaded file discovery in {dataset_path} (CPU-bound)")
+    print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound)")
     discovery_start_time = time.time()
-    subdir_times = [] # To store times for subdir processing
-    processed_subdir_count = 0
+    image_discovery_times = [] # To store times for image discovery iterations
+    processed_iterations_count = 0
 
-    # File discovery - CPU-bound operations (os.walk, glob.glob) - performed on CPU
-    subdirs = [dataset_path]  # Start with the main dataset path
-    depth_limit = 2 # Define depth limit
-    for root, dirs, _ in os.walk(dataset_path): # Removed maxdepth argument
-        current_depth = root[len(dataset_path.rstrip(os.sep)) + 1:].count(os.sep) # Calculate current depth
-        if current_depth >= depth_limit: # Stop if depth limit is reached
-            break
-        for dir_name in dirs:
-            subdir_path = os.path.join(root, dir_name)
-            subdirs.append(subdir_path)
 
+    # File discovery - CPU-bound operations (glob.glob) - performed on CPU
     with ThreadPoolExecutor(max_workers=16) as executor: # Adjust max_workers as needed
         futures = []
-        for search_dir in subdirs: # Search each subdirectory in parallel
-            for ext in image_extensions:
-                pattern = os.path.join(search_dir, f'*{ext}') # Non-recursive glob in subdirectories
-                future = executor.submit(glob.glob, pattern) # Run glob.glob in thread
-                futures.append(future)
+        for ext in image_extensions:
+            pattern = os.path.join(dataset_path, f'*{ext}') # Direct glob in dataset_path
+            future = executor.submit(glob.glob, pattern) # Run glob.glob in thread
+            futures.append(future)
 
-        for future in tqdm(as_completed(futures), total=len(subdirs), desc=f"Rank {rank} Discovering files"): # Added tqdm here
-            subdir_start_time = time.time()
+        for future in tqdm(as_completed(futures), total=len(image_extensions), desc=f"Rank {rank} Discovering files"): # Progress over image extensions
+            iteration_start_time = time.time()
             image_paths.extend(future.result()) # Collect image paths from each thread
-            subdir_duration = time.time() - subdir_start_time
-            subdir_times.append(subdir_duration)
-            processed_subdir_count += 1
+            iteration_duration = time.time() - iteration_start_time
+            image_discovery_times.append(iteration_duration)
+            processed_iterations_count += 1
 
-            if len(subdir_times) > 10:
-                subdir_times.pop(0) # Keep only last 10 times
+            if len(image_discovery_times) > 10:
+                image_discovery_times.pop(0) # Keep only last 10 times
 
-            avg_time_10_subdirs = sum(subdir_times) / len(subdir_times) if subdir_times else 0
-            subdirs_per_sec = 1 / avg_time_10_subdirs if avg_time_10_subdirs > 0 else 0
+            avg_time_10_iterations = sum(image_discovery_times) / len(image_discovery_times) if image_discovery_times else 0
+            iterations_per_sec = 1 / avg_time_10_iterations if avg_time_10_iterations > 0 else 0
 
-            description = f"Rank {rank} Discovering files - Avg time/subdir (last 10): {avg_time_10_subdirs:.3f}s, Subdirs/sec: {subdirs_per_sec:.2f}"
+            description = f"Rank {rank} Discovering files - Avg time/iteration (last 10): {avg_time_10_iterations:.3f}s, Iterations/sec: {iterations_per_sec:.2f}"
             tqdm.write("\r" + description, end='')
 
 
     discovery_duration = time.time() - discovery_start_time
-    print(f"\nRank {rank}: Multithreaded file discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
+    print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
 
 
     if not image_paths:
