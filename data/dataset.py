@@ -123,7 +123,14 @@ class DDMDataset(Dataset):
                 raise FileNotFoundError(f"Clustering failed to generate cluster files at {cluster_path}.")
 
         all_individual_clusters_cpu = []
-        for cluster_file in tqdm(cluster_files, desc="Loading cluster files"):
+        # Add progress bar for loading cluster files
+        pbar_cluster_files = tqdm(
+            cluster_files,
+            desc="Loading cluster files",
+            unit="file",
+            dynamic_ncols=True
+        )
+        for cluster_file in pbar_cluster_files: # Iterate over progress bar
             cluster_tensor = torch.load(os.path.join(cluster_path, cluster_file), map_location='cpu')
             all_individual_clusters_cpu.append(cluster_tensor)
 
@@ -496,10 +503,19 @@ class DDMDataset(Dataset):
         """CPU-based expert distribution using paper's clustering"""
         self.logger.info(f"Rank {self.rank}: Starting expert assignment for {len(self.image_files)} images...")
         expert_start = time.time()
-        
+
         # Cluster features using paper's two-stage approach
-        cluster_assignments = self.clusterer.cluster(feature_path=self.config.feature_cache_path) # Pass feature_path to clusterer
-        
+        # Add progress bar for clustering process
+        pbar_clustering = tqdm(
+            range(1), # Only one main clustering step
+            desc=f"Rank {self.rank}: Clustering features",
+            unit="step",
+            dynamic_ncols=True
+        )
+        for _ in pbar_clustering: # Iterate over progress bar (single step)
+            cluster_assignments = self.clusterer.cluster(feature_path=self.config.feature_cache_path) # Pass feature_path to clusterer
+            pbar_clustering.update() # Manually update progress bar
+
         # Store expert assignments from clustering
         self.expert_assignments = cluster_assignments.to(self.device)
         
