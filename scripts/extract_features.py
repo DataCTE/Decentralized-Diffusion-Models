@@ -6,7 +6,7 @@ from transformers import AutoModel, AutoProcessor
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import get_config
-# from data.dataset import DDMDataset # No longer need to instantiate the full dataset
+# from data.dataset import DDMDataset # No longer need to instantiate the full dataset - REMOVED
 import glob # For simpler file discovery
 import torch.distributed as dist
 from utils.distributed import setup_distributed, get_rank, get_world_size, is_main_process
@@ -26,7 +26,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         print(f"Using {world_size} GPUs for feature extraction.")
 
     config = get_config(config_path)
-    # dataset = DDMDataset(config, split='train') # Initialize dataset to get image paths - NO LONGER NEEDED
+    # dataset = DDMDataset(config, split='train') # Initialize dataset to get image paths - COMPLETELY REMOVED
 
     # Directly get image paths from the dataset directory
     image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
