@@ -122,7 +122,7 @@ def ddm_sample(
                 uncond_timestep = timestep
                 
                 # Get router predictions for unconditional
-                uncond_router_logits = router(uncond_input, uncond_timestep)
+                uncond_router_logits = router(uncond_input, uncond_timestep, text_embeddings=uncond_embeddings)
                 uncond_router_probs = F.softmax(uncond_router_logits / temperature, dim=-1)
                 
                 # Get top-k experts for unconditional
@@ -155,7 +155,7 @@ def ddm_sample(
                     selected_experts = list(experts.keys())
             else:
                 # For unconditional generation, just use router directly
-                router_logits = router(x, timestep)
+                router_logits = router(x, timestep, text_embeddings=None)
                 router_probs = F.softmax(router_logits / temperature, dim=-1)
                 
                 if top_k > 0:
