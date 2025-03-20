@@ -166,7 +166,7 @@ class DecentralizedFlowMatcher:
         self.sigma = sigma
         self.loss_type = loss_type
         self.temperature = 2.0  # Start with higher temperature
-        self.temp_anneal_rate = 0.0002
+        self.temp_decay = 0.99995
         
     def compute_flow_matching_target(self, x0, xt, t):
         """Implements paper Eq.1 with numerical stability"""
@@ -262,6 +262,6 @@ class DecentralizedFlowMatcher:
         loss = self.compute_flow_matching_loss(predictions, target)
         
         # Anneal temperature for router
-        self.temperature = max(0.5, self.temperature * (1 - self.temp_anneal_rate))
+        self.temperature = max(0.5, self.temperature * self.temp_decay)
         
         return loss 

@@ -62,6 +62,23 @@ def test_full_pipeline():
         assert dataset.clusterer.num_coarse == config.num_experts, "Cluster count mismatch"
         assert dataset.clusterer.num_fine == 2, "Fine clusters not 2"
         
+        # Test router temperature decay
+        def test_router_temperature_decay():
+            router_temp_test = RouterModel(config).to(device)
+            initial_temp = router_temp_test.get_temperature()
+            assert initial_temp == 2.0, "Initial temperature should be 2.0"
+
+            # Simulate some training steps to decay temperature
+            for _ in range(1000):
+                router_temp_test.update_temperature()
+
+            decayed_temp = router_temp_test.get_temperature()
+            assert decayed_temp < initial_temp, "Temperature should decay"
+            assert decayed_temp >= 0.5, "Temperature should not go below 0.5"
+            print("Router temperature decay test passed!")
+
+        test_router_temperature_decay()
+        
         # Initialize models with paper's architecture
         router = RouterModel(config).to(device)
         experts = {i: ExpertDiT(config).to(device) for i in range(config.num_experts)}
