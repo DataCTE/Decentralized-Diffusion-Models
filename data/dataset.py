@@ -127,8 +127,10 @@ class DDMDataset(Dataset):
             cluster_tensor = torch.load(os.path.join(cluster_path, cluster_file), map_location='cpu')
             all_individual_clusters_cpu.append(cluster_tensor)
 
-        self.clusters_assignments = torch.cat(all_individual_clusters_cpu, dim=0)
-        self.clusters = self.clusters_assignments
+        self.cluster_path = cluster_path # Store cluster path for later loading
+        self.cluster_files = cluster_files # Store cluster file names
+        self.num_cluster_files = len(cluster_files) # Store number of cluster files
+        self.cluster_assignments_cache = {} # Initialize a cache for loaded cluster assignments
 
         self._discover_and_process_files()
         self._init_buckets()
@@ -477,7 +479,7 @@ class DDMDataset(Dataset):
         expert_start = time.time()
         
         # Cluster features using paper's two-stage approach
-        cluster_assignments = self.clusterer.cluster(features_list=self.features)
+        cluster_assignments = self.clusterer.cluster(feature_path=self.config.feature_cache_path) # Pass feature_path to clusterer
         
         # Store expert assignments from clustering
         self.expert_assignments = cluster_assignments.to(self.device)
@@ -532,6 +534,9 @@ class DDMDataset(Dataset):
         target_h = self.bucket_dims[bucket_idx, 1]
         target_w = self.bucket_dims[bucket_idx, 0]
         
+        # Load cluster assignment for this index
+        cluster_assignment = self._load_cluster_assignment(idx)
+
         # Load image and caption
         tensor = self._load_image_tensor(idx, (target_w, target_h))
         caption = self._load_caption(idx)
@@ -539,9 +544,22 @@ class DDMDataset(Dataset):
         return {
             'image': tensor,
             'caption': caption,
-            'expert': self.expert_assignments[idx],
+            'expert': cluster_assignment, # Use loaded cluster assignment
             'bucket': bucket_idx
         }
+
+    def _load_cluster_assignment(self, index):
+        """Load cluster assignment for a given index from file, using cache"""
+        file_index = index // (len(self.clusters_assignments) // self.num_cluster_files) # Calculate file index
+        cluster_file_name = self.cluster_files[file_index]
+        
+        if cluster_file_name not in self.cluster_assignments_cache: # Check cache
+            cluster_file_path = os.path.join(self.cluster_path, cluster_file_name)
+            self.cluster_assignments_cache[cluster_file_name] = torch.load(cluster_file_path, map_location='cpu') # Load and cache
+
+        file_assignments = self.cluster_assignments_cache[cluster_file_name]
+        index_within_file = index % (len(self.clusters_assignments) // self.num_cluster_files) # Calculate index within file
+        return file_assignments[index_within_file] # Return assignment for index within file
 
     def __len__(self):
         """Get dataset length"""
