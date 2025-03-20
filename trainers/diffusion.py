@@ -185,7 +185,7 @@ class DecentralizedFlowMatcher:
         mask = t < 1e-3
         mask_reshaped = mask.view(-1, 1, 1, 1)
         t_masked_reshaped = t[mask].clamp(min=1e-7).view(-1, 1, 1, 1)
-        target[mask_reshaped] = (x0 - xt)[mask_reshaped] / t_masked_reshaped
+        target = torch.where(mask_reshaped, (x0 - xt) / t_masked_reshaped, target)
         
         return target
 
