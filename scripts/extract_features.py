@@ -12,6 +12,7 @@ import torch.distributed as dist
 from utils.distributed import setup_distributed, get_rank, get_world_size, is_main_process
 import time  # Import the time module
 from concurrent.futures import ThreadPoolExecutor, as_completed # Import for multithreading
+from data.dataset import find_valid_image_pairs
 
 def extract_features(config_path="config.py", output_dir="/workspace/Decentralized-Diffusion-Models/cache"):
     """
@@ -57,32 +58,22 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound, multi-threaded)")
         discovery_start_time = time.time()
         
-        # Initialize storage for valid files
-        valid_files = []
-        
-        # Discover all image files more efficiently
-        all_images = []
-        for ext in image_extensions:
-            pattern = os.path.join(dataset_path, f'**/*{ext}')
-            all_images.extend(glob.glob(pattern, recursive=True))
-        
-        # Initialize progress bar with rate display
+        # Use dataset.py's method for file discovery
         with tqdm(unit='img', unit_scale=True, desc=f"Rank {rank} Discovering files", position=0, leave=True) as progress_bar:
-            # Process files with ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                # Create futures for processing
-                futures = [
-                    executor.submit(_validate_image, img_path)
-                    for img_path in all_images
-                ]
-                
-                # Process results as they complete
-                for future in as_completed(futures):
-                    img_path = future.result()
-                    if img_path:
-                        valid_files.append(img_path)
-                        progress_bar.update(1)
-                        progress_bar.refresh()
+            # Process files in batches
+            batch_size = 1000
+            all_images = []
+            for ext in image_extensions:
+                pattern = os.path.join(dataset_path, f'**/*{ext}')
+                all_images.extend(glob.glob(pattern, recursive=True))
+            all_batches = [all_images[i:i + batch_size] for i in range(0, len(all_images), batch_size)]
+            
+            valid_files = []
+            for batch in all_batches:
+                batch_images, _, _ = find_valid_image_pairs(batch)
+                valid_files.extend(batch_images)
+                progress_bar.update(len(batch))
+                progress_bar.refresh()
 
         discovery_duration = time.time() - discovery_start_time
         print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(valid_files)} images.")
