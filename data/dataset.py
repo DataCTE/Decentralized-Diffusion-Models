@@ -88,64 +88,48 @@ class DDMDataset(Dataset):
         # Load precomputed features and clusters (paper section 4.1)
         feature_path = os.path.join(config.feature_cache_path, "features")
         cluster_path = os.path.join(config.feature_cache_path, "clusters")
+
+        if not os.path.exists(feature_path):
+            raise FileNotFoundError(f"Features not found at {feature_path}. Run feature extraction first.")
         
-        if not os.path.exists(feature_path) or not os.path.exists(cluster_path):
-            raise FileNotFoundError(
-                f"Precomputed features not found at {feature_path}. "
-                "Please run feature extraction and clustering first."
-            )
         print(f"Debugging dataset.py: feature_path being checked: {feature_path}")
-            
-        # Load features and clusters to CPU
-        all_features_cpu = torch.cat([torch.load(os.path.join(feature_path, f), map_location='cpu') for f in os.listdir(feature_path) if f.endswith(".pt")])
 
-        # Load individual cluster assignments to CPU
-        cluster_dir = cluster_path
-        cluster_files = sorted([f for f in os.listdir(cluster_dir) if f.endswith(".cluster.pt")])
-
-        # Check if any cluster files were found
-        if not cluster_files:
-            self.logger.warning(
-                f"No cluster assignment files (.cluster.pt) found in: {cluster_dir}. "
-                "Attempting to generate them automatically..."
-            )
-            
-            # Auto-generate clusters if missing
-            self.logger.info("Running clustering process automatically...")
-            cluster_assignments = self.clusterer.cluster(features_list=self.features)
-            
-            # Verify clusters were created
-            cluster_files = sorted([f for f in os.listdir(cluster_dir) if f.endswith(".cluster.pt")])
-            if not cluster_files:
-                raise FileNotFoundError(
-                    f"Failed to auto-generate cluster files in: {cluster_dir}. "
-                    "Please run the clustering script (`clustering.py`) manually "
-                    "and ensure that the `feature_cache_path` in your configuration is correct."
-                )
-            self.logger.info(f"Successfully auto-generated {len(cluster_files)} cluster files.")
-
-        all_individual_clusters_cpu = []
-        for cluster_file in tqdm(cluster_files, desc="Loading cluster files"):
-            individual_cluster_path = os.path.join(cluster_dir, cluster_file)
-            individual_clusters_cpu = torch.load(individual_cluster_path, map_location='cpu')
-            all_individual_clusters_cpu.append(individual_clusters_cpu)
-        all_clusters_assignments_cpu = torch.cat(all_individual_clusters_cpu, dim=0)
-
-
-        # Remove GPU distribution - use CPU tensors directly
-        print("Using CPU for features and clusters.")
+        all_features_cpu = torch.cat([
+            torch.load(os.path.join(feature_path, f), map_location='cpu')
+            for f in os.listdir(feature_path) if f.endswith(".pt")
+        ])
         self.features = all_features_cpu
-        self.clusters = all_clusters_assignments_cpu # Use CPU tensors if no GPUs
-        self.clusters_assignments = all_clusters_assignments_cpu # Use CPU tensors for cluster assignments
-        
-        # Add clustering initialization
+
+        # Initialize clusterer
         from data.clustering import DDMClustering
         self.clusterer = DDMClustering(
             num_coarse_clusters=config.num_experts,
-            num_fine_clusters=config.num_fine_clusters
+            num_fine_clusters=config.num_fine_clusters,
+            default_feature_path=config.feature_cache_path
         )
+
+        # Load or auto-generate clusters
+        if not os.path.exists(cluster_path):
+            os.makedirs(cluster_path)
         
-        # Load dataset with direct file discovery (no separate validation pass)
+        cluster_files = sorted([f for f in os.listdir(cluster_path) if f.endswith(".cluster.pt")])
+
+        if not cluster_files:
+            self.logger.warning("No cluster files found. Running clustering automatically...")
+            self.clusterer.cluster(features_list=[self.features])
+
+            cluster_files = sorted([f for f in os.listdir(cluster_path) if f.endswith(".cluster.pt")])
+            if not cluster_files:
+                raise FileNotFoundError(f"Clustering failed to generate cluster files at {cluster_path}.")
+
+        all_individual_clusters_cpu = []
+        for cluster_file in tqdm(cluster_files, desc="Loading cluster files"):
+            cluster_tensor = torch.load(os.path.join(cluster_path, cluster_file), map_location='cpu')
+            all_individual_clusters_cpu.append(cluster_tensor)
+
+        self.clusters_assignments = torch.cat(all_individual_clusters_cpu, dim=0)
+        self.clusters = self.clusters_assignments
+
         self._discover_and_process_files()
         self._init_buckets()
         self._distribute_samples()
