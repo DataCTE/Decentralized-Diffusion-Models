@@ -96,18 +96,44 @@ class DDMDataset(Dataset):
             )
         print(f"Debugging dataset.py: feature_path being checked: {feature_path}")
             
-        self.features = torch.cat([torch.load(os.path.join(feature_path, f), map_location='cuda') for f in os.listdir(feature_path) if f.endswith(".pt")])
-        self.clusters = torch.cat([torch.load(os.path.join(cluster_path, f'{split}_clusters.pt'), map_location='cuda')])
-        
-        # Load individual cluster assignments
+        # Load features and clusters to CPU first
+        all_features_cpu = torch.cat([torch.load(os.path.join(feature_path, f), map_location='cpu') for f in os.listdir(feature_path) if f.endswith(".pt")])
+        all_clusters_cpu = torch.cat([torch.load(os.path.join(cluster_path, f'{split}_clusters.pt'), map_location='cpu')])
+
+        # Load individual cluster assignments to CPU
         cluster_dir = cluster_path
         cluster_files = sorted([f for f in os.listdir(cluster_dir) if f.endswith(".cluster.pt")])
-        all_clusters = []
+        all_individual_clusters_cpu = []
         for cluster_file in tqdm(cluster_files, desc="Loading cluster files"):
             individual_cluster_path = os.path.join(cluster_dir, cluster_file)
-            individual_clusters = torch.load(individual_cluster_path, map_location='cuda')
-            all_clusters.append(individual_clusters)
-        self.clusters = torch.cat(all_clusters, dim=0)
+            individual_clusters_cpu = torch.load(individual_cluster_path, map_location='cpu')
+            all_individual_clusters_cpu.append(individual_clusters_cpu)
+        all_clusters_assignments_cpu = torch.cat(all_individual_clusters_cpu, dim=0)
+
+
+        # Distribute features and clusters across multiple GPUs
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 0:
+            print(f"Distributing features and clusters across {num_gpus} GPUs")
+            feature_chunks = torch.chunk(all_features_cpu, num_gpus, dim=0)
+            cluster_chunks = torch.chunk(all_clusters_cpu, num_gpus, dim=0)
+            cluster_assignment_chunks = torch.chunk(all_clusters_assignments_cpu, num_gpus, dim=0)
+
+            self.features = [chunk.cuda(i) for i, chunk in enumerate(feature_chunks)]
+            self.clusters = [chunk.cuda(i) for i, chunk in enumerate(cluster_chunks)]
+            self.cluster_assignments_list = [chunk.cuda(i) for i, chunk in enumerate(cluster_assignment_chunks)] # Store as list of tensors
+
+            # For now, use the features and clusters on the first GPU (device 0) for clustering
+            # You might need to adjust DDMClustering to handle distributed features if needed
+            self.features = self.features[0]
+            self.clusters = self.clusters[0]
+            self.clusters_assignments = self.cluster_assignments_list[0] # Use the first chunk for cluster assignments
+
+        else:
+            print("No GPUs found, using CPU for features and clusters.")
+            self.features = all_features_cpu
+            self.clusters = all_clusters_cpu
+            self.cluster_assignments = all_clusters_assignments_cpu # Use CPU tensors if no GPUs
         
         # Add clustering initialization
         from data.clustering import DDMClustering

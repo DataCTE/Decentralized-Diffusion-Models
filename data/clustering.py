@@ -43,9 +43,27 @@ class DDMClustering:
 
         # Stage 1: Fine-grained clustering (paper appendix B, Section 4.1)
         # "cluster these features to 1024 fine-grained centroids"
-        gpu_resources = faiss.GpuResources()
-        index_flat = faiss.IndexFlatL2(features.shape[1])
-        index_gpu = faiss.index_cpu_to_gpu(gpu_resources, 0, index_flat)
+        # Use multiple GPUs for faster KMeans (if available)
+        num_gpus = torch.cuda.device_count()
+        print(f"Number of GPUs available: {num_gpus}")
+        gpu_resources = []
+        indexes_gpu = []
+        if num_gpus > 1:
+            print(f"Using {num_gpus} GPUs for FAISS KMeans.")
+            for i in range(num_gpus):
+                gpu_resources.append(faiss.GpuResources())
+                index_flat = faiss.IndexFlatL2(features.shape[1])
+                indexes_gpu.append(faiss.index_cpu_to_gpu(gpu_resources[-1], i, index_flat))
+            # Distribute the index across multiple GPUs
+            index_gpu = faiss.IndexShards(features.shape[1])
+            for sub_index_gpu in indexes_gpu:
+                index_gpu.add_shard(sub_index_gpu)
+            index_gpu.own_fields = True
+        else:
+            print("Using single GPU for FAISS KMeans.")
+            gpu_resources.append(faiss.GpuResources())
+            index_flat = faiss.IndexFlatL2(features.shape[1])
+            index_gpu = faiss.index_cpu_to_gpu(gpu_resources[0], 0, index_flat)
 
         kmeans = faiss.Kmeans(
             features.shape[1],
