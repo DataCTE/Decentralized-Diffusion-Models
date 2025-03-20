@@ -27,6 +27,7 @@ DEFAULT_CONFIG = {
     'num_heads': 12,
     'num_layers': 12,
     'patch_size': 16,
+    'qk_rmsnorm': True,
 
     # ===== VAE and CLIP parameters =====
     'vae_model': "AuraDiffusion/16ch-vae",

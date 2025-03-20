@@ -97,8 +97,8 @@ class JointAttention(Module):
         self.to_out = ModuleList([nn.Linear(dim_inner, dim_input, bias = False) for dim_input in dim_inputs])
 
         self.qk_rmsnorm = qk_rmsnorm
-        self.q_rmsnorms = (None,) * num_inputs
-        self.k_rmsnorms = (None,) * num_inputs
+        self.q_rmsnorms = ModuleList([])
+        self.k_rmsnorms = ModuleList([])
 
         if qk_rmsnorm:
             self.q_rmsnorms = ModuleList([MultiHeadRMSNorm(dim_head, heads = heads) for _ in range(num_inputs)])
@@ -172,7 +172,7 @@ class JointAttention(Module):
 
         return tuple(all_outs)
 
-class MMDiTBlockInternal(nn.Module):
+class MMDiTBlock(nn.Module):
     def __init__(
         self,
         *,
@@ -234,7 +234,8 @@ class MMDiTBlockInternal(nn.Module):
             dim_inputs = (dim_text, dim_image),
             dim_head = dim_head,
             heads = heads,
-            flash = flash_attn
+            flash = flash_attn,
+            qk_rmsnorm = qk_rmsnorm
         )
 
         self.text_ff = FeedForward(dim_text, **ff_kwargs)
@@ -267,15 +268,23 @@ class MMDiTBlockInternal(nn.Module):
                 image_pre_ff_beta,
             ) = self.to_cond(time_cond).split(self.cond_dims, dim = -1)
 
-        text_tokens, add_text_residual = self.text_attn_residual_fn(text_tokens)
-        image_tokens, add_image_residual = self.image_attn_residual_fn(image_tokens)
+        # attention - text branch
 
+        text_tokens, add_text_residual = self.text_attn_residual_fn(text_tokens)
         text_tokens = self.text_attn_layernorm(text_tokens)
-        image_tokens = self.image_attn_layernorm(image_tokens)
 
         if self.has_cond:
             text_tokens = text_tokens * text_pre_attn_gamma + text_pre_attn_beta
+
+        # attention - image branch
+
+        image_tokens, add_image_residual = self.image_attn_residual_fn(image_tokens)
+        image_tokens = self.image_attn_layernorm(image_tokens)
+
+        if self.has_cond:
             image_tokens = image_tokens * image_pre_attn_gamma + image_pre_attn_beta
+
+        # joint attention
 
         text_tokens, image_tokens = self.joint_attn(
             inputs = (text_tokens, image_tokens),
@@ -289,21 +298,31 @@ class MMDiTBlockInternal(nn.Module):
         text_tokens = add_text_residual(text_tokens)
         image_tokens = add_image_residual(image_tokens)
 
-        if not skip_feedforward_text_tokens:
-            text_tokens, add_text_residual = self.text_ff_residual_fn(text_tokens)
-            text_tokens = self.text_ff_layernorm(text_tokens)
+        if skip_feedforward_text_tokens:
+            return text_tokens, image_tokens
 
-            if self.has_cond:
-                text_tokens = text_tokens * text_pre_ff_gamma + text_pre_ff_beta
+        # feedforward - text branch
+
+        text_tokens, add_text_residual = self.text_ff_residual_fn(text_tokens)
+        text_tokens = self.text_ff_layernorm(text_tokens)
+
+        if self.has_cond:
+            text_tokens = text_tokens * text_pre_ff_gamma + text_pre_ff_beta
+
+        text_tokens = self.text_ff(text_tokens)
+
+        if self.has_cond:
+            text_tokens = text_tokens * text_post_ff_gamma
+
+        text_tokens = add_text_residual(text_tokens)
+
+        # feedforward - image branch
 
         image_tokens, add_image_residual = self.image_ff_residual_fn(image_tokens)
         image_tokens = self.image_ff_layernorm(image_tokens)
 
         if self.has_cond:
             image_tokens = image_tokens * image_pre_ff_gamma + image_pre_ff_beta
-
-        if skip_feedforward_text_tokens:
-            return text_tokens, image_tokens
 
         image_tokens = self.image_ff(image_tokens)
 
@@ -337,11 +356,6 @@ class FinalLayer(nn.Module):
     def forward(self, x, c):
         # Get AdaLN modulation parameters
         hidden_size = x.shape[-1]
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         
         # Apply modulation
@@ -392,14 +406,15 @@ class ExpertMMDiT(nn.Module):
         # Text projection - assuming text projection is still needed to project CLIP embeddings
         self.text_projection = nn.Linear(self.clip_embedding_dim, self.router_hidden_size) # Project CLIP embeddings to router hidden dim for conditioning
 
-        # MMDiT blocks - using MMDiTBlockInternal (renamed DiTBlock)
-        self.blocks = nn.ModuleList([
-            MMDiTBlockInternal(
+        # MMDiT blocks - using MMDiTBlock (renamed DiTBlock)
+        self.blocks = ModuleList([
+            MMDiTBlock( # Changed from MMDiTBlockInternal to MMDiTBlock
                 dim_image = self.hidden_dim, # Image embedding dimension
-                dim_text = self.router_hidden_size, # Text embedding dimension (using router_hidden_size as projection)
+                dim_text = self.router_hidden_size, # Corrected: Parameter name to dim_text
                 dim_cond = self.router_hidden_size, # Time conditioning dimension (using router_hidden_size)
                 dim_head = self.config.num_heads, # Assuming num_heads is still relevant
                 heads = self.config.num_heads, # Assuming heads is still relevant
+                qk_rmsnorm = config.qk_rmsnorm, # Assuming qk_rmsnorm is in config
                 ff_kwargs=dict(mult=self.config.ffn_dim/config.hidden_dim) # Assuming ffn_dim ratio is still relevant
             )
             for _ in range(self.num_layers)
@@ -427,7 +442,7 @@ class ExpertMMDiT(nn.Module):
         nn.init.normal_(self.text_projection.weight, std=0.02)
         nn.init.zeros_(self.text_projection.bias)
 
-        # Note: Block adaLN modulation layers are already initialized in MMDiTBlockInternal
+        # Note: Block adaLN modulation layers are already initialized in MMDiTBlock
 
     def get_position_embeddings(self, h, w, device):
         """Generate position embeddings for arbitrary grid sizes"""
