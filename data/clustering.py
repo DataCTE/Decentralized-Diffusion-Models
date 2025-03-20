@@ -31,44 +31,21 @@ class DDMClustering:
                 all_features = []
                 for feature_file in tqdm(feature_files, desc="Loading feature files"):
                     feature_path = os.path.join(feature_dir, feature_file)
-                    individual_features = torch.load(feature_path, map_location=lambda storage, loc: storage.cuda())
+                    individual_features = torch.load(feature_path, map_location=lambda storage, loc: storage.cpu())
                     all_features.append(individual_features)
-                features = torch.cat(all_features, dim=0)
-                features_list = [features.cuda(i % torch.cuda.device_count()) for i in range(torch.cuda.device_count())]
+                features = torch.cat(all_features, dim=0).float()
+                features_list = [features]
             except FileNotFoundError:
                 raise FileNotFoundError(f"Features not provided and not found at default path: {load_path}. Please run feature extraction script or provide features directly.")
 
-        assert torch.cuda.is_available(), "CUDA is not available. Clustering cannot run on GPU."
-        num_gpus = len(features_list)
-        total_features_size = sum([f.shape[0] for f in features_list])
-        print(f"Features are distributed across {num_gpus} GPUs. Total feature size: {total_features_size}")
+        print(f"Starting clustering with features of shape: {features.shape}")
 
         # Stage 1: Fine-grained clustering (paper appendix B, Section 4.1)
         # "cluster these features to 1024 fine-grained centroids"
-        # Use multiple GPUs for faster KMeans (if available)
-        num_gpus = torch.cuda.device_count()
-        print(f"Number of GPUs available: {num_gpus}")
-        gpu_resources = []
-        indexes_gpu = []
-        if num_gpus > 1:
-            print(f"Using {num_gpus} GPUs for FAISS KMeans.")
-            for i in range(num_gpus):
-                gpu_resources.append(faiss.GpuResources())
-                index_flat = faiss.IndexFlatL2(features_list[0].shape[1])
-                indexes_gpu.append(faiss.index_cpu_to_gpu(gpu_resources[-1], i, index_flat))
-            # Distribute the index across multiple GPUs
-            index_gpu = faiss.IndexShards(features_list[0].shape[1])
-            for sub_index_gpu in indexes_gpu:
-                index_gpu.add_shard(sub_index_gpu)
-            index_gpu.own_fields = True
-        else:
-            print("Using single GPU for FAISS KMeans.")
-            gpu_resources.append(faiss.GpuResources())
-            index_flat = faiss.IndexFlatL2(features_list[0].shape[1])
-            index_gpu = faiss.index_cpu_to_gpu(gpu_resources[0], 0, index_flat)
-
+        # Use FAISS KMeans on CPU for simplicity and debugging
+        print("Performing fine-grained KMeans clustering on CPU...")
         kmeans = faiss.Kmeans(
-            features_list[0].shape[1],
+            features.shape[1],
             self.num_fine, # num_fine_clusters = 1024 as per paper
             niter=100,
             verbose=True,
@@ -76,64 +53,56 @@ class DDMClustering:
             nredo=3,  # Paper recommends 3 restarts
             min_points_per_centroid=100,
             max_points_per_centroid=10000,
-            index=index_gpu
+            gpu_index=False
         )
-        assert kmeans.index.is_trained, "KMeans index is not trained (pre-training issue?)"
-        assert isinstance(kmeans.index, faiss.GpuIndex), "KMeans index is NOT on GPU!"
-        print(f"KMeans index is on GPU: {isinstance(kmeans.index, faiss.GpuIndex)}")
+        kmeans.train(features.numpy())
+        self.fine_centroids = torch.from_numpy(kmeans.centroids).float()
 
-        # Train KMeans on the *list* of features (implicitly distributed by IndexShards)
-        kmeans.train(torch.cat(features_list, dim=0).cuda()) # Concatenate features for training (might need to reconsider this for very large datasets)
-        self.fine_centroids = torch.from_numpy(kmeans.centroids).cuda()
-        assert self.fine_centroids.is_cuda, "Fine centroids are not on GPU!"
+        print("Fine-grained KMeans clustering complete.")
 
         # Stage 2: Coarse clustering (paper Section 4.1)
         # "then further consolidate to k coarse centroids."
         # "We assign each data point to the nearest of the coarse centroids to produce the final set of partitions."
-        # Compute similarities between fine clusters
-        # Calculate similarity matrix on GPU (still single GPU for simplicity in this example)
-        similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t())
-        assert similarity_matrix.is_cuda, "Similarity matrix is not on GPU!"
+        print("Performing coarse-grained hierarchical clustering on CPU...")
 
-        # Use GPU-accelerated hierarchical clustering from cuML (single GPU for now)
-        similarity_matrix_gpu = similarity_matrix.cuda() # Ensure on GPU (redundant now, but kept for clarity)
-        assert similarity_matrix_gpu.is_cuda, "Similarity matrix (GPU copy) is not on GPU!"
+        # Compute similarities between fine clusters on CPU
+        similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t())
+
+        # Use CPU-based hierarchical clustering from cuML (single CPU for now)
         agg_clustering = cuml.AgglomerativeClustering(
             n_clusters=self.num_coarse,
             linkage='average', # Use average linkage as in original code
             output_type='pt' # Output as PyTorch tensor for easy integration
         )
-        agg_clustering.fit(similarity_matrix_gpu) # Still single GPU for hierarchical clustering in this example
-        coarse_labels = agg_clustering.labels_ # Keep labels on GPU as PyTorch tensor
-        assert coarse_labels.is_cuda, "Coarse labels from cuML are not on GPU!"
+        agg_clustering.fit(similarity_matrix.numpy())
+        coarse_labels = torch.from_numpy(agg_clustering.labels_).long()
         self.coarse_centroids = torch.stack([
-            self.fine_centroids[torch.where(coarse_labels == i)[0]].mean(0) # Perform operations on GPU
-            for i in range(self.num_coarse) # Iterate through coarse clusters (0 to num_coarse-1)
-        ]).cuda()
-        assert self.coarse_centroids.is_cuda, "Coarse centroids are not on GPU!"
+            self.fine_centroids[torch.where(coarse_labels == i)[0]].mean(0)
+            for i in range(self.num_coarse)
+        ])
+
+        print("Coarse-grained hierarchical clustering complete.")
 
         # Assign samples to nearest coarse centroid (done in DDMDataset._distribute_samples based on these centroids)
-        distances = torch.cdist(features_list[0], self.coarse_centroids)
-        assert features_list[0].is_cuda and self.coarse_centroids.is_cuda, "Features or coarse_centroids are not on GPU for distance calculation!"
-        cluster_assignments = torch.argmin(distances, dim=1)
-        assert cluster_assignments.is_cuda, "Cluster assignments are not on GPU!"
+        distances = torch.cdist(features, self.coarse_centroids)
+        cluster_assignments = torch.argmin(distances, dim=1).long()
 
         # Save individual cluster assignments
         feature_dir = os.path.join(self.default_feature_path, "features")
         cluster_dir = os.path.join(self.default_feature_path, "clusters")
         os.makedirs(cluster_dir, exist_ok=True)
-        feature_files = sorted([f for f in os.listdir(feature_dir) if f.endswith(".pt")])  # Ensure consistent order
+        feature_files = sorted([f for f in os.listdir(feature_dir) if f.endswith(".pt")])
         num_files = len(feature_files)
         assignments_per_file = len(cluster_assignments) // num_files
         start_index = 0
 
         for i, feature_file in enumerate(tqdm(feature_files, desc="Saving cluster assignments")):
             end_index = start_index + assignments_per_file
-            if i == num_files - 1:  # Handle potential remainder for last file
+            if i == num_files - 1:
                 end_index = len(cluster_assignments)
             file_assignments = cluster_assignments[start_index:end_index]
             cluster_output_path = os.path.join(cluster_dir, feature_file.replace(".pt", ".cluster.pt"))
-            torch.save(file_assignments.cpu(), cluster_output_path)
+            torch.save(file_assignments, cluster_output_path)
             start_index = end_index
 
         return cluster_assignments 
