@@ -53,6 +53,7 @@ def test_full_pipeline():
         
         # Set num_fine_clusters in config before dataset initialization
         config.num_fine_clusters = 2
+        print(f"config.num_fine_clusters in shape_test: {config.num_fine_clusters}")
         # Initialize dataset
         dataset = DDMDataset(config, split='train')
         
