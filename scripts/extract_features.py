@@ -43,7 +43,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
 
 
     # File discovery - CPU-bound operations (glob.glob) - performed on CPU
-    with ThreadPoolExecutor(max_workers=16) as executor: # Adjust max_workers as needed
+    with ThreadPoolExecutor(max_workers=8) as executor: # Adjust max_workers as needed
         futures = []
         for ext in image_extensions:
             pattern = os.path.join(dataset_path, f'*{ext}') # Direct glob in dataset_path
