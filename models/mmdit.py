@@ -460,7 +460,7 @@ class ExpertMMDiT(nn.Module):
                      h * self.patch_size, w * self.patch_size)
         return x
     
-    def forward(self, x, t, text_embeds=None):
+    def forward(self, x, t, text_embeds):
         cond_vector = self.t_embedder(t)
 
         # Patch embedding - remains the same

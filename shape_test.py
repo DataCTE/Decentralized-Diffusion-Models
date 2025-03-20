@@ -92,7 +92,8 @@ def test_full_pipeline():
         assert router_logits.shape == (1, config.num_experts), "Router output shape mismatch"
         
         # Test expert forward pass
-        expert_out = experts[0](dummy_latent, dummy_t)
+        dummy_text_embeds = torch.randn(1, 768, device=device)
+        expert_out = experts[0](dummy_latent, dummy_t, dummy_text_embeds)
         assert expert_out.shape == dummy_latent.shape, "Expert output shape mismatch"
         
         # Test training steps

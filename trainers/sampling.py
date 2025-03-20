@@ -194,14 +194,14 @@ def ddm_sample(
                 # Perform forward pass through expert
                 if use_cfg:
                     # Conditional generation
-                    uncond_pred = expert(uncond_input, uncond_timestep)
+                    uncond_pred = expert(uncond_input, uncond_timestep, uncond_embeddings)
                     cond_pred = expert(cond_input, cond_timestep, text_embeddings)
                     
                     # Combine with classifier-free guidance
                     pred = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
                 else:
                     # Unconditional generation
-                    pred = expert(x, timestep)
+                    pred = expert(x, timestep, uncond_embeddings)
                 
                 expert_predictions[expert_idx] = pred
             

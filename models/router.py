@@ -52,6 +52,9 @@ class RouterModel(nn.Module):
             nn.Linear(config.router_hidden_size // 2, config.router_hidden_size)
         )
         
+        # Text embedding projection
+        self.text_embed_proj = nn.Linear(config.clip_embedding_dim, config.router_hidden_size)
+        
         # Attention blocks (simplified compared to the DiT)
         self.blocks = nn.ModuleList([
             SelfAttentionBlock(
@@ -90,12 +93,12 @@ class RouterModel(nn.Module):
             nn.init.normal_(self.classifier[-1].weight, std=0.02)
             nn.init.zeros_(self.classifier[-1].bias)
 
-    def forward(self, x, t, text_embeddings=None):
+    def forward(self, x, t, text_embeddings):
         """
         Args:
             x: Input tensor [B, C, H, W]
             t: Timestep tensor [B,]
-            text_embeddings: Optional text embeddings for conditional generation
+            text_embeddings: Text embeddings for conditioning
         Returns:
             logits: Expert logits [B, num_experts]
         """
@@ -116,6 +119,10 @@ class RouterModel(nn.Module):
         
         # Add timestep information
         x = x + t_emb  # [B, D]
+        
+        # Add text embedding integration
+        text_emb = self.text_embed_proj(text_embeddings)  # Project text embeddings
+        x = x + text_emb  # Add projected text embeddings
         
         # Expand to sequence for transformer blocks
         x = x.unsqueeze(1)  # [B, 1, D]
