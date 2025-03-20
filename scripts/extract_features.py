@@ -46,22 +46,14 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     if is_main_process(): # File discovery only on main process (rank 0)
         print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound, single-threaded)")
         discovery_start_time = time.time()
-        discovery_iteration_start_time = time.time() # Start time for the single discovery iteration
-        total_discovered_images = 0 # Track total images discovered
-
-        # File discovery - CPU-bound operations (glob.glob) - performed on CPU (single-threaded)
-        all_patterns = [os.path.join(dataset_path, f'*{ext}') for ext in image_extensions] # Create patterns for all extensions
-        for pattern in tqdm(all_patterns, desc=f"Rank {rank} Discovering files"): # Iterate through patterns for progress bar (still 4 iterations, but simpler)
-            extension_image_paths = glob.glob(pattern) # Single-threaded glob.glob
-            image_paths.extend(extension_image_paths) # Collect image paths
-            total_discovered_images += len(extension_image_paths) # Accumulate discovered images
-
-        discovery_iteration_duration = time.time() - discovery_iteration_start_time # Duration for the entire discovery process
-        images_per_sec_overall = total_discovered_images / discovery_iteration_duration if discovery_iteration_duration > 0 else 0
-
-        description = f"Rank {rank} Discovering files - Found: {total_discovered_images}, Images/sec (overall): {images_per_sec_overall:.2f}" # Updated description - overall rate
-        tqdm.write("\r" + description, end='')
-
+        
+        # Initialize progress bar with rate display
+        with tqdm(unit='img', unit_scale=True, desc=f"Rank {rank} Discovering files") as progress_bar:
+            for ext in image_extensions:
+                pattern = os.path.join(dataset_path, f'*{ext}')
+                extension_image_paths = glob.glob(pattern)
+                image_paths.extend(extension_image_paths)
+                progress_bar.update(len(extension_image_paths))  # Update with number of images found
 
         discovery_duration = time.time() - discovery_start_time
         print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
