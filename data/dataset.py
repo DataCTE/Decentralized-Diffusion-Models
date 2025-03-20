@@ -102,7 +102,7 @@ class DDMDataset(Dataset):
         from data.clustering import DDMClustering
         self.clusterer = DDMClustering(
             num_coarse_clusters=config.num_experts,
-            num_fine_clusters=1024
+            num_fine_clusters=config.num_fine_clusters
         )
         
         # Load dataset with direct file discovery (no separate validation pass)
