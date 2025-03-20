@@ -242,9 +242,7 @@ class ExpertDiT(nn.Module):
         # Add position embeddings
         x = x + self.pos_embed  # [B, H/P*W/P, D]
         
-        # Apply text conditioning if provided
-        cond_vector = t_emb  # Start with timestep embedding
-        
+        # Text conditioning handling
         if text_embeds is not None:
             # Project text embeddings to hidden dimension
             text_embeds = self.text_projection(text_embeds)  # [B, L, D]
@@ -261,8 +259,12 @@ class ExpertDiT(nn.Module):
             
             # Create a combined conditioning vector (timestep + text)
             text_pooled = text_embeds.mean(dim=1)  # [B, D]
-            cond_vector = cond_vector + text_pooled  # [B, D]
-            
+        else:
+            # Add zero-initialized text contribution
+            text_pooled = torch.zeros_like(t_emb)
+        
+        cond_vector = t_emb + text_pooled  # Unified conditioning vector
+        
         # Ensure conditioning vector has proper dimensions before processing blocks
         if cond_vector.dim() < 2 or cond_vector.shape[0] != batch_size:
             if cond_vector.dim() == 1:

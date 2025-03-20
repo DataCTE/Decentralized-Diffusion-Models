@@ -165,7 +165,8 @@ class DecentralizedFlowMatcher:
         """
         self.sigma = sigma
         self.loss_type = loss_type
-        self.temperature = 1.0  # Default temperature for router softmax
+        self.temperature = 2.0  # Start with higher temperature
+        self.temp_anneal_rate = 0.0002
         
     def compute_flow_matching_target(self, x0, xt, t):
         """
@@ -180,28 +181,16 @@ class DecentralizedFlowMatcher:
             Flow matching target ut(xt|x0)
         """
         # Implements paper's Equation 1 with numerical stability
-        safe_t = torch.maximum(t, torch.tensor(1e-4, device=t.device))
-        denom = torch.sqrt(safe_t)
-        standard_target = (x0 - xt) / denom[:, None, None, None]
+        safe_t = torch.maximum(t, torch.tensor(1e-7, device=t.device))
+        sigma_t = torch.sin(0.5 * math.pi * safe_t)
+        alpha_t = torch.cos(0.5 * math.pi * safe_t)
         
-        # Improved numerical stability - use a smooth transition for very small t
-        # This prevents division by zero and excessive magnification of noise
-        eps = 1e-5
-        min_t_value = 1e-4
+        # Direct calculation from paper Eq.1
+        target = (x0 - alpha_t * xt) / (sigma_t ** 2 + 1e-7)
         
-        # Compute a smooth blend factor
-        blend = torch.sigmoid((safe_t - min_t_value) / eps)
-        
-        # For very small t, use zero flow
-        stable_target = torch.zeros_like(standard_target)
-        
-        # Smoothly blend between the two based on t value
-        target = blend[:, None, None, None] * standard_target + (1 - blend[:, None, None, None]) * stable_target
-        
-        # Make sure target has same shape as xt
-        if target.shape != xt.shape:
-            # Reshape target to match xt
-            target = target.reshape(xt.shape)
+        # Stabilize extremely small t values
+        mask = safe_t < 1e-3
+        target[mask] = (x0 - xt)[mask] / safe_t[mask].view(-1, 1, 1, 1)
         
         return target
 
@@ -222,83 +211,19 @@ class DecentralizedFlowMatcher:
         Returns:
             Loss value
         """
-        # Get shapes and dimensions for debugging
-        pred_shape = pred.shape
-        target_shape = target.shape
-        
-        # First, handle channel dimension mismatch (most critical issue)
-        if pred_shape[1] != target_shape[1]:
-            logger.warning(f"Channel mismatch: pred has {pred_shape[1]} channels, target has {target_shape[1]} channels")
-            
-            # Always adjust pred to match target's channel dimension
-            if pred_shape[1] < target_shape[1]:
-                # Pad pred with zeros to match target channels
-                padding = torch.zeros(
-                    (pred_shape[0], target_shape[1] - pred_shape[1], *pred_shape[2:]), 
-                    device=pred.device, 
-                    dtype=pred.dtype
-                )
-                pred = torch.cat([pred, padding], dim=1)
-            else:
-                # Trim pred to match target channels
-                pred = pred[:, :target_shape[1], ...]
-        
-        # Now handle dimension mismatch (flattened vs spatial)
-        pred_dim = pred.dim()
-        target_dim = target.dim()
-        
-        if pred_dim != target_dim:
-            # If one is 3D and one is 4D, convert to the same format
-            if pred_dim == 3 and target_dim == 4:
-                # Pred is [B, C, N] and target is [B, C, H, W]
-                # Flatten the target to match pred
-                target = target.reshape(target_shape[0], target_shape[1], -1)
-            elif pred_dim == 4 and target_dim == 3:
-                # Pred is [B, C, H, W] and target is [B, C, N]
-                # Flatten the pred to match target
-                pred = pred.reshape(pred_shape[0], pred.shape[1], -1)
-        
-        # For spatial dimension mismatches in flattened tensors
-        if pred.dim() == 3 and target.dim() == 3 and pred.shape[2] != target.shape[2]:
-            # Since we're supporting specific image sizes, use a simple approach:
-            # Truncate to the smaller size to avoid interpolation artifacts
-            min_size = min(pred.shape[2], target.shape[2])
-            pred = pred[:, :, :min_size]
-            target = target[:, :, :min_size]
-        
-        # For spatial dimension mismatches in 4D tensors
-        if pred.dim() == 4 and target.dim() == 4:
-            if pred.shape[2:] != target.shape[2:]:
-                # Flatten both to avoid spatial dimension issues
-                pred = pred.reshape(pred.shape[0], pred.shape[1], -1)
-                target = target.reshape(target.shape[0], target.shape[1], -1)
-                
-                # Truncate to the smaller spatial size
-                min_size = min(pred.shape[2], target.shape[2])
-                pred = pred[:, :, :min_size]
-                target = target[:, :, :min_size]
-        
-        # Calculate the appropriate loss based on config
+        # Remove all shape adjustments - assume pred/target already match
+        # Direct loss calculation as per paper
         if self.loss_type == 'mse':
-            # MSE loss (Equation 6 in the paper)
             loss = F.mse_loss(pred, target, reduction='none')
         elif self.loss_type == 'huber':
-            # Huber loss for robustness
-            loss = F.huber_loss(pred, target, reduction='none', delta=0.1)
+            loss = F.huber_loss(pred, target, delta=0.1, reduction='none')
         elif self.loss_type == 'l1':
-            # L1 loss
             loss = F.l1_loss(pred, target, reduction='none')
         else:
-            raise ValueError(f"Unknown loss_type: {self.loss_type}")
-        
-        # Dynamically determine reduction dimensions based on tensor shape
-        if loss.dim() == 4:  # [B, C, H, W]
-            return loss.mean(dim=[1, 2, 3]).mean()
-        elif loss.dim() == 3:  # [B, C, N]
-            return loss.mean(dim=[1, 2]).mean()
-        else:
-            # Fallback for unexpected dimensions
-            return loss.mean()
+            raise ValueError(f"Invalid loss type: {self.loss_type}")
+
+        # Paper specifies mean reduction over all dimensions
+        return loss.mean()
 
     def compute_loss(self, predictions, x0, t):
         """
@@ -322,4 +247,9 @@ class DecentralizedFlowMatcher:
         target = self.compute_flow_matching_target(x0, xt, t)
         
         # Compute loss
-        return self.compute_flow_matching_loss(predictions, target) 
+        loss = self.compute_flow_matching_loss(predictions, target)
+        
+        # Anneal temperature for router
+        self.temperature = max(0.5, self.temperature * (1 - self.temp_anneal_rate))
+        
+        return loss 
