@@ -96,8 +96,8 @@ class DDMDataset(Dataset):
             )
         print(f"Debugging dataset.py: feature_path being checked: {feature_path}")
             
-        self.features = torch.cat([torch.load(os.path.join(feature_path, f), map_location='cpu') for f in os.listdir(feature_path) if f.endswith(".pt")])
-        self.clusters = torch.cat([torch.load(os.path.join(cluster_path, f'{split}_clusters.pt'), map_location='cpu')])
+        self.features = torch.cat([torch.load(os.path.join(feature_path, f), map_location='cuda') for f in os.listdir(feature_path) if f.endswith(".pt")])
+        self.clusters = torch.cat([torch.load(os.path.join(cluster_path, f'{split}_clusters.pt'), map_location='cuda')])
         
         # Load individual cluster assignments
         cluster_dir = cluster_path
@@ -105,7 +105,7 @@ class DDMDataset(Dataset):
         all_clusters = []
         for cluster_file in tqdm(cluster_files, desc="Loading cluster files"):
             individual_cluster_path = os.path.join(cluster_dir, cluster_file)
-            individual_clusters = torch.load(individual_cluster_path, map_location='cpu')
+            individual_clusters = torch.load(individual_cluster_path, map_location='cuda')
             all_clusters.append(individual_clusters)
         self.clusters = torch.cat(all_clusters, dim=0)
         
