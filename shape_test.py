@@ -35,7 +35,7 @@ def test_full_pipeline():
         # Create dummy dataset (4 images)
         dummy_images = [np.random.rand(256, 256, 3) * 255 for _ in range(4)]
         dummy_features = torch.randn(4, 1024)  # Fake DINOv2 features
-        dummy_dims = torch.tensor([(256, 256)] * 4, dtype=torch.int64)  # Paper uses int64 for dimensions
+        dummy_dims = torch.tensor([[256, 256] for _ in range(4)], dtype=torch.int64)  # Should be shape [4, 2]
         
         # Save dummy data in paper's format
         for i in range(4):
