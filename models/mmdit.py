@@ -401,7 +401,7 @@ class ExpertMMDiT(nn.Module):
             kernel_size=self.patch_size,
             stride=self.patch_size
         )
-        self.t_embedder = TimestepEmbedder(self.router_hidden_size) # Using router_hidden_size for time embedding dim - adjust if needed
+        self.t_embedder = TimestepEmbedder(self.hidden_dim) # Use hidden_dim for time embedding dim
 
         # Text projection - assuming text projection is still needed to project CLIP embeddings
         self.text_projection = nn.Linear(self.clip_embedding_dim, self.router_hidden_size) # Project CLIP embeddings to router hidden dim for conditioning
