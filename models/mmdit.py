@@ -411,7 +411,7 @@ class ExpertMMDiT(nn.Module):
             MMDiTBlock( # Changed from MMDiTBlockInternal to MMDiTBlock
                 dim_image = self.hidden_dim, # Image embedding dimension
                 dim_text = self.router_hidden_size, # Corrected: Parameter name to dim_text
-                dim_cond = self.router_hidden_size, # Time conditioning dimension (using router_hidden_size)
+                dim_cond = self.hidden_dim, # Time conditioning dimension (using hidden_dim)
                 dim_head = self.config.num_heads, # Assuming num_heads is still relevant
                 heads = self.config.num_heads, # Assuming heads is still relevant
                 qk_rmsnorm = config.qk_rmsnorm, # Assuming qk_rmsnorm is in config
