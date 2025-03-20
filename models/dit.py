@@ -42,7 +42,7 @@ class DiTBlock(nn.Module):
         
         if debug_enabled:
             rank = torch.distributed.get_rank()
-            print(f"[Rank {rank}] DiTBlock input tensor c shape: {c.shape}, dim: {c.dim()}, device: {c.device}")
+            # print(f"[Rank {rank}] DiTBlock input tensor c shape: {c.shape}, dim: {c.dim()}, device: {c.device}")  # Disabled for production
         
         # Ensure c has at least 2 dimensions (batch_size, features)
         if c.dim() == 0:  # It's a scalar tensor
@@ -54,10 +54,11 @@ class DiTBlock(nn.Module):
             if debug_enabled:
                 print(f"[Rank {rank}] DiTBlock expanded 1D tensor to shape: {c.shape}")
         
-        # Fix this check too
-        if self.training and torch.distributed.is_initialized() and torch.rand(1).item() < 0.001:
-            if torch.distributed.get_rank() == 0:
-                print(f"Conditioning tensor shape: {c.shape}")
+        # Disabled for production runs
+        #if self.training and torch.distributed.is_initialized() and torch.rand(1).item() < 0.001:
+        #    if torch.distributed.get_rank() == 0:
+                # print(f"Conditioning tensor shape: {c.shape}")  # Disabled per config
+                
         
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
