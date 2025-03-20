@@ -110,12 +110,20 @@ def test_full_pipeline():
         # Router training
         router_trainer = RouterTrainer(config, device, rank=0, world_size=1)
         batch = next(iter(DataLoader(dataset, batch_size=2)))
-        router_loss = router_trainer.train_step(batch)
+
+        print("Testing Router Training for 20 steps:")
+        for step in range(20):  # Run router training for 20 steps
+            router_loss = router_trainer.train_step(batch)
+            print(f"  Step {step+1}/20 - Router Loss: {router_loss:.4f}")
         assert isinstance(router_loss, float), "Router training failed"
-        
+
         # Expert training
         expert_trainer = ExpertTrainer(0, config, device, 0, 1)
-        expert_loss = expert_trainer.train_step(batch)
+
+        print("Testing Expert Training for 20 steps:")
+        for step in range(20):  # Run expert training for 20 steps
+            expert_loss = expert_trainer.train_step(batch)
+            print(f"  Step {step+1}/20 - Expert Loss: {expert_loss:.4f}")
         assert isinstance(expert_loss, float), "Expert training failed"
         
         # Test sampling pipeline
