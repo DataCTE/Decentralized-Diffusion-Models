@@ -106,7 +106,7 @@ DEFAULT_CONFIG = {
     'expert_batch_size': 1,
     
     # ===== Expert Cache parameters =====
-    'max_experts_in_memory': 2,  # Number of experts to keep in GPU memory
+   
     'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
     
     # Add to DEFAULT_CONFIG
@@ -144,7 +144,7 @@ DEFAULT_CONFIG = {
     'wandb_log_batch_metrics': False,         # Log per-batch metrics (more overhead)
     'wandb_log_memory': False,                 # Log memory usage
     'wandb_commit_frequency': 1,   # Frequency to commit logs (N steps)
-    'max_sampling_experts': 4,  # Maximum experts to use in sampling
+
     'fast_validation': True,    # Use fewer steps for validation
     'sampling_steps': 20,       # Default number of sampling steps for validation
     
@@ -155,8 +155,10 @@ DEFAULT_CONFIG = {
     
     # Add to DEFAULT_CONFIG
     'expert_specialization': 'timestep',  # or 'text' for conditional models
-    'dynamic_expert_count': 4,
+    'dynamic_expert_count': 2,
     'expert_selection_strategy': 'top_k',
+    'max_sampling_experts': 2,  # Maximum experts to use in sampling
+    'max_experts_in_memory': 2,  # Number of experts to keep in GPU memory
     
     # ===== Shape Test Controls =====
     'bypass_cluster_validation': True, # Flag to bypass cluster size validation, set to True in shape_test.py

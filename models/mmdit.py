@@ -336,6 +336,12 @@ class FinalLayer(nn.Module):
 
     def forward(self, x, c):
         # Get AdaLN modulation parameters
+        hidden_size = x.shape[-1]
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         
         # Apply modulation
@@ -344,7 +350,7 @@ class FinalLayer(nn.Module):
         # Project to output and ensure output dimensions are consistent
         x = self.linear(x)  # [B, N, P*P*C]
         
-        # Optional: Verify output shape consistency 
+        # Optional: Verify output shape consistency
         batch_size, n_tokens, features = x.shape
         expected_features = self.patch_size**2 * self.out_channels
         if features != expected_features:
