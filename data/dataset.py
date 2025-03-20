@@ -102,17 +102,8 @@ class DDMDataset(Dataset):
                 "Please run `run_clustering.py` first to generate cluster assignments."
             )
 
-        all_individual_clusters_cpu = []
-        # Add progress bar for loading cluster files
-        pbar_cluster_files = tqdm(
-            cluster_files,
-            desc="Loading cluster files",
-            unit="file",
-            dynamic_ncols=True
-        )
-        for cluster_file in pbar_cluster_files: # Iterate over progress bar
-            cluster_tensor = torch.load(os.path.join(cluster_path, cluster_file), map_location='cpu')
-            all_individual_clusters_cpu.append(cluster_tensor)
+        # No longer load all cluster assignments into CPU memory
+        # Cluster assignments will be loaded on-demand in _load_cluster_assignment
 
         self.cluster_path = cluster_path  # Store cluster path for later loading
         self.cluster_files = cluster_files  # Store cluster file names
