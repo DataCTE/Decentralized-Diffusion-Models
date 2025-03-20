@@ -11,7 +11,7 @@ from queue import Queue
 from threading import Thread
 
 from config import DDMConfig
-from models.mmdit import ExpertDiT
+from models.mmdit import ExpertMMDiT
 from models.router import RouterModel
 from data.vae import VAEWrapper
 from data.clip import CLIPTextEncoder
@@ -161,7 +161,7 @@ def load_models(config, device, checkpoint_dir, cache_manager=None):
             expert_checkpoint = os.path.join(checkpoint_dir, f"expert_{expert_idx}.pt")
             if os.path.exists(expert_checkpoint):
                 logger.info(f"Loading expert {expert_idx}")
-                expert_model = ExpertDiT(config).to(device)
+                expert_model = ExpertMMDiT(config).to(device)
                 state_dict = torch.load(expert_checkpoint, map_location=device)
                 expert_model.load_state_dict(state_dict)
                 expert_models[expert_idx] = expert_model
@@ -176,7 +176,7 @@ def load_models(config, device, checkpoint_dir, cache_manager=None):
                 def create_expert_builder(idx, checkpoint_path):
                     def builder(_):
                         logger.info(f"Loading expert {idx} with cache manager")
-                        expert_model = ExpertDiT(config).to(device)
+                        expert_model = ExpertMMDiT(config).to(device)
                         state_dict = torch.load(checkpoint_path, map_location=device)
                         expert_model.load_state_dict(state_dict)
                         return expert_model
@@ -207,7 +207,7 @@ def load_distilled_model(config, device, checkpoint_path):
     
     try:
         logger.info(f"Loading distilled model from {checkpoint_path}")
-        distilled_model = ExpertDiT(config).to(device)
+        distilled_model = ExpertMMDiT(config).to(device)
         
         checkpoint = torch.load(checkpoint_path, map_location=device)
         if 'model_state_dict' in checkpoint:

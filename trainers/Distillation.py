@@ -7,7 +7,7 @@ import os
 import logging
 from tqdm import tqdm
 
-from models.mmdit import ExpertDiT
+from models.mmdit import ExpertMMDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from utils.expert_cache import ExpertCacheManager
 
@@ -42,7 +42,7 @@ class DiffusionDistiller:
         self.expert_cache = ExpertCacheManager(config, device)
         
         # Initialize distilled model
-        self.distilled_model = ExpertDiT(config).to(device)
+        self.distilled_model = ExpertMMDiT(config).to(device)
         
         # Paper-recommended optimizer settings for distillation
         self.optimizer = torch.optim.AdamW(
@@ -73,7 +73,7 @@ class DiffusionDistiller:
         self.alphas, self.alpha_bar, _ = get_alphas_and_betas()
         
         # Initialize EMA model for stable results
-        self.ema_model = ExpertDiT(config).to(device)
+        self.ema_model = ExpertMMDiT(config).to(device)
         self.ema_model.load_state_dict(self.distilled_model.state_dict())
         self.ema_decay = config.ema_decay
         

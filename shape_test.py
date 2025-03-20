@@ -8,7 +8,7 @@ from PIL import Image
 from config import get_config
 from data.dataset import DDMDataset
 from data.clustering import DDMClustering
-from models.mmdit import ExpertDiT
+from models.mmdit import ExpertMMDiT
 from models.router import RouterModel
 from trainers.sampling import ddm_sample
 from trainers.router import RouterTrainer
@@ -83,7 +83,7 @@ def test_full_pipeline():
         
         # Initialize models with paper's architecture
         router = RouterModel(config).to(device)
-        experts = {i: ExpertDiT(config).to(device) for i in range(config.num_experts)}
+        experts = {i: ExpertMMDiT(config).to(device) for i in range(config.num_experts)}
         
         # Test router forward pass
         dummy_latent = torch.randn(1, config.latent_channels, 16, 16, device=device)

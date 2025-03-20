@@ -5,7 +5,7 @@ from bitsandbytes.optim import AdamW8bit
 import math
 import os
 
-from models.mmdit import ExpertDiT
+from models.mmdit import ExpertMMDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from data.vae import VAEWrapper
 from data.clip import CLIPTextEncoder
@@ -25,7 +25,7 @@ class ExpertTrainer(BaseTrainer):
         self.world_size = world_size
         
         # Create base expert model
-        base_expert = ExpertDiT(config).to(device)
+        base_expert = ExpertMMDiT(config).to(device)
         
         # Apply FSDP wrapping using the same method as router
         self.expert = wrap_model_with_fsdp(

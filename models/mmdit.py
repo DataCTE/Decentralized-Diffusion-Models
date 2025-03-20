@@ -359,7 +359,7 @@ class FinalLayer(nn.Module):
                 
         return x
 
-class ExpertDiT(nn.Module):
+class ExpertMMDiT(nn.Module):
     """Implements expert model using MMDiT blocks"""
     def __init__(self, config):
         super().__init__()
