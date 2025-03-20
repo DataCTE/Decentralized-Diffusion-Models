@@ -35,7 +35,10 @@ class DDMClustering:
                 features = torch.cat(all_features, dim=0)
             except FileNotFoundError:
                 raise FileNotFoundError(f"Features not provided and not found at default path: {load_path}. Please run feature extraction script or provide features directly.")
+        assert torch.cuda.is_available(), "CUDA is not available. Clustering cannot run on GPU."
         features = features.cuda()
+        assert features.is_cuda, "Features tensor is not on GPU. Clustering will be slow."
+        print(f"Features are on GPU: {features.is_cuda}")
 
         # Stage 1: Fine-grained clustering (paper appendix B, Section 4.1)
         # "cluster these features to 1024 fine-grained centroids"
@@ -50,7 +53,7 @@ class DDMClustering:
             min_points_per_centroid=100,
             max_points_per_centroid=10000,
         )
-        kmeans.train(features.cpu().numpy())
+        kmeans.train(features)
         self.fine_centroids = torch.from_numpy(kmeans.centroids).cuda()
 
         # Stage 2: Coarse clustering (paper Section 4.1)
