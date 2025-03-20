@@ -155,7 +155,10 @@ def ddm_sample(
                     selected_experts = list(experts.keys())
             else:
                 # For unconditional generation, just use router directly
-                router_logits = router(x, timestep, text_embeddings=None)
+                # Create zero text embeddings for unconditional case
+                batch_size = shape[0]
+                zero_text_emb = torch.zeros((batch_size, config.clip_embedding_dim), dtype=torch.float32, device=device) # Assuming float32 and CLIP embedding dim
+                router_logits = router(x, timestep, text_embeddings=zero_text_emb)
                 router_probs = F.softmax(router_logits / temperature, dim=-1)
                 
                 if top_k > 0:
