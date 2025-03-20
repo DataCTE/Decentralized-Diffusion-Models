@@ -64,12 +64,14 @@ class DDMClustering:
 
         kmeans.train(features)
         self.fine_centroids = torch.from_numpy(kmeans.centroids).cuda()
+        assert self.fine_centroids.is_cuda, "Fine centroids are not on GPU!"
 
         # Stage 2: Coarse clustering (paper Section 4.1)
         # "then further consolidate to k coarse centroids."
         # "We assign each data point to the nearest of the coarse centroids to produce the final set of partitions."
         # Compute similarities between fine clusters
         similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t()) # Calculate similarity matrix on GPU
+        assert similarity_matrix.is_cuda, "Similarity matrix is not on GPU!"
 
         # Use hierarchical clustering on similarities
         # from scipy.cluster.hierarchy import linkage # CPU-based
@@ -81,6 +83,7 @@ class DDMClustering:
 
         # Use GPU-accelerated hierarchical clustering from cuML
         similarity_matrix_gpu = similarity_matrix.cuda() # Move similarity matrix to GPU
+        assert similarity_matrix_gpu.is_cuda, "Similarity matrix (GPU copy) is not on GPU!"
         agg_clustering = cuml.AgglomerativeClustering(
             n_clusters=self.num_coarse,
             linkage='average', # Use average linkage as in original code
@@ -88,14 +91,18 @@ class DDMClustering:
         )
         agg_clustering.fit(similarity_matrix_gpu)
         coarse_labels = agg_clustering.labels_ # Keep labels on GPU as PyTorch tensor
+        assert coarse_labels.is_cuda, "Coarse labels from cuML are not on GPU!"
         self.coarse_centroids = torch.stack([
             self.fine_centroids[torch.where(coarse_labels == i)[0]].mean(0) # Perform operations on GPU
             for i in range(self.num_coarse) # Iterate through coarse clusters (0 to num_coarse-1)
         ]).cuda()
+        assert self.coarse_centroids.is_cuda, "Coarse centroids are not on GPU!"
 
         # Assign samples to nearest coarse centroid (done in DDMDataset._distribute_samples based on these centroids)
         distances = torch.cdist(features, self.coarse_centroids)
+        assert features.is_cuda and self.coarse_centroids.is_cuda, "Features or coarse_centroids are not on GPU for distance calculation!"
         cluster_assignments = torch.argmin(distances, dim=1)
+        assert cluster_assignments.is_cuda, "Cluster assignments are not on GPU!"
 
         # Save individual cluster assignments
         feature_dir = os.path.join(self.default_feature_path, "features")
