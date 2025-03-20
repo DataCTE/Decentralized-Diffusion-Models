@@ -92,35 +92,15 @@ class DDMDataset(Dataset):
         if not os.path.exists(feature_path):
             raise FileNotFoundError(f"Features not found at {feature_path}. Run feature extraction first.")
         
-        print(f"Debugging dataset.py: feature_path being checked: {feature_path}")
-
-        all_features_cpu = torch.cat([
-            torch.load(os.path.join(feature_path, f), map_location='cpu')
-            for f in os.listdir(feature_path) if f.endswith(".pt")
-        ])
-        self.features = all_features_cpu
-
-        # Initialize clusterer
-        from data.clustering import DDMClustering
-        self.clusterer = DDMClustering(
-            num_coarse_clusters=config.num_experts,
-            num_fine_clusters=config.num_fine_clusters,
-            default_feature_path=config.feature_cache_path
-        )
-
-        # Load or auto-generate clusters
-        if not os.path.exists(cluster_path):
-            os.makedirs(cluster_path)
         
         cluster_files = sorted([f for f in os.listdir(cluster_path) if f.endswith(".cluster.pt")])
 
         if not cluster_files:
             self.logger.warning("No cluster files found. Running clustering automatically...")
-            self.clusterer.cluster(features_list=[self.features])
-
-            cluster_files = sorted([f for f in os.listdir(cluster_path) if f.endswith(".cluster.pt")])
-            if not cluster_files:
-                raise FileNotFoundError(f"Clustering failed to generate cluster files at {cluster_path}.")
+            raise FileNotFoundError(
+                f"No cluster files found at {cluster_path}. "
+                "Please run `run_clustering.py` first to generate cluster assignments."
+            )
 
         all_individual_clusters_cpu = []
         # Add progress bar for loading cluster files
@@ -134,10 +114,14 @@ class DDMDataset(Dataset):
             cluster_tensor = torch.load(os.path.join(cluster_path, cluster_file), map_location='cpu')
             all_individual_clusters_cpu.append(cluster_tensor)
 
-        self.cluster_path = cluster_path # Store cluster path for later loading
-        self.cluster_files = cluster_files # Store cluster file names
-        self.num_cluster_files = len(cluster_files) # Store number of cluster files
-        self.cluster_assignments_cache = {} # Initialize a cache for loaded cluster assignments
+        self.cluster_path = cluster_path  # Store cluster path for later loading
+        self.cluster_files = cluster_files  # Store cluster file names
+        self.num_cluster_files = len(cluster_files)  # Store number of cluster files
+        self.cluster_assignments_cache = {}  # Initialize a cache for loaded cluster assignments
+        self.feature_path = feature_path # Store feature path
+        self.feature_files = sorted([f for f in os.listdir(feature_path) if f.endswith(".pt")]) # Store feature file names
+        self.num_feature_files = len(self.feature_files) # Store number of feature files
+        self.features_cache = {} # Initialize cache for features
 
         self._discover_and_process_files()
         self._init_buckets()
@@ -504,63 +488,57 @@ class DDMDataset(Dataset):
         self.logger.info(f"Rank {self.rank}: Starting expert assignment for {len(self.image_files)} images...")
         expert_start = time.time()
 
-        # Cluster features using paper's two-stage approach
-        # Add progress bar for clustering process
-        pbar_clustering = tqdm(
-            range(1), # Only one main clustering step
-            desc=f"Rank {self.rank}: Clustering features",
-            unit="step",
-            dynamic_ncols=True
-        )
-        for _ in pbar_clustering: # Iterate over progress bar (single step)
-            cluster_assignments = self.clusterer.cluster(feature_path=self.config.feature_cache_path) # Pass feature_path to clusterer
-            pbar_clustering.update() # Manually update progress bar
+        # No clustering is performed here anymore, assuming pre-computed clusters are loaded
+        # We are only loading pre-computed cluster assignments, so no clustering here
+        pass # No clustering here, assuming pre-computed clusters are loaded
 
-        # Store expert assignments from clustering
-        self.expert_assignments = cluster_assignments.to(self.device)
+        # Store expert assignments from loaded cluster files
+        # We are no longer running clustering in dataset.py, so expert_assignments are not set here.
+        # Expert assignments are loaded on-demand in __getitem__ and _load_cluster_assignment
+        # self.expert_assignments = cluster_assignments.to(self.device) - Removed
+
+        # Validate cluster distribution - this part is no longer relevant as we are not clustering here
+        # unique_clusters = torch.unique(cluster_assignments)
+        # if unique_clusters.max() >= self.config.num_experts:
+        #     raise ValueError(f"Cluster IDs exceed number of experts ({self.config.num_experts})")
         
-        # Validate cluster distribution
-        unique_clusters = torch.unique(cluster_assignments)
-        if unique_clusters.max() >= self.config.num_experts:
-            raise ValueError(f"Cluster IDs exceed number of experts ({self.config.num_experts})")
+        # Count images per expert for logging - this part is no longer relevant here
+        # expert_counts = {}
+        # for i in range(self.num_experts.item()):
+        #     count = torch.sum(self.expert_assignments == i).item()
+        #     expert_counts[i] = count
         
-        # Count images per expert for logging
-        expert_counts = {}
-        for i in range(self.num_experts.item()):
-            count = torch.sum(self.expert_assignments == i).item()
-            expert_counts[i] = count
-            
         expert_time = time.time() - expert_start
-        self.logger.info(f"Rank {self.rank}: Expert distribution completed in {expert_time:.2f}s")
+        self.logger.info(f"Rank {self.rank}: Expert distribution completed in {expert_time:.2f}s") # Keep this log message, but it's misleading now
+
+        # Log distribution for this rank - this part is no longer relevant here
+        # this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
+        # self.logger.info(f"Rank {self.rank}: Will process {this_rank_count} images ({this_rank_count/len(self.image_files)*100:.1f}% of dataset)")
         
-        # Log distribution for this rank
-        this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
-        self.logger.info(f"Rank {self.rank}: Will process {this_rank_count} images ({this_rank_count/len(self.image_files)*100:.1f}% of dataset)")
-        
-        # Log total info
+        # Log total info - keep this
         dataset_prep_complete = time.time()
         self.logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
 
-        # Paper-mandated cluster validation
-        cluster_sizes = [(self.expert_assignments == i).sum().item()
-                        for i in range(self.config.num_experts)]
-        min_cluster_size = min(cluster_sizes)
-        max_cluster_size = max(cluster_sizes)
+        # Paper-mandated cluster validation - this part is no longer relevant here
+        # cluster_sizes = [(self.expert_assignments == i).sum().item()
+        #                 for i in range(self.config.num_experts)]
+        # min_cluster_size = min_cluster_sizesize
+        # max_cluster_size = max(cluster_sizes)
 
-        if getattr(self.config, 'bypass_cluster_validation', False):
-            self.logger.info("Bypassing cluster size validation as requested by config flag")
-        elif min_cluster_size < 1000:  # Paper's minimum cluster size
-            raise ValueError(
-                f"Cluster too small (min_size={min_cluster_size}). "
-                "Consider reducing num_experts or increasing dataset size."
-            )
+        # if getattr(self.config, 'bypass_cluster_validation', False):
+        #     self.logger.info("Bypassing cluster size validation as requested by config flag")
+        # elif min_cluster_size < 1000:  # Paper's minimum cluster size
+        #     raise ValueError(
+        #         f"Cluster too small (min_size={min_cluster_size}). "
+        #         "Consider reducing num_experts or increasing dataset size."
+        #     )
 
-        size_ratio = max_cluster_size / max_cluster_size
-        if size_ratio > 10:  # Paper's max imbalance
-            self.logger.warning(
-                f"Cluster size imbalance {size_ratio:.1f}x exceeds "
-                "paper's recommended 10x limit"
-            )
+        # size_ratio = max_cluster_size / max_cluster_size
+        # if size_ratio > 10:  # Paper's max imbalance
+        #     self.logger.warning(
+        #         f"Cluster size imbalance {size_ratio:.1f}x exceeds "
+        #         "paper's recommended 10x limit"
+        #     )
 
     def __getitem__(self, idx):
         """Get a training sample with image and caption"""
@@ -572,6 +550,9 @@ class DDMDataset(Dataset):
         # Load cluster assignment for this index
         cluster_assignment = self._load_cluster_assignment(idx)
 
+        # Load feature for this index
+        features = self._load_feature(idx)
+
         # Load image and caption
         tensor = self._load_image_tensor(idx, (target_w, target_h))
         caption = self._load_caption(idx)
@@ -580,6 +561,7 @@ class DDMDataset(Dataset):
             'image': tensor,
             'caption': caption,
             'expert': cluster_assignment, # Use loaded cluster assignment
+            'features': features, # Use loaded features
             'bucket': bucket_idx
         }
 
@@ -595,6 +577,19 @@ class DDMDataset(Dataset):
         file_assignments = self.cluster_assignments_cache[cluster_file_name]
         index_within_file = index % (len(self.clusters_assignments) // self.num_cluster_files) # Calculate index within file
         return file_assignments[index_within_file] # Return assignment for index within file
+
+    def _load_feature(self, index):
+        """Load feature for a given index from file, using cache"""
+        file_index = index // (len(self.features) // self.num_feature_files) # Calculate file index
+        feature_file_name = self.feature_files[file_index]
+
+        if feature_file_name not in self.features_cache: # Check cache
+            feature_file_path = os.path.join(self.feature_path, feature_file_name)
+            self.features_cache[feature_file_name] = torch.load(feature_file_path, map_location='cpu') # Load and cache
+
+        file_features = self.features_cache[feature_file_name]
+        index_within_file = index % (len(self.features) // self.num_feature_files) # Calculate index within file
+        return file_features[index_within_file] # Return feature for index within file
 
     def __len__(self):
         """Get dataset length"""
