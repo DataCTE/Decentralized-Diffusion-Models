@@ -462,7 +462,6 @@ class ExpertMMDiT(nn.Module):
     
     def forward(self, x, t, text_embeds=None):
         cond_vector = self.t_embedder(t)
-        cond_vector = self.text_projection(cond_vector) # Project timestep embedding using text_projection - adjust if needed
 
         # Patch embedding - remains the same
         x = self.x_embedder(x)  # [B, D, H', W']
