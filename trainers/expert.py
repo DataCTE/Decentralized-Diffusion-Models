@@ -5,7 +5,7 @@ from bitsandbytes.optim import AdamW8bit
 import math
 import os
 
-from models.dit import ExpertDiT
+from models.mmdit import ExpertDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from data.vae import VAEWrapper
 from data.clip import CLIPTextEncoder

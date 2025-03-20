@@ -11,8 +11,8 @@ from queue import Queue
 from threading import Thread
 
 from config import DDMConfig
+from models.mmdit import ExpertDiT
 from models.router import RouterModel
-from models.dit import ExpertDiT
 from data.vae import VAEWrapper
 from data.clip import CLIPTextEncoder
 from utils.visualization import tensor_to_pil

@@ -8,7 +8,7 @@ from PIL import Image
 from config import get_config
 from data.dataset import DDMDataset
 from data.clustering import DDMClustering
-from models.dit import ExpertDiT
+from models.mmdit import ExpertDiT
 from models.router import RouterModel
 from trainers.sampling import ddm_sample
 from trainers.router import RouterTrainer
