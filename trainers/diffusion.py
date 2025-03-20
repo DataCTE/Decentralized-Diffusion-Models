@@ -169,28 +169,17 @@ class DecentralizedFlowMatcher:
         self.temp_anneal_rate = 0.0002
         
     def compute_flow_matching_target(self, x0, xt, t):
-        """
-        Compute flow matching target according to paper Section 3.1
+        """Implements paper Eq.1 with numerical stability"""
+        # Time conditioning parameters
+        alpha_t = torch.cos(t * math.pi/2)
+        sigma_t = torch.sin(t * math.pi/2)
         
-        Args:
-            x0: Original data [B, C, H, W]
-            xt: Noisy data at time t [B, C, H, W]
-            t: Timestep tensor [B]
-            
-        Returns:
-            Flow matching target ut(xt|x0)
-        """
-        # Implements paper's Equation 1 with numerical stability
-        safe_t = torch.maximum(t, torch.tensor(1e-7, device=t.device))
-        sigma_t = torch.sin(0.5 * math.pi * safe_t)
-        alpha_t = torch.cos(0.5 * math.pi * safe_t)
-        
-        # Direct calculation from paper Eq.1
+        # Target flow calculation
         target = (x0 - alpha_t * xt) / (sigma_t ** 2 + 1e-7)
         
-        # Stabilize extremely small t values
-        mask = safe_t < 1e-3
-        target[mask] = (x0 - xt)[mask] / safe_t[mask].view(-1, 1, 1, 1)
+        # Handle near-zero sigma_t cases
+        mask = t < 1e-3
+        target[mask] = (x0 - xt)[mask] / t[mask].clamp(min=1e-7)
         
         return target
 
@@ -224,6 +213,29 @@ class DecentralizedFlowMatcher:
 
         # Paper specifies mean reduction over all dimensions
         return loss.mean()
+
+    def compute_loss(self, predictions, x0, t):
+        """Paper Eq.6 with uniform expert weighting"""
+        # Sample random noise
+        eps = torch.randn_like(x0)
+        
+        # Create noisy input
+        alpha_t = torch.cos(t * math.pi/2)
+        sigma_t = torch.sin(t * math.pi/2)
+        xt = alpha_t * x0 + sigma_t * eps
+        
+        # Get target flow
+        target = self.compute_flow_matching_target(x0, xt, t)
+        
+        # Calculate loss
+        if self.loss_type == 'mse':
+            loss = F.mse_loss(predictions, target, reduction='mean')
+        elif self.loss_type == 'huber':
+            loss = F.huber_loss(predictions, target, delta=0.1, reduction='mean')
+        elif self.loss_type == 'l1':
+            loss = F.l1_loss(predictions, target, reduction='mean')
+            
+        return loss
 
     def compute_loss(self, predictions, x0, t):
         """

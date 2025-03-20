@@ -70,9 +70,9 @@ class RouterModel(nn.Module):
             nn.Linear(config.router_hidden_size, config.num_experts)
         )
         
-        # Learnable temperature for calibration
-        # Initialize with a reasonable value
-        self.register_buffer('temperature', torch.ones(1) * 1.0)
+        # Add temperature decay
+        self.temperature = 2.0  # Initial temperature
+        self.temp_decay = 0.99995
         
         # Initialize weights with smaller values for stability
         self._init_weights()
@@ -138,10 +138,10 @@ class RouterModel(nn.Module):
         # Lower temperature gives sharper distribution
         return logits / self.temperature
     
-    def set_temperature(self, temp_value):
-        """Set the temperature value for the model"""
-        self.temperature.fill_(temp_value)
+    def update_temperature(self):
+        """Exponential temperature decay"""
+        self.temperature = max(0.5, self.temperature * self.temp_decay)
     
     def get_temperature(self):
         """Get the current temperature value"""
-        return self.temperature.item() 
+        return self.temperature 

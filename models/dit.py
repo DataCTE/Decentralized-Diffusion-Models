@@ -218,106 +218,14 @@ class ExpertDiT(nn.Module):
         return x
     
     def forward(self, x, t, text_embeds=None):
-        # Get input dimensions
-        batch_size, channels, height, width = x.shape
+        # Remove text cross-attention
+        cond_vector = self.t_embedder(t)
         
-        # Store original dimensions for later reconstruction
-        original_height, original_width = height, width
-        
-        # Compute patch count after convolution
-        h = height // self.patch_size
-        w = width // self.patch_size
-        
-        # Patch embedding
-        x = self.x_embedder(x)  # [B, D, H/P, W/P]
-        x = x.flatten(2).permute(0, 2, 1)  # [B, H/P*W/P, D]
-        
-        # Time embedding
-        t_emb = self.t_embedder(t)  # [B, D]
-        
-        # Generate position embeddings if not cached or dimensions changed
-        if self.pos_embed is None or self.pos_embed.shape[1] != h * w:
-            self.pos_embed = self.get_position_embeddings(h, w, x.device)
-            
-        # Add position embeddings
-        x = x + self.pos_embed  # [B, H/P*W/P, D]
-        
-        # Text conditioning handling
-        if text_embeds is not None:
-            # Project text embeddings to hidden dimension
-            text_embeds = self.text_projection(text_embeds)  # [B, L, D]
-            
-            # Apply cross-attention from image tokens to text tokens
-            attn_output, _ = self.text_cross_attention(
-                query=x,
-                key=text_embeds,
-                value=text_embeds
-            )
-            
-            # Add cross-attention output to sequence
-            x = x + attn_output
-            
-            # Create a combined conditioning vector (timestep + text)
-            text_pooled = text_embeds.mean(dim=1)  # [B, D]
-        else:
-            # Add zero-initialized text contribution
-            text_pooled = torch.zeros_like(t_emb)
-        
-        cond_vector = t_emb + text_pooled  # Unified conditioning vector
-        
-        # Ensure conditioning vector has proper dimensions before processing blocks
-        if cond_vector.dim() < 2 or cond_vector.shape[0] != batch_size:
-            if cond_vector.dim() == 1:
-                cond_vector = cond_vector.unsqueeze(0)
-            # Broadcast to match batch size if needed
-            if cond_vector.shape[0] == 1 and batch_size > 1:
-                cond_vector = cond_vector.expand(batch_size, -1)
-        
-        # Process through transformer blocks
+        # Original DiT processing
         for block in self.blocks:
-            if self.use_gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    block, 
-                    x, 
-                    cond_vector,
-                    use_reentrant=False,
-                    preserve_rng_state=False
-                )
-            else:
-                x = block(x, cond_vector)
-        
-        # Final projection
-        x = self.final_layer(x, cond_vector)
-        
-        # Debug the shape before unpatchify
-        #print(f"Before unpatchify - x shape: {x.shape}, h: {h}, w: {w}")
-        
-        # Ensure we maintain original shape by using proper padding or interpolation
-        # Instead of complex reshaping that might lose information, use a direct approach
-        
-        # First reshape to a 2D image in patch space
-        patch_channels = self.out_channels
-        
-        # Reshape to [B, h, w, patch_size*patch_size*C]
-        x = x.reshape(batch_size, h, w, self.patch_size*self.patch_size*patch_channels)
-        
-        # Permute to [B, C, h, w, patch_size, patch_size]
-        x = x.reshape(batch_size, h, w, self.patch_size, self.patch_size, patch_channels)
-        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-        
-        # Reshape to [B, C, h*patch_size, w*patch_size]
-        x = x.reshape(batch_size, patch_channels, h*self.patch_size, w*self.patch_size)
-        
-        # If dimensions don't match original, use interpolation to match original size
-        if h*self.patch_size != original_height or w*self.patch_size != original_width:
-            x = torch.nn.functional.interpolate(
-                x, 
-                size=(original_height, original_width),
-                mode='bilinear', 
-                align_corners=False
-            )
-        
-        return x 
+            x = block(x, cond_vector)
+            
+        return self.final_layer(x, cond_vector)
 
     def debug_tensor_shapes(self, prefix="", **tensors):
         """Debug tensor shapes during training"""
