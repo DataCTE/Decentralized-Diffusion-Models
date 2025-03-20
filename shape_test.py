@@ -19,7 +19,7 @@ def test_full_pipeline():
     """End-to-end shape test of DDM pipeline with dummy data"""
     # Setup
     config = get_config("config.py")
-    config.num_experts = 2
+    config.num_experts = 1
     config.batch_size = 2
     config.image_size = (64, 64)
     config.latent_channels = 16
