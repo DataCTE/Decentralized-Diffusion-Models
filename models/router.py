@@ -108,6 +108,7 @@ class RouterModel(nn.Module):
         attn_flat = attn_features.view(batch_size, 1, -1)
         attn_weights = torch.softmax(attn_flat, dim=2).view_as(attn_features)
         x = (attn_features * attn_weights).sum(dim=(2, 3))  # [B, D]
+        x = x.reshape(batch_size, -1) # Ensure x is [B, D] after spatial pooling
         
         # Timestep embedding - ensure float dtype
         t_float = t.float() if t.dtype != torch.float32 else t
