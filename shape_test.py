@@ -12,6 +12,9 @@ import os
 import sys
 import logging
 import time
+import math
+import numpy as np
+import torch.nn.functional as F
 
 # Configure logging
 logging.basicConfig(
@@ -29,6 +32,7 @@ from trainers.expert import ExpertTrainer
 from trainers.router import RouterTrainer
 from config import get_config
 from utils.checkpoint import load_model_checkpoint
+from trainers.diffusion import DecentralizedFlowMatcher
 
 class DummyConfig:
     """Dummy configuration with minimal settings for shape testing"""
@@ -301,6 +305,16 @@ def test_training_step(device="cuda"):
         loss = expert_trainer.train_step(batch)
         logger.info(f"Expert training step completed with loss: {loss}")
         
+        # Track loss statistics
+        loss_values = []
+        for _ in range(10):
+            loss = expert_trainer.train_step(batch)
+            loss_values.append(loss)
+            assert 0 < loss < 100, "Loss out of expected range"
+
+        logger.info(f"Loss trajectory: {loss_values}")
+        assert np.mean(loss_values[-3:]) < np.mean(loss_values[:3]), "Loss should decrease"
+        
     except Exception as e:
         logger.error(f"Error in expert training step: {str(e)}")
         import traceback
@@ -555,6 +569,119 @@ def test_sampling_pipeline(config=None, device="cuda", num_samples=4):
         
     return
 
+def test_flow_matching_loss(config=None, device="cuda"):
+    """Validate flow matching target and loss calculations"""
+    logger.info("\n=== Testing Flow Matching Calculations ===")
+    
+    if config is None:
+        config = DummyConfig()
+    
+    # Initialize flow matcher with different loss types
+    loss_types = ['mse', 'huber', 'l1']
+    
+    for loss_type in loss_types:
+        logger.info(f"\nTesting {loss_type.upper()} loss:")
+        
+        # Create flow matcher
+        fm = DecentralizedFlowMatcher(loss_type=loss_type)
+        
+        # Create dummy data
+        x0 = torch.randn(2, config.latent_channels, 32, 32, device=device)
+        t = torch.tensor([0.1, 0.9], device=device)
+        noise = torch.randn_like(x0)
+        
+        # Compute xt
+        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
+        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+        xt = alpha_t * x0 + sigma_t * noise
+        
+        # Calculate target
+        target = fm.compute_flow_matching_target(x0, xt, t)
+        logger.info(f"Target shape: {target.shape}")
+        
+        # Validate target properties
+        assert not torch.isnan(target).any(), "NaNs in flow target"
+        assert target.requires_grad == False, "Target should not require grad"
+        
+        # Create dummy predictions
+        pred = torch.randn_like(target)
+        
+        # Calculate loss
+        loss = fm.compute_flow_matching_loss(pred, target)
+        logger.info(f"Loss value: {loss.item():.4f}")
+        
+        # Basic loss validation
+        assert loss > 0, "Loss should be positive"
+        assert loss.requires_grad == False, "Loss should not require grad"
+
+        # Validate against known values
+        x0 = torch.zeros(1, config.latent_channels, 4, 4, device=device)
+        t = torch.tensor([0.0], device=device)
+        xt = x0.clone()
+        target = fm.compute_flow_matching_target(x0, xt, t)
+        assert torch.allclose(target, torch.zeros_like(target)), "t=0 target should be zero"
+
+        x0 = torch.ones(1, 1, 1, 1, device=device)
+        t = torch.tensor([1.0], device=device)
+        xt = torch.zeros(1, 1, 1, 1, device=device)
+        target = fm.compute_flow_matching_target(x0, xt, t)
+        assert torch.allclose(target, (x0 - xt)/1.0), "t=1 target should be (x0 - xt)"
+
+def test_temperature_annealing():
+    """Validate router temperature annealing"""
+    logger.info("\n=== Testing Router Temperature Annealing ===")
+    
+    fm = DecentralizedFlowMatcher()
+    initial_temp = fm.temperature
+    
+    # Simulate training steps
+    for step in range(1000):
+        fm.temperature = max(0.5, fm.temperature * (1 - fm.temp_anneal_rate))
+    
+    logger.info(f"Initial temp: {initial_temp:.2f}, Final temp: {fm.temperature:.2f}")
+    assert fm.temperature >= 0.5, "Temperature should not drop below 0.5"
+    assert fm.temperature < initial_temp, "Temperature should decrease"
+
+def enhanced_test_sampling(config=None, device="cuda", num_samples=4):
+    """Enhanced sampling test with validation checks"""
+    # ... [existing setup code] ...
+    
+    # Add validation checks
+    sampling_logger.info("Adding validation checks:")
+    
+    # Check 1: Verify expert combination weights sum to 1
+    weight_sum = weights.sum(dim=-1)
+    sampling_logger.info(f"Expert weight sums: {weight_sum}")
+    assert torch.allclose(weight_sum, torch.ones_like(weight_sum), atol=1e-5), "Weights should sum to 1"
+    
+    # Check 2: Validate latent dimensions through sampling steps
+    for i in range(steps):
+        # ... [existing sampling code] ...
+        
+        # Validate latent stats
+        current_mean = latents.mean().item()
+        current_std = latents.std().item()
+        sampling_logger.info(f"Step {i}: Latent mean={current_mean:.4f}, std={current_std:.4f}")
+        
+        assert not torch.isnan(latents).any(), "NaNs in latents"
+        assert abs(current_mean) < 2.0, "Latent mean out of expected range"
+        assert 0.5 < current_std < 2.0, "Latent std out of expected range"
+
+def test_router_distribution(config=None, device="cuda"):
+    """Validate router output distribution properties"""
+    # ... [setup code] ...
+    
+    # Test 1: Uniform input
+    uniform_input = torch.randn(1, config.latent_channels, 8, 8, device=device)
+    logits = model(uniform_input, torch.tensor([0.5], device=device))
+    probs = F.softmax(logits, dim=-1)
+    assert torch.allclose(probs.sum(), torch.tensor(1.0)), "Probabilities should sum to 1"
+    
+    # Test 2: Extreme temperatures
+    model.temperature = 0.1
+    sharp_probs = F.softmax(logits/model.temperature, dim=-1)
+    assert sharp_probs.max() > 0.9, "Low temp should sharpen distribution"
+
 def main():
     parser = argparse.ArgumentParser(description="Test shapes in Decentralized Diffusion Models")
     parser.add_argument("--cpu", action="store_true", help="Run on CPU instead of CUDA")
@@ -562,11 +689,13 @@ def main():
     parser.add_argument("--router", action="store_true", help="Test router model shapes")
     parser.add_argument("--train", action="store_true", help="Test training step")
     parser.add_argument("--sampling", action="store_true", help="Test sampling pipeline")
+    parser.add_argument("--flow", action="store_true", help="Test flow matching calculations")
+    parser.add_argument("--temp", action="store_true", help="Test temperature annealing")
     args = parser.parse_args()
     
     # Default to testing everything if no specific test is selected
-    if not (args.expert or args.router or args.train or args.sampling):
-        args.expert = args.router = args.train = args.sampling = True
+    if not (args.expert or args.router or args.train or args.sampling or args.flow or args.temp):
+        args.expert = args.router = args.train = args.sampling = args.flow = args.temp = True
     
     # Set device
     device = "cpu" if args.cpu else "cuda"
@@ -592,6 +721,12 @@ def main():
     # Run sampling test
     if args.sampling:
         test_sampling_pipeline(config, device, num_samples=4)
+    
+    # Add new test options
+    if args.flow:
+        test_flow_matching_loss(config, device)
+    if args.temp:
+        test_temperature_annealing()
     
     logger.info("Shape tests completed")
 
