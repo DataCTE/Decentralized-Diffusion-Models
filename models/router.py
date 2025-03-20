@@ -112,7 +112,7 @@ class RouterModel(nn.Module):
         # Timestep embedding - ensure float dtype
         t_float = t.float() if t.dtype != torch.float32 else t
         t_float = t_float.to(self.time_embedder.mlp[0].weight.dtype)
-        t_emb = self.time_embedder(t_float.unsqueeze(-1))  # [B, D]
+        t_emb = self.time_embedder(t_float)  # [B, D] - Removed unsqueeze here
         
         # Add timestep information
         x = x + t_emb  # [B, D]
