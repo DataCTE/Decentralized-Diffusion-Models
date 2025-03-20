@@ -443,13 +443,18 @@ class DDMTrainingCoordinator:
             
             if missing_experts:
                 logger.info(f"Creating {len(missing_experts)} additional experts for sampling: {missing_experts}")
+                # Ensure all ranks participate in expert creation
                 for expert_idx in missing_experts:
-                    # Create expert directly (not via cache manager)
-                    try:
-                        experts_dict[expert_idx] = expert_builder_fn(expert_idx)
+                    # Create expert with proper distributed context
+                    with self.router.router.no_sync():  # Disable router gradient sync
+                        expert = expert_builder_fn(expert_idx)
+                        if hasattr(expert, 'module'):  # Unwrap DDP/FSDP
+                            experts_dict[expert_idx] = expert.module
+                        else:
+                            experts_dict[expert_idx] = expert
                         logger.info(f"Successfully created expert {expert_idx} for sampling")
-                    except Exception as e:
-                        logger.error(f"Failed to create expert {expert_idx}: {e}")
+                    # Synchronize after expert creation
+                    torch.distributed.barrier()
         
         # Put experts in evaluation mode before sampling
         for expert in experts_dict.values():

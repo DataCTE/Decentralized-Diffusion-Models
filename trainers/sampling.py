@@ -65,6 +65,8 @@ def ddm_sample(
     
     # 2. Force evaluation mode
     router.eval()
+    # Add device synchronization
+    torch.cuda.synchronize(device=device)
     for expert in experts.values():
         if hasattr(expert, 'eval'):
             expert.eval()
@@ -94,6 +96,8 @@ def ddm_sample(
         
         # For each timestep t
         for t in progress:
+            if verbose and t == 0:
+                logger.debug(f"Rank {torch.distributed.get_rank()} entered sampling loop")
             # Get timestep
             timestep = torch.tensor([t] * batch_size, device=device)
             
