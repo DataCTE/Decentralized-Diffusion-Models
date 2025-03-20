@@ -134,7 +134,7 @@ class ExpertTrainer(BaseTrainer):
                 # Calculate norm for only this expert's gradients
                 grad_norm = torch.norm(
                     torch.stack([
-                        torch.norm(grad, 2, dim=-1)
+                        torch.norm(grad.flatten(), 2) # Flatten each grad to scalar
                         for grad in grads
                     ]), 
                     2
