@@ -211,10 +211,18 @@ def ddm_sample(
             
             # Combine expert predictions according to router weights (paper Equation 7)
             combined_pred = torch.zeros_like(x)
-            for i, expert_pred in enumerate(expert_predictions.values()):
-                # Extract weights for this expert across all batches
-                weights = expert_weights[:, i].view(-1, 1, 1, 1)
-                combined_pred += weights * expert_pred
+            if top_k > 0:
+                for k in range(top_k): # Iterate up to top_k
+                    for batch_index in range(expert_weights.shape[0]): # Iterate over batch dimension
+                        expert_idx = expert_indices[batch_index, k].item() # Get expert index for this batch and top_k position
+                        if expert_idx in expert_predictions: # Check if expert prediction exists
+                            expert_pred = expert_predictions[expert_idx] # Get prediction for this expert
+                            weight = expert_weights[batch_index, k].view(1, 1, 1, 1) # Get weight for this batch and top_k position
+                            combined_pred[batch_index] += weight * expert_pred[batch_index] # Accumulate weighted prediction
+            else:
+                for expert_idx, expert_pred in expert_predictions.items():
+                    weights = expert_weights[:, expert_idx].view(-1, 1, 1, 1)
+                    combined_pred += weights * expert_pred
             
             # Release experts back to cache if needed
             if expert_cache_manager is not None:
