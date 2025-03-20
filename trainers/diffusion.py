@@ -174,6 +174,10 @@ class DecentralizedFlowMatcher:
         alpha_t = torch.cos(t * math.pi/2)
         sigma_t = torch.sin(t * math.pi/2)
         
+        # Reshape for broadcasting
+        alpha_t = alpha_t.view(-1, 1, 1, 1)
+        sigma_t = sigma_t.view(-1, 1, 1, 1)
+        
         # Target flow calculation
         target = (x0 - alpha_t * xt) / (sigma_t ** 2 + 1e-7)
         
