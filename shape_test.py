@@ -19,7 +19,7 @@ def test_full_pipeline():
     """End-to-end shape test of DDM pipeline with dummy data"""
     # Setup
     config = get_config("config.py")
-    config.num_experts = 1
+    config.num_experts = 4
     config.batch_size = 2
     config.image_size = (64, 64)
     config.latent_channels = 16
@@ -32,14 +32,15 @@ def test_full_pipeline():
         train_dir = os.path.join(tmpdir, "train")
         os.makedirs(train_dir, exist_ok=True)
         
-        # Create dummy dataset (4 images)
-        dummy_images = [np.random.rand(256, 256, 3) * 255 for _ in range(4)]
-        dummy_features = torch.randn(4, 1024)  # Fake DINOv2 features
-        dummy_dims = torch.tensor([[256, 256] for _ in range(4)], dtype=torch.int64)  # Should be shape [4, 2]
-        dummy_dims = dummy_dims.reshape(4, 2)  # Explicitly reshape to [4, 2] to ensure correct shape
+        # Create dummy dataset (200 images)
+        num_dummy_images = 200
+        dummy_images = [np.random.rand(256, 256, 3) * 255 for _ in range(num_dummy_images)]
+        dummy_features = torch.randn(num_dummy_images, 1024)  # Fake DINOv2 features
+        dummy_dims = torch.tensor([[256, 256] for _ in range(num_dummy_images)], dtype=torch.int64)
+        dummy_dims = dummy_dims.reshape(num_dummy_images, 2)  # Explicitly reshape to [num_dummy_images, 2]
         
         # Save dummy data in paper's format
-        for i in range(4):
+        for i in range(num_dummy_images):
             img = Image.fromarray(dummy_images[i].astype('uint8'))
             img.save(os.path.join(train_dir, f"image_{i}.png"))
             caption_path = os.path.join(train_dir, f"image_{i}.txt")
@@ -49,7 +50,7 @@ def test_full_pipeline():
         # Save features and clusters
         torch.save(dummy_features, os.path.join(tmpdir, "train_features.pt"))
         torch.save(dummy_dims, os.path.join(tmpdir, "dim_cache.pt"))
-        torch.save(torch.randint(0,4,(4,)), os.path.join(tmpdir, "train_clusters.pt"))
+        torch.save(torch.randint(0,4,(num_dummy_images,)), os.path.join(tmpdir, "train_clusters.pt"))
         
         # Set num_fine_clusters in config before dataset initialization
         config.num_fine_clusters = 2
