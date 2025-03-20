@@ -15,7 +15,7 @@ import time  # Import the time module
 def extract_features(config_path="config.py", output_dir="/workspace/Decentralized-Diffusion-Models/cache"):
     """
     Extracts DINOv2 features for the dataset in parallel using multiple GPUs and saves them to disk as individual files.
-    Includes progress bar with average time per image.
+    Includes progress bar with average time per image and maximizes GPU utilization.
 
     Args:
         config_path (str): Path to the configuration file.
@@ -23,6 +23,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     """
     rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device) # Explicitly set device for current process
 
     if is_main_process():
         print(f"Using {world_size} GPUs for feature extraction.")
@@ -53,7 +54,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     # Load DINOv2 model and processor
     model_name = "facebook/dinov2-base"
     processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device)
+    model = AutoModel.from_pretrained(model_name).to(device) # Move model to current GPU
     model.eval()
 
     # Create separate output directories for features and dimensions
@@ -71,21 +72,21 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         image_process_start_time = time.time() # Start timer for image processing
         try:
             image = Image.open(image_path).convert('RGB')
-            dims = torch.tensor([image.width, image.height], dtype=torch.int64)
+            dims = torch.tensor([image.width, image.height], dtype=torch.int64).to(device) # Move dims to GPU
 
-            inputs = processor(images=image, return_tensors="pt").to(device)
+            inputs = processor(images=image, return_tensors="pt").to(device) # Move inputs to current GPU
             with torch.no_grad():
                 outputs = model(**inputs)
-                features = outputs.last_hidden_state[:, 0, :].cpu() # Move features to CPU immediately
+                features = outputs.last_hidden_state[:, 0, :] # Features remain on GPU
 
             # Construct base filename from image path (remove extension and path prefix)
             base_filename = os.path.splitext(os.path.basename(image_path))[0]
             feature_filename = f"{base_filename}.pt"
             dim_filename = f"{base_filename}.pt" # Use .pt extension for dimensions as well for consistency
 
-            # Save feature and dimension files
-            torch.save(features, os.path.join(features_dir, feature_filename))
-            torch.save(dims, os.path.join(dims_dir, dim_filename))
+            # Save feature and dimension files - move features to CPU only when saving
+            torch.save(features.cpu(), os.path.join(features_dir, feature_filename))
+            torch.save(dims.cpu(), os.path.join(dims_dir, dim_filename))
 
 
         except Exception as e:
