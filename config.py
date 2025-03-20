@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     'vae_scaling_factor': 0.18215,  # Seen in data/vae.py
     'clip_model': "openai/clip-vit-large-patch14",
     'max_token_length': 77,  # Standard CLIP token length
+    'clip_embedding_dim': 768, # Assuming CLIP embedding dim is 768 for ViT-Large-Patch14
     
     
     # ===== Router parameters =====
