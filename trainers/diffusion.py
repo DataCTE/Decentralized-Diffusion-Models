@@ -184,8 +184,11 @@ class DecentralizedFlowMatcher:
         # Handle near-zero sigma_t cases
         mask = t < 1e-3
         mask_reshaped = mask.view(-1, 1, 1, 1)
-        t_masked_reshaped = t[mask].clamp(min=1e-7).view(-1, 1, 1, 1)
-        target = torch.where(mask_reshaped, (x0 - xt) / t_masked_reshaped, target)
+        near_zero_sigma_t_value = 1e-7  # Use a constant value instead of t_masked_reshaped
+
+        value_if_true = torch.zeros_like(target) # Initialize with zeros
+        value_if_true = torch.where(~mask_reshaped, value_if_true, (x0 - xt) / near_zero_sigma_t_value) # Apply division only where mask is True
+        target = torch.where(mask_reshaped, value_if_true, target) # Use the conditionally created value_if_true
         
         return target
 
