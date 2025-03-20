@@ -16,6 +16,7 @@ from trainers.expert import ExpertTrainer
 from trainers.diffusion import DecentralizedFlowMatcher
 from utils.distributed import setup_distributed, get_rank
 from utils.fsdp import create_fsdp_model
+import matplotlib.pyplot as plt
 
 def test_full_pipeline():
     """End-to-end shape test of DDM pipeline with dummy data using FSDP"""
@@ -112,8 +113,10 @@ def test_full_pipeline():
         batch = next(iter(DataLoader(dataset, batch_size=2)))
 
         print("Testing Router Training for 20 steps:")
+        router_losses = []
         for step in range(20):  # Run router training for 20 steps
             router_loss = router_trainer.train_step(batch)
+            router_losses.append(router_loss)
             print(f"  Step {step+1}/20 - Router Loss: {router_loss:.4f}")
         assert isinstance(router_loss, float), "Router training failed"
 
@@ -121,11 +124,29 @@ def test_full_pipeline():
         expert_trainer = ExpertTrainer(0, config, device, 0, 1)
 
         print("Testing Expert Training for 20 steps:")
+        expert_losses = []
         for step in range(20):  # Run expert training for 20 steps
             expert_loss = expert_trainer.train_step(batch)
+            expert_losses.append(expert_loss)
             print(f"  Step {step+1}/20 - Expert Loss: {expert_loss:.4f}")
         assert isinstance(expert_loss, float), "Expert training failed"
         
+        # Plotting loss curves
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(router_losses)
+        plt.title('Router Loss Curve')
+        plt.xlabel('Step')
+        plt.ylabel('Loss')
+
+        plt.subplot(1, 2, 2)
+        plt.plot(expert_losses)
+        plt.title('Expert Loss Curve')
+        plt.xlabel('Step')
+        plt.ylabel('Loss')
+        plt.tight_layout()
+        plt.show()
+
         # Test sampling pipeline
         shape = (2, config.latent_channels, 16, 16)
         samples = ddm_sample(
