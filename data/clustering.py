@@ -69,7 +69,7 @@ class DDMClustering:
         # "then further consolidate to k coarse centroids."
         # "We assign each data point to the nearest of the coarse centroids to produce the final set of partitions."
         # Compute similarities between fine clusters
-        similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t()).cpu() # Move to CPU for hierarchical clustering
+        similarity_matrix = torch.mm(self.fine_centroids, self.fine_centroids.t()) # Calculate similarity matrix on GPU
 
         # Use hierarchical clustering on similarities
         # from scipy.cluster.hierarchy import linkage # CPU-based
