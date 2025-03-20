@@ -11,11 +11,12 @@ import glob # For simpler file discovery
 import torch.distributed as dist
 from utils.distributed import setup_distributed, get_rank, get_world_size, is_main_process
 import time  # Import the time module
+from concurrent.futures import ThreadPoolExecutor, as_completed # Import for multithreading
 
 def extract_features(config_path="config.py", output_dir="/workspace/Decentralized-Diffusion-Models/cache"):
     """
-    Extracts DINOv2 features for the dataset in parallel using multiple GPUs and saves them to disk as individual files.
-    Includes progress bar with average time per image and maximizes GPU utilization.
+    Extracts DINOv2 features for the dataset in parallel using multiple GPUs and maximizes GPU utilization.
+    Includes progress bar with average time per image, explicit device placement checks, and multithreading.
 
     Args:
         config_path (str): Path to the configuration file.
@@ -24,6 +25,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device) # Explicitly set device for current process
+    print(f"Rank {rank}: Using device: {device}") # Print device for each rank
 
     if is_main_process():
         print(f"Using {world_size} GPUs for feature extraction.")
@@ -56,6 +58,7 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     processor = AutoProcessor.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name).to(device) # Move model to current GPU
     model.eval()
+    print(f"Rank {rank}: Model device: {next(model.parameters()).device}") # Check model device
 
     # Create separate output directories for features and dimensions
     features_dir = os.path.join(output_dir, "features")
@@ -67,35 +70,28 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
 
     start_time = time.time() # Start timer for total duration
     image_times = [] # List to store processing times for last 10 images
+    processed_images_count = 0 # Track total images processed for tqdm update
 
-    for image_path in tqdm(partitioned_image_paths, desc=f"Rank {rank} Extracting features", position=rank, total=len(partitioned_image_paths)):
-        image_process_start_time = time.time() # Start timer for image processing
-        try:
-            image = Image.open(image_path).convert('RGB')
-            dims = torch.tensor([image.width, image.height], dtype=torch.int64).to(device) # Move dims to GPU
+    # Use ThreadPoolExecutor for multithreading
+    with ThreadPoolExecutor(max_workers=8) as executor: # Adjust max_workers as needed
+        futures = []
+        for image_path in partitioned_image_paths:
+            future = executor.submit( # Submit task to thread pool
+                process_single_image,
+                image_path,
+                processor,
+                model,
+                device,
+                features_dir,
+                dims_dir
+            )
+            futures.append(future)
 
-            inputs = processor(images=image, return_tensors="pt").to(device) # Move inputs to current GPU
-            with torch.no_grad():
-                outputs = model(**inputs)
-                features = outputs.last_hidden_state[:, 0, :] # Features remain on GPU
-
-            # Construct base filename from image path (remove extension and path prefix)
-            base_filename = os.path.splitext(os.path.basename(image_path))[0]
-            feature_filename = f"{base_filename}.pt"
-            dim_filename = f"{base_filename}.pt" # Use .pt extension for dimensions as well for consistency
-
-            # Save feature and dimension files - move features to CPU only when saving
-            torch.save(features.cpu(), os.path.join(features_dir, feature_filename))
-            torch.save(dims.cpu(), os.path.join(dims_dir, dim_filename))
-
-
-        except Exception as e:
-            print(f"Rank {rank} Error processing image {image_path}: {e}")
-            continue
-        finally: # Ensure time is recorded even if there's an exception
-            image_process_end_time = time.time()
-            image_process_time = image_process_end_time - image_process_start_time
+        # Process results as they become available (in any order)
+        for future in tqdm(as_completed(futures), total=len(partitioned_image_paths), desc=f"Rank {rank} Extracting features", position=rank):
+            image_process_time = future.result() # Get processing time from thread
             image_times.append(image_process_time)
+            processed_images_count += 1
 
             if len(image_times) > 10: # Keep only last 10 times
                 image_times.pop(0)
@@ -115,6 +111,36 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         print(f"Dimensions saved to {dims_dir}")
 
     dist.destroy_process_group()
+
+def process_single_image(image_path, processor, model, device, features_dir, dims_dir):
+    """Processes a single image: loads, extracts features, and saves them.
+    This function is designed to be run in a separate thread.
+    """
+    image_process_start_time = time.time() # Start timer for image processing
+    try:
+        image = Image.open(image_path).convert('RGB')
+        dims = torch.tensor([image.width, image.height], dtype=torch.int64).to(device) # Move dims to GPU
+
+        inputs = processor(images=image, return_tensors="pt").to(device) # Move inputs to current GPU
+        with torch.no_grad():
+            outputs = model(**inputs)
+            features = outputs.last_hidden_state[:, 0, :] # Features remain on GPU
+
+        # Construct base filename from image path (remove extension and path prefix)
+        base_filename = os.path.splitext(os.path.basename(image_path))[0]
+        feature_filename = f"{base_filename}.pt"
+        dim_filename = f"{base_filename}.pt" # Use .pt extension for dimensions as well for consistency
+
+        # Save feature and dimension files - move features to CPU only when saving
+        torch.save(features.cpu(), os.path.join(features_dir, feature_filename))
+        torch.save(dims.cpu(), os.path.join(dims_dir, dim_filename))
+
+    except Exception as e:
+        print(f"Error processing image {image_path}: {e}")
+    finally:
+        image_process_end_time = time.time()
+        image_process_time = image_process_end_time - image_process_start_time
+        return image_process_time # Return processing time for progress tracking
 
 if __name__ == "__main__":
     extract_features()
