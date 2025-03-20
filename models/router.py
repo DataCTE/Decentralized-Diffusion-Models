@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from models.mmdit import TimestepEmbedder
+from models.embeddings import TimestepEmbedder
 
 class SelfAttentionBlock(nn.Module):
     """Efficient self-attention block for the router"""
