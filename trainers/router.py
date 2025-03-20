@@ -101,18 +101,14 @@ class RouterTrainer:
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * torch.randn_like(latents)
             
-            # Use uniform random assignments instead of cluster_idx
-            batch_size = latents.size(0)
-            num_experts = getattr(self.config, 'num_experts', 8)
-            
-            # Uniform random targets (evenly distribute samples to all experts)
-            random_targets = torch.randint(0, num_experts, (batch_size,), device=self.device)
+            # Get actual cluster assignments from dataset
+            targets = batch["expert"].to(self.device)
             
             # Get router predictions
             logits = self.router(latent_t, t_indices)  # Note: Call directly with 2 args
             
             # Compute loss
-            loss = self.criterion(logits, random_targets)
+            loss = self.criterion(logits, targets)
         
         # Optimize with gradient isolation
         self.optimizer.zero_grad()

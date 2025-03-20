@@ -85,6 +85,26 @@ class DDMDataset(Dataset):
             dtype=torch.int32
         )
         
+        # Load precomputed features and clusters (paper section 4.1)
+        feature_path = os.path.join(config.dataset_path, f'{split}_features.pt')
+        cluster_path = os.path.join(config.dataset_path, f'{split}_clusters.pt')
+        
+        if not os.path.exists(feature_path) or not os.path.exists(cluster_path):
+            raise FileNotFoundError(
+                f"Precomputed features not found at {feature_path}. "
+                "Please run feature extraction and clustering first."
+            )
+            
+        self.features = torch.load(feature_path, map_location='cpu')
+        self.clusters = torch.load(cluster_path, map_location='cpu')
+        
+        # Add clustering initialization
+        from data.clustering import DDMClustering
+        self.clusterer = DDMClustering(
+            num_coarse_clusters=config.num_experts,
+            num_fine_clusters=1024
+        )
+        
         # Load dataset with direct file discovery (no separate validation pass)
         self._discover_and_process_files()
         self._init_buckets()
@@ -427,13 +447,20 @@ class DDMDataset(Dataset):
             self.logger.info(f"Rank {self.rank}: Bucket {bucket_idx} ({bucket_size}): {count} images")
 
     def _distribute_samples(self):
-        """CPU-based expert distribution"""
+        """CPU-based expert distribution using paper's clustering"""
         self.logger.info(f"Rank {self.rank}: Starting expert assignment for {len(self.image_files)} images...")
         expert_start = time.time()
         
-        # Create expert assignments using modulo
-        indices = torch.arange(len(self.image_files), device=self.device)
-        self.expert_assignments = indices % self.num_experts
+        # Cluster features using paper's two-stage approach
+        cluster_assignments = self.clusterer.cluster(self.features)
+        
+        # Store expert assignments from clustering
+        self.expert_assignments = cluster_assignments.to(self.device)
+        
+        # Validate cluster distribution
+        unique_clusters = torch.unique(cluster_assignments)
+        if unique_clusters.max() >= self.config.num_experts:
+            raise ValueError(f"Cluster IDs exceed number of experts ({self.config.num_experts})")
         
         # Count images per expert for logging
         expert_counts = {}
@@ -451,6 +478,25 @@ class DDMDataset(Dataset):
         # Log total info
         dataset_prep_complete = time.time()
         self.logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
+
+        # Paper-mandated cluster validation
+        cluster_sizes = [(self.expert_assignments == i).sum().item() 
+                        for i in range(self.config.num_experts)]
+        min_cluster_size = min(cluster_sizes)
+        max_cluster_size = max(cluster_sizes)
+        
+        if min_cluster_size < 1000:  # Paper's minimum cluster size
+            raise ValueError(
+                f"Cluster too small (min_size={min_cluster_size}). "
+                "Consider reducing num_experts or increasing dataset size."
+            )
+            
+        size_ratio = max_cluster_size / min_cluster_size
+        if size_ratio > 10:  # Paper's max imbalance
+            self.logger.warning(
+                f"Cluster size imbalance {size_ratio:.1f}x exceeds "
+                "paper's recommended 10x limit"
+            )
 
     def __getitem__(self, idx):
         """Get a training sample with image and caption"""

@@ -159,13 +159,11 @@ class DiffusionDistiller:
                             text_embeds
                         )
                         expert_weights = F.softmax(router_logits, dim=-1)
+                        topk_weights, topk_indices = torch.topk(expert_weights, self.config.top_k, dim=-1)
                     
-                    # Select top-k experts per example
-                    topk_weights, topk_indices = torch.topk(
-                        expert_weights, 
-                        self.config.top_k,
-                        dim=-1
-                    )
+                    # Use ground truth expert assignments
+                    topk_indices = batch["expert"].unsqueeze(-1)  # [B, 1]
+                    topk_weights = torch.ones_like(topk_indices, dtype=torch.float)
                     
                     # Get predictions from top-k experts
                     teacher_pred = torch.zeros_like(student_pred)

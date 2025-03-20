@@ -152,6 +152,11 @@ DEFAULT_CONFIG = {
     'enable_validation': False,
     'enable_sampling': False, 
     'enable_checkpointing': True,
+    
+    # Add to DEFAULT_CONFIG
+    'expert_specialization': 'timestep',  # or 'text' for conditional models
+    'dynamic_expert_count': 4,
+    'expert_selection_strategy': 'top_k',
 }
 
 def get_config(config_path):
