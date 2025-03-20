@@ -364,7 +364,7 @@ class ExpertMMDiT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_dim # Assuming hidden_dim still refers to image embedding dimension
+        self.hidden_dim = config.hidden_dim # Assuming hidden_dim still refers to image embedding dimension
         self.patch_size = config.patch_size
         self.in_channels = config.latent_channels  # VAE latent channels (16)
         self.out_channels = config.latent_channels  # Predict latent noise
@@ -377,7 +377,7 @@ class ExpertMMDiT(nn.Module):
         # Embeddings
         self.x_embedder = nn.Conv2d(
             self.in_channels,
-            self.hidden_size,
+            self.hidden_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size
         )
@@ -389,18 +389,18 @@ class ExpertMMDiT(nn.Module):
         # MMDiT blocks - using MMDiTBlockInternal (renamed DiTBlock)
         self.blocks = nn.ModuleList([
             MMDiTBlockInternal(
-                dim_image = self.hidden_size, # Image embedding dimension
+                dim_image = self.hidden_dim, # Image embedding dimension
                 dim_text = self.router_hidden_size, # Text embedding dimension (using router_hidden_size as projection)
                 dim_cond = self.router_hidden_size, # Time conditioning dimension (using router_hidden_size)
                 dim_head = self.config.num_heads, # Assuming num_heads is still relevant
                 heads = self.config.num_heads, # Assuming heads is still relevant
-                ff_kwargs=dict(mult=self.config.ffn_dim/self.config.hidden_dim) # Assuming ffn_dim ratio is still relevant
+                ff_kwargs=dict(mult=self.config.ffn_dim/config.hidden_dim) # Assuming ffn_dim ratio is still relevant
             )
             for _ in range(self.num_layers)
         ])
 
         # Final layer - remains the same
-        self.final_layer = FinalLayer(self.hidden_size, self.patch_size, self.out_channels)
+        self.final_layer = FinalLayer(self.hidden_dim, self.patch_size, self.out_channels)
 
         # Initialize weights - remains mostly the same
         self.initialize_weights()
@@ -432,7 +432,7 @@ class ExpertMMDiT(nn.Module):
         ), dim=-1).float()  # [H, W, 2]
         
         # Calculate embeddings for each dimension
-        omega = torch.arange(self.hidden_size // 4, device=device) / (self.hidden_size // 4 - 1)
+        omega = torch.arange(self.hidden_dim // 4, device=device) / (self.hidden_dim // 4 - 1)
         omega = 1. / (10000 ** omega)
         
         # Calculate embeddings
@@ -443,7 +443,7 @@ class ExpertMMDiT(nn.Module):
         pos_embed = torch.cat([
             torch.sin(y_embed), torch.cos(y_embed),
             torch.sin(x_embed), torch.cos(x_embed)
-        ], dim=-1).reshape(h * w, self.hidden_size).unsqueeze(0)  # [1, H*W, D]
+        ], dim=-1).reshape(h * w, self.hidden_dim).unsqueeze(0)  # [1, H*W, D]
         
         return pos_embed
             

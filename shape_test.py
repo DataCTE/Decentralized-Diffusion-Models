@@ -88,7 +88,8 @@ def test_full_pipeline():
         # Test router forward pass
         dummy_latent = torch.randn(1, config.latent_channels, 16, 16, device=device)
         dummy_t = torch.randint(0, 1000, (1,), device=device)
-        router_logits = router(dummy_latent, dummy_t)
+        dummy_text_embeds = torch.randn(1, config.clip_embedding_dim, device=device)
+        router_logits = router(dummy_latent, dummy_t, dummy_text_embeds)
         assert router_logits.shape == (1, config.num_experts), "Router output shape mismatch"
         
         # Test expert forward pass

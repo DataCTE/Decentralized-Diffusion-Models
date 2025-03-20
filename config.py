@@ -23,7 +23,6 @@ DEFAULT_CONFIG = {
     # ===== DDM Model parameters =====
     'num_experts': 8,
     'ffn_dim': 3072,    # 4x hidden_dim
-    'hidden_size': 768,
     'hidden_dim': 768,  # ExpertMMDiT uses hidden_dim instead of hidden_size
     'num_heads': 12,
     'num_layers': 12,
