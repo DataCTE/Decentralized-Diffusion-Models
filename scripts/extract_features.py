@@ -54,16 +54,23 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         raise FileNotFoundError(f"Dataset path not found: {dataset_path}. Please check your config.py")
 
     if is_main_process(): # File discovery only on main process (rank 0)
-        print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound, single-threaded)")
+        print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound, multi-threaded)")
         discovery_start_time = time.time()
         
         # Initialize progress bar with rate display
         with tqdm(unit='img', unit_scale=True, desc=f"Rank {rank} Discovering files") as progress_bar:
-            for ext in image_extensions:
-                pattern = os.path.join(dataset_path, f'*{ext}')
-                extension_image_paths = glob.glob(pattern)
-                image_paths.extend(extension_image_paths)
-                progress_bar.update(len(extension_image_paths))  # Update with number of images found
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                # Create futures for each extension
+                futures = [
+                    executor.submit(glob.glob, os.path.join(dataset_path, f'*{ext}'))
+                    for ext in image_extensions
+                ]
+                
+                # Process results as they complete
+                for future in as_completed(futures):
+                    extension_image_paths = future.result()
+                    image_paths.extend(extension_image_paths)
+                    progress_bar.update(len(extension_image_paths))
 
         discovery_duration = time.time() - discovery_start_time
         print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
