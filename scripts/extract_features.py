@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed # Import for mul
 def extract_features(config_path="config.py", output_dir="/workspace/Decentralized-Diffusion-Models/cache"):
     """
     Extracts DINOv2 features with multithreaded file discovery and processing for massive datasets.
+    (Compatible with older Python versions - manual depth control for os.walk)
     """
     rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{rank}")
@@ -37,13 +38,16 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     print(f"Rank {rank}: Starting multithreaded file discovery in {dataset_path}")
     discovery_start_time = time.time()
 
-    # Get subdirectories for parallel globbing - limit depth to avoid excessive recursion
+    # Get subdirectories for parallel globbing - limit depth manually
     subdirs = [dataset_path]  # Start with the main dataset path
-    for root, dirs, _ in os.walk(dataset_path, maxdepth=2): # Check only first 2 levels of subdirectories
+    depth_limit = 2 # Define depth limit
+    for root, dirs, _ in os.walk(dataset_path): # Removed maxdepth argument
+        current_depth = root[len(dataset_path.rstrip(os.sep)) + 1:].count(os.sep) # Calculate current depth
+        if current_depth >= depth_limit: # Stop if depth limit is reached
+            break
         for dir_name in dirs:
             subdir_path = os.path.join(root, dir_name)
             subdirs.append(subdir_path)
-        break # No need to go deeper for subdirectory discovery
 
     with ThreadPoolExecutor(max_workers=8) as executor: # Adjust max_workers as needed
         futures = []
