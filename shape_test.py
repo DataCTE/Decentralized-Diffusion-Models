@@ -51,9 +51,10 @@ def test_full_pipeline():
         torch.save(dummy_dims, os.path.join(tmpdir, "dim_cache.pt"))
         torch.save(torch.randint(0,4,(4,)), os.path.join(tmpdir, "train_clusters.pt"))
         
-        # Initialize dataset with reduced number of fine clusters for testing
-        clustering = DDMClustering(num_coarse_clusters=config.num_experts, num_fine_clusters=2)
-        dataset = DDMDataset(config, split='train', clusterer=clustering)
+        # Set num_fine_clusters in config before dataset initialization
+        config.num_fine_clusters = 2
+        # Initialize dataset
+        dataset = DDMDataset(config, split='train')
         
         # Test clustering matches paper specs
         assert hasattr(dataset, 'clusterer'), "Clustering not initialized"
