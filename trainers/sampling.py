@@ -29,6 +29,7 @@ def ddm_sample(
     callback=None,
     expert_cache_manager=None,
     temperature=1.0,
+    config=None,
 ):
     """
     Sample from Decentralized Diffusion Models as described in paper Section 3.5
@@ -49,12 +50,14 @@ def ddm_sample(
         callback: Optional callback function called after each step
         expert_cache_manager: Optional ExpertCacheManager for efficient expert loading
         temperature: Temperature for router softmax
+        config: Configuration object
         
     Returns:
         Sampled batch of images
     """
     # Performance optimizations:
-    config = get_config()
+    # config = get_config()  # Remove this line
+    # Use the config passed to ddm_sample instead
     
     # 1. Reduce sampling steps for validation
     if steps > 20 and getattr(config, 'fast_validation', True):

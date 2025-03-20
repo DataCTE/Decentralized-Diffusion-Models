@@ -531,7 +531,8 @@ class DDMTrainingCoordinator:
                     eta=getattr(self.config, 'eta', 0.0),
                     scheduler=getattr(self.config, 'beta_schedule', "cosine"),
                     verbose=True,
-                    temperature=getattr(self.config, 'temperature', 1.0)
+                    temperature=getattr(self.config, 'temperature', 1.0),
+                    config=self.config  # Add this line to pass the config
                 )
             
             # Save samples
