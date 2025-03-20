@@ -37,6 +37,8 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
 
     print(f"Rank {rank}: Starting multithreaded file discovery in {dataset_path} (CPU-bound)")
     discovery_start_time = time.time()
+    subdir_times = [] # To store times for subdir processing
+    processed_subdir_count = 0
 
     # File discovery - CPU-bound operations (os.walk, glob.glob) - performed on CPU
     subdirs = [dataset_path]  # Start with the main dataset path
@@ -57,11 +59,25 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
                 future = executor.submit(glob.glob, pattern) # Run glob.glob in thread
                 futures.append(future)
 
-        for future in futures:
+        for future in tqdm(as_completed(futures), total=len(subdirs), desc=f"Rank {rank} Discovering files"): # Added tqdm here
+            subdir_start_time = time.time()
             image_paths.extend(future.result()) # Collect image paths from each thread
+            subdir_duration = time.time() - subdir_start_time
+            subdir_times.append(subdir_duration)
+            processed_subdir_count += 1
+
+            if len(subdir_times) > 10:
+                subdir_times.pop(0) # Keep only last 10 times
+
+            avg_time_10_subdirs = sum(subdir_times) / len(subdir_times) if subdir_times else 0
+            subdirs_per_sec = 1 / avg_time_10_subdirs if avg_time_10_subdirs > 0 else 0
+
+            description = f"Rank {rank} Discovering files - Avg time/subdir (last 10): {avg_time_10_subdirs:.3f}s, Subdirs/sec: {subdirs_per_sec:.2f}"
+            tqdm.write("\r" + description, end='')
+
 
     discovery_duration = time.time() - discovery_start_time
-    print(f"Rank {rank}: Multithreaded file discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
+    print(f"\nRank {rank}: Multithreaded file discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
 
 
     if not image_paths:
