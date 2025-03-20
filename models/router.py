@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-
+from models.mmdit import TimestepEmbedder
 
 class SelfAttentionBlock(nn.Module):
     """Efficient self-attention block for the router"""
@@ -46,11 +46,7 @@ class RouterModel(nn.Module):
         )
         
         # Timestep embedding
-        self.time_embedder = nn.Sequential(
-            nn.Linear(1, config.router_hidden_size // 2),
-            nn.GELU(),
-            nn.Linear(config.router_hidden_size // 2, config.router_hidden_size)
-        )
+        self.time_embedder = TimestepEmbedder(config.router_hidden_size)
         
         # Text embedding projection
         self.text_embed_proj = nn.Linear(config.clip_embedding_dim, config.router_hidden_size)
