@@ -27,11 +27,10 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
         
-        # Initialize process group with explicit device_id
+        # Initialize process group with explicit device
         dist.init_process_group(
             backend='nccl',
-            init_method='env://',
-            device_id=local_rank
+            init_method='env://'
         )
         
         world_size = dist.get_world_size()
