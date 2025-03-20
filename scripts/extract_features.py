@@ -57,24 +57,36 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
         print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound, multi-threaded)")
         discovery_start_time = time.time()
         
+        # Initialize storage for valid files
+        valid_files = []
+        
+        # Discover all image files more efficiently
+        all_images = []
+        for ext in image_extensions:
+            pattern = os.path.join(dataset_path, f'**/*{ext}')
+            all_images.extend(glob.glob(pattern, recursive=True))
+        
         # Initialize progress bar with rate display
         with tqdm(unit='img', unit_scale=True, desc=f"Rank {rank} Discovering files", position=0, leave=True) as progress_bar:
+            # Process files with ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=8) as executor:
-                # Create futures for each extension
+                # Create futures for processing
                 futures = [
-                    executor.submit(glob.glob, os.path.join(dataset_path, f'*{ext}'))
-                    for ext in image_extensions
+                    executor.submit(_validate_image, img_path)
+                    for img_path in all_images
                 ]
                 
                 # Process results as they complete
                 for future in as_completed(futures):
-                    extension_image_paths = future.result()
-                    image_paths.extend(extension_image_paths)
-                    progress_bar.update(len(extension_image_paths))
-                    progress_bar.refresh()  # Force refresh the progress bar
+                    img_path = future.result()
+                    if img_path:
+                        valid_files.append(img_path)
+                        progress_bar.update(1)
+                        progress_bar.refresh()
 
         discovery_duration = time.time() - discovery_start_time
-        print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(image_paths)} images.")
+        print(f"\nRank {rank}: File discovery completed in {discovery_duration:.2f} seconds. Found {len(valid_files)} images.")
+        image_paths = valid_files
 
     else: # Non-main processes (ranks > 0)
         image_paths = [None] * world_size # Initialize image_paths list to receive broadcast
@@ -184,6 +196,15 @@ def process_single_image(image_path, processor, model, device, features_dir, dim
         image_process_time = image_process_end_time - image_process_start_time
         return image_process_time
 
+def _validate_image(img_path):
+    """Validate an image file"""
+    try:
+        # Quick validation by opening the image
+        with Image.open(img_path) as img:
+            img.verify()  # Verify that the file is a valid image
+            return img_path
+    except Exception:
+        return None
 
 if __name__ == "__main__":
     extract_features()
