@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import get_config
 from utils.distributed import setup_distributed, get_rank, get_world_size, is_main_process
 import glob
+from datetime import timedelta
 
 def extract_features(config_path="config.py", output_dir="cache"):
     """Main feature extraction workflow with distributed support"""
@@ -35,7 +36,8 @@ def distributed_setup():
     
     dist.init_process_group(
         backend='nccl',
-        init_method='env://'
+        init_method='env://',
+        timeout=timedelta(minutes=90)
     )
     
     world_size = dist.get_world_size()
