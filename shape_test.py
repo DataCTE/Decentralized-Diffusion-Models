@@ -145,7 +145,11 @@ def test_full_pipeline():
         plt.xlabel('Step')
         plt.ylabel('Loss')
         plt.tight_layout()
-        plt.show()
+
+        plot_path = os.path.join(tmpdir, "loss_curves.png")
+        plt.savefig(plot_path)
+        print(f"Loss curves plot saved to: {plot_path}")
+        plt.close()
 
         # Test sampling pipeline
         shape = (2, config.latent_channels, 16, 16)
