@@ -222,8 +222,8 @@ def ddm_sample(
                         if expert_idx in expert_predictions: # Check if expert prediction exists
                             expert_pred = expert_predictions[expert_idx] # Get prediction for this expert
 
-                            print(f"Step {t}, Batch {batch_index}: expert_pred shape={expert_pred.shape}, combined_pred shape={combined_pred.shape}")
-                            print(f"  expert_pred[batch_index] shape: {expert_pred[batch_index].shape}, combined_pred[batch_index] shape: {combined_pred[batch_index].shape}, weight shape: {expert_weights_k[batch_index].view(1, 1, 1, 1).shape}")
+                            #print(f"Step {t}, Batch {batch_index}: expert_pred shape={expert_pred.shape}, combined_pred shape={combined_pred.shape}")
+                            #print(f"  expert_pred[batch_index] shape: {expert_pred[batch_index].shape}, combined_pred[batch_index] shape: {combined_pred[batch_index].shape}, weight shape: {expert_weights_k[batch_index].view(1, 1, 1, 1).shape}")
 
                             weight = expert_weights_k[batch_index].view(1, 1, 1, 1) # Get weight for this batch and top_k position
                             combined_pred[batch_index:batch_index+1] += weight * expert_pred[batch_index:batch_index+1]
