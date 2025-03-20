@@ -46,29 +46,21 @@ def extract_features(config_path="config.py", output_dir="/workspace/Decentraliz
     if is_main_process(): # File discovery only on main process (rank 0)
         print(f"Rank {rank}: Starting file discovery in {dataset_path} (CPU-bound, single-threaded)")
         discovery_start_time = time.time()
-        image_discovery_times = [] # To store times for image discovery iterations
-        processed_iterations_count = 0
+        discovery_iteration_start_time = time.time() # Start time for the single discovery iteration
         total_discovered_images = 0 # Track total images discovered
 
         # File discovery - CPU-bound operations (glob.glob) - performed on CPU (single-threaded)
-        for ext in tqdm(image_extensions, desc=f"Rank {rank} Discovering files"): # Progress over image extensions, generic description
-            iteration_start_time = time.time()
-            pattern = os.path.join(dataset_path, f'*{ext}') # Direct glob in dataset_path
+        all_patterns = [os.path.join(dataset_path, f'*{ext}') for ext in image_extensions] # Create patterns for all extensions
+        for pattern in tqdm(all_patterns, desc=f"Rank {rank} Discovering files"): # Iterate through patterns for progress bar (still 4 iterations, but simpler)
             extension_image_paths = glob.glob(pattern) # Single-threaded glob.glob
             image_paths.extend(extension_image_paths) # Collect image paths
-            iteration_duration = time.time() - iteration_start_time
-            image_discovery_times.append(iteration_duration)
-            processed_iterations_count += 1
             total_discovered_images += len(extension_image_paths) # Accumulate discovered images
 
-            if len(image_discovery_times) > 10:
-                image_discovery_times.pop(0) # Keep only last 10 times
+        discovery_iteration_duration = time.time() - discovery_iteration_start_time # Duration for the entire discovery process
+        images_per_sec_overall = total_discovered_images / discovery_iteration_duration if discovery_iteration_duration > 0 else 0
 
-            
-            images_per_sec = len(extension_image_paths) / iteration_duration if iteration_duration > 0 else 0 # Images per second for current iteration
-
-            description = f"Rank {rank} Discovering files - Found: {total_discovered_images}, Images/sec (iteration): {images_per_sec:.2f}" # Updated description
-            tqdm.write("\r" + description, end='')
+        description = f"Rank {rank} Discovering files - Found: {total_discovered_images}, Images/sec (overall): {images_per_sec_overall:.2f}" # Updated description - overall rate
+        tqdm.write("\r" + description, end='')
 
 
         discovery_duration = time.time() - discovery_start_time
