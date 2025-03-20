@@ -66,5 +66,5 @@ class DDMClustering:
         ])
 
         # Assign samples to nearest coarse centroid (done in DDMDataset._distribute_samples based on these centroids)
-        distances = torch.cdist(features, self.coarse_centroids)
+        distances = torch.cdist(features, self.coarse_centroids.cpu())
         return torch.argmin(distances, dim=1) 
