@@ -485,32 +485,23 @@ class ExpertMMDiT(nn.Module):
         cond_vector = self.t_embedder(t)
 
         # Patch embedding - remains the same
-        print(f"Input x shape: {x.shape}") # Debug: input shape
         x = self.x_embedder(x)  # [B, D, H', W']
-        print(f"After x_embedder shape: {x.shape}") # Debug: after patch embedding
         batch_size, hidden_size, h, w = x.shape
         x = x.reshape(batch_size, hidden_size, h * w).transpose(1, 2) # [B, N, D] - Reshape to [B, N, D]
-        print(f"After reshape and transpose shape: {x.shape}") # Debug: after reshape
 
         text_embeds = self.text_projection(text_embeds) # Project text embeddings - adjust if needed
-        print(f"Text embeds shape: {text_embeds.shape}") # Debug: text embedding shape
 
         # MMDiT blocks - forward pass through MMDiT blocks
-        for i, block in enumerate(self.blocks):
-            print(f"Block {i} input x shape: {x.shape}, text_embeds shape: {text_embeds.shape}") # Debug: block input shape
+        for block in self.blocks:
             text_embeds, x = block( # MMDiTBlock now expects and returns text_embeds and image_tokens (x)
                 image_tokens = x,
                 text_tokens = text_embeds,
                 time_cond = cond_vector, # Pass timestep conditioning
                 text_mask = None # Assuming no text mask needed for now
             )
-            print(f"Block {i} output x shape: {x.shape}, text_embeds shape: {text_embeds.shape}") # Debug: block output shape
 
-        print(f"Final layer input x shape: {x.shape}, cond_vector shape: {cond_vector.shape}") # Debug: final layer input
         x = self.final_layer(x, cond_vector) # Final layer still takes image tokens (x) and cond_vector
-        print(f"After final_layer shape: {x.shape}") # Debug: after final layer
         x = self.unpatchify(x, h, w) # Unpatchify to get back to image shape
-        print(f"Output x shape: {x.shape}") # Debug: output shape
         return x
 
     def debug_tensor_shapes(self, prefix="", **tensors):

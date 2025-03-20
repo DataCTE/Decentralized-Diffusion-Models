@@ -226,7 +226,7 @@ def ddm_sample(
                             print(f"  expert_pred[batch_index] shape: {expert_pred[batch_index].shape}, combined_pred[batch_index] shape: {combined_pred[batch_index].shape}, weight shape: {expert_weights_k[batch_index].view(1, 1, 1, 1).shape}")
 
                             weight = expert_weights_k[batch_index].view(1, 1, 1, 1) # Get weight for this batch and top_k position
-                            combined_pred[batch_index] += weight * expert_pred[batch_index] # Accumulate weighted prediction
+                            combined_pred[batch_index:batch_index+1] += weight * expert_pred[batch_index:batch_index+1]
             else:
                 # Full ensemble sampling: use all experts (more computationally expensive)
                 for expert_idx, expert_pred in expert_predictions.items():
