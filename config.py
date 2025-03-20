@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 # Add this at the top under imports
 DEFAULT_CONFIG = {
     # ===== Training parameters =====
-    'num_steps': 100000,
+    'num_steps': 1000000,
     'batch_size': 16,
     'learning_rate': 1e-4,
     'weight_decay': 1e-2,
@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
     
     # ===== Dataset parameters =====
     'dataset_path': '/home/alex/workspace/datasets/danbooru2025',
-    'dataset_size': 100000,
+    'dataset_size': 300000,
     'min_size': 256,  # Minimum image dimension
     'max_size': 1024,  # Maximum image dimension
     'val_size': 1000,
@@ -147,6 +147,11 @@ DEFAULT_CONFIG = {
     'max_sampling_experts': 4,  # Maximum experts to use in sampling
     'fast_validation': True,    # Use fewer steps for validation
     'sampling_steps': 20,       # Default number of sampling steps for validation
+    
+    # ===== Training controls =====
+    'enable_validation': False,
+    'enable_sampling': False, 
+    'enable_checkpointing': True,
 }
 
 def get_config(config_path):

@@ -78,6 +78,13 @@ class DDMTrainingCoordinator:
         # Defer non-critical initialization
         self.flow_matcher = None  # Will be created on first training step
         
+        # Modify sample directory creation
+        if config.enable_sampling and rank == 0:
+            sample_dir = os.path.join(config.output_dir, 'samples')
+            os.makedirs(sample_dir, exist_ok=True)
+        else:
+            logger.info("Sampling disabled in config")
+        
         # Final initialization sync
         total_init_time = time.time() - init_start_time
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
@@ -288,12 +295,12 @@ class DDMTrainingCoordinator:
             if step % 100 == 0 or step == num_steps - 1:
                 logger.info(f"Step {step}/{num_steps}: Expert loss = {expert_loss:.4f}, Router loss = {router_loss:.4f}")
                 
-            # Periodic validation
-            if step % 1000 == 0:
+            # Modified periodic validation with config check
+            if self.config.enable_validation and step % self.config.validate_every == 0:
                 self.validate(step)
                 
-            # Save checkpoint every N steps
-            if step > 0 and step % 5000 == 0:
+            # Modified checkpoint saving with config check
+            if self.config.enable_checkpointing and step > 0 and step % self.config.save_every == 0:
                 self.save_checkpoint(step)
         
         # Log final training stats
@@ -371,8 +378,8 @@ class DDMTrainingCoordinator:
     
     def validate(self, step):
         """Run validation using DDM inference process"""
-        # Only run validation on rank 0
-        if self.rank != 0:
+        if not self.config.enable_validation:
+            logger.debug("Skipping validation (disabled in config)")
             return
             
         logger.info(f"Running validation at step {step}")
@@ -391,7 +398,8 @@ class DDMTrainingCoordinator:
     
     def generate_samples(self, num_samples=4, step=None, prompts=None, return_images=False):
         """Generate samples using the DDM inference approach"""
-        if self.rank != 0:
+        if not self.config.enable_sampling:
+            logger.debug("Skipping sample generation (disabled in config)")
             return None
             
         logger.info(f"Generating {num_samples} samples")
@@ -565,8 +573,8 @@ class DDMTrainingCoordinator:
     
     def save_checkpoint(self, step):
         """Save checkpoint of all components"""
-        # Only save from main process unless configured otherwise
-        if self.rank != 0 and not getattr(self.config, 'save_from_all_ranks', False):
+        if not self.config.enable_checkpointing:
+            logger.debug("Skipping checkpoint save (disabled in config)")
             return
             
         logger.info(f"Saving checkpoint at step {step}")
@@ -671,6 +679,13 @@ class DDMTrainingCoordinator:
                 print("=" * 80 + "\n")
                 
                 logger.info(f"W&B initialized: {wandb.run.name} (ID: {wandb.run.id})")
+                
+                # Add config flags to wandb
+                wandb.config.update({
+                    "enable_validation": self.config.enable_validation,
+                    "enable_sampling": self.config.enable_sampling,
+                    "enable_checkpointing": self.config.enable_checkpointing
+                })
                 
             except ImportError:
                 logger.warning("wandb package not found. Install with 'pip install wandb'")
