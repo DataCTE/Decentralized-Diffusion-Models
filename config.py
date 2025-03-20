@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
     
     # ===== Dataset parameters =====
     'dataset_path': '/home/alex/workspace/datasets/danbooru2025',
-    'dataset_size': 300000,
+    'dataset_size': 380000,
     'min_size': 256,  # Minimum image dimension
     'max_size': 1024,  # Maximum image dimension
     'val_size': 1000,

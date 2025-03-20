@@ -331,6 +331,19 @@ def run_inference_pipeline(
         num_steps: Number of sampling steps
         cache_manager: Optional ExpertCacheManager for efficient expert loading
     """
+    # Add config validation
+    if not config.enable_sampling:
+        logger.error("Sampling disabled in config, aborting inference")
+        return
+    
+    # Add expert count check
+    if len(expert_models) == 0:
+        logger.error("No experts found for inference")
+        return
+    
+    # Add device synchronization
+    torch.cuda.synchronize(device=device)
+    
     # Load models
     router_model, expert_models, vae, clip = load_models(config, device, checkpoint_dir, cache_manager)
     

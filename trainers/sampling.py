@@ -10,6 +10,7 @@ from trainers.diffusion import (
 import torch.nn.functional as F
 from collections import defaultdict
 from config import get_config
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,19 @@ def ddm_sample(
     for expert in experts.values():
         if hasattr(expert, 'eval'):
             expert.eval()
+    
+    # Add expert count validation
+    if len(experts) == 0:
+        raise ValueError("No experts available for sampling")
+    
+    # Add expert availability check
+    available_experts = [idx for idx in experts if experts[idx] is not None]
+    if len(available_experts) == 0:
+        raise RuntimeError("No valid experts found for sampling")
+    
+    # Add distributed barrier
+    if dist.is_initialized():
+        dist.barrier()
     
     # 3. Use no_grad context for the entire sampling
     with torch.no_grad():
