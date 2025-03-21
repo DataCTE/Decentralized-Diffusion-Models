@@ -106,6 +106,12 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
         x_{t-1}: Next latent
     """
     try:
+        print("Shape of t:", t.shape)
+        print("Values of t:", t)
+        if t_next is not None:
+            print("Shape of t_next:", t_next.shape)
+            print("Values of t_next:", t_next)
+
         # Get model prediction
         with torch.no_grad():
             noise_pred = model(x_t, t, text_embeddings)
