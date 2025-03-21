@@ -118,13 +118,16 @@ class DDMDataset(Dataset):
         self._feature_loading_lock = defaultdict(threading.Lock) # Initialize lock
         self.feature_counts_per_file = [] # New: store feature counts per file
         cumulative_feature_count = 0 # New: track cumulative count
-        for file_name in self.feature_files:
-            file_path = os.path.join(feature_path, file_name)
-            # Load just to get shape, avoid loading all features into memory
-            sample_features = torch.load(file_path, map_location='cpu')
-            num_features_in_file = sample_features.shape[0]
-            self.feature_counts_per_file.append(num_features_in_file)
-            cumulative_feature_count += num_features_in_file
+
+        # Use ThreadPoolExecutor to parallelize feature count loading
+        with ThreadPoolExecutor(max_workers=8) as executor: # Adjust max_workers as needed
+            futures = [executor.submit(self._get_feature_count, os.path.join(feature_path, file_name))
+                       for file_name in self.feature_files]
+            for future in futures:
+                num_features_in_file = future.result()
+                self.feature_counts_per_file.append(num_features_in_file)
+                cumulative_feature_count += num_features_in_file
+
         self.cumulative_feature_counts = torch.tensor(self.feature_counts_per_file).cumsum(dim=0) # New: cumulative counts
         self.total_features = cumulative_feature_count # New: total features across all files
 
@@ -688,6 +691,11 @@ class DDMDataset(Dataset):
                 self.bucket_samplers[bucket_idx] = SubsetRandomSampler(bucket_indices)
         
         logger.info(f"Created {len(self.bucket_samplers)} bucket-specific samplers")
+
+    def _get_feature_count(self, file_path):
+        """Helper function to load a feature file and get the count of features"""
+        sample_features = torch.load(file_path, map_location='cpu')
+        return sample_features.shape[0]
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
