@@ -42,6 +42,9 @@ def ddm_sample(
     alphas = alphas.to(device)
     alpha_bar = alpha_bar.to(device)
 
+    print("Shape of alphas:", alphas.shape)
+    print("Shape of alpha_bar:", alpha_bar.shape)
+
     batch_size = shape[0]
     if text_embeddings is not None:
         text_embeddings = text_embeddings[:batch_size]
