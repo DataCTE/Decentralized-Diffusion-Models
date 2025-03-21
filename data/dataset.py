@@ -98,7 +98,7 @@ class DDMDataset(Dataset):
             # Broadcast metadata to other ranks
             broadcast_object((self.cluster_lengths, self.cumulative_clusters, self.feature_lengths, self.cumulative_features))
         else: # Receive broadcasted metadata on other ranks
-            (self.cluster_lengths, self.cumulative_clusters, self.feature_lengths, self.cumulative_features) = broadcast_object()
+            (self.cluster_lengths, self.cumulative_clusters, self.feature_lengths, self.cumulative_features) = broadcast_object(None)
 
         # Limited caches
         self.cluster_cache = OrderedDict()
