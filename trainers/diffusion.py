@@ -121,7 +121,12 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
         a_prev = a_prev.view(-1, 1, 1, 1)
         a_bar_t = a_bar_t.view(-1, 1, 1, 1)
         a_bar_prev = a_bar_prev.view(-1, 1, 1, 1)
-        
+
+        print("Shape of x_t:", x_t.shape)
+        print("Shape of noise_pred:", noise_pred.shape)
+        print("Shape of a_bar_t:", a_bar_t.shape)
+        print("Shape of (1 - a_bar_t).sqrt():", (1 - a_bar_t).sqrt().shape)
+
         # Compute predicted x0
         x0_pred = (x_t - torch.sqrt(1 - a_bar_t) * noise_pred) / torch.sqrt(a_bar_t)
         
