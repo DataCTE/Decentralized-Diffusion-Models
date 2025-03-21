@@ -54,7 +54,7 @@ def precompute_latents(config_path="config.py", output_dir="cache", precompute_v
 
 
     # Initialize dataset (only for file discovery)
-    dataset = DDMDataset(dataset_config, split='train')
+    dataset = DDMDataset(dataset_config, split='train', bypass_clip_check=True)
 
     image_files_partition = partition_data(dataset.image_files, rank, world_size)
 

@@ -50,6 +50,7 @@ class DDMDataset(Dataset):
         self.logger = logging.getLogger(__name__)
         self.config = config
         self.split = split
+        self.bypass_clip_check = False # Add bypass_clip_check flag, default False
         
         # Validate required parameters
         if not hasattr(config, 'min_size'):
@@ -100,8 +101,9 @@ class DDMDataset(Dataset):
         if not os.path.exists(latent_path): # New: check for latent path
             raise FileNotFoundError(f"Latents not found at {latent_path}. Run precompute_latents.py first.")
 
-        if not os.path.exists(clip_embedding_output_dir): # New: check for clip embedding path
-            raise FileNotFoundError(f"CLIP embeddings not found at {clip_embedding_output_dir}. Run precompute_latents.py with --precompute_clip first.")
+        if not self.bypass_clip_check: # Conditionally check for clip embeddings dir
+            if not os.path.exists(clip_embedding_output_dir): # New: check for clip embedding path
+                raise FileNotFoundError(f"CLIP embeddings not found at {clip_embedding_output_dir}. Run precompute_latents.py with --precompute_clip first.")
 
         cluster_files = sorted([f for f in os.listdir(cluster_path) if f.endswith(".cluster.pt")])
 
