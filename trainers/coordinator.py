@@ -417,145 +417,85 @@ class DDMTrainingCoordinator:
         
         # Define expert builder function for cache manager
         def expert_builder_fn(expert_idx):
-            # Import the actual expert trainer class 
             from trainers.expert import ExpertTrainer
-            
-            # Create a new expert trainer with proper initialization 
-            expert = ExpertTrainer(
+            return ExpertTrainer(
                 expert_idx=expert_idx,
                 config=self.config,
                 device=self.device,
                 rank=self.rank,
                 world_size=self.world_size
             )
-            return expert
         
-        # Implement expert sharing - Get access to more experts
-        # Approach: For rank 0, create additional experts beyond its assigned ones
         experts_dict = {}
-        
-        # First collect local experts
         for expert_idx in self.expert_indices:
             experts_dict[expert_idx] = self.cache_manager.get_expert(expert_idx, expert_builder_fn)
-        
-        # For rank 0, also create additional experts for better sampling
-        # Define max number of experts to use for sampling
+
         max_sampling_experts = min(getattr(self.config, 'max_sampling_experts', 4), self.config.num_experts)
         
-        # Add additional experts if needed (up to max_sampling_experts)
         if self.rank == 0 and len(experts_dict) < max_sampling_experts:
-            # Get indices of experts we need to create
             all_expert_indices = list(range(self.config.num_experts))
             needed_experts = sorted(all_expert_indices[:max_sampling_experts])
             missing_experts = [idx for idx in needed_experts if idx not in self.expert_indices]
             
             if missing_experts:
                 logger.info(f"Creating {len(missing_experts)} additional experts for sampling: {missing_experts}")
-                # Ensure all ranks participate in expert creation
                 for expert_idx in missing_experts:
-                    # Create expert with proper distributed context
-                    with self.router.router.no_sync():  # Disable router gradient sync
+                    with self.router.router.no_sync():
                         expert = expert_builder_fn(expert_idx)
-                        if hasattr(expert, 'module'):  # Unwrap DDP/FSDP
-                            experts_dict[expert_idx] = expert.module
-                        else:
-                            experts_dict[expert_idx] = expert
+                        experts_dict[expert_idx] = expert.module if hasattr(expert, 'module') else expert
                         logger.info(f"Successfully created expert {expert_idx} for sampling")
-                    # Synchronize after expert creation
                     torch.distributed.barrier()
         
-        # Put experts in evaluation mode before sampling
         for expert in experts_dict.values():
             if hasattr(expert, 'expert'):
-                expert.expert.eval()  # For ExpertTrainer objects
+                expert.expert.eval()
             else:
-                expert.eval()  # For direct model objects
-        
-        # Validate top_k value
-        top_k = getattr(self.config, 'top_k', 1)
-        num_available_experts = len(experts_dict)
-        if top_k > num_available_experts:
-            logger.warning(f"top_k ({top_k}) is greater than available experts ({num_available_experts}). Setting top_k={num_available_experts}")
-            top_k = num_available_experts
-        
-        # Use proper DDM sampling from trainers/sampling.py
+                expert.eval()
+
         try:
-            # Determine whether to use mixed precision
             use_mixed_precision = getattr(self.config, 'use_mixed_precision', False)
             
-            # Use the first bucket's dimensions for sampling
-            # In real applications, you might want to sample from different buckets
             if hasattr(self.config, 'buckets') and len(self.config.buckets) > 0:
-                w, h = self.config.buckets[0]  # Get dimensions from first bucket
-                
-                # Use latent_channels instead of image_size[0]
-                C = getattr(self.config, 'latent_channels', 16)  # Default to 16 for 16ch-VAE
-                
-                # Adjust dimensions for VAE latent space if needed
+                w, h = self.config.buckets[0]
+                C = getattr(self.config, 'latent_channels', 16)
                 vae_scale_factor = getattr(self.config, 'vae_scale_factor', 8)
                 latent_h, latent_w = h // vae_scale_factor, w // vae_scale_factor
-                
                 shape = (num_samples, C, latent_h, latent_w)
-                logger.info(f"Generating samples with dimensions {shape} (scaled from {w}x{h}) from bucket 0")
             else:
-                # Fallback to image_size but ensure we use latent_channels
-                H, W = self.config.image_size[1], self.config.image_size[2]  # Only take H and W
-                C = getattr(self.config, 'latent_channels', 16)  # Get channel count from config
-                
-                # Scale down for latent space
+                H, W = self.config.image_size[1], self.config.image_size[2]
+                C = getattr(self.config, 'latent_channels', 16)
                 vae_scale_factor = getattr(self.config, 'vae_scale_factor', 8)
                 latent_h, latent_w = H // vae_scale_factor, W // vae_scale_factor
-                
                 shape = (num_samples, C, latent_h, latent_w)
-                logger.info(f"Generating samples with dimensions {shape} from image_size")
             
-            # Get optional text embeddings if conditional
             text_embeddings = None
             uncond_embeddings = None
-            if prompts is not None and hasattr(self, 'text_encoder') and self.text_encoder is not None:
-                text_embeddings = []
-                for prompt in prompts:
-                    text_embeddings.append(self.text_encoder.encode(prompt))
-                text_embeddings = torch.cat(text_embeddings, dim=0).to(self.device)
-                
-                # Create unconditional embeddings (empty string) for classifier-free guidance
-                uncond_embeddings = self.text_encoder.encode([""] * num_samples).to(self.device)
+            if prompts is not None and hasattr(self, 'text_encoder'):
+                text_embeddings = torch.cat([self.text_encoder.encode(p) for p in prompts], dim=0).to(self.device)
+                uncond_embeddings = self.text_encoder.encode([""]*num_samples).to(self.device)
             
-            # Access the actual router model, not the trainer
             router_model = self.router.router if hasattr(self.router, 'router') else self.router
-            
-            # Ensure router is in evaluation mode
             if hasattr(router_model, 'eval'):
                 router_model.eval()
             
-            # Use consistent precision throughout sampling
             with torch.amp.autocast(device_type='cuda', enabled=use_mixed_precision):
-                # Use ddm_sample from trainers/sampling.py for proper DDM sampling
                 samples = ddm_sample(
-                    router=router_model,  # Use the actual model, not the trainer
+                    router=router_model,
                     experts=experts_dict,
                     shape=shape,
-                    steps=getattr(self.config, 'sampling_steps', 50),
-                    top_k=top_k,
+                    num_steps=self.config.sampling_steps,
+                    cfg_scale=self.config.cfg_scale,
+                    temperature=self.config.sampling_temp,
                     device=self.device,
-                    cfg_scale=getattr(self.config, 'cfg_scale', 7.5),
                     text_embeddings=text_embeddings,
-                    uncond_embeddings=uncond_embeddings,
-                    eta=getattr(self.config, 'eta', 0.0),
-                    scheduler=getattr(self.config, 'beta_schedule', "cosine"),
-                    verbose=True,
-                    temperature=getattr(self.config, 'temperature', 1.0),
-                    config=self.config  # Add this line to pass the config
+                    uncond_embeddings=uncond_embeddings
                 )
             
-            # Save samples
             try:
                 from torchvision.utils import save_image
                 for i in range(num_samples):
-                    # Convert to appropriate format for saving if needed
-                    sample_to_save = samples[i].float() if samples[i].dtype != torch.float32 else samples[i]
+                    sample_to_save = samples[i].float()
                     save_image(sample_to_save, os.path.join(sample_dir, f'sample_{i}.png'))
-                    
                 logger.info(f"Saved {num_samples} samples to {sample_dir}")
             except Exception as e:
                 logger.error(f"Error saving samples: {e}")
@@ -563,12 +503,10 @@ class DDMTrainingCoordinator:
         except Exception as e:
             logger.error(f"Error generating samples: {e}")
             import traceback
-            logger.error(traceback.format_exc())  # Add detailed traceback
+            logger.error(traceback.format_exc())
         
-        # Return images if requested
         if return_images and samples is not None:
-            # Ensure we return float32 tensors for consistency
-            return samples.float() if hasattr(samples, 'float') else samples
+            return samples.float()
         return None
     
     def save_checkpoint(self, step):

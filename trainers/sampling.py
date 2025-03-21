@@ -15,112 +15,60 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 def ddm_sample(
-    router, 
-    experts, 
-    shape, 
-    steps=50, 
-    top_k=1, 
-    device="cuda", 
+    router,
+    experts,
+    shape,
+    num_steps=50,  # Renamed from steps for consistency
+    device=None,    # Get device from router instead of parameter
     cfg_scale=7.5,
     text_embeddings=None,
     uncond_embeddings=None,
-    eta=0.0,  # 0.0 = deterministic (DDIM), 1.0 = stochastic (DDPM)
-    scheduler="cosine",
+    eta=0.0,
     verbose=True,
-    callback=None,
-    expert_cache_manager=None,
     temperature=1.0,
-    config=None,
 ):
-    """
-    Sample from Decentralized Diffusion Models as described in paper Section 3.5
+    """Naive DDM sampling following paper's simple example"""
+    # Auto-detect device if not specified
+    if device is None:
+        device = next(router.parameters()).device
     
-    Args:
-        router: Router model
-        experts: Dict of expert models {expert_idx: model}
-        shape: Output shape [B, C, H, W]
-        steps: Number of sampling steps
-        top_k: Number of experts to use per step (0 for full ensemble)
-        device: Device to sample on
-        cfg_scale: Classifier-free guidance scale
-        text_embeddings: Optional text embeddings for conditioning
-        uncond_embeddings: Optional unconditional embeddings for CFG
-        eta: Controls the amount of noise added (0.0 = DDIM, 1.0 = DDPM)
-        scheduler: Noise schedule ("cosine", "linear", etc.)
-        verbose: Whether to show progress bar
-        callback: Optional callback function called after each step
-        expert_cache_manager: Optional ExpertCacheManager for efficient expert loading
-        temperature: Temperature for router softmax
-        config: Configuration object
-        
-    Returns:
-        Sampled batch of images
-    """
-    # Paper-recommended optimizations
-    if config is None:
-        raise ValueError("Config must be provided for DDM sampling")
-        
     # Initialize from random noise
     x = torch.randn(shape, device=device)
+    num_clusters = len(experts)
     
-    # Get batch size from shape
-    batch_size = shape[0]
-    
-    # Paper's recommended noise schedule
-    alphas, alpha_bar, betas = get_alphas_and_betas(steps, "cosine")
+    # Get paper-recommended cosine schedule (remove scheduler parameter)
+    alphas, alpha_bar, _ = get_alphas_and_betas(num_steps, "cosine")
     alphas = alphas.to(device)
     alpha_bar = alpha_bar.to(device)
-    
-    # Track expert usage as described in paper Appendix C.2
-    expert_usage = defaultdict(int)
-    
-    # Sampling loop with paper's recommended modifications
-    for t in tqdm(range(steps), disable=not verbose):
-        timestep = torch.full((batch_size,), t, device=device)
+
+    for t in tqdm(range(num_steps), disable=not verbose):
+        timestep = torch.full((shape[0],), t, device=device)
         
-        # Get router predictions (paper Eq. 7)
+        # Get router predictions
         router_logits = router(x, timestep, text_embeddings)
         router_weights = F.softmax(router_logits / temperature, dim=-1)
         
-        # Select top-k experts per sample (paper Section 3.5)
-        expert_weights, expert_indices = torch.topk(router_weights, top_k, dim=-1)
-        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
-        
-        # Get unique experts needed for this step
-        selected_experts = torch.unique(expert_indices)
-        
-        # Get predictions from required experts
-        expert_preds = []
-        for expert_idx in selected_experts:
-            expert = experts[expert_idx]
-            mask = (expert_indices == expert_idx).any(dim=1)
+        # Combine expert predictions
+        combined_pred = torch.zeros_like(x)
+        for cluster_idx in range(num_clusters):
+            expert = experts[cluster_idx]
             
-            # Get conditional and unconditional predictions
+            # Classifier-free guidance
             if text_embeddings is not None and cfg_scale > 1.0:
-                uncond_pred = expert(x[mask], timestep[mask], uncond_embeddings[mask])
-                cond_pred = expert(x[mask], timestep[mask], text_embeddings[mask])
+                uncond_pred = expert(x, timestep, uncond_embeddings)
+                cond_pred = expert(x, timestep, text_embeddings)
                 pred = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
             else:
-                pred = expert(x[mask], timestep[mask], text_embeddings[mask] if text_embeddings else None)
+                pred = expert(x, timestep, text_embeddings)
             
-            expert_preds.append(pred)
-            expert_usage[expert_idx.item()] += mask.sum().item()
+            combined_pred += router_weights[:, cluster_idx].view(-1,1,1,1) * pred
 
-        # Combine predictions using router weights (paper Eq. 4)
-        combined_pred = torch.zeros_like(x)
-        for batch_idx in range(batch_size):
-            for k in range(top_k):
-                expert_idx = expert_indices[batch_idx, k]
-                weight = expert_weights[batch_idx, k]
-                pred = expert_preds[selected_experts.tolist().index(expert_idx)][batch_idx]
-                combined_pred[batch_idx] += weight * pred
-
-        # Paper's recommended DDIM update step
+        # DDIM update step
         x = ddim_step(
             lambda x_t, t, c: combined_pred,
             x,
             timestep,
-            torch.full((batch_size,), t+1, device=device) if t < steps-1 else None,
+            torch.full((shape[0],), t+1, device=device) if t < num_steps-1 else None,
             alphas,
             alpha_bar,
             eta=eta
@@ -226,31 +174,20 @@ def quantize_model_for_inference(model, dtype=torch.float16):
     logger.info(f"Converted model to {dtype} for efficient inference")
     return model
 
-def ddm_sample_optimized(router, experts, shape, steps=50, top_k=1, **kwargs):
+def ddm_sample_optimized(router, experts, shape, **kwargs):
     """
-    Memory-optimized version of ddm_sample that quantizes models
-    
-    Args:
-        Same as ddm_sample but applies quantization
-        
-    Returns:
-        Sampled tensor
+    Memory-optimized version that quantizes models
     """
-    # Quantize router for efficient inference
+    # Quantize models
     quantized_router = quantize_model_for_inference(router)
+    quantized_experts = {
+        idx: quantize_model_for_inference(expert)
+        for idx, expert in experts.items()
+    }
     
-    # Quantize experts
-    quantized_experts = {}
-    for idx, expert in experts.items():
-        if expert is not None:
-            quantized_experts[idx] = quantize_model_for_inference(expert)
-    
-    # Call regular sampling with quantized models
     return ddm_sample(
         router=quantized_router,
         experts=quantized_experts,
         shape=shape,
-        steps=steps,
-        top_k=top_k,
         **kwargs
     ) 
