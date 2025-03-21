@@ -558,7 +558,7 @@ class DDMDataset(Dataset):
 
     def _load_cluster_assignment(self, index):
         """Load cluster assignment for a given index from file, using cache"""
-        file_index = index // (len(self.clusters_assignments) // self.num_cluster_files) # Calculate file index
+        file_index = index // (len(self.image_files) // self.num_cluster_files) # Calculate file index
         cluster_file_name = self.cluster_files[file_index]
         
         if cluster_file_name not in self.cluster_assignments_cache: # Check cache
@@ -566,7 +566,7 @@ class DDMDataset(Dataset):
             self.cluster_assignments_cache[cluster_file_name] = torch.load(cluster_file_path, map_location='cpu') # Load and cache
 
         file_assignments = self.cluster_assignments_cache[cluster_file_name]
-        index_within_file = index % (len(self.clusters_assignments) // self.num_cluster_files) # Calculate index within file
+        index_within_file = index % (len(self.image_files) // self.num_cluster_files) # Calculate index within file
         return file_assignments[index_within_file] # Return assignment for index within file
 
     def _load_feature(self, index):
