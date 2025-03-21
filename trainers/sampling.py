@@ -42,8 +42,8 @@ def ddm_sample(
     alphas = alphas.to(device)
     alpha_bar = alpha_bar.to(device)
 
-    print("Shape of alphas:", alphas.shape)
-    print("Shape of alpha_bar:", alpha_bar.shape)
+    #print("Shape of alphas:", alphas.shape)
+    #print("Shape of alpha_bar:", alpha_bar.shape)
 
     batch_size = shape[0]
     if text_embeddings is not None:
@@ -53,10 +53,10 @@ def ddm_sample(
     for t in tqdm(range(num_steps), disable=not verbose):
         timestep = torch.full((x.size(0),), t, device=device)
 
-        print(f"Sampling loop iteration: t = {t}") # Print current timestep iteration
-        print("Shape of timestep:", timestep.shape) # Print shape of timestep tensor
-        print("Values of timestep:", timestep) # Print values of timestep tensor
-        print(f"Timestep value range: min={timestep.min()}, max={timestep.max()}") # Print min/max timestep values
+        #print(f"Sampling loop iteration: t = {t}") # Print current timestep iteration
+        #print("Shape of timestep:", timestep.shape) # Print shape of timestep tensor
+        #print("Values of timestep:", timestep) # Print values of timestep tensor
+        #print(f"Timestep value range: min={timestep.min()}, max={timestep.max()}") # Print min/max timestep values
 
         # Get router predictions
         router_logits = router(x, timestep, text_embeddings)
@@ -190,8 +190,8 @@ def ddm_sample(
                 sample_pred += pred * weight # Accumulate prediction for this sample
             combined_pred[batch_idx:batch_idx+1] = sample_pred # Assign sample prediction to combined prediction
 
-        print("Shape of combined_pred before ddim_step:", combined_pred.shape)
-        print("Shape of timestep before ddim_step:", timestep.shape)
+        #print("Shape of combined_pred before ddim_step:", combined_pred.shape)
+        #print("Shape of timestep before ddim_step:", timestep.shape)
 
         # DDIM update step
         x = ddim_step(

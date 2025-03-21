@@ -111,15 +111,15 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
             noise_pred = model(x_t, t, text_embeddings)
             
         # Now safe to print noise_pred details
-        print("Shape of t:", t.shape)
-        print("Values of t:", t)
-        if t_next is not None:
-            print("Shape of t_next:", t_next.shape)
-            print("Values of t_next:", t_next)
+        #print("Shape of t:", t.shape)
+        #print("Values of t:", t)
+        #if t_next is not None:
+            #print("Shape of t_next:", t_next.shape)
+            #print("Values of t_next:", t_next)
 
-        print("dtype of x_t:", x_t.dtype)
-        print("dtype of noise_pred:", noise_pred.dtype)
-        print("Shape of noise_pred:", noise_pred.shape)
+        #print("dtype of x_t:", x_t.dtype)
+        #print("dtype of noise_pred:", noise_pred.dtype)
+        #print("Shape of noise_pred:", noise_pred.shape)
         
         # Get alphas for current and next timestep
         a_t = alphas[t]
@@ -133,10 +133,10 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
         a_bar_t = a_bar_t.view(-1, 1, 1, 1)
         a_bar_prev = a_bar_prev.view(-1, 1, 1, 1)
 
-        print("Shape of x_t:", x_t.shape)
-        print("Shape of noise_pred:", noise_pred.shape)
-        print("Shape of a_bar_t:", a_bar_t.shape)
-        print("Shape of (1 - a_bar_t).sqrt():", (1 - a_bar_t).sqrt().shape)
+        #print("Shape of x_t:", x_t.shape)
+        #print("Shape of noise_pred:", noise_pred.shape)
+        #print("Shape of a_bar_t:", a_bar_t.shape)
+        #print("Shape of (1 - a_bar_t).sqrt():", (1 - a_bar_t).sqrt().shape)
 
         # Compute predicted x0
         try:
@@ -150,9 +150,9 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
         
         # Compute variance
         try:
-            print("Shape of a_bar_prev:", a_bar_prev.shape)
-            print("Shape of a_bar_t:", a_bar_t.shape)
-            print("Shape of a_t:", a_t.shape)
+            #print("Shape of a_bar_prev:", a_bar_prev.shape)
+            #print("Shape of a_bar_t:", a_bar_t.shape)
+            #print("Shape of a_t:", a_t.shape)
             var = eta * torch.sqrt(
                 (1 - a_bar_prev) / (1 - a_bar_t) * (1 - a_t / a_bar_t)
             )
