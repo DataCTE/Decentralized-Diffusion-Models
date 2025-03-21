@@ -558,20 +558,22 @@ class DDMDataset(Dataset):
 
     def _load_cluster_assignment(self, index):
         """Load cluster assignment for a given index from file, using cache"""
-        file_index = index // (len(self.image_files) // self.num_cluster_files) # Calculate file index
+        samples_per_cluster_file = (len(self.image_files) // self.num_cluster_files)
+        file_index = index // max(samples_per_cluster_file, 1) # Calculate file index, ensure divisor is not zero
         cluster_file_name = self.cluster_files[file_index]
-        
+
         if cluster_file_name not in self.cluster_assignments_cache: # Check cache
             cluster_file_path = os.path.join(self.cluster_path, cluster_file_name)
             self.cluster_assignments_cache[cluster_file_name] = torch.load(cluster_file_path, map_location='cpu') # Load and cache
 
         file_assignments = self.cluster_assignments_cache[cluster_file_name]
-        index_within_file = index % (len(self.image_files) // self.num_cluster_files) # Calculate index within file
+        index_within_file = index % max(samples_per_cluster_file, 1) # Calculate index within file, ensure divisor is not zero
         return file_assignments[index_within_file] # Return assignment for index within file
 
     def _load_feature(self, index):
         """Load feature for a given index from file, using cache"""
-        file_index = index // (len(self.features) // self.num_feature_files) # Calculate file index
+        samples_per_feature_file = (len(self.features) // self.num_feature_files)
+        file_index = index // max(samples_per_feature_file, 1) # Calculate file index, ensure divisor is not zero
         feature_file_name = self.feature_files[file_index]
 
         if feature_file_name not in self.features_cache: # Check cache
@@ -579,7 +581,7 @@ class DDMDataset(Dataset):
             self.features_cache[feature_file_name] = torch.load(feature_file_path, map_location='cpu') # Load and cache
 
         file_features = self.features_cache[feature_file_name]
-        index_within_file = index % (len(self.features) // self.num_feature_files) # Calculate index within file
+        index_within_file = index % max(samples_per_feature_file, 1) # Calculate index within file, ensure divisor is not zero
         return file_features[index_within_file] # Return feature for index within file
 
     def __len__(self):
