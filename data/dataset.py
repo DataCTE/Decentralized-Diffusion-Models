@@ -115,6 +115,8 @@ class DDMDataset(Dataset):
         self.num_feature_files = len(self.feature_files) # Store number of feature files
         self.feature_cache = OrderedDict() # Initialize feature cache
         self.feature_cache_max_size = 500 # Set a reasonable cache size (adjust as needed)
+        self._feature_loading_lock = defaultdict(threading.Lock) # Initialize lock
+        self.feature_counts_per_file = [] # New: store feature counts per file
 
         self._discover_and_process_files()
         self._init_buckets()
