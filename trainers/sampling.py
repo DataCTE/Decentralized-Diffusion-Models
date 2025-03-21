@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
+# test add
 def ddm_sample(
     router,
     experts,
