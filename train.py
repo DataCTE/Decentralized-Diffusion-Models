@@ -25,18 +25,24 @@ def setup_distributed():
     # Initialize process group
     dist.init_process_group(
         backend='nccl',
-        timeout=timedelta(minutes=90)
+        timeout=timedelta(minutes=90),
+        init_method="env://"
     )
+    
+    # Get ranks safely
     rank = dist.get_rank()
+    local_rank = dist.get_local_rank()
     world_size = dist.get_world_size()
     
-    # Set device
-    torch.cuda.set_device(rank)
-    device = torch.device(f"cuda:{rank}")
-    
-    # Simple barrier sync
-    dist.barrier()
-    
+    num_gpus = torch.cuda.device_count()
+    if local_rank >= num_gpus:
+         raise RuntimeError(f"Local rank {local_rank} exceeds available GPUs ({num_gpus})")
+            
+    # Use local_rank for device assignment
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    print(f"Rank {rank} using GPU {local_rank}/{num_gpus}")
+        
     return rank, world_size
 
 def main():
