@@ -120,13 +120,21 @@ class DDMDataset(Dataset):
         cumulative_feature_count = 0 # New: track cumulative count
 
         # Use ThreadPoolExecutor to parallelize feature count loading
-        with ThreadPoolExecutor(max_workers=8) as executor: # Adjust max_workers as needed
+        pbar_feature_count = tqdm(
+            total=len(self.feature_files),
+            desc="Counting features",
+            unit="file",
+            dynamic_ncols=True
+        ) # Initialize progress bar
+        with ThreadPoolExecutor(max_workers=min(32, os.cpu_count())) as executor: # Adjust max_workers as needed
             futures = [executor.submit(self._get_feature_count, os.path.join(feature_path, file_name))
                        for file_name in self.feature_files]
             for future in futures:
                 num_features_in_file = future.result()
                 self.feature_counts_per_file.append(num_features_in_file)
                 cumulative_feature_count += num_features_in_file
+                pbar_feature_count.update(1) # Update progress bar for each completed file
+        pbar_feature_count.close() # Close progress bar
 
         self.cumulative_feature_counts = torch.tensor(self.feature_counts_per_file).cumsum(dim=0) # New: cumulative counts
         self.total_features = cumulative_feature_count # New: total features across all files
