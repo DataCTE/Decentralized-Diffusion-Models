@@ -115,7 +115,10 @@ def ddm_sample(
                     pred = expert(x[mask], timestep[mask], text_embeddings[mask])
                 
                 # Apply strategy-specific weighting
-                weight = selected_weights[mask, i].view(-1, 1, 1, 1)
+                if inference_strategy == "sample":
+                    weight = selected_weights[mask].view(-1, 1, 1, 1) # Use mask directly for 'sample'
+                else:
+                    weight = selected_weights[mask, i].view(-1, 1, 1, 1) # Use mask and i for other strategies
                 combined_pred[mask] += pred * weight
 
         # DDIM update step
