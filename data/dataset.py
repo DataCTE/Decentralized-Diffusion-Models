@@ -70,27 +70,35 @@ class DDMDataset(Dataset):
         self.image_files = sorted([f.replace(".latent.pt", "") for f in os.listdir(self.latent_path)])
         self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
         
-        # Cluster file metadata with parallel loading
-        self.cluster_files = sorted(glob.glob(os.path.join(self.cluster_path, "*.cluster.pt")))
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(get_tensor_length, cf) for cf in self.cluster_files]
-            with tqdm(total=len(futures), desc="Loading cluster metadata") as pbar:
-                self.cluster_lengths = []
-                for future in as_completed(futures):
-                    self.cluster_lengths.append(future.result())
-                    pbar.update(1)
-        self.cumulative_clusters = np.cumsum([0] + self.cluster_lengths).tolist()
+        if is_main_process(): # Only load metadata on rank 0
+            # Cluster file metadata with parallel loading
+            self.cluster_files = sorted(glob.glob(os.path.join(self.cluster_path, "*.cluster.pt")))
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(get_tensor_length, cf) for cf in self.cluster_files]
+                with tqdm(total=len(futures), desc="Loading cluster metadata") as pbar:
+                    cluster_lengths = [] # Local variable for rank 0
+                    for future in as_completed(futures):
+                        cluster_lengths.append(future.result())
+                        pbar.update(1)
+            self.cluster_lengths = cluster_lengths # Assign to self for rank 0
+            self.cumulative_clusters = np.cumsum([0] + self.cluster_lengths).tolist()
 
-        # Feature file metadata with parallel loading
-        self.feature_files = sorted(glob.glob(os.path.join(self.feature_path, "*.pt")))
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(get_tensor_length, ff) for ff in self.feature_files]
-            with tqdm(total=len(futures), desc="Loading feature metadata") as pbar:
-                self.feature_lengths = []
-                for future in as_completed(futures):
-                    self.feature_lengths.append(future.result())
-                    pbar.update(1)
-        self.cumulative_features = np.cumsum([0] + self.feature_lengths).tolist()
+            # Feature file metadata with parallel loading
+            self.feature_files = sorted(glob.glob(os.path.join(self.feature_path, "*.pt")))
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(get_tensor_length, ff) for ff in self.feature_files]
+                with tqdm(total=len(futures), desc="Loading feature metadata") as pbar:
+                    feature_lengths = [] # Local variable for rank 0
+                    for future in as_completed(futures):
+                        feature_lengths.append(future.result())
+                        pbar.update(1)
+            self.feature_lengths = feature_lengths # Assign to self for rank 0
+            self.cumulative_features = np.cumsum([0] + self.feature_lengths).tolist()
+
+            # Broadcast metadata to other ranks
+            broadcast_object((self.cluster_lengths, self.cumulative_clusters, self.feature_lengths, self.cumulative_features))
+        else: # Receive broadcasted metadata on other ranks
+            (self.cluster_lengths, self.cumulative_clusters, self.feature_lengths, self.cumulative_features) = broadcast_object()
 
         # Limited caches
         self.cluster_cache = OrderedDict()
