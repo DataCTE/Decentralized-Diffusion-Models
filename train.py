@@ -15,7 +15,7 @@ multiprocessing.set_start_method('spawn', force=True)
 
 # Import core components
 from trainers.coordinator import DDMTrainingCoordinator
-from config import get_config
+from config import get_config, estimate_model_size
 from utils.logging import setup_logger, log_training_start
 from utils.checkpoint import load_coordinator_checkpoint
 from utils.expert_cache import ExpertCacheManager
@@ -46,6 +46,17 @@ def main():
     try:
         rank, world_size = setup_distributed()
         device = torch.device(f"cuda:{rank}")
+        
+        # Add model size estimation here, AFTER distributed setup
+        if rank == 0:
+            print("Estimating ExpertMMDiT model size:")
+            estimate_model_size(config, model_type="expert")
+            print("\nEstimating RouterModel size:")
+            estimate_model_size(config, model_type="router")
+        
+        # Ensure all processes wait for model size prints to complete
+        dist.barrier()
+        torch.cuda.empty_cache()
         
         # Initialize logging only on main process
         if rank == 0:

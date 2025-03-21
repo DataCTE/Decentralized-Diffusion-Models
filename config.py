@@ -5,6 +5,13 @@ import sys
 import importlib.util
 from types import SimpleNamespace
 import logging
+import torch
+# Add import for torchinfo and check availability
+try:
+    from torchinfo import summary
+    TORCHINFO_AVAILABLE = True
+except ImportError:
+    TORCHINFO_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -251,3 +258,77 @@ def save_config(config, path):
                     f.write(f'{key} = {value}\n')
     
     logger.info(f"Saved configuration to {path}")
+
+# Modified function to estimate and print model size - now accepts model_type
+def estimate_model_size(config, model_type="expert"):
+    """
+    Estimates and prints the size of the specified model type, then clears memory.
+
+    Args:
+        config: Configuration object.
+        model_type: "expert" or "router" to specify which model size to estimate.
+    """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu' # Determine device
+    dummy_model = None # Initialize dummy_model
+
+    if model_type == "expert":
+        from models.mmdit import ExpertMMDiT  # Import locally
+        dummy_model = ExpertMMDiT(config).to(device) # Create ExpertMMDiT model
+        model_name = "ExpertMMDiT"
+    elif model_type == "router":
+        from models.router import RouterModel # Import locally
+        dummy_model = RouterModel(config).to(device) # Create RouterModel
+        model_name = "RouterModel"
+    else:
+        raise ValueError(f"Invalid model_type: {model_type}. Must be 'expert' or 'router'.")
+
+    if TORCHINFO_AVAILABLE:
+        input_size = None
+        if model_type == "expert":
+            input_size = (
+                config.batch_size,
+                config.latent_channels,
+                config.image_size[1] // config.patch_size, # Corrected input size
+                config.image_size[2] // config.patch_size, # Corrected input size
+            )
+        elif model_type == "router":
+            input_size = (
+                config.batch_size,
+                config.latent_channels,
+                config.image_size[1] // config.patch_size, # Corrected input size
+                config.image_size[2] // config.patch_size, # Corrected input size
+            )
+
+        model_summary = summary(
+            dummy_model,
+            input_size=input_size,
+            dtypes=[torch.float32],
+            device=device, # Run summary on the determined device
+            verbose=0 # Reduced verbosity
+        )
+        total_params = model_summary.total_params
+        trainable_params = model_summary.trainable_params
+        non_trainable_params = model_summary.non_trainable_params
+        param_size_mb = model_summary.total_param_size / 1024**2
+
+        print(f"===================== {model_name} Size Summary =====================") # Model name in summary
+        print(f"Total params:        {total_params:,}")
+        print(f"Trainable params:    {trainable_params:,}")
+        print(f"Non-trainable params:{non_trainable_params:,}")
+        print(f"Model size (MB):     {param_size_mb:.2f}")
+        print("===============================================================")
+
+    else:
+        total_params = sum(p.numel() for p in dummy_model.parameters())
+        print(f"torchinfo not available. Estimating parameter count manually for {model_name}.") # Model name in message
+        print(f"Total parameters (approximate): {total_params:,}")
+        print("Please install torchinfo for a detailed model summary.")
+
+    # Cleanup: Move model to CPU and delete to free memory
+    dummy_model.to('cpu') # Move model to CPU
+    del dummy_model # Delete model object
+    if device == 'cuda':
+        torch.cuda.empty_cache() # Clear CUDA cache
+
+    print("Model unloaded and memory cleared.") # Inform user about cleanup
+
