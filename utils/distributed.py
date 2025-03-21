@@ -18,7 +18,7 @@ def is_dist_initialized():
 
 def get_rank():
     """Get the rank of the current process."""
-    return int(os.environ.get('RANK', '0'))
+    return dist.get_rank() if is_dist_initialized() else 0
 
 def get_local_rank():
     """Get the local rank of the current process from the LOCAL_RANK environment variable."""

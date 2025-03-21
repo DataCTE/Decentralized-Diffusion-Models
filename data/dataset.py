@@ -58,7 +58,6 @@ class DDMDataset(Dataset):
         
         # Initialize logging
         self.logger = logging.getLogger(__name__)
-        self.rank = get_rank()  # Get distributed rank
         
         # Load precomputed paths
         self.feature_cache_path = config.feature_cache_path
