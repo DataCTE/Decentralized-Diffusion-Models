@@ -42,7 +42,9 @@ def ddm_sample(
     alpha_bar = alpha_bar.to(device)
 
     for t in tqdm(range(num_steps), disable=not verbose):
-        timestep = torch.full((shape[0],), t, device=device)
+        # Get actual batch size from current x tensor
+        batch_size = x.size(0)
+        timestep = torch.full((batch_size,), t, device=device)
         
         # Get router predictions
         router_logits = router(x, timestep, text_embeddings)
@@ -55,20 +57,28 @@ def ddm_sample(
             
             # Classifier-free guidance
             if text_embeddings is not None and cfg_scale > 1.0:
-                uncond_pred = expert(x, timestep, uncond_embeddings)
-                cond_pred = expert(x, timestep, text_embeddings)
-                pred = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
+                # Handle potential batch size mismatch in guidance
+                uncond_batch = min(batch_size, uncond_embeddings.size(0))
+                cond_batch = min(batch_size, text_embeddings.size(0))
+                
+                uncond_pred = expert(x[:uncond_batch], timestep[:uncond_batch], 
+                                   uncond_embeddings[:uncond_batch])
+                cond_pred = expert(x[:cond_batch], timestep[:cond_batch], 
+                                 text_embeddings[:cond_batch])
+                pred = torch.zeros_like(x)
+                pred[:cond_batch] = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
             else:
                 pred = expert(x, timestep, text_embeddings)
             
             combined_pred += router_weights[:, cluster_idx].view(-1,1,1,1) * pred
 
         # DDIM update step
+        next_timestep = torch.full((batch_size,), t+1, device=device) if t < num_steps-1 else None
         x = ddim_step(
             lambda x_t, t, c: combined_pred,
             x,
             timestep,
-            torch.full((shape[0],), t+1, device=device) if t < num_steps-1 else None,
+            next_timestep,
             alphas,
             alpha_bar,
             eta=eta
@@ -116,6 +126,7 @@ def distilled_sample(distilled_model, shape, num_steps=50, prompt_embeds=None,
     # Sampling loop
     for t in progress:
         # Current timestep
+        batch_size = x.shape[0]
         timestep = torch.full((batch_size,), t, device=device)
         
         with torch.no_grad():
