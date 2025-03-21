@@ -478,9 +478,15 @@ class DDMTrainingCoordinator:
             if hasattr(router_model, 'eval'):
                 router_model.eval()
             
-            # Get top_k from config with validation
-            top_k = getattr(self.config, 'top_k', 1)
-            top_k = min(top_k, len(experts_dict))  # Ensure we don't exceed available experts
+            # Get sampling parameters from config with validation
+            inference_strategy = getattr(self.config, 'inference_strategy', 'top_k')
+            top_k = min(getattr(self.config, 'top_k', 1), len(experts_dict))
+            top_p = getattr(self.config, 'top_p', 0.9)
+            
+            # Handle special oracle case
+            true_clusters = None
+            if inference_strategy == "oracle":
+                true_clusters = self._get_true_clusters(num_samples)
             
             with torch.amp.autocast(device_type='cuda', enabled=use_mixed_precision):
                 samples = ddm_sample(
@@ -493,7 +499,10 @@ class DDMTrainingCoordinator:
                     device=self.device,
                     text_embeddings=text_embeddings,
                     uncond_embeddings=uncond_embeddings,
-                    top_k=top_k  # Add top_k parameter
+                    inference_strategy=inference_strategy,
+                    top_k=top_k,
+                    top_p=top_p,
+                    true_clusters=true_clusters
                 )
             
             try:
@@ -513,6 +522,18 @@ class DDMTrainingCoordinator:
         if return_images and samples is not None:
             return samples.float()
         return None
+
+    def _get_true_clusters(self, num_samples):
+        """Get true cluster labels for oracle strategy (paper Section 4.2)"""
+        if not hasattr(self, 'val_loader'):
+            return None
+            
+        try:
+            batch = next(iter(self.val_loader))
+            return batch["expert"][:num_samples].to(self.device)
+        except Exception as e:
+            logger.warning(f"Couldn't get true clusters for oracle sampling: {e}")
+            return None
     
     def save_checkpoint(self, step):
         """Save checkpoint of all components"""

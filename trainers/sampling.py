@@ -18,83 +18,101 @@ def ddm_sample(
     router,
     experts,
     shape,
-    num_steps=50,  # Renamed from steps for consistency
-    device=None,    # Get device from router instead of parameter
+    num_steps=50,
+    device=None,
     cfg_scale=7.5,
     text_embeddings=None,
     uncond_embeddings=None,
     eta=0.0,
     verbose=True,
     temperature=1.0,
-    top_k=1,  # Add top_k parameter from paper
+    inference_strategy="top_k",  # Add strategy parameter from paper
+    top_k=1,                     # For top-k selection
+    top_p=0.9,                   # For nucleus sampling
+    true_clusters=None,          # For oracle evaluation
 ):
-    """Naive DDM sampling following paper's simple example"""
-    # Auto-detect device if not specified
+    """DDM sampling with multiple inference strategies"""
     if device is None:
         device = next(router.parameters()).device
     
-    # Initialize from random noise with proper batch dimension
     x = torch.randn(shape, device=device)
     num_clusters = len(experts)
-    
-    # Get paper-recommended cosine schedule (remove scheduler parameter)
     alphas, alpha_bar, _ = get_alphas_and_betas(num_steps, "cosine")
     alphas = alphas.to(device)
     alpha_bar = alpha_bar.to(device)
 
-    # Pre-process embeddings for consistent batch dimensions
     batch_size = shape[0]
     if text_embeddings is not None:
         text_embeddings = text_embeddings[:batch_size]
-        uncond_embeddings = uncond_embeddings[:batch_size] if uncond_embeddings is not None else None
+        uncond_embeddings = uncond_embeddings[:batch_size] if uncond_embeddings else None
 
     for t in tqdm(range(num_steps), disable=not verbose):
         timestep = torch.full((x.size(0),), t, device=device)
         
-        # Get router predictions and select top-k
+        # Get router predictions
         router_logits = router(x, timestep, text_embeddings)
         router_weights = F.softmax(router_logits / temperature, dim=-1)
         
-        # Paper's efficient top-k selection (Section 3.5)
-        topk_weights, topk_indices = router_weights.topk(top_k, dim=-1)
-        topk_weights = F.softmax(topk_weights / temperature, dim=-1)
+        # Paper's inference strategies (Section 3.5)
+        if inference_strategy == "full":
+            # Full ensemble - use all experts
+            selected_weights = router_weights
+            selected_indices = torch.arange(num_clusters, device=device).expand(batch_size, -1)
+        elif inference_strategy == "top_k":
+            # Top-k experts
+            selected_weights, selected_indices = router_weights.topk(top_k, dim=-1)
+            selected_weights = F.softmax(selected_weights / temperature, dim=-1)
+        elif inference_strategy == "sample":
+            # Stochastic sampling
+            selected_indices = torch.multinomial(router_weights, 1).squeeze(-1)
+            selected_weights = torch.ones_like(selected_indices, dtype=torch.float32)
+        elif inference_strategy == "nucleus":
+            # Nucleus sampling (top-p)
+            sorted_weights, sorted_indices = torch.sort(router_weights, descending=True, dim=-1)
+            cum_probs = torch.cumsum(sorted_weights, dim=-1)
+            mask = cum_probs <= top_p
+            mask[..., 0] = True  # Ensure at least one expert
+            selected_weights = sorted_weights[mask]
+            selected_indices = sorted_indices[mask]
+        elif inference_strategy == "oracle" and true_clusters is not None:
+            # Oracle selection (for evaluation only)
+            selected_indices = true_clusters
+            selected_weights = torch.ones_like(selected_indices, dtype=torch.float32)
+        else:
+            raise ValueError(f"Invalid inference strategy: {inference_strategy}")
 
         combined_pred = torch.zeros_like(x)
-        for i in range(top_k):
-            # Process each expert in current top-k position
-            cluster_indices = topk_indices[:, i]
+        active_experts = set()
+        
+        # Process selected experts
+        for i in range(selected_indices.size(1)):
+            cluster_indices = selected_indices[:, i]
             unique_experts = torch.unique(cluster_indices)
             
             for expert_idx in unique_experts:
-                # Mask for samples using this expert
                 mask = cluster_indices == expert_idx
                 if not mask.any():
                     continue
                 
                 expert = experts[expert_idx.item()]
-                x_masked = x[mask]
-                t_masked = timestep[mask]
+                active_experts.add(expert_idx.item())
                 
-                # Paper's efficient CFG implementation (Appendix B)
+                # Classifier-free guidance
                 if text_embeddings is not None and cfg_scale > 1.0:
-                    emb_masked = text_embeddings[mask] if text_embeddings else None
-                    uncond_masked = uncond_embeddings[mask] if uncond_embeddings else None
-                    
-                    # Batch-efficient CFG with mask-aware concatenation
-                    x_in = torch.cat([x_masked, x_masked])
-                    t_in = torch.cat([t_masked, t_masked])
-                    emb_in = torch.cat([uncond_masked, emb_masked])
+                    x_in = torch.cat([x[mask], x[mask]])
+                    t_in = torch.cat([timestep[mask], timestep[mask]])
+                    emb_in = torch.cat([uncond_embeddings[mask], text_embeddings[mask]])
                     
                     preds = expert(x_in, t_in, emb_in).chunk(2)
                     pred = preds[0] + cfg_scale * (preds[1] - preds[0])
                 else:
-                    pred = expert(x_masked, t_masked, text_embeddings[mask] if text_embeddings else None)
+                    pred = expert(x[mask], timestep[mask], text_embeddings[mask])
                 
-                # Accumulate weighted predictions
-                weight = topk_weights[mask, i].view(-1, 1, 1, 1)
+                # Apply strategy-specific weighting
+                weight = selected_weights[mask, i].view(-1, 1, 1, 1)
                 combined_pred[mask] += pred * weight
 
-        # DDIM update with proper dimension handling
+        # DDIM update step
         x = ddim_step(
             lambda x_t, t, c: combined_pred,
             x,

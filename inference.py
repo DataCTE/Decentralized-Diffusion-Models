@@ -317,24 +317,14 @@ def run_inference_pipeline(
     num_steps=50,
     cache_manager=None
 ):
-    """
-    Run inference pipeline for Decentralized Diffusion Models
-    
-    Args:
-        config: Configuration object
-        device: Device to run inference on
-        checkpoint_dir: Directory containing checkpoints
-        output_dir: Directory to save outputs
-        prompts_file: Optional path to JSON file containing prompts
-        images_file: Optional path to file containing input images (not implemented)
-        batch_size: Batch size for inference
-        num_steps: Number of sampling steps
-        cache_manager: Optional ExpertCacheManager for efficient expert loading
-    """
+    """Run inference pipeline for Decentralized Diffusion Models"""
     # Add config validation
     if not config.enable_sampling:
         logger.error("Sampling disabled in config, aborting inference")
         return
+    
+    # Load models
+    router_model, expert_models, vae, clip = load_models(config, device, checkpoint_dir, cache_manager)
     
     # Add expert count check
     if len(expert_models) == 0:
@@ -343,9 +333,6 @@ def run_inference_pipeline(
     
     # Add device synchronization
     torch.cuda.synchronize(device=device)
-    
-    # Load models
-    router_model, expert_models, vae, clip = load_models(config, device, checkpoint_dir, cache_manager)
     
     # Load distilled model if available
     distilled_model = None
@@ -406,21 +393,25 @@ def run_inference_pipeline(
                         if idx in expert_models and callable(expert_models[idx]):
                             cache_manager.queue_prefetch(idx, expert_models[idx])
                 
+                # Get sampling parameters from config
+                inference_strategy = getattr(config, 'inference_strategy', 'top_k')
+                top_k = min(getattr(config, 'top_k', 1), len(expert_models))
+                top_p = getattr(config, 'top_p', 0.9)
+                true_clusters = None  # Oracle strategy not supported in inference.py
+                
                 latents = ddm_sample(
                     router=router_model,
                     experts=expert_models,
                     shape=latent_shape,
-                    steps=num_steps,
-                    top_k=config.use_top_k,
+                    num_steps=num_steps,
                     device=device,
                     cfg_scale=config.cfg_scale,
                     text_embeddings=text_embeddings,
                     uncond_embeddings=uncond_embeddings,
-                    eta=0.0,
-                    scheduler="cosine",
-                    verbose=True,
-                    # Pass cache_manager to the get_expert_for_inference callback
-                    callback=lambda idx: get_expert_for_inference(idx, expert_models, cache_manager)
+                    inference_strategy=inference_strategy,
+                    top_k=top_k,
+                    top_p=top_p,
+                    true_clusters=true_clusters
                 )
             
             # Decode latents to images

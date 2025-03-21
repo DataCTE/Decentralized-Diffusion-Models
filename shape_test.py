@@ -221,18 +221,23 @@ def test_full_pipeline():
         # Test sampling pipeline
         shape = (2, config.latent_channels, 16, 16)
         dummy_text = torch.randn(2, 768, device=device)  # CLIP embedding dim
-        samples = ddm_sample(
-            router=router,
-            experts=experts,
-            shape=shape,
-            num_steps=4,
-            device=device,
-            text_embeddings=dummy_text,
-            uncond_embeddings=dummy_text,  # For simplicity use same embeddings
-            top_k=1  # Add top_k parameter from paper
-        )
-        assert samples.shape == shape, "Sampling output shape mismatch"
-        print("All shape tests passed!")
+        # Test different inference strategies
+        strategies = ["top_k", "full", "sample", "nucleus"]
+        for strategy in strategies:
+            samples = ddm_sample(
+                router=router,
+                experts=experts,
+                shape=shape,
+                num_steps=4,
+                device=device,
+                text_embeddings=dummy_text,
+                uncond_embeddings=dummy_text,
+                inference_strategy=strategy,
+                top_k=2 if strategy == "top_k" else 1,
+                top_p=0.9 if strategy == "nucleus" else 1.0
+            )
+            assert samples.shape == shape, f"{strategy} strategy failed"
+            print(f"{strategy} strategy passed")
 
 if __name__ == "__main__":
     test_full_pipeline()
