@@ -239,7 +239,7 @@ def test_full_pipeline():
                 router=dummy_router, # Use dummy router here
                 experts=experts,
                 shape=shape,
-                num_steps=4,
+                num_steps=config.sampling_steps,
                 device=device,
                 text_embeddings=dummy_text,
                 uncond_embeddings=dummy_uncond,  # Use proper unconditional embeddings
