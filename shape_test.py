@@ -220,12 +220,15 @@ def test_full_pipeline():
 
         # Test sampling pipeline
         shape = (2, config.latent_channels, 16, 16)
+        dummy_text = torch.randn(2, 768, device=device)  # CLIP embedding dim
         samples = ddm_sample(
             router=router,
             experts=experts,
             shape=shape,
             num_steps=4,
-            device=device
+            device=device,
+            text_embeddings=dummy_text,
+            uncond_embeddings=dummy_text  # For simplicity use same embeddings
         )
         assert samples.shape == shape, "Sampling output shape mismatch"
         print("All shape tests passed!")
