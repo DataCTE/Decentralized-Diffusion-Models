@@ -17,6 +17,7 @@ from PIL import Image
 import argparse  # Import argparse for command-line arguments
 import torchvision.transforms as transforms # Import torchvision transforms
 from data.transforms import normalize # Import normalize function
+import glob
 
 def precompute_latents(config_path="config.py", output_dir="cache", precompute_vae=True, precompute_clip=True):
     """Main function to precompute VAE latents and CLIP embeddings using distributed processing."""
@@ -52,17 +53,20 @@ def precompute_latents(config_path="config.py", output_dir="cache", precompute_v
     else:
         clip_embedding_output_dir = None
 
-
-    # Initialize dataset (only for file discovery)
-    dataset = DDMDataset(dataset_config, split='train', bypass_clip_check=True, bypass_latent_check=True)
-
-    image_files_partition = partition_data(dataset.image_files, rank, world_size)
-
-    # Process images and save latents and CLIP embeddings
+    # Get image files from dataset path
+    image_files = []
+    for ext in ['.jpg', '.jpeg', '.png', '.webp']:
+        image_files.extend(glob.glob(os.path.join(config.dataset_path, f'**/*{ext}'), recursive=True))
+    
+    image_files_partition = partition_data(image_files, rank, world_size)
+    
+    # Rest of processing remains the same
     process_and_save_latents(
         image_files_partition, device, output_dir, vae, clip, rank, world_size, config,
-        vae_latent_output_dir=vae_latent_output_dir, clip_embedding_output_dir=clip_embedding_output_dir,
-        precompute_vae=precompute_vae, precompute_clip=precompute_clip
+        vae_latent_output_dir=vae_latent_output_dir, 
+        clip_embedding_output_dir=clip_embedding_output_dir,
+        precompute_vae=precompute_vae, 
+        precompute_clip=precompute_clip
     )
 
 def distributed_setup():
@@ -164,6 +168,30 @@ def process_single_image(image_path, device, output_dir, vae, clip, latent_exten
 
     except Exception as e:
         print(f"Rank: {get_rank()} Error processing image {image_path}: {e}")
+
+def discover_and_validate_files(config):
+    """Moved from dataset.py with validation removed"""
+    image_files = []
+    caption_files = []
+    dim_cache = []
+    
+    for ext in ['.jpg', '.jpeg', '.png', '.webp']:
+        for img_path in glob.glob(os.path.join(config.dataset_path, f'**/*{ext}'), recursive=True):
+            caption_path = os.path.splitext(img_path)[0] + ".txt"
+            if not os.path.exists(caption_path):
+                continue
+                
+            try:
+                with Image.open(img_path) as img:
+                    w, h = img.size
+                    if w >= config.min_size and h >= config.min_size:
+                        image_files.append(img_path)
+                        caption_files.append(caption_path)
+                        dim_cache.append([w, h])
+            except Exception:
+                continue
+                
+    return image_files, caption_files, torch.tensor(dim_cache)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Precompute VAE latents and CLIP embeddings.")
