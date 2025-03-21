@@ -317,8 +317,8 @@ def estimate_model_size(config, model_type="expert"):
             dtypes=[torch.float32],
             device=device, # Run summary on the determined device
             verbose=0, # Reduced verbosity
-            # Pass dummy inputs here
-            args=dummy_input
+            # Pass dummy inputs as positional arguments using input_data
+            input_data=dummy_input
         )
         total_params = model_summary.total_params
         trainable_params = model_summary.trainable_params
