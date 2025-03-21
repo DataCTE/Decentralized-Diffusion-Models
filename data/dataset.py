@@ -116,7 +116,6 @@ class DDMDataset(Dataset):
 
         self._discover_and_process_files()
         self._init_buckets()
-        self._distribute_samples()
 
     def __getstate__(self):
         """Control what gets pickled to ensure we don't include unpicklable objects"""
