@@ -93,6 +93,15 @@ def ddm_sample(
                 cluster_indices = selected_indices # Use 1D tensor directly for 'sample'
             else:
                 cluster_indices = selected_indices[:, i]
+
+            if inference_strategy == "sample":
+                print("Inference strategy is sample")
+                print("Shape of selected_indices:", selected_indices.shape)
+                print("Type of selected_indices:", selected_indices.dtype)
+                print("Min value of selected_indices:", selected_indices.min())
+                print("Max value of selected_indices:", selected_indices.max())
+                print("Sample values of selected_indices:", selected_indices[:10])
+
             unique_experts = torch.unique(cluster_indices)
             
             for expert_idx in unique_experts:
