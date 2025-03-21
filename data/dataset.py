@@ -500,31 +500,39 @@ class DDMDataset(Dataset):
 
     def _load_cluster_assignment(self, index):
         """Load cluster assignment for a given index from file, using cache"""
-        samples_per_cluster_file = (len(self.image_files) // self.num_cluster_files)
-        file_index = index // max(samples_per_cluster_file, 1) # Calculate file index, ensure divisor is not zero
+        # Add safety checks for zero division
+        if self.num_cluster_files == 0 or len(self.image_files) == 0:
+            raise ValueError("No cluster files or images available")
+            
+        samples_per_cluster_file = (len(self.image_files) + self.num_cluster_files - 1) // self.num_cluster_files  # Use ceiling division
+        file_index = index // samples_per_cluster_file
         cluster_file_name = self.cluster_files[file_index]
 
-        if cluster_file_name not in self.cluster_assignments_cache: # Check cache
+        if cluster_file_name not in self.cluster_assignments_cache:
             cluster_file_path = os.path.join(self.cluster_path, cluster_file_name)
-            self.cluster_assignments_cache[cluster_file_name] = torch.load(cluster_file_path, map_location='cpu') # Load and cache
+            self.cluster_assignments_cache[cluster_file_name] = torch.load(cluster_file_path, map_location='cpu')
 
         file_assignments = self.cluster_assignments_cache[cluster_file_name]
-        index_within_file = index % max(samples_per_cluster_file, 1) # Calculate index within file, ensure divisor is not zero
-        return file_assignments[index_within_file] # Return assignment for index within file
+        index_within_file = index % samples_per_cluster_file
+        return file_assignments[index_within_file]
 
     def _load_feature(self, index):
         """Load feature for a given index from file, using cache"""
-        samples_per_feature_file = (len(self.features) // self.num_feature_files)
-        file_index = index // max(samples_per_feature_file, 1) # Calculate file index, ensure divisor is not zero
+        # Add safety checks for zero division
+        if self.num_feature_files == 0 or len(self.image_files) == 0:
+            raise ValueError("No feature files or images available")
+            
+        samples_per_feature_file = (len(self.image_files) + self.num_feature_files - 1) // self.num_feature_files  # Use ceiling division
+        file_index = index // samples_per_feature_file
         feature_file_name = self.feature_files[file_index]
 
-        if feature_file_name not in self.features_cache: # Check cache
+        if feature_file_name not in self.features_cache:
             feature_file_path = os.path.join(self.feature_path, feature_file_name)
-            self.features_cache[feature_file_name] = torch.load(feature_file_path, map_location='cpu') # Load and cache
+            self.features_cache[feature_file_name] = torch.load(feature_file_path, map_location='cpu')
 
         file_features = self.features_cache[feature_file_name]
-        index_within_file = index % max(samples_per_feature_file, 1) # Calculate index within file, ensure divisor is not zero
-        return file_features[index_within_file] # Return feature for index within file
+        index_within_file = index % samples_per_feature_file
+        return file_features[index_within_file]
 
     def __len__(self):
         """Get dataset length"""
