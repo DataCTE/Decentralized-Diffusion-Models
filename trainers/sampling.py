@@ -32,7 +32,7 @@ def ddm_sample(
     if device is None:
         device = next(router.parameters()).device
     
-    # Initialize from random noise
+    # Initialize from random noise with proper batch dimension
     x = torch.randn(shape, device=device)
     num_clusters = len(experts)
     
@@ -41,44 +41,45 @@ def ddm_sample(
     alphas = alphas.to(device)
     alpha_bar = alpha_bar.to(device)
 
+    # Pre-process embeddings for consistent batch dimensions
+    batch_size = shape[0]
+    if text_embeddings is not None:
+        text_embeddings = text_embeddings[:batch_size]
+        uncond_embeddings = uncond_embeddings[:batch_size] if uncond_embeddings is not None else None
+
     for t in tqdm(range(num_steps), disable=not verbose):
-        # Get actual batch size from current x tensor
-        batch_size = x.size(0)
-        timestep = torch.full((batch_size,), t, device=device)
+        timestep = torch.full((x.size(0),), t, device=device)
         
-        # Get router predictions
+        # Get router predictions once per timestep
         router_logits = router(x, timestep, text_embeddings)
         router_weights = F.softmax(router_logits / temperature, dim=-1)
         
-        # Combine expert predictions
         combined_pred = torch.zeros_like(x)
         for cluster_idx in range(num_clusters):
             expert = experts[cluster_idx]
             
-            # Classifier-free guidance
+            # Efficient classifier-free guidance using batch expansion
             if text_embeddings is not None and cfg_scale > 1.0:
-                # Handle potential batch size mismatch in guidance
-                uncond_batch = min(batch_size, uncond_embeddings.size(0))
-                cond_batch = min(batch_size, text_embeddings.size(0))
+                # Create combined batch [uncond, cond]
+                x_in = torch.cat([x, x])
+                t_in = torch.cat([timestep, timestep])
+                emb_in = torch.cat([uncond_embeddings, text_embeddings])
                 
-                uncond_pred = expert(x[:uncond_batch], timestep[:uncond_batch], 
-                                   uncond_embeddings[:uncond_batch])
-                cond_pred = expert(x[:cond_batch], timestep[:cond_batch], 
-                                 text_embeddings[:cond_batch])
-                pred = torch.zeros_like(x)
-                pred[:cond_batch] = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
+                # Single forward pass for both paths
+                preds = expert(x_in, t_in, emb_in).chunk(2)
+                pred = preds[0] + cfg_scale * (preds[1] - preds[0])
             else:
                 pred = expert(x, timestep, text_embeddings)
-            
-            combined_pred += router_weights[:, cluster_idx].view(-1,1,1,1) * pred
 
-        # DDIM update step
-        next_timestep = torch.full((batch_size,), t+1, device=device) if t < num_steps-1 else None
+            # Weighted combination using broadcasting
+            combined_pred += router_weights[:, cluster_idx].view(-1, 1, 1, 1) * pred
+
+        # DDIM update with proper dimension handling
         x = ddim_step(
             lambda x_t, t, c: combined_pred,
             x,
             timestep,
-            next_timestep,
+            torch.full_like(timestep, t+1) if t < num_steps-1 else None,
             alphas,
             alpha_bar,
             eta=eta
