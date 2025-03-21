@@ -123,9 +123,9 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
         
         # Get alphas for current and next timestep
         a_t = alphas[t]
-        a_prev = alphas[t_next]
+        a_prev = alphas[t_next] if t_next is not None else alphas[t]
         a_bar_t = alpha_bar[t]
-        a_bar_prev = alpha_bar[t_next]
+        a_bar_prev = alpha_bar[t_next] if t_next is not None else alpha_bar[t]
         
         # Reshape for broadcasting
         a_t = a_t.view(-1, 1, 1, 1)
