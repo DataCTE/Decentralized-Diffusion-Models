@@ -64,6 +64,12 @@ def ddm_sample(
             selected_weights = F.softmax(selected_weights / temperature, dim=-1)
         elif inference_strategy == "sample":
             # Stochastic sampling
+            if torch.isnan(router_weights).any() or torch.isinf(router_weights).any() or (router_weights < 0).any():
+                print("Warning: Invalid values detected in router_weights before multinomial sampling!")
+                print("router_weights min:", router_weights.min())
+                print("router_weights max:", router_weights.max())
+                router_weights = torch.clamp(router_weights, min=0, max=1) # Clamp to valid probability range
+
             selected_indices = torch.multinomial(router_weights, 1).squeeze(-1)
             selected_weights = torch.ones_like(selected_indices, dtype=torch.float32)
         elif inference_strategy == "nucleus":
