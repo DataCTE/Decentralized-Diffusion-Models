@@ -85,11 +85,14 @@ def ddm_sample(
         active_experts = set()
         
         # Process selected experts
-        # For 'sample' strategy, selected_indices is 1D, so iterate once
+        # For 'sample' strategy, selected_indices is 1D, so do not iterate over a second dimension
         # For other strategies, iterate over the second dimension of selected_indices
         num_experts_per_sample = 1 if inference_strategy == "sample" else selected_indices.size(1)
         for i in range(num_experts_per_sample):
-            cluster_indices = selected_indices[:, i]
+            if inference_strategy == "sample":
+                cluster_indices = selected_indices # Use 1D tensor directly for 'sample'
+            else:
+                cluster_indices = selected_indices[:, i]
             unique_experts = torch.unique(cluster_indices)
             
             for expert_idx in unique_experts:
