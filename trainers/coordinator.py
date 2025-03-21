@@ -478,6 +478,10 @@ class DDMTrainingCoordinator:
             if hasattr(router_model, 'eval'):
                 router_model.eval()
             
+            # Get top_k from config with validation
+            top_k = getattr(self.config, 'top_k', 1)
+            top_k = min(top_k, len(experts_dict))  # Ensure we don't exceed available experts
+            
             with torch.amp.autocast(device_type='cuda', enabled=use_mixed_precision):
                 samples = ddm_sample(
                     router=router_model,
@@ -488,7 +492,8 @@ class DDMTrainingCoordinator:
                     temperature=self.config.sampling_temp,
                     device=self.device,
                     text_embeddings=text_embeddings,
-                    uncond_embeddings=uncond_embeddings
+                    uncond_embeddings=uncond_embeddings,
+                    top_k=top_k  # Add top_k parameter
                 )
             
             try:

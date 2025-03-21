@@ -26,6 +26,7 @@ def ddm_sample(
     eta=0.0,
     verbose=True,
     temperature=1.0,
+    top_k=1,  # Add top_k parameter from paper
 ):
     """Naive DDM sampling following paper's simple example"""
     # Auto-detect device if not specified
@@ -50,29 +51,48 @@ def ddm_sample(
     for t in tqdm(range(num_steps), disable=not verbose):
         timestep = torch.full((x.size(0),), t, device=device)
         
-        # Get router predictions once per timestep
+        # Get router predictions and select top-k
         router_logits = router(x, timestep, text_embeddings)
         router_weights = F.softmax(router_logits / temperature, dim=-1)
         
-        combined_pred = torch.zeros_like(x)
-        for cluster_idx in range(num_clusters):
-            expert = experts[cluster_idx]
-            
-            # Efficient classifier-free guidance using batch expansion
-            if text_embeddings is not None and cfg_scale > 1.0:
-                # Create combined batch [uncond, cond]
-                x_in = torch.cat([x, x])
-                t_in = torch.cat([timestep, timestep])
-                emb_in = torch.cat([uncond_embeddings, text_embeddings])
-                
-                # Single forward pass for both paths
-                preds = expert(x_in, t_in, emb_in).chunk(2)
-                pred = preds[0] + cfg_scale * (preds[1] - preds[0])
-            else:
-                pred = expert(x, timestep, text_embeddings)
+        # Paper's efficient top-k selection (Section 3.5)
+        topk_weights, topk_indices = router_weights.topk(top_k, dim=-1)
+        topk_weights = F.softmax(topk_weights / temperature, dim=-1)
 
-            # Weighted combination using broadcasting
-            combined_pred += router_weights[:, cluster_idx].view(-1, 1, 1, 1) * pred
+        combined_pred = torch.zeros_like(x)
+        for i in range(top_k):
+            # Process each expert in current top-k position
+            cluster_indices = topk_indices[:, i]
+            unique_experts = torch.unique(cluster_indices)
+            
+            for expert_idx in unique_experts:
+                # Mask for samples using this expert
+                mask = cluster_indices == expert_idx
+                if not mask.any():
+                    continue
+                
+                expert = experts[expert_idx.item()]
+                x_masked = x[mask]
+                t_masked = timestep[mask]
+                
+                # Paper's efficient CFG implementation (Appendix B)
+                if text_embeddings is not None and cfg_scale > 1.0:
+                    emb_masked = text_embeddings[mask] if text_embeddings else None
+                    uncond_masked = uncond_embeddings[mask] if uncond_embeddings else None
+                    
+                    # Batch-efficient CFG with mask-aware concatenation
+                    x_in = torch.cat([x_masked, x_masked])
+                    t_in = torch.cat([t_masked, t_masked])
+                    emb_in = torch.cat([uncond_masked, emb_masked])
+                    
+                    preds = expert(x_in, t_in, emb_in).chunk(2)
+                    pred = preds[0] + cfg_scale * (preds[1] - preds[0])
+                else:
+                    pred = expert(x_masked, t_masked, text_embeddings[mask] if text_embeddings else None)
+                
+                # Accumulate weighted predictions
+                weight = topk_weights[mask, i].view(-1, 1, 1, 1)
+                combined_pred[mask] += pred * weight
 
         # DDIM update with proper dimension handling
         x = ddim_step(

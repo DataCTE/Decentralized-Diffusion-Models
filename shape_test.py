@@ -228,7 +228,8 @@ def test_full_pipeline():
             num_steps=4,
             device=device,
             text_embeddings=dummy_text,
-            uncond_embeddings=dummy_text  # For simplicity use same embeddings
+            uncond_embeddings=dummy_text,  # For simplicity use same embeddings
+            top_k=1  # Add top_k parameter from paper
         )
         assert samples.shape == shape, "Sampling output shape mismatch"
         print("All shape tests passed!")
