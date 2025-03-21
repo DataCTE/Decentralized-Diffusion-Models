@@ -221,6 +221,10 @@ def test_full_pipeline():
         # Test sampling pipeline
         shape = (2, config.latent_channels, 16, 16)
         dummy_text = torch.randn(2, 768, device=device)  # CLIP embedding dim
+        
+        # Paper's recommendation: Use separate unconditional embeddings
+        dummy_uncond = torch.zeros_like(dummy_text)  # Zero embeddings for unconditional
+        
         # Test different inference strategies
         strategies = ["top_k", "full", "sample", "nucleus"]
         for strategy in strategies:
@@ -231,7 +235,7 @@ def test_full_pipeline():
                 num_steps=4,
                 device=device,
                 text_embeddings=dummy_text,
-                uncond_embeddings=dummy_text,
+                uncond_embeddings=dummy_uncond,  # Use proper unconditional embeddings
                 inference_strategy=strategy,
                 top_k=2 if strategy == "top_k" else 1,
                 top_p=0.9 if strategy == "nucleus" else 1.0

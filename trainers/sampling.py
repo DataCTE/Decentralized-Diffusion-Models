@@ -44,7 +44,7 @@ def ddm_sample(
     batch_size = shape[0]
     if text_embeddings is not None:
         text_embeddings = text_embeddings[:batch_size]
-        uncond_embeddings = uncond_embeddings[:batch_size] if uncond_embeddings else None
+        uncond_embeddings = uncond_embeddings[:batch_size] if uncond_embeddings is not None else None
 
     for t in tqdm(range(num_steps), disable=not verbose):
         timestep = torch.full((x.size(0),), t, device=device)
