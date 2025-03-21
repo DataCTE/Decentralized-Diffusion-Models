@@ -66,9 +66,9 @@ def ddm_sample(
         elif inference_strategy == "sample":
             # Stochastic sampling
             if torch.isnan(router_weights).any() or torch.isinf(router_weights).any() or (router_weights < 0).any():
-                print("Warning: Invalid values detected in router_weights before multinomial sampling!")
-                print("router_weights min:", router_weights.min())
-                print("router_weights max:", router_weights.max())
+                #print("Warning: Invalid values detected in router_weights before multinomial sampling!")
+                #print("router_weights min:", router_weights.min())
+                #print("router_weights max:", router_weights.max())
                 router_weights = torch.clamp(router_weights, min=0, max=1) # Clamp to valid probability range
 
             # Ensure router_weights are valid probabilities for multinomial sampling
@@ -76,19 +76,19 @@ def ddm_sample(
             router_weights = torch.clamp(router_weights, min=0, max=1) # Double clamp to be safe
 
             if inference_strategy == "sample":
-                print("Inference strategy is sample")
-                print("Sum of router_weights:", router_weights.sum())
-                print("Min of router_weights:", router_weights.min())
-                print("Max of router_weights:", router_weights.max())
-                print("Shape of router_weights:", router_weights.shape)
-                print("Sample values of router_weights:", router_weights[:2])
+                #print("Inference strategy is sample")
+                #print("Sum of router_weights:", router_weights.sum())
+                #print("Min of router_weights:", router_weights.min())
+                #print("Max of router_weights:", router_weights.max())
+                #print("Shape of router_weights:", router_weights.shape)
+                #print("Sample values of router_weights:", router_weights[:2])
 
                 selected_indices = torch.multinomial(router_weights, 1).squeeze(-1)
-                print("Shape of selected_indices:", selected_indices.shape)
-                print("Type of selected_indices:", selected_indices.dtype)
-                print("Min value of selected_indices:", selected_indices.min())
-                print("Max value of selected_indices:", selected_indices.max())
-                print("Sample values of selected_indices:", selected_indices[:10])
+                #print("Shape of selected_indices:", selected_indices.shape)
+                #print("Type of selected_indices:", selected_indices.dtype)
+                #print("Min value of selected_indices:", selected_indices.min())
+                #print("Max value of selected_indices:", selected_indices.max())
+                #print("Sample values of selected_indices:", selected_indices[:10])
 
             selected_weights = torch.ones_like(selected_indices, dtype=torch.float32)
         elif inference_strategy == "nucleus":
@@ -109,80 +109,78 @@ def ddm_sample(
         combined_pred = torch.zeros_like(x)
         active_experts = set()
 
-        # Process selected experts
-        num_experts_per_sample = 0 # Initialize to 0
+        # Process selected experts - Batch-first approach
+        for batch_idx in range(batch_size): # Iterate over batch dimension
+            sample_pred = torch.zeros_like(x[batch_idx:batch_idx+1]) # Initialize prediction for this sample
+            active_experts_sample = set() # Track active experts for this sample
 
-        if inference_strategy == "sample":
-            num_experts_per_sample = 1
-        elif inference_strategy in ["top_k", "full", "nucleus"]:
-            if selected_indices.ndim == 1: # Handle case where selected_indices is 1D for nucleus in some cases
-                num_experts_per_sample = 1
-            elif selected_indices.ndim == 2:
-                num_experts_per_sample = selected_indices.size(1)
-            else:
-                raise ValueError(f"Unexpected dimensions for selected_indices in {inference_strategy}: {selected_indices.ndim}")
-        else:
-             raise ValueError(f"Invalid inference strategy: {inference_strategy}")
-
-        for i in range(num_experts_per_sample):
+            num_experts_per_sample = 0
             if inference_strategy == "sample":
-                cluster_indices = selected_indices # Use 1D tensor directly for 'sample'
+                num_experts_per_sample = 1
             elif inference_strategy in ["top_k", "full", "nucleus"]:
-                if selected_indices.ndim == 1:
-                    cluster_indices = selected_indices # Handle 1D case for nucleus
+                if selected_indices.ndim == 1: # Handle case where selected_indices is 1D for nucleus in some cases
+                    num_experts_per_sample = 1
                 elif selected_indices.ndim == 2:
-                    cluster_indices = selected_indices[:, i]
+                    num_experts_per_sample = selected_indices.size(1)
                 else:
                     raise ValueError(f"Unexpected dimensions for selected_indices in {inference_strategy}: {selected_indices.ndim}")
+            else:
+                raise ValueError(f"Invalid inference strategy: {inference_strategy}")
 
-            if inference_strategy == "sample":
-                print("Inference strategy is sample")
-                print("Shape of selected_indices:", selected_indices.shape)
-                print("Type of selected_indices:", selected_indices.dtype)
-                print("Min value of selected_indices:", selected_indices.min())
-                print("Max value of selected_indices:", selected_indices.max())
-                print("Sample values of selected_indices:", selected_indices[:10])
-                print("Sum of router_weights:", router_weights.sum())
-                print("Min of router_weights:", router_weights.min())
-                print("Max of router_weights:", router_weights.max())
 
-            unique_experts = torch.unique(cluster_indices)
+            for i in range(num_experts_per_sample):
+                expert_idx_sample = None
+                if inference_strategy == "sample":
+                    cluster_index_sample = selected_indices[batch_idx:batch_idx+1] # Get cluster index for this sample
+                    expert_idx_sample = cluster_index_sample.item()
+                elif inference_strategy in ["top_k", "full", "nucleus"]:
+                    if selected_indices.ndim == 1:
+                        cluster_index_sample = selected_indices[batch_idx:batch_idx+1] # Handle 1D case for nucleus
+                        expert_idx_sample = cluster_index_sample[i].item() # Still need index 'i' even if 1D to align with loop
+                    elif selected_indices.ndim == 2:
+                        cluster_index_sample = selected_indices[batch_idx, i]
+                        expert_idx_sample = cluster_index_sample.item()
+                    else:
+                        raise ValueError(f"Unexpected dimensions for selected_indices in {inference_strategy}: {selected_indices.ndim}")
 
-            for expert_idx in unique_experts:
-                mask = cluster_indices == expert_idx
-                if not mask.any():
-                    continue
 
-                expert = experts[expert_idx.item()]
-                active_experts.add(expert_idx.item())
+                expert_idx = expert_idx_sample # Get the expert index for the current sample and expert iteration
+                mask = torch.tensor([True], device=device) # Mask is now just for this sample (size 1)
 
-                print("Shape of mask:", mask.shape)
-                print("Shape of x:", x.shape)
-                print("Shape of cluster_indices:", cluster_indices.shape)
-                print("Unique experts:", unique_experts)
+                expert = experts[expert_idx]
+                active_experts_sample.add(expert_idx)
+
 
                 # Classifier-free guidance
+                sample_x = x[batch_idx:batch_idx+1] # Get sample x
                 if text_embeddings is not None and cfg_scale > 1.0:
-                    x_in = torch.cat([x[mask], x[mask]])
-                    t_in = torch.cat([timestep[mask], timestep[mask]])
-                    emb_in = torch.cat([uncond_embeddings[mask], text_embeddings[mask]])
+                    x_in = torch.cat([sample_x, sample_x]) # Use sample_x here
+                    t_in = timestep[batch_idx:batch_idx+1].repeat(2)
+                    emb_in = torch.cat([uncond_embeddings[batch_idx:batch_idx+1], text_embeddings[batch_idx:batch_idx+1]])
 
                     preds = expert(x_in, t_in, emb_in).chunk(2)
                     pred = preds[0] + cfg_scale * (preds[1] - preds[0])
                 else:
-                    pred = expert(x[mask], timestep[mask], text_embeddings[mask])
+                    pred = expert(sample_x, timestep[batch_idx:batch_idx+1], text_embeddings[batch_idx:batch_idx+1])
 
                 # Apply strategy-specific weighting
+                weight = 1.0 # Weight is 1.0 per expert for now, adjust if needed for strategies other than sample
                 if inference_strategy == "sample":
-                    weight = selected_weights[mask].view(-1, 1, 1, 1) # Use mask directly for 'sample'
+                    weight_sample = selected_weights[batch_idx:batch_idx+1].view(-1, 1, 1, 1) # Get weight for sample
+                    weight = weight_sample # Assign sample-specific weight
                 elif inference_strategy in ["top_k", "full", "nucleus"]:
                     if selected_weights.ndim == 1: # Handle 1D weights for nucleus if needed
-                         weight = selected_weights[mask].view(-1, 1, 1, 1)
+                         weight_sample = selected_weights[batch_idx:batch_idx+1].view(-1, 1, 1, 1) # Get weight for sample
+                         weight = weight_sample
                     elif selected_weights.ndim == 2:
-                        weight = selected_weights[mask, i].view(-1, 1, 1, 1) # Use mask and i for other strategies
+                        weight_sample = selected_weights[batch_idx, i].view(-1, 1, 1, 1) # Get weight for sample and expert
+                        weight = weight_sample
                     else:
                         raise ValueError(f"Unexpected dimensions for selected_weights in {inference_strategy}: {selected_weights.ndim}")
-                combined_pred[mask] += pred * weight
+
+
+                sample_pred += pred * weight # Accumulate prediction for this sample
+            combined_pred[batch_idx:batch_idx+1] = sample_pred # Assign sample prediction to combined prediction
 
         # DDIM update step
         x = ddim_step(
