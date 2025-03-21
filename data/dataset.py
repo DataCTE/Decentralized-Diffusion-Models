@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.distributed import is_main_process, broadcast_object, get_rank, get_local_rank, get_world_size
 from utils.logging import setup_distributed_logger
 from data.transforms import resize_image, normalize
+import threading
 
 
 # Setup logging
@@ -518,31 +519,67 @@ class DDMDataset(Dataset):
         return file_assignments[index_within_file]
 
     def _load_feature(self, index):
-        """Load feature for a given index from file, using cache"""
         feature_file_index = index // self.num_feature_files
-        feature_file_path = self.feature_files[feature_file_index]
         feature_index_in_file = index % self.num_feature_files
+        feature_file_path = self.feature_files[feature_file_index]
 
-        # Check cache first
-        if index in self.feature_cache:
-            feature = self.feature_cache.pop(index) # Move to end of LRU
-            self.feature_cache[index] = feature
-            return feature
-
-        feature_path = os.path.join(self.feature_path, feature_file_path)
         try:
-            features_in_file = torch.load(feature_path, map_location='cpu')
-            feature = features_in_file[feature_index_in_file]
+            # Check cache first
+            if self.feature_cache is not None and feature_file_path in self.feature_cache:
+                features = self.feature_cache[feature_file_path]
+                # Ensure feature_index_in_file is within bounds
+                if feature_index_in_file >= features.shape[0]:
+                    logger.error(
+                        f"Index {feature_index_in_file} out of bounds for cached feature file "
+                        f"{feature_file_path} with shape {features.shape} at index {index}"
+                    )
+                    return None  # Handle out-of-bounds access from cache
+                feature = features[feature_index_in_file]
+                return feature
+            else:
+                # Load features from disk
+                if feature_file_path not in self._feature_loading_lock:
+                    self._feature_loading_lock[feature_file_path] = threading.Lock()
 
-            # Add to cache, evicting LRU if necessary
-            if len(self.feature_cache) >= self.feature_cache_max_size:
-                self.feature_cache.popitem(last=False) # Remove LRU item
-            self.feature_cache[index] = feature
+                with self._feature_loading_lock[feature_file_path]:
+                    if self.feature_cache is not None and feature_file_path in self.feature_cache:
+                        # Re-check cache in case it was loaded while waiting for lock
+                        features = self.feature_cache[feature_file_path]
+                        if feature_index_in_file >= features.shape[0]:
+                            logger.error(
+                                f"Index {feature_index_in_file} out of bounds for cached feature file "
+                                f"{feature_file_path} with shape {features.shape} at index {index} (after lock)"
+                            )
+                            return None # Handle out-of-bounds access after lock
+                        feature = features[feature_index_in_file]
+                        return feature
+                    else:
+                        try:
+                            features = torch.load(feature_file_path, map_location='cpu')
+                            if self.feature_cache is not None:
+                                self.feature_cache[feature_file_path] = features
+                                # Manage cache size - LRU eviction
+                                if len(self.feature_cache) > self.feature_cache_max_size:
+                                    self.feature_cache.popitem(last=False) # Remove LRU item
 
-            return feature
+                            # Double check index after loading from disk
+                            if feature_index_in_file >= features.shape[0]:
+                                logger.error(
+                                    f"Index {feature_index_in_file} out of bounds for feature file "
+                                    f"{feature_file_path} with shape {features.shape} at index {index} (disk load)"
+                                )
+                                return None # Handle out-of-bounds access after disk load
+                            feature = features[feature_index_in_file]
+                            return feature
+
+                        except Exception as e:
+                            logger.error(
+                                f"Error loading feature from {feature_file_path} at index {index}: {e}"
+                            )
+                            return None # Handle file loading errors
         except Exception as e:
-            logger.error(f"Error loading feature from {feature_path} at index {feature_index_in_file}: {e}")
-            return None
+            logger.error(f"General error in _load_feature at index {index}: {e}")
+            return None # Catch-all for unexpected errors
 
     def __len__(self):
         """Get dataset length"""

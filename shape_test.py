@@ -97,6 +97,16 @@ def test_full_pipeline():
         # Initialize dataset first
         dataset = DDMDataset(config, split='train')
         
+        # Add a test for feature loading
+        print("Testing feature loading for a few samples...")
+        for i in range(min(10, len(dataset))): # Test for first 10 samples or less
+            try:
+                feature = dataset._load_feature(i)
+                assert feature is not None, f"Feature loading failed for index {i}"
+            except Exception as e:
+                assert False, f"Feature loading crashed for index {i}: {e}"
+        print("Feature loading test passed!")
+        
         # Then add clusterer attributes
         dataset.clusterer = DDMClustering(
             num_coarse_clusters=config.num_experts,
