@@ -150,6 +150,9 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
         
         # Compute variance
         try:
+            print("Shape of a_bar_prev:", a_bar_prev.shape)
+            print("Shape of a_bar_t:", a_bar_t.shape)
+            print("Shape of a_t:", a_t.shape)
             var = eta * torch.sqrt(
                 (1 - a_bar_prev) / (1 - a_bar_t) * (1 - a_t / a_bar_t)
             )
