@@ -110,53 +110,64 @@ def ddm_sample(
         active_experts = set()
         
         # Process selected experts
-        # For 'sample' strategy, selected_indices is 1D, so do not iterate over a second dimension
-        # For other strategies, iterate over the second dimension of selected_indices
-        num_experts_per_sample = 1 if inference_strategy == "sample" else selected_indices.size(1)
-        for i in range(num_experts_per_sample):
-            if inference_strategy == "sample":
+        if inference_strategy == "sample":
+            # For 'sample' strategy, selected_indices is 1D
+            num_experts_per_sample = 1
+            for i in range(num_experts_per_sample): # Loop once for 'sample' strategy
                 cluster_indices = selected_indices # Use 1D tensor directly for 'sample'
-            else:
-                cluster_indices = selected_indices[:, i]
+                unique_experts = torch.unique(cluster_indices)
 
-            if inference_strategy == "sample":
-                print("Inference strategy is sample")
-                print("Shape of selected_indices:", selected_indices.shape)
-                print("Type of selected_indices:", selected_indices.dtype)
-                print("Min value of selected_indices:", selected_indices.min())
-                print("Max value of selected_indices:", selected_indices.max())
-                print("Sample values of selected_indices:", selected_indices[:10])
-                print("Sum of router_weights:", router_weights.sum())
-                print("Min of router_weights:", router_weights.min())
-                print("Max of router_weights:", router_weights.max())
+                for expert_idx in unique_experts:
+                    mask = cluster_indices == expert_idx
+                    if not mask.any():
+                        continue
 
-            unique_experts = torch.unique(cluster_indices)
-            
-            for expert_idx in unique_experts:
-                mask = cluster_indices == expert_idx
-                if not mask.any():
-                    continue
-                
-                expert = experts[expert_idx.item()]
-                active_experts.add(expert_idx.item())
-                
-                # Classifier-free guidance
-                if text_embeddings is not None and cfg_scale > 1.0:
-                    x_in = torch.cat([x[mask], x[mask]])
-                    t_in = torch.cat([timestep[mask], timestep[mask]])
-                    emb_in = torch.cat([uncond_embeddings[mask], text_embeddings[mask]])
-                    
-                    preds = expert(x_in, t_in, emb_in).chunk(2)
-                    pred = preds[0] + cfg_scale * (preds[1] - preds[0])
-                else:
-                    pred = expert(x[mask], timestep[mask], text_embeddings[mask])
-                
-                # Apply strategy-specific weighting
-                if inference_strategy == "sample":
+                    expert = experts[expert_idx.item()]
+                    active_experts.add(expert_idx.item())
+
+                    # Classifier-free guidance
+                    if text_embeddings is not None and cfg_scale > 1.0:
+                        x_in = torch.cat([x[mask], x[mask]])
+                        t_in = torch.cat([timestep[mask], timestep[mask]])
+                        emb_in = torch.cat([uncond_embeddings[mask], text_embeddings[mask]])
+
+                        preds = expert(x_in, t_in, emb_in).chunk(2)
+                        pred = preds[0] + cfg_scale * (preds[1] - preds[0])
+                    else:
+                        pred = expert(x[mask], timestep[mask], text_embeddings[mask])
+
+                    # Apply strategy-specific weighting
                     weight = selected_weights[mask].view(-1, 1, 1, 1) # Use mask directly for 'sample'
-                else:
+                    combined_pred[mask] += pred * weight
+        else:
+            # For other strategies, iterate over the second dimension of selected_indices
+            num_experts_per_sample = selected_indices.size(1)
+            for i in range(num_experts_per_sample):
+                cluster_indices = selected_indices[:, i]
+                unique_experts = torch.unique(cluster_indices)
+
+                for expert_idx in unique_experts:
+                    mask = cluster_indices == expert_idx
+                    if not mask.any():
+                        continue
+
+                    expert = experts[expert_idx.item()]
+                    active_experts.add(expert_idx.item())
+
+                    # Classifier-free guidance
+                    if text_embeddings is not None and cfg_scale > 1.0:
+                        x_in = torch.cat([x[mask], x[mask]])
+                        t_in = torch.cat([timestep[mask], timestep[mask]])
+                        emb_in = torch.cat([uncond_embeddings[mask], text_embeddings[mask]])
+
+                        preds = expert(x_in, t_in, emb_in).chunk(2)
+                        pred = preds[0] + cfg_scale * (preds[1] - preds[0])
+                    else:
+                        pred = expert(x[mask], timestep[mask], text_embeddings[mask])
+
+                    # Apply strategy-specific weighting
                     weight = selected_weights[mask, i].view(-1, 1, 1, 1) # Use mask and i for other strategies
-                combined_pred[mask] += pred * weight
+                    combined_pred[mask] += pred * weight
 
         # DDIM update step
         x = ddim_step(
