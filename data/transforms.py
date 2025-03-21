@@ -29,6 +29,7 @@ def get_train_transforms(config):
             ratio=(0.75, 1.33),
             interpolation=T.InterpolationMode.BICUBIC
         ),
+        T.CenterCrop(image_size),
         T.RandomHorizontalFlip(),
         T.ToTensor(),
         T.Normalize(mean=mean, std=std)
