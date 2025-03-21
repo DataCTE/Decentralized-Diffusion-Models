@@ -43,7 +43,7 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 class DDMDataset(Dataset):
-    """GPU-optimized dataset pipeline for decentralized diffusion models"""
+    """GPU-optimized dataset pipeline for decentralized diffusion models with precomputed latents"""
     
     def __init__(self, config, split='train', transforms=None, hf_split=None):
         # Initialize logger first
@@ -68,6 +68,8 @@ class DDMDataset(Dataset):
         # Define file extensions
         self.image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
         self.caption_ext = '.txt'
+        self.latent_ext = '.latent.pt' # New: extension for latent files
+        self.clip_embedding_ext = '.clip_emb.pt' # New: extension for CLIP embedding files
         
         # Convert config values to tensors with proper validation
         self.min_size = torch.tensor(
@@ -89,11 +91,18 @@ class DDMDataset(Dataset):
         # Load precomputed features and clusters (paper section 4.1)
         feature_path = os.path.join(config.feature_cache_path, "features")
         cluster_path = os.path.join(config.feature_cache_path, "clusters")
+        latent_path = os.path.join(config.feature_cache_path, "latents") # New: latent path
+        clip_embedding_output_dir = os.path.join(config.feature_cache_path, "clip_embeddings") # New: clip embedding output directory
 
         if not os.path.exists(feature_path):
             raise FileNotFoundError(f"Features not found at {feature_path}. Run feature extraction first.")
         
-        
+        if not os.path.exists(latent_path): # New: check for latent path
+            raise FileNotFoundError(f"Latents not found at {latent_path}. Run precompute_latents.py first.")
+
+        if not os.path.exists(clip_embedding_output_dir): # New: check for clip embedding path
+            raise FileNotFoundError(f"CLIP embeddings not found at {clip_embedding_output_dir}. Run precompute_latents.py with --precompute_clip first.")
+
         cluster_files = sorted([f for f in os.listdir(cluster_path) if f.endswith(".cluster.pt")])
 
         if not cluster_files:
@@ -118,6 +127,18 @@ class DDMDataset(Dataset):
         self._feature_loading_lock = defaultdict(threading.Lock) # Initialize lock
         self.feature_counts_per_file = [] # New: store feature counts per file
         cumulative_feature_count = 0 # New: track cumulative count
+        self.dataset_pair_cache = OrderedDict() # Initialize dataset pair cache
+        self.dataset_pair_cache_max_size = 1000 # Set a reasonable cache size for dataset pairs
+        self.latent_path = latent_path # New: store latent path
+        self.latent_files = sorted([f for f in os.listdir(latent_path) if f.endswith(self.latent_ext)]) # New: latent files
+        self.latent_cache = OrderedDict() # New: latent cache
+        self.latent_cache_max_size = 200 # New: latent cache max size
+        self._latent_loading_lock = defaultdict(threading.Lock) # New: latent loading lock
+        self.clip_embedding_path = clip_embedding_output_dir # New: clip embedding path
+        self.clip_embedding_files = sorted([f for f in os.listdir(clip_embedding_output_dir) if f.endswith(self.clip_embedding_ext)]) # New: clip embedding files
+        self.clip_embedding_cache = OrderedDict() # New: clip embedding cache
+        self.clip_embedding_cache_max_size = 200 # New: clip embedding cache max size
+        self._clip_embedding_loading_lock = defaultdict(threading.Lock) # New: clip embedding loading lock
 
         # Use ThreadPoolExecutor to parallelize feature count loading
         pbar_feature_count = tqdm(
@@ -242,6 +263,16 @@ class DDMDataset(Dataset):
         
         self.logger.info(f"Rank {self.rank}: Finding image-caption pairs in {self.config.dataset_path}")
         
+        # Check if dataset pairs are already in cache
+        if self.dataset_pair_cache:
+            cached_data = self.dataset_pair_cache.get('dataset_pairs')
+            if cached_data:
+                self.logger.info(f"Rank {self.rank}: Using cached dataset pairs from dataset_pair_cache")
+                self.image_files = cached_data['image_files']
+                self.caption_files = cached_data['caption_files']
+                self.dim_cache = cached_data['dim_cache']
+                return # Exit early if cache is used
+        
         try:
             # Initialize storage for valid filesdebug
             valid_files = []
@@ -364,6 +395,18 @@ class DDMDataset(Dataset):
             self.caption_files = caption_files
             self.dim_cache = torch.tensor(valid_dims, device=self.device, dtype=torch.int32)
             
+            # Cache dataset pairs after discovery
+            if self.dataset_pair_cache is not None:
+                dataset_pairs_data = {
+                    'image_files': self.image_files,
+                    'caption_files': self.caption_files,
+                    'dim_cache': self.dim_cache
+                }
+                self.dataset_pair_cache['dataset_pairs'] = dataset_pairs_data
+                # Manage cache size - LRU eviction (though unlikely to be needed for this cache)
+                if len(self.dataset_pair_cache) > self.dataset_pair_cache_max_size:
+                    self.dataset_pair_cache.popitem(last=False) # Remove LRU item if cache exceeds max size
+            
             # Update the global cache
             _GLOBAL_DATASET_CACHE["image_files"] = self.image_files
             _GLOBAL_DATASET_CACHE["caption_files"] = self.caption_files
@@ -410,19 +453,9 @@ class DDMDataset(Dataset):
         return valid_images, valid_captions, valid_dims
         
     def _load_image_tensor(self, idx, target_size):
-        """Load image efficiently for training - GPU usage only for final tensor"""
-        with open(self.image_files[idx], 'rb') as f:
-            img = Image.open(io.BytesIO(f.read())).convert('RGB')
-            if target_size:
-                img = img.resize(target_size, Image.BILINEAR)
-                
-            # Process on CPU then only transfer final tensor to GPU if needed
-            tensor = transforms.ToTensor()(img)
-            normalized = normalize(tensor)
-            
-            # Return the CPU tensor - moving to device will happen in the model forward pass instead
-            return normalized
-            
+        """No longer loading image tensor - loading precomputed latents instead"""
+        raise NotImplementedError("Loading image tensor is disabled when using precomputed latents. Use _load_latent_tensor instead.")
+
     def _load_caption(self, idx):
         """Load caption for the given image index"""
         with open(self.caption_files[idx], 'r', encoding='utf-8') as f:
@@ -502,7 +535,7 @@ class DDMDataset(Dataset):
             self.logger.info(f"Rank {self.rank}: Bucket {bucket_idx} ({bucket_size}): {count} images")
 
     def __getitem__(self, idx):
-        """Get a training sample with image and caption"""
+        """Get a training sample with precomputed latents, caption, and expert assignment"""
         # Get target size from bucket assignment
         bucket_idx = self.bucket_assignments[idx]
         target_h = self.bucket_dims[bucket_idx, 1]
@@ -514,15 +547,21 @@ class DDMDataset(Dataset):
         # Load feature for this index
         features = self._load_feature(idx)
 
-        # Load image and caption
-        tensor = self._load_image_tensor(idx, (target_w, target_h))
+        # Load precomputed latent tensor
+        latent_tensor = self._load_latent_tensor(idx) # New: load latent
+
+        # Load caption (still load caption as text)
         caption = self._load_caption(idx)
         
+        # Load precomputed CLIP embedding tensor
+        clip_embedding_tensor = self._load_clip_embedding_tensor(idx) # New: load clip embedding
+
         return {
-            'image': tensor,
+            'latent': latent_tensor, # Use precomputed latent
             'caption': caption,
             'expert': cluster_assignment, # Use loaded cluster assignment
             'features': features, # Use loaded features
+            'clip_embedding': clip_embedding_tensor, # Use precomputed clip embedding
             'bucket': bucket_idx
         }
 
@@ -613,9 +652,91 @@ class DDMDataset(Dataset):
             logger.error(f"General error in _load_feature at index {index}: {e}")
             return None # Catch-all for unexpected errors
 
+    def _load_latent_tensor(self, idx): # New: load latent tensor
+        """Load precomputed latent tensor from file, using cache"""
+        latent_file_index = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item()
+        if latent_file_index > 0:
+            latent_index_in_file = idx - self.cumulative_feature_counts[latent_file_index - 1].item()
+        else:
+            latent_index_in_file = idx
+
+        latent_file_path = os.path.join(self.latent_path, self.latent_files[latent_file_index])
+
+        try:
+            # Check cache first
+            if self.latent_cache is not None and latent_file_path in self.latent_cache:
+                latents = self.latent_cache[latent_file_path]
+                latent = latents[latent_index_in_file]
+                return latent
+            else:
+                # Load latents from disk
+                if latent_file_path not in self._latent_loading_lock:
+                    self._latent_loading_lock[latent_file_path] = threading.Lock()
+
+                with self._latent_loading_lock[latent_file_path]:
+                    if self.latent_cache is not None and latent_file_path in self.latent_cache:
+                        # Re-check cache in case it was loaded while waiting for lock
+                        latents = self.latent_cache[latent_file_path]
+                        latent = latents[latent_index_in_file]
+                        return latent
+                    else:
+                        latents = torch.load(latent_file_path, map_location='cpu')
+                        if self.latent_cache is not None:
+                            self.latent_cache[latent_file_path] = latents
+                            # Manage cache size - LRU eviction
+                            if len(self.latent_cache) > self.latent_cache_max_size:
+                                self.latent_cache.popitem(last=False) # Remove LRU item
+
+                        latent = latents[latent_index_in_file]
+                        return latent
+        except Exception as e:
+            self.logger.error(f"Error loading latent from {latent_file_path} at index {idx}: {e}")
+            return None
+
+    def _load_clip_embedding_tensor(self, idx): # New: load clip embedding tensor
+        """Load precomputed CLIP embedding tensor from file, using cache"""
+        clip_embedding_file_index = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item()
+        if clip_embedding_file_index > 0:
+            clip_embedding_index_in_file = idx - self.cumulative_feature_counts[clip_embedding_file_index - 1].item()
+        else:
+            clip_embedding_index_in_file = idx
+
+        clip_embedding_file_path = os.path.join(self.clip_embedding_path, self.clip_embedding_files[clip_embedding_file_index])
+
+        try:
+            # Check cache first
+            if self.clip_embedding_cache is not None and clip_embedding_file_path in self.clip_embedding_cache:
+                clip_embeddings = self.clip_embedding_cache[clip_embedding_file_path]
+                clip_embedding = clip_embeddings[clip_embedding_index_in_file]
+                return clip_embedding
+            else:
+                # Load clip embeddings from disk
+                if clip_embedding_file_path not in self._clip_embedding_loading_lock:
+                    self._clip_embedding_loading_lock[clip_embedding_file_path] = threading.Lock()
+
+                with self._clip_embedding_loading_lock[clip_embedding_file_path]:
+                    if self.clip_embedding_cache is not None and clip_embedding_file_path in self.clip_embedding_cache:
+                        # Re-check cache in case it was loaded while waiting for lock
+                        clip_embeddings = self.clip_embedding_cache[clip_embedding_file_path]
+                        clip_embedding = clip_embeddings[clip_embedding_index_in_file]
+                        return clip_embedding
+                    else:
+                        clip_embeddings = torch.load(clip_embedding_file_path, map_location='cpu')
+                        if self.clip_embedding_cache is not None:
+                            self.clip_embedding_cache[clip_embedding_file_path] = clip_embeddings
+                            # Manage cache size - LRU eviction
+                            if len(self.clip_embedding_cache) > self.clip_embedding_cache_max_size:
+                                self.clip_embedding_cache.popitem(last=False) # Remove LRU item
+
+                        clip_embedding = clip_embeddings[clip_embedding_index_in_file]
+                        return clip_embedding
+        except Exception as e:
+            self.logger.error(f"Error loading clip embedding from {clip_embedding_file_path} at index {idx}: {e}")
+            return None
+
     def __len__(self):
-        """Get dataset length"""
-        return len(self.image_files)
+        """Get dataset length (number of latents, same as images)"""
+        return len(self.image_files) # Or len(self.latent_files) - whichever is the driver length
         
     def get_status_summary(self):
         """Generate a user-friendly status summary of dataset processing"""
@@ -706,13 +827,22 @@ class DDMDataset(Dataset):
         return sample_features.shape[0]
 
     def clear_cache(self):
-        """Explicitly clear feature and cluster assignment caches to free RAM."""
+        """Explicitly clear all caches to free RAM."""
         if self.feature_cache:
             self.logger.info("Clearing feature cache")
             self.feature_cache.clear()
         if self.cluster_assignments_cache:
             self.logger.info("Clearing cluster assignments cache")
             self.cluster_assignments_cache.clear()
+        if self.dataset_pair_cache:
+            self.logger.info("Clearing dataset pair cache")
+            self.dataset_pair_cache.clear()
+        if self.latent_cache: # New: clear latent cache
+            self.logger.info("Clearing latent cache")
+            self.latent_cache.clear()
+        if self.clip_embedding_cache: # New: clear clip embedding cache
+            self.logger.info("Clearing clip embedding cache")
+            self.clip_embedding_cache.clear()
         torch.cuda.empty_cache() # Also clear CUDA cache just in case
         self.logger.info("Caches cleared.")
 
