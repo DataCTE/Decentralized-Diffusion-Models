@@ -75,6 +75,17 @@ def ddm_sample(
             router_weights = torch.where(torch.isnan(router_weights) | torch.isinf(router_weights) | (router_weights < 0), torch.zeros_like(router_weights), router_weights)
             router_weights = torch.clamp(router_weights, min=0, max=1) # Double clamp to be safe
 
+            if inference_strategy == "sample":
+                print("Inference strategy is sample")
+                print("Shape of selected_indices:", selected_indices.shape)
+                print("Type of selected_indices:", selected_indices.dtype)
+                print("Min value of selected_indices:", selected_indices.min())
+                print("Max value of selected_indices:", selected_indices.max())
+                print("Sample values of selected_indices:", selected_indices[:10])
+                print("Sum of router_weights:", router_weights.sum())
+                print("Min of router_weights:", router_weights.min())
+                print("Max of router_weights:", router_weights.max())
+
             selected_indices = torch.multinomial(router_weights, 1).squeeze(-1)
             selected_weights = torch.ones_like(selected_indices, dtype=torch.float32)
         elif inference_strategy == "nucleus":
@@ -112,6 +123,9 @@ def ddm_sample(
                 print("Min value of selected_indices:", selected_indices.min())
                 print("Max value of selected_indices:", selected_indices.max())
                 print("Sample values of selected_indices:", selected_indices[:10])
+                print("Sum of router_weights:", router_weights.sum())
+                print("Min of router_weights:", router_weights.min())
+                print("Max of router_weights:", router_weights.max())
 
             unique_experts = torch.unique(cluster_indices)
             
