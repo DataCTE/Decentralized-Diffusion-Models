@@ -112,6 +112,14 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
             print("Shape of t_next:", t_next.shape)
             print("Values of t_next:", t_next)
 
+        print("dtype of x_t:", x_t.dtype)
+        print("dtype of noise_pred:", noise_pred.dtype)
+        print("dtype of a_bar_t:", a_bar_t.dtype)
+        print("dtype of a_bar_prev:", a_bar_prev.dtype)
+        print("dtype of a_t:", a_t.dtype)
+        print("dtype of alphas:", alphas.dtype)
+        print("dtype of alpha_bar:", alpha_bar.dtype)
+
         # Get model prediction
         with torch.no_grad():
             noise_pred = model(x_t, t, text_embeddings)
@@ -134,24 +142,44 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
         print("Shape of (1 - a_bar_t).sqrt():", (1 - a_bar_t).sqrt().shape)
 
         # Compute predicted x0
-        x0_pred = (x_t - torch.sqrt(1 - a_bar_t) * noise_pred) / torch.sqrt(a_bar_t)
+        try:
+            x0_pred = (x_t - torch.sqrt(1 - a_bar_t) * noise_pred) / torch.sqrt(a_bar_t)
+        except RuntimeError as e:
+            print("Error in x0_pred calculation:", e)
+            return x_t
         
         # Prevent extreme values for stability
         x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
         
         # Compute variance
-        var = eta * torch.sqrt(
-            (1 - a_bar_prev) / (1 - a_bar_t) * (1 - a_t / a_bar_t)
-        )
+        try:
+            var = eta * torch.sqrt(
+                (1 - a_bar_prev) / (1 - a_bar_t) * (1 - a_t / a_bar_t)
+            )
+        except RuntimeError as e:
+            print("Error in var calculation:", e)
+            return x_t
         
         # Compute direction
-        dir_xt = torch.sqrt(1 - a_bar_prev - var**2) * noise_pred
+        try:
+            dir_xt = torch.sqrt(1 - a_bar_prev - var**2) * noise_pred
+        except RuntimeError as e:
+            print("Error in dir_xt calculation:", e)
+            return x_t
         
         # Sample random noise for stochastic component
-        noise = torch.randn_like(x_t) if eta > 0 else torch.zeros_like(x_t)
+        try:
+            noise = torch.randn_like(x_t) if eta > 0 else torch.zeros_like(x_t)
+        except RuntimeError as e:
+            print("Error in noise calculation:", e)
+            return x_t
         
         # Compute next latent
-        x_prev = torch.sqrt(a_bar_prev) * x0_pred + dir_xt + var * noise
+        try:
+            x_prev = torch.sqrt(a_bar_prev) * x0_pred + dir_xt + var * noise
+        except RuntimeError as e:
+            print("Error in x_prev calculation:", e)
+            return x_t
         
         return x_prev
     except Exception as e:
