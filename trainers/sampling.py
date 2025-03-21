@@ -156,6 +156,11 @@ def ddm_sample(
                 expert = experts[expert_idx.item()]
                 active_experts.add(expert_idx.item())
 
+                print("Shape of mask:", mask.shape)
+                print("Shape of x:", x.shape)
+                print("Shape of cluster_indices:", cluster_indices.shape)
+                print("Unique experts:", unique_experts)
+
                 # Classifier-free guidance
                 if text_embeddings is not None and cfg_scale > 1.0:
                     x_in = torch.cat([x[mask], x[mask]])
