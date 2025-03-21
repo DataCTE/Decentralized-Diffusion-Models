@@ -224,10 +224,8 @@ def test_full_pipeline():
             router=router,
             experts=experts,
             shape=shape,
-            steps=4,
-            top_k=1,
-            device=device,
-            config=config
+            num_steps=4,
+            device=device
         )
         assert samples.shape == shape, "Sampling output shape mismatch"
         print("All shape tests passed!")
