@@ -320,7 +320,11 @@ def estimate_model_size(config, model_type="expert"):
         )
         total_params = model_summary.total_params
         trainable_params = model_summary.trainable_params
-        non_trainable_params = model_summary.non_trainable_params
+        # Conditional check for non_trainable_params
+        if hasattr(model_summary, 'non_trainable_params'):
+            non_trainable_params = model_summary.non_trainable_params
+        else:
+            non_trainable_params = total_params - trainable_params # Calculate manually if not available
         param_size_mb = model_summary.total_param_size / 1024**2
 
         print(f"===================== {model_name} Size Summary =====================") # Model name in summary
