@@ -201,26 +201,25 @@ class DecentralizedFlowMatcher:
     def compute_flow_matching_loss(self, pred, target):
         """
         Compute flow matching loss following paper Section 3.4
-        
-        Args:
-            pred: Model prediction [B, C, H, W] or [B, C, N]
-            target: Target flow [B, C, H, W] or [B, C, N]
-            
-        Returns:
-            Loss value
+        with bucket-aware resizing
         """
-        # Remove all shape adjustments - assume pred/target already match
-        # Direct loss calculation as per paper
+        # Get current bucket dimensions from prediction shape
+        _, _, H, W = pred.shape
+        
+        # Resize target to match prediction dimensions
+        target_resized = torch.nn.functional.interpolate(
+            target, size=(H, W), mode='bilinear', align_corners=False
+        )
+        
         if self.loss_type == 'mse':
-            loss = F.mse_loss(pred, target, reduction='none')
+            loss = F.mse_loss(pred, target_resized, reduction='none')
         elif self.loss_type == 'huber':
-            loss = F.huber_loss(pred, target, delta=0.1, reduction='none')
+            loss = F.huber_loss(pred, target_resized, delta=0.1, reduction='none')
         elif self.loss_type == 'l1':
-            loss = F.l1_loss(pred, target, reduction='none')
+            loss = F.l1_loss(pred, target_resized, reduction='none')
         else:
             raise ValueError(f"Invalid loss type: {self.loss_type}")
 
-        # Paper specifies mean reduction over all dimensions
         return loss.mean()
 
     def compute_loss(self, predictions, x0, t):
