@@ -474,63 +474,6 @@ class DDMDataset(Dataset):
             bucket_size = tuple(self.bucket_dims[bucket_idx].tolist())
             self.logger.info(f"Rank {self.rank}: Bucket {bucket_idx} ({bucket_size}): {count} images")
 
-    def _distribute_samples(self):
-        """CPU-based expert distribution using paper's clustering"""
-        self.logger.info(f"Rank {self.rank}: Starting expert assignment for {len(self.image_files)} images...")
-        expert_start = time.time()
-
-        # No clustering is performed here anymore, assuming pre-computed clusters are loaded
-        # We are only loading pre-computed cluster assignments, so no clustering here
-        pass # No clustering here, assuming pre-computed clusters are loaded
-
-        # Store expert assignments from loaded cluster files
-        # We are no longer running clustering in dataset.py, so expert_assignments are not set here.
-        # Expert assignments are loaded on-demand in __getitem__ and _load_cluster_assignment
-        # self.expert_assignments = cluster_assignments.to(self.device) - Removed
-
-        # Validate cluster distribution - this part is no longer relevant as we are not clustering here
-        # unique_clusters = torch.unique(cluster_assignments)
-        # if unique_clusters.max() >= self.config.num_experts:
-        #     raise ValueError(f"Cluster IDs exceed number of experts ({self.config.num_experts})")
-        
-        # Count images per expert for logging - this part is no longer relevant here
-        # expert_counts = {}
-        # for i in range(self.num_experts.item()):
-        #     count = torch.sum(self.expert_assignments == i).item()
-        #     expert_counts[i] = count
-        
-        expert_time = time.time() - expert_start
-        self.logger.info(f"Rank {self.rank}: Expert distribution completed in {expert_time:.2f}s") # Keep this log message, but it's misleading now
-
-        # Log distribution for this rank - this part is no longer relevant here
-        # this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
-        # self.logger.info(f"Rank {self.rank}: Will process {this_rank_count} images ({this_rank_count/len(self.image_files)*100:.1f}% of dataset)")
-        
-        # Log total info - keep this
-        dataset_prep_complete = time.time()
-        self.logger.info(f"Rank {self.rank}: Dataset preparation complete - ready to start training")
-
-        # Paper-mandated cluster validation - this part is no longer relevant here
-        # cluster_sizes = [(self.expert_assignments == i).sum().item()
-        #                 for i in range(self.config.num_experts)]
-        # min_cluster_size = min_cluster_sizesize
-        # max_cluster_size = max(cluster_sizes)
-
-        # if getattr(self.config, 'bypass_cluster_validation', False):
-        #     self.logger.info("Bypassing cluster size validation as requested by config flag")
-        # elif min_cluster_size < 1000:  # Paper's minimum cluster size
-        #     raise ValueError(
-        #         f"Cluster too small (min_size={min_cluster_size}). "
-        #         "Consider reducing num_experts or increasing dataset size."
-        #     )
-
-        # size_ratio = max_cluster_size / max_cluster_size
-        # if size_ratio > 10:  # Paper's max imbalance
-        #     self.logger.warning(
-        #         f"Cluster size imbalance {size_ratio:.1f}x exceeds "
-        #         "paper's recommended 10x limit"
-        #     )
-
     def __getitem__(self, idx):
         """Get a training sample with image and caption"""
         # Get target size from bucket assignment
