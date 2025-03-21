@@ -17,6 +17,8 @@ from trainers.diffusion import DecentralizedFlowMatcher
 from utils.distributed import setup_distributed, get_rank
 from utils.fsdp import create_fsdp_model
 import matplotlib.pyplot as plt
+from torchvision import transforms
+from torch.nn import functional as F
 
 def test_full_pipeline():
     """End-to-end shape test of DDM pipeline with dummy data using FSDP"""
@@ -27,9 +29,19 @@ def test_full_pipeline():
     config = get_config("config.py")
     config.num_experts = 4
     config.batch_size = 2
-    config.image_size = (64, 64)
+    config.image_size = (256, 256)
     config.latent_channels = 16
     config.bypass_cluster_validation = True # Enable bypass for shape test
+
+    # Modify config to include multiple buckets
+    config.buckets = [
+        (256, 256),   # Original size
+        (288, 224),   # Landscape variant
+        (224, 288),   # Portrait variant
+    ]
+    config.image_size = (256, 256)  # Base size
+    config.latent_channels = 16
+    config.bypass_cluster_validation = True
 
     # Create temporary dataset directory
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -40,7 +52,12 @@ def test_full_pipeline():
         
         # Create dummy dataset (200 images)
         num_dummy_images = 2000
-        dummy_images = [np.random.rand(256, 256, 3) * 255 for _ in range(num_dummy_images)]
+        dummy_images = []
+        bucket_sizes = [(256, 256), (288, 224), (224, 288)]
+        for i in range(num_dummy_images):
+            # Assign images to different buckets
+            w, h = bucket_sizes[i % 3]
+            dummy_images.append(np.random.rand(h, w, 3) * 255)
         dummy_features = torch.randn(num_dummy_images, 1024)  # Fake DINOv2 features
         dummy_dims = torch.tensor([[256, 256] for _ in range(num_dummy_images)], dtype=torch.int64)
         dummy_dims = dummy_dims.reshape(num_dummy_images, 2)  # Explicitly reshape to [num_dummy_images, 2]
@@ -123,13 +140,39 @@ def test_full_pipeline():
         # Expert training
         expert_trainer = ExpertTrainer(0, config, device, 0, 1)
 
-        print("Testing Expert Training for 20 steps:")
+        # Add explicit test for flow matching with different sizes
+        def test_bucket_aware_flow_matching():
+            flow_matcher = DecentralizedFlowMatcher(loss_type='huber')
+            
+            # Create mismatched prediction/target sizes
+            pred = torch.randn(2, 16, 32, 32)  # Simulate 256x256 bucket
+            target = torch.randn(2, 16, 28, 28)  # Simulate 224x288 bucket
+            
+            try:
+                loss = flow_matcher.compute_flow_matching_loss(pred, target)
+                assert isinstance(loss.item(), float), "Should return scalar loss"
+                print("Bucket-aware flow matching test passed!")
+            except Exception as e:
+                assert False, f"Bucket-aware flow matching failed: {str(e)}"
+
+        test_bucket_aware_flow_matching()
+        
+        # Modify expert training test to verify bucket handling
+        print("Testing Expert Training for 20 steps with mixed buckets:")
         expert_losses = []
-        for step in range(20):  # Run expert training for 20 steps
+        for step in range(20):
+            # Get batch with mixed buckets (simulated via resizing)
+            batch = next(iter(DataLoader(dataset, batch_size=2)))
+            
+            # Manually modify batch dimensions
+            if step % 3 == 0:
+                batch['image'] = F.interpolate(batch['image'], size=(288, 224))
+            elif step % 3 == 1:
+                batch['image'] = F.interpolate(batch['image'], size=(224, 288))
+            
             expert_loss = expert_trainer.train_step(batch)
             expert_losses.append(expert_loss)
             print(f"  Step {step+1}/20 - Expert Loss: {expert_loss:.4f}")
-        assert isinstance(expert_loss, float), "Expert training failed"
         
         # Plotting loss curves
         plt.figure(figsize=(10, 5))
