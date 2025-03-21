@@ -49,7 +49,12 @@ def ddm_sample(
 
     for t in tqdm(range(num_steps), disable=not verbose):
         timestep = torch.full((x.size(0),), t, device=device)
-        
+
+        print(f"Sampling loop iteration: t = {t}") # Print current timestep iteration
+        print("Shape of timestep:", timestep.shape) # Print shape of timestep tensor
+        print("Values of timestep:", timestep) # Print values of timestep tensor
+        print(f"Timestep value range: min={timestep.min()}, max={timestep.max()}") # Print min/max timestep values
+
         # Get router predictions
         router_logits = router(x, timestep, text_embeddings)
         router_weights = F.softmax(router_logits / temperature, dim=-1)
