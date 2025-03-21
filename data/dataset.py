@@ -10,6 +10,7 @@ from collections import defaultdict, OrderedDict
 import logging
 import time  
 import glob
+import bisect
 
 import io
 import torchvision.transforms as transforms
@@ -61,30 +62,73 @@ class DDMDataset(Dataset):
         self.image_files = sorted([f.replace(".latent.pt", "") for f in os.listdir(self.latent_path)])
         self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
         
-        # Load cluster assignments
-        cluster_files = sorted([f for f in os.listdir(self.cluster_path) if f.endswith(".cluster.pt")])
-        self.cluster_assignments = torch.cat([torch.load(os.path.join(self.cluster_path, f)) for f in cluster_files], dim=0)
+        # Cluster file metadata
+        self.cluster_files = sorted(glob.glob(os.path.join(self.cluster_path, "*.cluster.pt")))
+        self.cluster_lengths = []
+        self.cumulative_clusters = [0]
+        
+        # Feature file metadata
+        self.feature_files = sorted(glob.glob(os.path.join(self.feature_path, "*.pt")))
+        self.feature_lengths = []
+        self.cumulative_features = [0]
+        
+        # Initialize file metadata without loading full data
+        for cf in self.cluster_files:
+            with open(cf, 'rb') as f:
+                self.cluster_lengths.append(torch.load(f).shape[0])
+            self.cumulative_clusters.append(self.cumulative_clusters[-1] + self.cluster_lengths[-1])
+            
+        for ff in self.feature_files:
+            with open(ff, 'rb') as f:
+                self.feature_lengths.append(torch.load(f).shape[0])
+            self.cumulative_features.append(self.cumulative_features[-1] + self.feature_lengths[-1])
 
-        # Load features to get dimensions
-        self.feature_files = sorted([f for f in os.listdir(self.feature_path) if f.endswith(".pt")])
-        all_features = [torch.load(os.path.join(self.feature_path, f)) for f in self.feature_files]
-        self.dim_cache = torch.cat([f[:, :2] for f in all_features])  # Assuming first 2 dims are width/height
+        # Limited caches
+        self.cluster_cache = OrderedDict()
+        self.feature_cache = OrderedDict()
+        self.cache_size = 5  # Keep 5 files in memory at once
 
         # Initialize buckets
         self._init_buckets()
 
     def __getitem__(self, idx):
-        # Remove caption loading and use only CLIP embeddings
         return {
             'latent': self._load_latent(idx),
-            'expert': self.cluster_assignments[idx],
+            'expert': self._load_cluster(idx),
             'features': self._load_feature(idx),
             'clip_embedding': self._load_clip_embedding(idx),
             'bucket': self.bucket_assignments[idx]
         }
 
-    # Remove all file discovery and validation methods
-    # Keep only loading methods for precomputed data
+    def _load_cluster(self, idx):
+        # Find which cluster file contains the index
+        file_idx = bisect.bisect_right(self.cumulative_clusters, idx) - 1
+        file_path = self.cluster_files[file_idx]
+        
+        # Load with caching
+        if file_path not in self.cluster_cache:
+            if len(self.cluster_cache) >= self.cache_size:
+                self.cluster_cache.popitem(last=False)
+            self.cluster_cache[file_path] = torch.load(file_path)
+            
+        # Get position within file
+        pos = idx - self.cumulative_clusters[file_idx]
+        return self.cluster_cache[file_path][pos]
+
+    def _load_feature(self, idx):
+        # Find which feature file contains the index
+        file_idx = bisect.bisect_right(self.cumulative_features, idx) - 1
+        file_path = self.feature_files[file_idx]
+        
+        # Load with caching
+        if file_path not in self.feature_cache:
+            if len(self.feature_cache) >= self.cache_size:
+                self.feature_cache.popitem(last=False)
+            self.feature_cache[file_path] = torch.load(file_path)
+            
+        # Get position within file
+        pos = idx - self.cumulative_features[file_idx]
+        return self.feature_cache[file_path][pos]
 
     def _init_buckets(self):
         """CPU-based bucket initialization"""
