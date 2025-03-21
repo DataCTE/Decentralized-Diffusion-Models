@@ -106,6 +106,11 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
         x_{t-1}: Next latent
     """
     try:
+        # Get model prediction first
+        with torch.no_grad():
+            noise_pred = model(x_t, t, text_embeddings)
+            
+        # Now safe to print noise_pred details
         print("Shape of t:", t.shape)
         print("Values of t:", t)
         if t_next is not None:
@@ -114,16 +119,8 @@ def ddim_step(model, x_t, t, t_next, alphas, alpha_bar, eta=0.0, text_embeddings
 
         print("dtype of x_t:", x_t.dtype)
         print("dtype of noise_pred:", noise_pred.dtype)
-        print("dtype of a_bar_t:", a_bar_t.dtype)
-        print("dtype of a_bar_prev:", a_bar_prev.dtype)
-        print("dtype of a_t:", a_t.dtype)
-        print("dtype of alphas:", alphas.dtype)
-        print("dtype of alpha_bar:", alpha_bar.dtype)
-
-        # Get model prediction
-        with torch.no_grad():
-            noise_pred = model(x_t, t, text_embeddings)
-            
+        print("Shape of noise_pred:", noise_pred.shape)
+        
         # Get alphas for current and next timestep
         a_t = alphas[t]
         a_prev = alphas[t_next]
