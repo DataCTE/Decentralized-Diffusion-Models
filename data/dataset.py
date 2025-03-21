@@ -705,6 +705,17 @@ class DDMDataset(Dataset):
         sample_features = torch.load(file_path, map_location='cpu')
         return sample_features.shape[0]
 
+    def clear_cache(self):
+        """Explicitly clear feature and cluster assignment caches to free RAM."""
+        if self.feature_cache:
+            self.logger.info("Clearing feature cache")
+            self.feature_cache.clear()
+        if self.cluster_assignments_cache:
+            self.logger.info("Clearing cluster assignments cache")
+            self.cluster_assignments_cache.clear()
+        torch.cuda.empty_cache() # Also clear CUDA cache just in case
+        self.logger.info("Caches cleared.")
+
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
     def __init__(self, batch_samplers):
