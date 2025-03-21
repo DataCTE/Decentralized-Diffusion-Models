@@ -283,29 +283,28 @@ def estimate_model_size(config, model_type="expert"):
         raise ValueError(f"Invalid model_type: {model_type}. Must be 'expert' or 'router'.")
 
     if TORCHINFO_AVAILABLE:
-        input_size = None
         dummy_input = None
         if model_type == "expert":
-            input_size = (
-                config.batch_size,
-                config.latent_channels,
-                config.image_size[1] // config.patch_size, # Corrected input size
-                config.image_size[2] // config.patch_size, # Corrected input size
-            )
             dummy_input = [
-                torch.randn(input_size, device=device), # x
+                torch.randn(
+                    config.batch_size,
+                    config.latent_channels,
+                    config.image_size[1] // config.patch_size, # Corrected input size
+                    config.image_size[2] // config.patch_size, # Corrected input size,
+                    device=device
+                ), # x
                 torch.randint(0, 1000, (config.batch_size,), device=device), # t
                 torch.randn(config.batch_size, config.clip_embedding_dim, device=device) # text_embeds
             ]
         elif model_type == "router":
-            input_size = (
-                config.batch_size,
-                config.latent_channels,
-                config.image_size[1] // config.patch_size, # Corrected input size
-                config.image_size[2] // config.patch_size, # Corrected input size
-            )
             dummy_input = [
-                torch.randn(input_size, device=device), # x
+                torch.randn(
+                    config.batch_size,
+                    config.latent_channels,
+                    config.image_size[1] // config.patch_size, # Corrected input size
+                    config.image_size[2] // config.patch_size, # Corrected input size,
+                    device=device
+                ), # x
                 torch.randint(0, 1000, (config.batch_size,), device=device), # t
                 torch.randn(config.batch_size, config.clip_embedding_dim, device=device) # text_embeds
             ]
@@ -313,12 +312,11 @@ def estimate_model_size(config, model_type="expert"):
 
         model_summary = summary(
             dummy_model,
-            input_size=input_size,
             dtypes=[torch.float32],
             device=device, # Run summary on the determined device
             verbose=0, # Reduced verbosity
             # Pass dummy inputs as positional arguments using input_data
-            input_data=dummy_input
+            input_data=dummy_input,
         )
         total_params = model_summary.total_params
         trainable_params = model_summary.trainable_params
