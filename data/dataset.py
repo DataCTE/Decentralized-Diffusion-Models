@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, Sampler, SubsetRandomSampler
 from PIL import Image
 import random
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import logging
 import time  
 import glob
@@ -112,7 +112,8 @@ class DDMDataset(Dataset):
         self.feature_path = feature_path # Store feature path
         self.feature_files = sorted([f for f in os.listdir(feature_path) if f.endswith(".pt")]) # Store feature file names
         self.num_feature_files = len(self.feature_files) # Store number of feature files
-        self.features_cache = {} # Initialize cache for features
+        self.feature_cache = OrderedDict() # Initialize feature cache
+        self.feature_cache_max_size = 500 # Set a reasonable cache size (adjust as needed)
 
         self._discover_and_process_files()
         self._init_buckets()
@@ -518,21 +519,30 @@ class DDMDataset(Dataset):
 
     def _load_feature(self, index):
         """Load feature for a given index from file, using cache"""
-        # Add safety checks for zero division
-        if self.num_feature_files == 0 or len(self.image_files) == 0:
-            raise ValueError("No feature files or images available")
-            
-        samples_per_feature_file = (len(self.image_files) + self.num_feature_files - 1) // self.num_feature_files  # Use ceiling division
-        file_index = index // samples_per_feature_file
-        feature_file_name = self.feature_files[file_index]
+        feature_file_index = index // self.num_feature_files
+        feature_file_path = self.feature_files[feature_file_index]
+        feature_index_in_file = index % self.num_feature_files
 
-        if feature_file_name not in self.features_cache:
-            feature_file_path = os.path.join(self.feature_path, feature_file_name)
-            self.features_cache[feature_file_name] = torch.load(feature_file_path, map_location='cpu')
+        # Check cache first
+        if index in self.feature_cache:
+            feature = self.feature_cache.pop(index) # Move to end of LRU
+            self.feature_cache[index] = feature
+            return feature
 
-        file_features = self.features_cache[feature_file_name]
-        index_within_file = index % samples_per_feature_file
-        return file_features[index_within_file]
+        feature_path = os.path.join(self.feature_path, feature_file_path)
+        try:
+            features_in_file = torch.load(feature_path, map_location='cpu')
+            feature = features_in_file[feature_index_in_file]
+
+            # Add to cache, evicting LRU if necessary
+            if len(self.feature_cache) >= self.feature_cache_max_size:
+                self.feature_cache.popitem(last=False) # Remove LRU item
+            self.feature_cache[index] = feature
+
+            return feature
+        except Exception as e:
+            logger.error(f"Error loading feature from {feature_path} at index {feature_index_in_file}: {e}")
+            return None
 
     def __len__(self):
         """Get dataset length"""
