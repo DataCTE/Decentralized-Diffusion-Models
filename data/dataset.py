@@ -45,12 +45,13 @@ def chunks(lst, n):
 class DDMDataset(Dataset):
     """GPU-optimized dataset pipeline for decentralized diffusion models with precomputed latents"""
     
-    def __init__(self, config, split='train', transforms=None, hf_split=None):
+    def __init__(self, config, split='train', transforms=None, hf_split=None, bypass_clip_check=False, bypass_latent_check=False):
         # Initialize logger first
         self.logger = logging.getLogger(__name__)
         self.config = config
         self.split = split
-        self.bypass_clip_check = False # Add bypass_clip_check flag, default False
+        self.bypass_clip_check = bypass_clip_check # Use bypass_clip_check flag, default False
+        self.bypass_latent_check = bypass_latent_check # Add bypass_latent_check flag, default False
         
         # Validate required parameters
         if not hasattr(config, 'min_size'):
@@ -98,8 +99,9 @@ class DDMDataset(Dataset):
         if not os.path.exists(feature_path):
             raise FileNotFoundError(f"Features not found at {feature_path}. Run feature extraction first.")
         
-        if not os.path.exists(latent_path): # New: check for latent path
-            raise FileNotFoundError(f"Latents not found at {latent_path}. Run precompute_latents.py first.")
+        if not self.bypass_latent_check: # Conditionally check for latent path
+            if not os.path.exists(latent_path): # New: check for latent path
+                raise FileNotFoundError(f"Latents not found at {latent_path}. Run precompute_latents.py first.")
 
         if not self.bypass_clip_check: # Conditionally check for clip embeddings dir
             if not os.path.exists(clip_embedding_output_dir): # New: check for clip embedding path
