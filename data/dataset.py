@@ -43,6 +43,11 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
+def get_tensor_length(file_path):
+    """Helper function for parallel metadata loading"""
+    with open(file_path, 'rb') as f:
+        return torch.load(f, map_location='cpu').shape[0]
+
 class DDMDataset(Dataset):
     """GPU-optimized dataset pipeline for decentralized diffusion models with precomputed latents"""
     
@@ -62,26 +67,27 @@ class DDMDataset(Dataset):
         self.image_files = sorted([f.replace(".latent.pt", "") for f in os.listdir(self.latent_path)])
         self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
         
-        # Cluster file metadata
+        # Cluster file metadata with parallel loading
         self.cluster_files = sorted(glob.glob(os.path.join(self.cluster_path, "*.cluster.pt")))
-        self.cluster_lengths = []
-        self.cumulative_clusters = [0]
-        
-        # Feature file metadata
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(get_tensor_length, cf) for cf in self.cluster_files]
+            with tqdm(total=len(futures), desc="Loading cluster metadata") as pbar:
+                self.cluster_lengths = []
+                for future in as_completed(futures):
+                    self.cluster_lengths.append(future.result())
+                    pbar.update(1)
+        self.cumulative_clusters = np.cumsum([0] + self.cluster_lengths).tolist()
+
+        # Feature file metadata with parallel loading
         self.feature_files = sorted(glob.glob(os.path.join(self.feature_path, "*.pt")))
-        self.feature_lengths = []
-        self.cumulative_features = [0]
-        
-        # Initialize file metadata without loading full data
-        for cf in self.cluster_files:
-            with open(cf, 'rb') as f:
-                self.cluster_lengths.append(torch.load(f).shape[0])
-            self.cumulative_clusters.append(self.cumulative_clusters[-1] + self.cluster_lengths[-1])
-            
-        for ff in self.feature_files:
-            with open(ff, 'rb') as f:
-                self.feature_lengths.append(torch.load(f).shape[0])
-            self.cumulative_features.append(self.cumulative_features[-1] + self.feature_lengths[-1])
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(get_tensor_length, ff) for ff in self.feature_files]
+            with tqdm(total=len(futures), desc="Loading feature metadata") as pbar:
+                self.feature_lengths = []
+                for future in as_completed(futures):
+                    self.feature_lengths.append(future.result())
+                    pbar.update(1)
+        self.cumulative_features = np.cumsum([0] + self.feature_lengths).tolist()
 
         # Limited caches
         self.cluster_cache = OrderedDict()
