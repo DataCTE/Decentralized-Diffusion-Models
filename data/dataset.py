@@ -56,6 +56,10 @@ class DDMDataset(Dataset):
         self.split = split
         self.device = torch.device('cpu')
         
+        # Initialize logging
+        self.logger = logging.getLogger(__name__)
+        self.rank = get_rank()  # Get distributed rank
+        
         # Load precomputed paths
         self.feature_cache_path = config.feature_cache_path
         self.feature_path = os.path.join(self.feature_cache_path, "features")
