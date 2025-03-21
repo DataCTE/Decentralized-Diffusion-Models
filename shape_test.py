@@ -75,6 +75,22 @@ def test_full_pipeline():
         torch.save(dummy_dims, os.path.join(tmpdir, "dim_cache.pt"))
         torch.save(torch.randint(0,4,(num_dummy_images,)), os.path.join(tmpdir, "train_clusters.pt"))
         
+        # Save clustered features in paper's format
+        cluster_dir = os.path.join(tmpdir, "clusters")
+        os.makedirs(cluster_dir, exist_ok=True)
+        
+        # Paper's clustering: 2-stage process with fine then coarse
+        fine_clusters = torch.randint(0, 2, (num_dummy_images,))  # Stage 1: 2 fine clusters
+        coarse_clusters = torch.randint(0, 4, (num_dummy_images,))  # Stage 2: 4 experts
+        
+        # Save in paper's expected format - 1 file per coarse cluster
+        for cluster_idx in range(config.num_experts):
+            mask = coarse_clusters == cluster_idx
+            torch.save({
+                'fine': fine_clusters[mask],
+                'coarse': coarse_clusters[mask]
+            }, os.path.join(cluster_dir, f"cluster_{cluster_idx}.pt"))
+        
         # Set num_fine_clusters in config before dataset initialization
         config.num_fine_clusters = 2
         print(f"config.num_fine_clusters in shape_test: {config.num_fine_clusters}")
