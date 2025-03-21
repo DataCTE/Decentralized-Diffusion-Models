@@ -182,6 +182,9 @@ def ddm_sample(
                 sample_pred += pred * weight # Accumulate prediction for this sample
             combined_pred[batch_idx:batch_idx+1] = sample_pred # Assign sample prediction to combined prediction
 
+        print("Shape of combined_pred before ddim_step:", combined_pred.shape)
+        print("Shape of timestep before ddim_step:", timestep.shape)
+
         # DDIM update step
         x = ddim_step(
             lambda x_t, t, c: combined_pred,
