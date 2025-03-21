@@ -128,8 +128,8 @@ class DDMDataset(Dataset):
         self.cumulative_feature_counts = torch.tensor(self.feature_counts_per_file).cumsum(dim=0) # New: cumulative counts
         self.total_features = cumulative_feature_count # New: total features across all files
 
-        print(f"Feature path: {self.feature_path}") # Debug print
-        print(f"Feature files: {self.feature_files[:5]}...") # Debug print, first 5 files
+        #print(f"Feature path: {self.feature_path}") # Debug print
+        #print(f"Feature files: {self.feature_files[:5]}...") # Debug print, first 5 files
 
         self._discover_and_process_files()
         self._init_buckets()
@@ -542,7 +542,7 @@ class DDMDataset(Dataset):
 
         feature_file_path = os.path.join(self.feature_path, self.feature_files[feature_file_index])
 
-        print(f"Loading feature file: {feature_file_path} for index {index}") # Debug print
+        #print(f"Loading feature file: {feature_file_path} for index {index}") # Debug print
 
         try:
             # Check cache first
