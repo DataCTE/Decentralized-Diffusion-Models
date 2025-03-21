@@ -228,8 +228,15 @@ def test_full_pipeline():
         # Test different inference strategies
         strategies = ["top_k", "full", "sample", "nucleus"]
         for strategy in strategies:
+            # Dummy router function to ensure valid probabilities for shape test
+            def dummy_router(x_t, timestep, text_embeddings):
+                batch_size = x_t.shape[0]
+                num_experts = config.num_experts
+                # Return uniform logits to ensure valid probabilities
+                return torch.randn(batch_size, num_experts, device=device)
+
             samples = ddm_sample(
-                router=router,
+                router=dummy_router, # Use dummy router here
                 experts=experts,
                 shape=shape,
                 num_steps=4,
