@@ -117,6 +117,19 @@ class DDMDataset(Dataset):
         self.feature_cache_max_size = 500 # Set a reasonable cache size (adjust as needed)
         self._feature_loading_lock = defaultdict(threading.Lock) # Initialize lock
         self.feature_counts_per_file = [] # New: store feature counts per file
+        cumulative_feature_count = 0 # New: track cumulative count
+        for file_name in self.feature_files:
+            file_path = os.path.join(feature_path, file_name)
+            # Load just to get shape, avoid loading all features into memory
+            sample_features = torch.load(file_path, map_location='cpu')
+            num_features_in_file = sample_features.shape[0]
+            self.feature_counts_per_file.append(num_features_in_file)
+            cumulative_feature_count += num_features_in_file
+        self.cumulative_feature_counts = torch.tensor(self.feature_counts_per_file).cumsum(dim=0) # New: cumulative counts
+        self.total_features = cumulative_feature_count # New: total features across all files
+
+        print(f"Feature path: {self.feature_path}") # Debug print
+        print(f"Feature files: {self.feature_files[:5]}...") # Debug print, first 5 files
 
         self._discover_and_process_files()
         self._init_buckets()
@@ -521,9 +534,15 @@ class DDMDataset(Dataset):
         return file_assignments[index_within_file]
 
     def _load_feature(self, index):
-        feature_file_index = index // self.num_feature_files
-        feature_index_in_file = index % self.num_feature_files
-        feature_file_path = self.feature_files[feature_file_index]
+        feature_file_index = torch.searchsorted(self.cumulative_feature_counts, index, right=True).item()
+        if feature_file_index > 0:
+            feature_index_in_file = index - self.cumulative_feature_counts[feature_file_index - 1].item()
+        else:
+            feature_index_in_file = index
+
+        feature_file_path = os.path.join(self.feature_path, self.feature_files[feature_file_index])
+
+        print(f"Loading feature file: {feature_file_path} for index {index}") # Debug print
 
         try:
             # Check cache first
