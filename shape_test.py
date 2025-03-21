@@ -94,6 +94,13 @@ def test_full_pipeline():
         # Set num_fine_clusters in config before dataset initialization
         config.num_fine_clusters = 2
         print(f"config.num_fine_clusters in shape_test: {config.num_fine_clusters}")
+        # Manually initialize clusterer as per paper's Appendix B
+        dataset.clusterer = DDMClustering(
+            num_coarse_clusters=config.num_experts,
+            num_fine_clusters=config.num_fine_clusters
+        )
+        dataset.clusterer.coarse_centroids = torch.randn(config.num_experts, 1024)  # Match dummy feature dim
+        dataset.clusterer.fine_centroids = torch.randn(config.num_fine_clusters, 1024)
         # Initialize dataset
         dataset = DDMDataset(config, split='train')
         
