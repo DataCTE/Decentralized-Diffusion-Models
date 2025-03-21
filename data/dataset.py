@@ -134,12 +134,18 @@ class DDMDataset(Dataset):
         self.dataset_pair_cache = OrderedDict() # Initialize dataset pair cache
         self.dataset_pair_cache_max_size = 1000 # Set a reasonable cache size for dataset pairs
         self.latent_path = latent_path # New: store latent path
-        self.latent_files = sorted([f for f in os.listdir(latent_path) if f.endswith(self.latent_ext)]) # New: latent files
+        if os.path.exists(latent_path):
+            self.latent_files = sorted([f for f in os.listdir(latent_path) if f.endswith(self.latent_ext)]) # New: latent files
+        else:
+            self.latent_files = [] # Initialize as empty list if not exists
         self.latent_cache = OrderedDict() # New: latent cache
         self.latent_cache_max_size = 200 # New: latent cache max size
         self._latent_loading_lock = defaultdict(threading.Lock) # New: latent loading lock
         self.clip_embedding_path = clip_embedding_output_dir # New: clip embedding path
-        self.clip_embedding_files = sorted([f for f in os.listdir(clip_embedding_output_dir) if f.endswith(self.clip_embedding_ext)]) # New: clip embedding files
+        if os.path.exists(clip_embedding_output_dir):
+            self.clip_embedding_files = sorted([f for f in os.listdir(clip_embedding_output_dir) if f.endswith(self.clip_embedding_ext)]) # New: clip embedding files
+        else:
+            self.clip_embedding_files = [] # Initialize as empty list if not exist
         self.clip_embedding_cache = OrderedDict() # New: clip embedding cache
         self.clip_embedding_cache_max_size = 200 # New: clip embedding cache max size
         self._clip_embedding_loading_lock = defaultdict(threading.Lock) # New: clip embedding loading lock
