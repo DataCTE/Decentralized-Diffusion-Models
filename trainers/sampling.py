@@ -240,7 +240,8 @@ def ddm_sample(
             
             # Update progress with active expert info
             if verbose and t % 5 == 0:
-                active_str = ", ".join([f"E{selected_experts[i]}:{expert_weights[:,i].mean().item():.2f}" for i in range(len(selected_experts))])
+                active_str = ", ".join([f"E{selected_experts[:,i]}:{expert_weights[:,i].mean().item():.2f}" 
+                                      for i in range(selected_experts.size(1))])  # Use tensor shape instead of length
                 progress.set_postfix({"Active": active_str})
             
             # Sample step (DDIM)
