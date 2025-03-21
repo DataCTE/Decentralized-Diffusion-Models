@@ -71,6 +71,10 @@ def ddm_sample(
                 print("router_weights max:", router_weights.max())
                 router_weights = torch.clamp(router_weights, min=0, max=1) # Clamp to valid probability range
 
+            # Ensure router_weights are valid probabilities for multinomial sampling
+            router_weights = torch.where(torch.isnan(router_weights) | torch.isinf(router_weights) | (router_weights < 0), torch.zeros_like(router_weights), router_weights)
+            router_weights = torch.clamp(router_weights, min=0, max=1) # Double clamp to be safe
+
             selected_indices = torch.multinomial(router_weights, 1).squeeze(-1)
             selected_weights = torch.ones_like(selected_indices, dtype=torch.float32)
         elif inference_strategy == "nucleus":
