@@ -77,16 +77,19 @@ def ddm_sample(
 
             if inference_strategy == "sample":
                 print("Inference strategy is sample")
+                print("Sum of router_weights:", router_weights.sum())
+                print("Min of router_weights:", router_weights.min())
+                print("Max of router_weights:", router_weights.max())
+                print("Shape of router_weights:", router_weights.shape)
+                print("Sample values of router_weights:", router_weights[:2])
+
+                selected_indices = torch.multinomial(router_weights, 1).squeeze(-1)
                 print("Shape of selected_indices:", selected_indices.shape)
                 print("Type of selected_indices:", selected_indices.dtype)
                 print("Min value of selected_indices:", selected_indices.min())
                 print("Max value of selected_indices:", selected_indices.max())
                 print("Sample values of selected_indices:", selected_indices[:10])
-                print("Sum of router_weights:", router_weights.sum())
-                print("Min of router_weights:", router_weights.min())
-                print("Max of router_weights:", router_weights.max())
 
-            selected_indices = torch.multinomial(router_weights, 1).squeeze(-1)
             selected_weights = torch.ones_like(selected_indices, dtype=torch.float32)
         elif inference_strategy == "nucleus":
             # Nucleus sampling (top-p)
