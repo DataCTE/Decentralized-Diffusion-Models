@@ -164,7 +164,6 @@ class DDMDataset(Dataset):
                 self.image_files = [self.image_files[i] for i in val_indices]
                 self.caption_files = [self.caption_files[i] for i in val_indices]
                 self.dim_cache = self.dim_cache[val_indices]
-                self.logger.info(f"Rank {get_rank()}: Selected {len(self.image_files)} files for validation split")
         elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
             # For training, exclude validation samples if specified
             val_size = getattr(self.config, 'val_size', 1000)
@@ -179,10 +178,8 @@ class DDMDataset(Dataset):
                 self.image_files = [self.image_files[i] for i in train_indices]
                 self.caption_files = [self.caption_files[i] for i in train_indices]
                 self.dim_cache = self.dim_cache[train_indices]
-                self.logger.info(f"Rank {get_rank()}: Selected {len(self.image_files)} files for training split (excluded {val_size} validation files)")
         
-        self.logger.info(f"Rank {get_rank()}: Starting bucket assignment for {len(self.image_files)} images...")
-        bucket_start = time.time()
+      
         
         # Calculate aspect ratios
         bucket_aspects = self.bucket_dims[:,0] / self.bucket_dims[:,1]
@@ -211,15 +208,6 @@ class DDMDataset(Dataset):
             if count > 0:
                 bucket_counts[i] = count
         
-        bucket_time = time.time() - bucket_start
-        self.logger.info(f"Rank {get_rank()}: Bucket assignment completed in {bucket_time:.2f}s - {len(bucket_counts)} buckets used")
-        
-        # Log distribution stats
-        top_buckets = sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        for bucket_idx, count in top_buckets:
-            bucket_size = tuple(self.bucket_dims[bucket_idx].tolist())
-            self.logger.info(f"Rank {get_rank()}: Bucket {bucket_idx} ({bucket_size}): {count} images")
-
     def _load_latent(self, idx):
         """Load precomputed latent tensor from disk, with caching and thread safety"""
         latent_file = self.image_files[idx] + ".latent.pt"
