@@ -55,12 +55,13 @@ class DDMDataset(Dataset):
         # Initialize logging
         self.logger = logging.getLogger(__name__)
 
-        # Load precomputed paths
+        # Initialize paths
         self.feature_cache_path = config.feature_cache_path
         self.feature_path = os.path.join(self.feature_cache_path, "features")
         self.cluster_path = os.path.join(self.feature_cache_path, "clusters")
         self.latent_path = os.path.join(self.feature_cache_path, "latents")
         self.clip_embedding_path = os.path.join(self.feature_cache_path, "clip_embeddings")
+        self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions")
 
         # Load precomputed file lists
         self.image_files = sorted([f.replace(".latent.pt", "") for f in os.listdir(self.latent_path)])
