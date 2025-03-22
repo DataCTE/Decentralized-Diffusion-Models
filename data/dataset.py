@@ -89,19 +89,36 @@ class DDMDataset(Dataset):
         logger.info(f"Dimensions path: {self.dim_cache_path}") # Log dimensions path - removed rank info
 
         if is_main_process():
-            self.dimension_files = sorted(glob.glob(os.path.join(self.dim_cache_path, "*.pt"))) # List all dimension files
-            logger.info(f"Loading {len(self.dimension_files)} dimension files...") # Log number of dimension files - removed rank info
+            self.dimension_files = sorted(glob.glob(os.path.join(self.dim_cache_path, "*.pt")))
+            logger.info(f"Loading {len(self.dimension_files)} dimension files...")
 
             dim_cache_list = []
-            for file_path in tqdm(self.dimension_files, desc="Loading dimension files", unit="file"): # Load each dimension file
-                try:
-                    dims = torch.load(file_path, map_location='cpu')
-                    dim_cache_list.append(dims)
-                except Exception as e:
-                    logger.error(f"Error loading dimension file {file_path}: {e}")
-                    dim_cache_list.append(None) # Append None in case of loading error
+            
+            # Use batched parallel loading with error handling
+            def load_dims_batch(file_batch):
+                batch_results = []
+                for file_path in file_batch:
+                    try:
+                        dims = torch.load(file_path, map_location='cpu')
+                        batch_results.append(dims)
+                    except Exception as e:
+                        logger.error(f"Error loading dimension file {file_path}: {e}")
+                        batch_results.append(None)
+                return batch_results
 
-            self.dim_cache = torch.stack([d for d in dim_cache_list if d is not None]) if any(d is not None for d in dim_cache_list) else None # Stack valid tensors, handle cases where all are None
+            batch_size = 512  # Optimal for HDD/SSD I/O
+            file_batches = [self.dimension_files[i:i+batch_size] 
+                           for i in range(0, len(self.dimension_files), batch_size)]
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = []
+                for batch in file_batches:
+                    futures.append(executor.submit(load_dims_batch, batch))
+                
+                for future in tqdm(futures, desc="Loading dimension batches", unit="batch"):
+                    dim_cache_list.extend(future.result())
+
+            self.dim_cache = torch.stack([d for d in dim_cache_list if d is not None]) if any(d is not None for d in dim_cache_list) else None
 
             if self.dim_cache is not None:
                 logger.info(f"Dimension files loaded and stacked successfully. Shape: {self.dim_cache.shape}") # Log shape of stacked dim_cache - removed rank info
