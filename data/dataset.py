@@ -94,60 +94,47 @@ class DDMDataset(Dataset):
         self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions") # Path to dimensions directory
         logger.info(f"Dimensions path: {self.dim_cache_path}") # Log dimensions path - removed rank info
 
+        # Load dimension cache - MAIN PROCESS ONLY
         if is_main_process():
             self.dimension_files = sorted(glob.glob(os.path.join(self.dim_cache_path, "*.pt")))
             logger.info(f"Loading {len(self.dimension_files)} dimension files...")
 
-            dim_cache_list = []
-            
-            # Use batched parallel loading with error handling
+            # Parallel loading with error handling
             def load_dims_batch(file_batch):
-                batch_results = []
-                for file_path in file_batch:
-                    try:
-                        dims = torch.load(file_path, map_location='cpu')
-                        batch_results.append(dims)
-                    except Exception as e:
-                        logger.error(f"Error loading dimension file {file_path}: {e}")
-                        batch_results.append(None)
-                return batch_results
-
-            batch_size = 512  # Optimal for HDD/SSD I/O
-            file_batches = [self.dimension_files[i:i+batch_size] 
-                           for i in range(0, len(self.dimension_files), batch_size)]
+                return [torch.load(f, map_location='cpu') for f in file_batch]
 
             with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = []
-                for batch in file_batches:
-                    futures.append(executor.submit(load_dims_batch, batch))
-                
-                for future in tqdm(futures, desc="Loading dimension batches", unit="batch"):
-                    dim_cache_list.extend(future.result())
+                # Split files into batches without tqdm
+                file_batches = [self.dimension_files[i:i+512] 
+                              for i in range(0, len(self.dimension_files), 512)]
+                futures = [executor.submit(load_dims_batch, batch) for batch in file_batches]
+                dim_cache_list = []
+                for future in futures:
+                    try:
+                        dim_cache_list.extend(future.result())
+                    except Exception as e:
+                        logger.error(f"Dimension loading failed: {e}")
 
-            self.dim_cache = torch.stack([d for d in dim_cache_list if d is not None]) if any(d is not None for d in dim_cache_list) else None
-
-            if self.dim_cache is not None:
-                logger.info(f"Dimension files loaded and stacked successfully. Shape: {self.dim_cache.shape}") # Log shape of stacked dim_cache - removed rank info
-            else:
-                logger.error(f"Failed to load any dimension files!") # Log if dim_cache is None - removed rank info
-
-            # Initialize clip embedding metadata
-            self.clip_embedding_files = sorted(glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))) # Load clip embedding file list
-            self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path) # Calculate cumulative counts
-
-            broadcast_object((self.dim_cache, self.cumulative_feature_counts, self.clip_embedding_files)) # Broadcast dim_cache, cumulative_feature_counts, and clip_embedding_files
+            self.dim_cache = torch.stack(dim_cache_list)
+            
+            # Broadcast full dataset state
+            broadcast_data = (
+                self.image_files,
+                self.caption_files,
+                self.dim_cache,
+                self.clip_embedding_files,
+                self.cumulative_feature_counts
+            )
+            broadcast_object(broadcast_data)
         else:
-            logger.info(f"Receiving broadcasted dim_cache...") # Log before receiving - removed rank info
-            (self.dim_cache, self.cumulative_feature_counts, self.clip_embedding_files) = broadcast_object(None) # Receive broadcasted dim_cache, cumulative_feature_counts, and clip_embedding_files
-            if self.dim_cache is not None:
-                logger.info(f"Received dim_cache successfully. Shape: {self.dim_cache.shape if hasattr(self.dim_cache, 'shape') else 'N/A (None)'}") # Log after successful receive - removed rank info
-            else:
-                 logger.warning(f"Received None for dim_cache.") # Log if None received - removed rank info
+            # Receive all data from main process
+            (self.image_files,
+             self.caption_files,
+             self.dim_cache,
+             self.clip_embedding_files,
+             self.cumulative_feature_counts) = broadcast_object(None)
 
-        if self.dim_cache is None: # Check if dim_cache is None after loading/broadcast
-            logger.error(f"dim_cache is None after loading/broadcast!") # Log if dim_cache is None - removed rank info
-
-        # Initialize buckets
+        # Initialize buckets AFTER receiving data
         self._init_buckets()
 
     def __getitem__(self, idx):
@@ -190,9 +177,9 @@ class DDMDataset(Dataset):
         return self.feature_cache[file_path] # Return entire tensor
 
     def _init_buckets(self):
-        """CPU-based bucket initialization with distributed optimization"""
+        """Distributed-safe bucket initialization with full data sync"""
         if is_main_process():
-            # Main process computes bucket assignments
+            # Main process handles all dataset filtering
             if self.split == 'val' and _GLOBAL_DATASET_CACHE["initialized"]:
                 # If this is the validation dataset and we're using cached data, 
                 # select only a subset for validation
@@ -222,27 +209,33 @@ class DDMDataset(Dataset):
                     self.caption_files = [self.caption_files[i] for i in train_indices]
                     self.dim_cache = self.dim_cache[train_indices]
             
-            # Vectorized bucket assignment (20-50x faster than per-item)
-            bucket_aspects = self.bucket_dims[:,0] / self.bucket_dims[:,1]
-            image_aspects = self.dim_cache[:,0] / self.dim_cache[:,1]
+            # Compute bucket assignments (vectorized)
+            bucket_aspects = self.bucket_dims[:, 0] / self.bucket_dims[:, 1]
+            image_aspects = self.dim_cache[:, 0] / self.dim_cache[:, 1]
             diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
             self.bucket_assignments = torch.argmin(diffs, dim=1)
-            
-            # Broadcast results to other ranks (critical for sync)
-            broadcast_object((
+
+            # Package critical data for broadcast
+            broadcast_data = (
                 self.image_files,
                 self.caption_files,
-                self.bucket_assignments
-            ))
+                self.bucket_assignments,
+                self.dim_cache
+            )
+            broadcast_object(broadcast_data)
         else:
-            # Receive precomputed data from main process
+            # Receive precomputed data from main
+            received = broadcast_object(None)
             (self.image_files, 
-             self.caption_files, 
-             self.bucket_assignments) = broadcast_object(None)
-        
-        # Final validation check
-        assert len(self.bucket_assignments) == len(self.image_files), \
-            f"Bucket mismatch: {len(self.bucket_assignments)} vs {len(self.image_files)}"
+             self.caption_files,
+             self.bucket_assignments,
+             self.dim_cache) = received
+
+        # Final validation (critical for distributed sync)
+        assert len(self.image_files) == len(self.bucket_assignments), \
+            f"Dataset/Bucket mismatch: {len(self.image_files)} vs {len(self.bucket_assignments)}"
+        assert self.dim_cache.shape[0] == len(self.image_files), \
+            f"Dimension cache mismatch: {self.dim_cache.shape[0]} vs {len(self.image_files)}"
 
     def _load_latent(self, idx):
         """Load precomputed latent tensor from disk, with caching and thread safety"""
