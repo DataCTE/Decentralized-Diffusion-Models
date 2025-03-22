@@ -181,15 +181,18 @@ class DDMDataset(Dataset):
                 file_batches = [self.dimension_files[i:i+512] 
                               for i in range(0, len(self.dimension_files), 512)]
                 
-                with tqdm(total=len(file_batches), desc="Loading dimension batches", unit="batch") as pbar:
-                    futures = []
-                    for batch in file_batches:
-                        futures.append(executor.submit(load_dims_batch, batch))
+                with tqdm(total=len(self.dimension_files),  # Change to total files instead of batches
+                         desc="Loading dimension files", 
+                         unit="file") as pbar:
+                    # Submit all batches
+                    futures = [executor.submit(load_dims_batch, batch) for batch in file_batches]
                     
+                    # Process completed batches
                     dim_cache_list = []
                     for future in as_completed(futures):
-                        dim_cache_list.extend(future.result())
-                        pbar.update(1)
+                        batch_result = future.result()
+                        dim_cache_list.extend(batch_result)
+                        pbar.update(len(batch_result))  # Update by actual files processed
 
             self.dim_cache = torch.stack(dim_cache_list)
             
@@ -369,20 +372,36 @@ class DDMDataset(Dataset):
         return latent
 
     def _calculate_cumulative_counts(self, files, path):
-        """Calculates cumulative counts of features in each file for indexing"""
-        cumulative_counts = []
-        count = 0
+        """Optimized cumulative counts calculation with parallel processing"""
+        # Pre-allocate tensor for counts
+        counts = torch.zeros(len(files), dtype=torch.long)
         
-        # Add progress bar for cumulative counts
-        with tqdm(total=len(files), desc="Calculating feature counts", unit="file") as pbar:
-            for file in files:
-                file_path = os.path.join(path, file)
-                num_features = self._get_feature_count(file_path)
-                count += num_features
-                cumulative_counts.append(torch.tensor(count))
-                pbar.update(1)
-                
-        return torch.stack(cumulative_counts) if cumulative_counts else torch.tensor([])
+        # Use maximum available workers
+        num_workers = min(32, os.cpu_count())
+        
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Create future map for parallel processing
+            future_to_idx = {
+                executor.submit(self._get_feature_count, os.path.join(path, f)): i
+                for i, f in enumerate(files)
+            }
+            
+            # Progress bar with manual updates
+            with tqdm(total=len(files), desc="Calculating feature counts") as pbar:
+                # Process completed futures as they come in
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        counts[idx] = future.result()
+                    except Exception as e:
+                        logger.error(f"Error processing file {files[idx]}: {e}")
+                        counts[idx] = 0
+                    pbar.update(1)
+
+        # Calculate cumulative sum using vectorized operations
+        cumulative_counts = torch.cumsum(counts, dim=0)
+        
+        return cumulative_counts
 
     def _get_feature_count(self, file_path):
         """Helper function to load a feature file and get the count of features"""
