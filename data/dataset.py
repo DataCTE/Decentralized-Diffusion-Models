@@ -45,8 +45,12 @@ def chunks(lst, n):
 
 def get_tensor_length(file_path):
     """Helper function for parallel metadata loading"""
-    with open(file_path, 'rb') as f:
-        return torch.load(f, map_location='cpu').shape[0]
+    try:
+        with open(file_path, 'rb') as f:
+            return torch.load(f, map_location='cpu').shape[0]
+    except Exception as e:
+        logger.error(f"Error loading metadata from {file_path}: {e}")
+        return 0 # Or consider raising the exception to halt training if metadata is critical
 
 class DDMDataset(Dataset):
     """GPU-optimized dataset pipeline for decentralized diffusion models with precomputed latents"""
@@ -85,7 +89,7 @@ class DDMDataset(Dataset):
 
             # Feature file metadata with parallel loading
             self.feature_files = sorted(glob.glob(os.path.join(self.feature_path, "*.pt")))
-            with ThreadPoolExecutor(max_workers=8) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [executor.submit(get_tensor_length, ff) for ff in self.feature_files]
                 with tqdm(total=len(futures), desc="Loading feature metadata") as pbar:
                     feature_lengths = [] # Local variable for rank 0
