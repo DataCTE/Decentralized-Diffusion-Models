@@ -103,10 +103,42 @@ class DDMDataset(Dataset):
             
             self.feature_files = sorted(feature_files)
 
-            # Broadcast metadata to other ranks
-            broadcast_object((self.cluster_files, self.feature_files))
-        else: # Receive broadcasted metadata on other ranks
-            (self.cluster_files, self.feature_files) = broadcast_object(None) # Receive file lists
+            # Load CLIP embedding files
+            self.clip_embedding_files = sorted(glob.glob(os.path.join(
+                self.clip_embedding_path, "*.pt"
+            )))
+            
+            # Add progress bar for CLIP file loading
+            with tqdm(total=len(self.clip_embedding_files), 
+                     desc="Loading CLIP embedding files") as pbar:
+                # Process in batches
+                file_batches = [self.clip_embedding_files[i:i+512] 
+                               for i in range(0, len(self.clip_embedding_files), 512)]
+                
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = []
+                    for batch in file_batches:
+                        futures.append(executor.submit(lambda x: x, batch))
+                    
+                    for future in as_completed(futures):
+                        pbar.update(len(future.result()))
+
+            # Update broadcast data to include CLIP files
+            broadcast_data = (
+                self.image_files,
+                self.caption_files,
+                self.dim_cache,
+                self.clip_embedding_files,
+                self.cumulative_feature_counts
+            )
+            broadcast_object(broadcast_data)
+        else:
+            # Receive all data including CLIP files
+            (self.image_files,
+             self.caption_files,
+             self.dim_cache,
+             self.clip_embedding_files,
+             self.cumulative_feature_counts) = broadcast_object(None)
 
         # Add latent loading lock initialization
         self._latent_loading_lock = defaultdict(threading.Lock)
