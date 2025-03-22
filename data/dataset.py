@@ -158,7 +158,7 @@ class DDMDataset(Dataset):
     def _load_cluster(self, idx):
         # Find which cluster file contains the index
         image_file = self.image_files[idx] # Get image file name
-        cluster_file_name = "cluster_" + image_file.split(os.sep)[-1] + ".cluster.pt" # Construct cluster file name
+        cluster_file_name = image_file.split(os.sep)[-1] + ".cluster.pt" # Construct cluster file name
         file_path = os.path.join(self.cluster_path, cluster_file_name) # Construct cluster file path
 
         # Load with caching
