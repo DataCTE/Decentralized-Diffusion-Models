@@ -423,7 +423,7 @@ class DDMDataset(Dataset):
             future_to_idx = {
                 executor.submit(
                     self._get_feature_count, 
-                    os.path.join(path, f"{f}.clip_emb.pt")  # Add extension here
+                    os.path.join(path, f)  # Use original filename without modification
                 ): i 
                 for i, f in enumerate(files)
             }
