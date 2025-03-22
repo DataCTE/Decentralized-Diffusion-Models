@@ -88,10 +88,10 @@ def broadcast_object(obj, src=0, group=None, device=None, timeout=None):
     
     dist.broadcast(tensor, src=src, group=group)
     
-    # If we're not the source, unpickle the object
+    # If we're not the source, unpickle the object with weights_only=False
     if rank != src:
         buffer = io.BytesIO(tensor.cpu().numpy().tobytes())
-        obj = torch.load(buffer)
+        obj = torch.load(buffer, weights_only=False)  # Allow trusted loading
     
     # Return the broadcast object
     return obj
