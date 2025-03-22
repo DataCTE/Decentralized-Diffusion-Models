@@ -144,15 +144,24 @@ class DDMDataset(Dataset):
 
         # 6. Broadcast optimized data ----------------------------------------------------
         if is_main_process():
+            # Calculate and store cumulative feature counts before broadcasting
+            self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
+            
             broadcast_data = (
                 self.image_files,
                 [os.path.join(self.config.dataset_path, f"{base}.txt") for base in self.image_files],
                 self.dim_cache,
                 self.clip_embedding_files,
-                self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
+                self.cumulative_feature_counts
             )
+            broadcast_object(broadcast_data)
         else:
-            broadcast_data = broadcast_object(None)
+            # Receive all data from main process
+            (self.image_files,
+             self.caption_files,
+             self.dim_cache,
+             self.clip_embedding_files,
+             self.cumulative_feature_counts) = broadcast_object(None)
 
         # Load precomputed file lists
         self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
@@ -322,12 +331,16 @@ class DDMDataset(Dataset):
             diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
             self.bucket_assignments = torch.argmin(diffs, dim=1)
 
-            # Package critical data for broadcast
+            # Calculate and store cumulative feature counts before broadcasting
+            self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
+            
+            # Broadcast full dataset state
             broadcast_data = (
                 self.image_files,
                 self.caption_files,
-                self.bucket_assignments,
-                self.dim_cache
+                self.dim_cache,
+                self.clip_embedding_files,
+                self.cumulative_feature_counts
             )
             broadcast_object(broadcast_data)
         else:
