@@ -123,20 +123,23 @@ class DDMDataset(Dataset):
                     for future in as_completed(futures):
                         pbar.update(len(future.result()))
 
-            # Update broadcast data to include CLIP files
+            # Move dimension cache loading before broadcast_data
+            self.dim_cache = self._load_dimension_cache()
+            
+            # Then create broadcast_data
             broadcast_data = (
                 self.image_files,
                 self.caption_files,
-                self.dim_cache,
+                self.dim_cache,  # Now initialized
                 self.clip_embedding_files,
                 self.cumulative_feature_counts
             )
             broadcast_object(broadcast_data)
         else:
-            # Receive all data including CLIP files
+            # Receive dim_cache from main process
             (self.image_files,
              self.caption_files,
-             self.dim_cache,
+             self.dim_cache,  # Add this line
              self.clip_embedding_files,
              self.cumulative_feature_counts) = broadcast_object(None)
 
@@ -543,6 +546,35 @@ class DDMDataset(Dataset):
             self.clip_embedding_cache.clear()
         torch.cuda.empty_cache() # Also clear CUDA cache just in case
         self.logger.info("Caches cleared.")
+
+    def _load_dimension_cache(self):
+        """Load dimension cache with progress tracking"""
+        self.dimension_files = sorted(glob.glob(os.path.join(
+            self.dim_cache_path, "*.pt"
+        )))
+        
+        logger.info(f"Loading {len(self.dimension_files)} dimension files...")
+        
+        dim_cache_list = []
+        with tqdm(total=len(self.dimension_files), 
+                 desc="Loading dimension files") as pbar:
+            # Process in batches
+            file_batches = [self.dimension_files[i:i+512] 
+                           for i in range(0, len(self.dimension_files), 512)]
+            
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = []
+                for batch in file_batches:
+                    futures.append(executor.submit(
+                        lambda x: [torch.load(f) for f in x],
+                        batch
+                    ))
+                
+                for future in as_completed(futures):
+                    dim_cache_list.extend(future.result())
+                    pbar.update(len(batch))
+        
+        return torch.stack(dim_cache_list)
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
