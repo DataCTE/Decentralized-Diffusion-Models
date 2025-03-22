@@ -9,10 +9,10 @@
 This implementation provides a streamlined approach to Decentralized Diffusion Models (DDM) training without requiring data clustering or DINO feature extraction. The system trains multiple expert models on random data partitions and uses a learned router for dynamic expert selection during inference.
 
 Key Features:
--  **No Clustering or DINO Required** - Random data partitioning replaces semantic clustering without requiring DINOv2 features
+-  **Automatic Clustering** - Integrated two-stage clustering for optimal expert specialization
 -  **Dynamic Expert Selection** - Router learns optimal expert combinations per-input
 -  **Efficient Inference** - Top-k expert selection reduces compute costs
--  **Modular Design** - Add/remove experts without retraining entire system
+-  **Precomputed Latents** - GPU-optimized latent caching for faster training
 
 ## Prerequisites
 
@@ -27,8 +27,18 @@ Key Features:
 
 1. **Prepare Dataset**
    ```python
-   # Point to any image folder
-   DATA_DIR = "/path/to/images" 
+   # 1. Run feature extraction and clustering
+   python run_clustering.py \
+     --dataset_path /path/to/images \
+     --feature_path ./cache/features
+     
+   # 2. Precompute VAE latents
+   python precompute_latents.py \
+     --dataset_path /path/to/images \
+     --output_dir ./cache/latents
+     
+   # 3. Generate cluster assignments
+   python generate_clusters.py --config config.py
    ```
 
 2. **Start Training**
@@ -56,7 +66,7 @@ Key Features:
 
 | Component       | Description                                                                 |
 |-----------------|-----------------------------------------------------------------------------|
-| **Experts**     | Specialized diffusion models trained on random data partitions              |
+| **Experts**     | Specialized diffusion models trained on clustered data partitions           |
 | **Router**      | Lightweight network predicting expert relevance scores                      |
 | **Coordinator** | Manages distributed training and model checkpoints                          |
 
@@ -78,7 +88,7 @@ class TrainingConfig:
 
 - **Decentralized Flow Matching** - Implements paper's equations 4-7
 - **Expert Isolation** - Each expert trains on separate data partition
-- **Dynamic Routing** - Learned router adapts to input characteristics
+- **Cluster-Aware Routing** - Router uses precomputed cluster assignments
 - **Efficient Sampling** - Top-k expert selection reduces compute by 4-8x
 
 ## Benchmarks (256x256 Images)
@@ -94,6 +104,7 @@ class TrainingConfig:
 - Requires careful expert count vs quality tradeoff
 - Router training needs sufficient diversity in data
 - Larger models benefit from distributed training
+- Requires precomputation of clusters and latents (~30 mins for 1M images)
 
 ## Acknowledgments
 
