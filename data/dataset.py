@@ -142,7 +142,10 @@ class DDMDataset(Dataset):
         assert len(self.image_files) == len(self.dim_cache), \
             f"Final mismatch: {len(self.image_files)} latents vs {len(self.dim_cache)} dimensions"
 
-        # 6. Broadcast optimized data ----------------------------------------------------
+        # 6. Initialize buckets BEFORE any broadcasting
+        self._init_buckets()
+
+        # 7. Broadcast optimized data ----------------------------------------------------
         if is_main_process():
             # Calculate and store cumulative feature counts before broadcasting
             self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
@@ -186,27 +189,6 @@ class DDMDataset(Dataset):
         # Load dimension cache
         self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions") # Path to dimensions directory
         logger.info(f"Dimensions path: {self.dim_cache_path}") # Log dimensions path - removed rank info
-
-        # Broadcast initial dataset state from main process
-        if is_main_process():
-            broadcast_data = (
-                self.image_files,
-                self.caption_files,
-                self.dim_cache,  # Keep as tensor
-                self.clip_embedding_files,
-                self.cumulative_feature_counts
-            )
-            broadcast_object(broadcast_data)
-        else:
-            # Receive tensor directly
-            (self.image_files,
-             self.caption_files,
-             self.dim_cache,  # Receive as tensor
-             self.clip_embedding_files,
-             self.cumulative_feature_counts) = broadcast_object(None)
-
-        # Initialize buckets AFTER receiving data
-        self._init_buckets()
 
     def __getitem__(self, idx):
         return {
