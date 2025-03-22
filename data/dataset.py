@@ -184,40 +184,12 @@ class DDMDataset(Dataset):
         self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions") # Path to dimensions directory
         logger.info(f"Dimensions path: {self.dim_cache_path}") # Log dimensions path - removed rank info
 
-        # Load dimension cache - MAIN PROCESS ONLY
+        # Broadcast initial dataset state from main process
         if is_main_process():
-            self.dimension_files = sorted(glob.glob(os.path.join(self.dim_cache_path, "*.pt")))
-            logger.info(f"Loading {len(self.dimension_files)} dimension files...")
-
-            # Define the batch loading function
-            def load_dims_batch(file_batch):
-                return [torch.load(f, map_location='cpu') for f in file_batch]
-
-            # Rest of the existing dimension loading code with progress bars
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                file_batches = [self.dimension_files[i:i+512] 
-                              for i in range(0, len(self.dimension_files), 512)]
-                
-                with tqdm(total=len(self.dimension_files),  # Change to total files instead of batches
-                         desc="Loading dimension files", 
-                         unit="file") as pbar:
-                    # Submit all batches
-                    futures = [executor.submit(load_dims_batch, batch) for batch in file_batches]
-                    
-                    # Process completed batches
-                    dim_cache_list = []
-                    for future in as_completed(futures):
-                        batch_result = future.result()
-                        dim_cache_list.extend(batch_result)
-                        pbar.update(len(batch_result))  # Update by actual files processed
-
-            self.dim_cache = torch.stack(dim_cache_list)
-            
-            # Broadcast full dataset state
             broadcast_data = (
                 self.image_files,
                 self.caption_files,
-                self.dim_cache,
+                self.dim_cache,  # Use already loaded dim_cache
                 self.clip_embedding_files,
                 self.cumulative_feature_counts
             )
