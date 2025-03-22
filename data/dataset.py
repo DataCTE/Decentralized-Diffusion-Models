@@ -349,7 +349,8 @@ class DDMDataset(Dataset):
             (self.image_files, 
              self.caption_files,
              self.bucket_assignments,
-             self.dim_cache) = received
+             self.dim_cache,
+             self.cumulative_feature_counts) = received
 
         # Final validation (critical for distributed sync)
         assert len(self.image_files) == len(self.bucket_assignments), \
