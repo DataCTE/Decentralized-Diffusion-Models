@@ -258,6 +258,14 @@ class DDMDataset(Dataset):
                         self.dim_cache = self.dim_cache[val_indices]
                         pbar.update(len(val_indices))
                         
+                # After filtering image_files, re-filter clip_embedding_files
+                with tqdm(total=len(val_indices), desc="Filtering CLIP files") as pbar:
+                    self.clip_embedding_files = [
+                        f for f in self.clip_embedding_files 
+                        if os.path.basename(f).replace(".pt", "") in set(self.image_files)
+                    ]
+                    pbar.update(len(val_indices))
+                        
             elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
                 val_size = getattr(self.config, 'val_size', 1000)
                 if val_size > 0 and val_size < len(self.image_files):
@@ -280,25 +288,28 @@ class DDMDataset(Dataset):
                         self.dim_cache = self.dim_cache[train_indices]
                         pbar.update(len(train_indices))
 
-            # Add progress bar for bucket assignments
-            with tqdm(total=len(self.image_files), desc="Calculating bucket assignments") as pbar:
-                bucket_aspects = self.bucket_dims[:, 0] / self.bucket_dims[:, 1]
-                image_aspects = self.dim_cache[:, 0] / self.dim_cache[:, 1]
-                diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
-                self.bucket_assignments = torch.argmin(diffs, dim=1)
-                pbar.update(len(self.image_files))
+                # After filtering image_files, re-filter clip_embedding_files
+                with tqdm(total=len(train_indices), desc="Filtering CLIP files") as pbar:
+                    self.clip_embedding_files = [
+                        f for f in self.clip_embedding_files 
+                        if os.path.basename(f).replace(".pt", "") in set(self.image_files)
+                    ]
+                    pbar.update(len(train_indices))
 
-            # Calculate and store cumulative feature counts before broadcasting
-            self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
+            # Recalculate cumulative counts AFTER filtering
+            self.cumulative_feature_counts = self._calculate_cumulative_counts(
+                self.clip_embedding_files, 
+                self.clip_embedding_path
+            )
             
-            # Convert to tensor before broadcasting
+            # Update broadcast data with filtered clip_embedding_files
             broadcast_data = (
                 self.image_files,
                 self.caption_files,
-                self.dim_cache,  # Keep as tensor
-                self.clip_embedding_files,
+                self.dim_cache,
+                self.clip_embedding_files,  # Now contains filtered files
                 self.cumulative_feature_counts,
-                self.bucket_assignments  # Add this line
+                self.bucket_assignments
             )
             broadcast_object(broadcast_data)
         else:
