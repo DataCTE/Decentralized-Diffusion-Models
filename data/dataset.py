@@ -200,14 +200,7 @@ class DDMDataset(Dataset):
 
         pbar_bucket_assign.update(len(image_aspects)) # Complete progress bar
         pbar_bucket_assign.close()
-        
-        # Count images per bucket for logging
-        bucket_counts = {}
-        for i in range(self.bucket_dims.shape[0]):
-            count = torch.sum(self.bucket_assignments == i).item()
-            if count > 0:
-                bucket_counts[i] = count
-        
+
     def _load_latent(self, idx):
         """Load precomputed latent tensor from disk, with caching and thread safety"""
         latent_file = self.image_files[idx] + ".latent.pt"
