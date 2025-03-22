@@ -390,60 +390,48 @@ class DDMDataset(Dataset):
 
     def _load_clip_embedding(self, idx):
         """Load precomputed CLIP embedding tensor from file, using cache"""
-        clip_embedding_file_index = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item()
-        if clip_embedding_file_index > 0:
-            clip_embedding_index_in_file = idx - self.cumulative_feature_counts[clip_embedding_file_index - 1].item()
+        # Calculate which file contains this embedding
+        file_idx = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item()
+        file_idx = min(file_idx, len(self.clip_embedding_files) - 1)  # Safety clamp
+        
+        # Calculate index within file
+        if file_idx > 0:
+            idx_in_file = idx - self.cumulative_feature_counts[file_idx-1].item()
         else:
-            clip_embedding_index_in_file = idx
+            idx_in_file = idx
 
-        clip_embedding_file_path = os.path.join(self.clip_embedding_path, self.clip_embedding_files[clip_embedding_file_index])
+        file_path = os.path.join(self.clip_embedding_path, self.clip_embedding_files[file_idx])
 
-        try:
-            # Check cache first
-            if self.clip_embedding_cache is not None and clip_embedding_file_path in self.clip_embedding_cache:
-                clip_embeddings = self.clip_embedding_cache[clip_embedding_file_path]
-                clip_embedding = clip_embeddings[clip_embedding_index_in_file]
-                return clip_embedding
+        # Locking and caching mechanism similar to _load_latent
+        with self._clip_embedding_loading_lock[file_path]:
+            if file_path in self.clip_embedding_cache:
+                embeddings = self.clip_embedding_cache[file_path]
             else:
-                # Load clip embeddings from disk
-                if clip_embedding_file_path not in self._clip_embedding_loading_lock:
-                    self._clip_embedding_loading_lock[clip_embedding_file_path] = threading.Lock()
+                # Load full embeddings file
+                embeddings = torch.load(file_path, map_location='cpu')
+                self.clip_embedding_cache[file_path] = embeddings
+                
+                # Update progress on main process
+                if is_main_process() and not hasattr(self, '_clip_progress'):
+                    self._clip_progress = tqdm(
+                        total=len(self.clip_embedding_files),
+                        desc="Loading CLIP embeddings",
+                        unit="file",
+                        position=2
+                    )
+                if is_main_process():
+                    self._clip_progress.update(1)
+                
+                # LRU cache eviction
+                if len(self.clip_embedding_cache) > self.clip_embedding_cache_max_size:
+                    self.clip_embedding_cache.popitem(last=False)
 
-                with self._clip_embedding_loading_lock[clip_embedding_file_path]:
-                    if self.clip_embedding_cache is not None and clip_embedding_file_path in self.clip_embedding_cache:
-                        clip_embeddings = self.clip_embedding_cache[clip_embedding_file_path]
-                        clip_embedding = clip_embeddings[clip_embedding_index_in_file]
-                        return clip_embedding
-                    else:
-                        # Add loading progress bar (main process only)
-                        if is_main_process():
-                            self._clip_progress = getattr(self, '_clip_progress', None)
-                            if self._clip_progress is None:
-                                self._clip_progress = tqdm(
-                                    total=len(self.clip_embedding_files),
-                                    desc="Loading CLIP embeddings",
-                                    unit="file",
-                                    position=2
-                                )
-                        
-                        clip_embeddings = torch.load(clip_embedding_file_path, map_location='cpu')
-                        
-                        if self.clip_embedding_cache is not None:
-                            self.clip_embedding_cache[clip_embedding_file_path] = clip_embeddings
-                            
-                            # Update progress bar if main process
-                            if is_main_process():
-                                self._clip_progress.update(1)
-                            
-                            # Manage cache size
-                            if len(self.clip_embedding_cache) > self.clip_embedding_cache_max_size:
-                                self.clip_embedding_cache.popitem(last=False)
+        # Safety check for index range
+        if idx_in_file >= len(embeddings):
+            self.logger.error(f"Clip index {idx_in_file} out of range for {file_path} (size {len(embeddings)})")
+            return torch.zeros_like(embeddings[0])
 
-                        clip_embedding = clip_embeddings[clip_embedding_index_in_file]
-                        return clip_embedding
-        except Exception as e:
-            self.logger.error(f"Error loading clip embedding from {clip_embedding_file_path} at index {idx}: {e}")
-            return None
+        return embeddings[idx_in_file]
 
     def __len__(self):
         """Get dataset length (number of latents, same as images)"""
