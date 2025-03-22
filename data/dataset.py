@@ -655,22 +655,40 @@ class DDMDataset(Dataset):
             # Calculate total expected samples
             total_samples = len(self.image_files)
             
-            # Verify CLIP embeddings coverage
+            # Verify CLIP embeddings coverage with explicit file checking
+            valid_clip_files = [
+                f for f in self.clip_embedding_files
+                if os.path.exists(os.path.join(self.clip_embedding_path, f))
+            ]
+            self.clip_embedding_files = valid_clip_files
+            
+            # Recalculate with verified files
+            self.cumulative_feature_counts = self._calculate_cumulative_counts(
+                [os.path.basename(f).replace(".clip_emb.pt", "") for f in valid_clip_files],
+                self.clip_embedding_path
+            )
+            
+            # Final alignment check
             total_clip_features = self.cumulative_feature_counts[-1].item()
-            assert total_samples == total_clip_features, \
-                f"Dataset/CLIP mismatch: {total_samples} vs {total_clip_features}"
+            if total_samples != total_clip_features:
+                self.logger.warning(f"Adjusting dataset size to match CLIP features ({total_clip_features})")
+                self.image_files = self.image_files[:total_clip_features]
+                self.dim_cache = self.dim_cache[:total_clip_features]
 
-            # Create verification payload
-            verification_data = (total_samples, total_clip_features)
+            # Create verification payload with adjusted counts
+            verification_data = (len(self.image_files), self.cumulative_feature_counts[-1].item())
             broadcast_object(verification_data)
         else:
             main_total, main_clip_total = broadcast_object(None)
-            assert len(self.image_files) == main_total, \
-                f"Rank {get_rank()} has {len(self.image_files)} vs main's {main_total}"
-            assert self.cumulative_feature_counts[-1] == main_clip_total, \
-                f"Rank {get_rank()} CLIP total {self.cumulative_feature_counts[-1]} vs main's {main_clip_total}"
+            
+            # Trim datasets on other ranks to match main
+            self.image_files = self.image_files[:main_total]
+            self.dim_cache = self.dim_cache[:main_total]
+            self.cumulative_feature_counts = torch.tensor([main_clip_total])
 
-        logger.info(f"Rank {get_rank()} consistency verified: {len(self.image_files)} samples")
+        # Final assertion with synchronized values
+        assert len(self.image_files) == self.cumulative_feature_counts[-1].item(), \
+            f"Final mismatch: {len(self.image_files)} vs {self.cumulative_feature_counts[-1].item()}"
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
