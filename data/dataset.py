@@ -86,8 +86,8 @@ class DDMDataset(Dataset):
                 ): "Dimensions",
                 executor.submit(
                     lambda: sorted([
-                        f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.pt"))
-                        if os.path.basename(f).replace(".pt", "") in latent_basenames
+                        f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))
+                        if os.path.basename(f).replace(".clip_emb.pt", "") in latent_basenames
                     ])
                 ): "CLIP Embeddings"
             }
@@ -264,14 +264,27 @@ class DDMDataset(Dataset):
                         self.dim_cache = self.dim_cache[val_indices]
                         pbar.update(len(val_indices))
                         
-                # After filtering image_files, re-filter clip_embedding_files
-                with tqdm(total=len(val_indices), desc="Filtering CLIP files") as pbar:
-                    self.clip_embedding_files = [
-                        f for f in self.clip_embedding_files 
-                        if os.path.basename(f).replace(".pt", "") in set(self.image_files)
-                    ]
-                    pbar.update(len(val_indices))
-                        
+                # After filtering image_files, re-filter clip_embedding_files with proper extension handling
+                current_image_basenames = {os.path.basename(f) for f in self.image_files}
+                self.clip_embedding_files = [
+                    f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))
+                    if os.path.basename(f).replace(".clip_emb.pt", "") in current_image_basenames
+                ]
+                
+                # Add validation before recalculating counts
+                assert len(self.clip_embedding_files) > 0, "No CLIP embedding files match filtered dataset"
+                
+                # Recalculate cumulative counts AFTER filtering with proper path handling
+                self.cumulative_feature_counts = self._calculate_cumulative_counts(
+                    [os.path.basename(f).replace(".clip_emb.pt", "") for f in self.clip_embedding_files],
+                    self.clip_embedding_path
+                )
+                
+                # Verify counts match before broadcasting
+                total_features = self.cumulative_feature_counts[-1].item()
+                assert total_features == len(self.image_files), \
+                    f"CLIP features ({total_features}) don't match images ({len(self.image_files)})"
+                
             elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
                 val_size = getattr(self.config, 'val_size', 1000)
                 if val_size > 0 and val_size < len(self.image_files):
@@ -294,13 +307,26 @@ class DDMDataset(Dataset):
                         self.dim_cache = self.dim_cache[train_indices]
                         pbar.update(len(train_indices))
 
-                # After filtering image_files, re-filter clip_embedding_files
-                with tqdm(total=len(train_indices), desc="Filtering CLIP files") as pbar:
-                    self.clip_embedding_files = [
-                        f for f in self.clip_embedding_files 
-                        if os.path.basename(f).replace(".pt", "") in set(self.image_files)
-                    ]
-                    pbar.update(len(train_indices))
+                # After filtering image_files, re-filter clip_embedding_files with proper extension handling
+                current_image_basenames = {os.path.basename(f) for f in self.image_files}
+                self.clip_embedding_files = [
+                    f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))
+                    if os.path.basename(f).replace(".clip_emb.pt", "") in current_image_basenames
+                ]
+                
+                # Add validation before recalculating counts
+                assert len(self.clip_embedding_files) > 0, "No CLIP embedding files match filtered dataset"
+                
+                # Recalculate cumulative counts AFTER filtering with proper path handling
+                self.cumulative_feature_counts = self._calculate_cumulative_counts(
+                    [os.path.basename(f).replace(".clip_emb.pt", "") for f in self.clip_embedding_files],
+                    self.clip_embedding_path
+                )
+                
+                # Verify counts match before broadcasting
+                total_features = self.cumulative_feature_counts[-1].item()
+                assert total_features == len(self.image_files), \
+                    f"CLIP features ({total_features}) don't match images ({len(self.image_files)})"
 
             # Recalculate cumulative counts AFTER filtering
             self.cumulative_feature_counts = self._calculate_cumulative_counts(
