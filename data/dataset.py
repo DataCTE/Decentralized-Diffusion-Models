@@ -194,6 +194,9 @@ class DDMDataset(Dataset):
         assert len(self.image_files) == len(self.bucket_assignments), \
             f"Broadcast mismatch: {len(self.image_files)} vs {len(self.bucket_assignments)}"
 
+        # 10. Add final synchronization check (NEW)
+        self._verify_global_consistency()
+
     def __getitem__(self, idx):
         return {
             'latent': self._load_latent(idx),
@@ -600,6 +603,29 @@ class DDMDataset(Dataset):
             f"Dimension cache mismatch: {self.dim_cache.shape[0]} vs {len(self.image_files)}"
         assert torch.allclose(self.bucket_dims, torch.tensor(self.config.buckets, dtype=torch.float32)), \
             "Bucket dimensions mismatch between config and loaded data"
+
+    def _verify_global_consistency(self):
+        """Final distributed consistency verification"""
+        if is_main_process():
+            # Calculate total expected samples
+            total_samples = len(self.image_files)
+            
+            # Verify CLIP embeddings coverage
+            total_clip_features = self.cumulative_feature_counts[-1].item()
+            assert total_samples == total_clip_features, \
+                f"Dataset/CLIP mismatch: {total_samples} vs {total_clip_features}"
+
+            # Create verification payload
+            verification_data = (total_samples, total_clip_features)
+            broadcast_object(verification_data)
+        else:
+            main_total, main_clip_total = broadcast_object(None)
+            assert len(self.image_files) == main_total, \
+                f"Rank {get_rank()} has {len(self.image_files)} vs main's {main_total}"
+            assert self.cumulative_feature_counts[-1] == main_clip_total, \
+                f"Rank {get_rank()} CLIP total {self.cumulative_feature_counts[-1]} vs main's {main_clip_total}"
+
+        logger.info(f"Rank {get_rank()} consistency verified: {len(self.image_files)} samples")
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
