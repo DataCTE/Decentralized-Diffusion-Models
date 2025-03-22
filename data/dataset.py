@@ -125,7 +125,11 @@ class DDMDataset(Dataset):
         with ThreadPoolExecutor(max_workers=8) as executor:
             file_batches = [ordered_dim_files[i:i+512] for i in range(0, len(ordered_dim_files), 512)]
             
-            with tqdm(total=len(ordered_dim_files), desc="Loading dimensions") as pbar:
+            with tqdm(total=len(ordered_dim_files), 
+                     desc="Loading dimensions",
+                     unit="file",
+                     dynamic_ncols=True,
+                     bar_format="{l_bar}{bar:20}{r_bar}{bar:-20b}") as pbar:
                 futures = [executor.submit(load_dims_batch, batch) for batch in file_batches]
                 dim_cache = []
                 for future in as_completed(futures):
