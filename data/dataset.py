@@ -237,6 +237,9 @@ class DDMDataset(Dataset):
 
     def _init_buckets(self):
         """Distributed-safe bucket initialization with full data sync"""
+        # Calculate bucket assignments first
+        self.bucket_assignments = self._calculate_bucket_assignments()
+        
         if is_main_process():
             # Add progress bar for validation/train filtering
             if self.split == 'val' and _GLOBAL_DATASET_CACHE["initialized"]:
@@ -329,6 +332,22 @@ class DDMDataset(Dataset):
             f"Dataset/Bucket mismatch: {len(self.image_files)} vs {len(self.bucket_assignments)}"
         assert self.dim_cache.shape[0] == len(self.image_files), \
             f"Dimension cache mismatch: {self.dim_cache.shape[0]} vs {len(self.image_files)}"
+
+    def _calculate_bucket_assignments(self):
+        """Calculate bucket assignments based on image dimensions"""
+        # Convert bucket dims to tensor for vectorized operations
+        bucket_dims_tensor = self.bucket_dims
+        
+        # Get image dimensions from cache [width, height]
+        image_dims = self.dim_cache[:, [1, 0]].float()  # Swap W/H if needed
+        
+        # Calculate distances to all buckets
+        diffs = bucket_dims_tensor.unsqueeze(0) - image_dims.unsqueeze(1)
+        distances = torch.norm(diffs, dim=2)
+        
+        # Find closest bucket for each image
+        _, assignments = torch.min(distances, dim=1)
+        return assignments
 
     def _load_latent(self, idx):
         """Load precomputed latent tensor from disk, with caching and thread safety"""
