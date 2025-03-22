@@ -144,13 +144,13 @@ class DDMDataset(Dataset):
 
         # 6. Broadcast optimized data ----------------------------------------------------
         if is_main_process():
-            # Calculate and store cumulative feature counts before broadcasting
-            self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
+            # Convert to numpy array before broadcasting
+            dim_cache_np = self.dim_cache.numpy() if isinstance(self.dim_cache, torch.Tensor) else self.dim_cache
             
             broadcast_data = (
                 self.image_files,
                 [os.path.join(self.config.dataset_path, f"{base}.txt") for base in self.image_files],
-                self.dim_cache,
+                dim_cache_np,  # Send numpy array
                 self.clip_embedding_files,
                 self.cumulative_feature_counts
             )
@@ -160,11 +160,11 @@ class DDMDataset(Dataset):
             received = broadcast_object(None)
             (self.image_files,
              self.caption_files,
-             dim_cache_np,  # Receive as numpy array
+             dim_cache_np,  # This will now be a numpy array
              self.clip_embedding_files,
              self.cumulative_feature_counts) = received
             
-            # Convert numpy array back to tensor
+            # Convert numpy array to tensor
             self.dim_cache = torch.from_numpy(dim_cache_np)
 
         # Load precomputed file lists
