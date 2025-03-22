@@ -84,6 +84,42 @@ class DDMDataset(Dataset):
         # Initialize bucket dimensions from config
         self.bucket_dims = torch.tensor(config.buckets, dtype=torch.float32)
 
+        # Load dimension cache
+        self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions") # Path to dimensions directory
+        logger.info(f"Dimensions path: {self.dim_cache_path}") # Log dimensions path - removed rank info
+
+        if is_main_process():
+            self.dimension_files = sorted(glob.glob(os.path.join(self.dim_cache_path, "*.pt"))) # List all dimension files
+            logger.info(f"Loading {len(self.dimension_files)} dimension files...") # Log number of dimension files - removed rank info
+
+            dim_cache_list = []
+            for file_path in tqdm(self.dimension_files, desc="Loading dimension files", unit="file"): # Load each dimension file
+                try:
+                    dims = torch.load(file_path, map_location='cpu')
+                    dim_cache_list.append(dims)
+                except Exception as e:
+                    logger.error(f"Error loading dimension file {file_path}: {e}")
+                    dim_cache_list.append(None) # Append None in case of loading error
+
+            self.dim_cache = torch.stack([d for d in dim_cache_list if d is not None]) if any(d is not None for d in dim_cache_list) else None # Stack valid tensors, handle cases where all are None
+
+            if self.dim_cache is not None:
+                logger.info(f"Dimension files loaded and stacked successfully. Shape: {self.dim_cache.shape}") # Log shape of stacked dim_cache - removed rank info
+            else:
+                logger.error(f"Failed to load any dimension files!") # Log if dim_cache is None - removed rank info
+
+            broadcast_object((self.dim_cache,)) # Broadcast dim_cache
+        else:
+            logger.info(f"Receiving broadcasted dim_cache...") # Log before receiving - removed rank info
+            (self.dim_cache,) = broadcast_object(None) # Receive broadcasted dim_cache
+            if self.dim_cache is not None:
+                logger.info(f"Received dim_cache successfully. Shape: {self.dim_cache.shape if hasattr(self.dim_cache, 'shape') else 'N/A (None)'}") # Log after successful receive - removed rank info
+            else:
+                 logger.warning(f"Received None for dim_cache.") # Log if None received - removed rank info
+
+        if self.dim_cache is None: # Check if dim_cache is None after loading/broadcast
+            logger.error(f"dim_cache is None after loading/broadcast!") # Log if dim_cache is None - removed rank info
+
         # Initialize buckets
         self._init_buckets()
 
@@ -168,7 +204,7 @@ class DDMDataset(Dataset):
         # Add progress bar for bucket assignment
         pbar_bucket_assign = tqdm(
             range(len(image_aspects)),
-            desc=f"Rank {get_rank()}: Assigning buckets",
+            desc="Rank {get_rank()}: Assigning buckets",
             unit="image",
             dynamic_ncols=True
         )
