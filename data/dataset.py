@@ -378,8 +378,8 @@ class DDMDataset(Dataset):
                         counts[idx] = 0
                     pbar.update(1)
 
-        # Calculate cumulative sum using vectorized operations
-        cumulative_counts = torch.cumsum(counts, dim=0)
+        # Calculate cumulative sum with initial zero
+        cumulative_counts = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(counts, dim=0)])
         
         return cumulative_counts
 
@@ -390,48 +390,60 @@ class DDMDataset(Dataset):
 
     def _load_clip_embedding(self, idx):
         """Load precomputed CLIP embedding tensor from file, using cache"""
-        # Calculate which file contains this embedding
-        file_idx = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item()
-        file_idx = min(file_idx, len(self.clip_embedding_files) - 1)  # Safety clamp
-        
+        # Add bounds checking
+        if idx >= self.cumulative_feature_counts[-1]:
+            self.logger.error(f"Requested index {idx} exceeds total features {self.cumulative_feature_counts[-1]}")
+            return torch.zeros_like(next(iter(self.clip_embedding_cache.values()))[0])
+
+        # Find the first index where cumulative_counts > idx
+        file_idx = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item() - 1
+        file_idx = max(0, min(file_idx, len(self.clip_embedding_files) - 1))
+
         # Calculate index within file
-        if file_idx > 0:
-            idx_in_file = idx - self.cumulative_feature_counts[file_idx-1].item()
-        else:
-            idx_in_file = idx
+        idx_in_file = idx - self.cumulative_feature_counts[file_idx].item()
+        if idx_in_file < 0:
+            self.logger.error(f"Negative index calculation: {idx} - {self.cumulative_feature_counts[file_idx]} = {idx_in_file}")
+            return torch.zeros_like(next(iter(self.clip_embedding_cache.values()))[0])
 
         file_path = os.path.join(self.clip_embedding_path, self.clip_embedding_files[file_idx])
 
-        # Locking and caching mechanism similar to _load_latent
+        # Locking and caching mechanism
+        if file_path not in self._clip_embedding_loading_lock:
+            self._clip_embedding_loading_lock[file_path] = threading.Lock()
+            
         with self._clip_embedding_loading_lock[file_path]:
             if file_path in self.clip_embedding_cache:
                 embeddings = self.clip_embedding_cache[file_path]
             else:
-                # Load full embeddings file
-                embeddings = torch.load(file_path, map_location='cpu')
+                try:
+                    embeddings = torch.load(file_path, map_location='cpu')
+                except Exception as e:
+                    self.logger.error(f"Failed to load {file_path}: {e}")
+                    return torch.zeros(self.config.clip_embedding_dim)
+                
                 self.clip_embedding_cache[file_path] = embeddings
                 
-                # Update progress on main process
-                if is_main_process() and not hasattr(self, '_clip_progress'):
-                    self._clip_progress = tqdm(
-                        total=len(self.clip_embedding_files),
-                        desc="Loading CLIP embeddings",
-                        unit="file",
-                        position=2
-                    )
+                # Update progress
                 if is_main_process():
+                    if not hasattr(self, '_clip_progress'):
+                        self._clip_progress = tqdm(
+                            total=len(self.clip_embedding_files),
+                            desc="Loading CLIP embeddings",
+                            unit="file",
+                            position=2
+                        )
                     self._clip_progress.update(1)
                 
-                # LRU cache eviction
+                # LRU eviction
                 if len(self.clip_embedding_cache) > self.clip_embedding_cache_max_size:
                     self.clip_embedding_cache.popitem(last=False)
 
-        # Safety check for index range
-        if idx_in_file >= len(embeddings):
-            self.logger.error(f"Clip index {idx_in_file} out of range for {file_path} (size {len(embeddings)})")
-            return torch.zeros_like(embeddings[0])
+            # Final bounds check
+            if idx_in_file >= len(embeddings):
+                self.logger.error(f"Index {idx_in_file} out of range for {file_path} (size {len(embeddings)})")
+                return torch.zeros_like(embeddings[0])
 
-        return embeddings[idx_in_file]
+            return embeddings[idx_in_file]
 
     def __len__(self):
         """Get dataset length (number of latents, same as images)"""
