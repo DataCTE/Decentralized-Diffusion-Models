@@ -157,11 +157,15 @@ class DDMDataset(Dataset):
             broadcast_object(broadcast_data)
         else:
             # Receive all data from main process
+            received = broadcast_object(None)
             (self.image_files,
              self.caption_files,
-             self.dim_cache,
+             dim_cache_np,  # Receive as numpy array
              self.clip_embedding_files,
-             self.cumulative_feature_counts) = broadcast_object(None)
+             self.cumulative_feature_counts) = received
+            
+            # Convert numpy array back to tensor
+            self.dim_cache = torch.from_numpy(dim_cache_np)
 
         # Load precomputed file lists
         self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
@@ -308,11 +312,11 @@ class DDMDataset(Dataset):
             # Calculate and store cumulative feature counts before broadcasting
             self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
             
-            # Broadcast full dataset state
+            # Convert to tensor before broadcasting
             broadcast_data = (
                 self.image_files,
                 self.caption_files,
-                self.dim_cache,
+                self.dim_cache.numpy() if isinstance(self.dim_cache, torch.Tensor) else self.dim_cache,  # Convert tensor to numpy for broadcasting
                 self.clip_embedding_files,
                 self.cumulative_feature_counts
             )
@@ -322,9 +326,12 @@ class DDMDataset(Dataset):
             received = broadcast_object(None)
             (self.image_files, 
              self.caption_files,
-             self.bucket_assignments,
-             self.dim_cache,
+             dim_cache_np,  # Receive as numpy array
+             self.clip_embedding_files,
              self.cumulative_feature_counts) = received
+            
+            # Convert numpy array back to tensor
+            self.dim_cache = torch.from_numpy(dim_cache_np)
 
         # Final validation (critical for distributed sync)
         assert len(self.image_files) == len(self.bucket_assignments), \
