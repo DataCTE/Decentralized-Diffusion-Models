@@ -127,13 +127,18 @@ class DDMDataset(Dataset):
             # Move dimension cache loading before broadcast_data
             self.dim_cache = self._load_dimension_cache()
             
-            # Then create broadcast_data
+            # After loading feature_files
+            self.cumulative_feature_counts = self._calculate_cumulative_counts(
+                self.feature_files, self.feature_path
+            )
+            
+            # Then create broadcast_data including this new attribute
             broadcast_data = (
                 self.image_files,
                 self.caption_files,
-                self.dim_cache,  # Now initialized
+                self.dim_cache,
                 self.clip_embedding_files,
-                self.cumulative_feature_counts
+                self.cumulative_feature_counts  # Now properly initialized
             )
             broadcast_object(broadcast_data)
         else:
