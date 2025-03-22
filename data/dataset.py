@@ -142,10 +142,23 @@ class DDMDataset(Dataset):
         assert len(self.image_files) == len(self.dim_cache), \
             f"Final mismatch: {len(self.image_files)} latents vs {len(self.dim_cache)} dimensions"
 
-        # 6. Initialize buckets BEFORE any broadcasting
-        self._init_buckets()
+        # 6. Initialize core dataset properties before any broadcasting
+        self.caption_files = [os.path.join(config.dataset_path, f+".txt") for f in self.image_files]
+        self.bucket_dims = torch.tensor(config.buckets, dtype=torch.float32)
+        self._latent_loading_lock = defaultdict(threading.Lock)
+        
+        # Initialize caches
+        self.cluster_cache = OrderedDict()
+        self.feature_cache = OrderedDict()
+        self.latent_cache = OrderedDict()
+        self.clip_embedding_cache = OrderedDict()
+        self.cache_size = 5
+        self.clip_embedding_cache_max_size = 5
 
-        # 7. Broadcast optimized data ----------------------------------------------------
+        # 7. Calculate bucket assignments
+        self._init_buckets()  # Now creates self.bucket_assignments
+
+        # 8. Broadcast all necessary data together
         if is_main_process():
             # Calculate and store cumulative feature counts before broadcasting
             self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
@@ -153,42 +166,33 @@ class DDMDataset(Dataset):
             # Add bucket_assignments to broadcast data
             broadcast_data = (
                 self.image_files,
-                [os.path.join(self.config.dataset_path, f"{base}.txt") for base in self.image_files],
-                self.dim_cache,  # Keep as tensor
+                self.caption_files,
+                self.dim_cache,
                 self.clip_embedding_files,
                 self.cumulative_feature_counts,
-                self.bucket_assignments  # Add this line
+                self.bucket_assignments,
+                self.bucket_dims
             )
             broadcast_object(broadcast_data)
         else:
-            # Receive including bucket_assignments
             (self.image_files,
              self.caption_files,
              self.dim_cache,
              self.clip_embedding_files,
              self.cumulative_feature_counts,
-             self.bucket_assignments) = broadcast_object(None)  # Add bucket_assignments here
+             self.bucket_assignments,
+             self.bucket_dims) = broadcast_object(None)
 
-        # Load precomputed file lists
-        self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
-        
-        # Add latent loading lock initialization
-        self._latent_loading_lock = defaultdict(threading.Lock)
-
-        # Limited caches
-        self.cluster_cache = OrderedDict()
-        self.feature_cache = OrderedDict()
-        self.latent_cache = OrderedDict() # Initialize latent_cache
-        self.clip_embedding_cache = OrderedDict() # Initialize clip_embedding_cache
-        self.cache_size = 5  # Keep 5 files in memory at once
-        self.clip_embedding_cache_max_size = 5 # Set max size for clip embedding cache
-
-        # Initialize bucket dimensions from config
-        self.bucket_dims = torch.tensor(config.buckets, dtype=torch.float32)
+        # 9. Final validation
+        self._validate_distributed_state()
 
         # Load dimension cache
         self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions") # Path to dimensions directory
         logger.info(f"Dimensions path: {self.dim_cache_path}") # Log dimensions path - removed rank info
+
+        # After line 194
+        assert len(self.image_files) == len(self.bucket_assignments), \
+            f"Broadcast mismatch: {len(self.image_files)} vs {len(self.bucket_assignments)}"
 
     def __getitem__(self, idx):
         return {
@@ -283,12 +287,6 @@ class DDMDataset(Dataset):
                 diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
                 self.bucket_assignments = torch.argmin(diffs, dim=1)
                 pbar.update(len(self.image_files))
-
-            # Compute bucket assignments (vectorized)
-            bucket_aspects = self.bucket_dims[:, 0] / self.bucket_dims[:, 1]
-            image_aspects = self.dim_cache[:, 0] / self.dim_cache[:, 1]
-            diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
-            self.bucket_assignments = torch.argmin(diffs, dim=1)
 
             # Calculate and store cumulative feature counts before broadcasting
             self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
@@ -582,6 +580,15 @@ class DDMDataset(Dataset):
                     pbar.update(len(batch))
         
         return torch.stack(dim_cache_list)
+
+    def _validate_distributed_state(self):
+        """Validate synchronized state across all processes"""
+        assert len(self.image_files) == len(self.bucket_assignments), \
+            f"Image/bucket mismatch: {len(self.image_files)} vs {len(self.bucket_assignments)}"
+        assert self.dim_cache.shape[0] == len(self.image_files), \
+            f"Dimension cache mismatch: {self.dim_cache.shape[0]} vs {len(self.image_files)}"
+        assert torch.allclose(self.bucket_dims, torch.tensor(self.config.buckets, dtype=torch.float32)), \
+            "Bucket dimensions mismatch between config and loaded data"
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
