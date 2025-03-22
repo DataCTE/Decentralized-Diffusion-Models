@@ -419,10 +419,10 @@ class DDMDataset(Dataset):
         num_workers = min(32, os.cpu_count())
         
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Create future map for parallel processing
+            # Create future map for parallel processing with proper file extensions
             future_to_idx = {
-                executor.submit(self._get_feature_count, os.path.join(path, f)): i
-                for i, f in enumerate(files)
+                executor.submit(self._get_feature_count, os.path.join(path, f"{base_name}.clip_emb.pt")): i
+                for i, base_name in enumerate(files)
             }
             
             # Progress bar with manual updates
