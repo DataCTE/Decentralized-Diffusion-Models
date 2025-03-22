@@ -63,92 +63,96 @@ class DDMDataset(Dataset):
         self.clip_embedding_path = os.path.join(self.feature_cache_path, "clip_embeddings")
         self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions")
 
-        # Load precomputed file lists
-        self.image_files = sorted([f.replace(".latent.pt", "") for f in os.listdir(self.latent_path)])
-        self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
+        # 1. Latent-first initialization -------------------------------------------------
+        latent_files = sorted(os.listdir(self.latent_path))
+        self.image_files = [f.replace(".latent.pt", "") for f in latent_files]
+        latent_basenames = set(self.image_files)
         
-        if is_main_process(): # Only load metadata on rank 0
-            # Cluster file metadata with parallel loading
-            logger.info("Collecting cluster files...")
-            self.cluster_files = []
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                # Get initial file list
-                all_cluster_files = glob.glob(os.path.join(self.cluster_path, "cluster_*.pt"))
-                
-                # Create progress bar
-                with tqdm(total=len(all_cluster_files), desc="Loading cluster metadata", unit="file") as pbar:
-                    # Process files in parallel batches
-                    file_batches = [all_cluster_files[i:i+512] for i in range(0, len(all_cluster_files), 512)]
-                    futures = [executor.submit(lambda x: x, batch) for batch in file_batches]
-                    
-                    for future in as_completed(futures):
-                        batch = future.result()
-                        self.cluster_files.extend(batch)
-                        pbar.update(len(batch))
-            
-            self.cluster_files = sorted(self.cluster_files)
+        # 2. Parallel filtering with progress tracking ----------------------------------------
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            # Create futures with task descriptions
+            futures = {
+                executor.submit(
+                    lambda: [
+                        f for f in glob.glob(os.path.join(self.cluster_path, "*.cluster.pt"))
+                        if os.path.basename(f).replace(".cluster.pt", "") in latent_basenames
+                    ]
+                ): "Clusters",
+                executor.submit(
+                    lambda: [
+                        f for f in glob.glob(os.path.join(self.dim_cache_path, "*.pt"))
+                        if os.path.basename(f).replace(".pt", "") in latent_basenames
+                    ]
+                ): "Dimensions",
+                executor.submit(
+                    lambda: sorted([
+                        f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.pt"))
+                        if os.path.basename(f).replace(".pt", "") in latent_basenames
+                    ])
+                ): "CLIP Embeddings"
+            }
 
-            # Similar progress for feature files
-            feature_files = []
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                all_feature_files = glob.glob(os.path.join(self.feature_path, "*.pt"))
-                
-                with tqdm(total=len(all_feature_files), desc="Loading feature metadata", unit="file") as pbar:
-                    file_batches = [all_feature_files[i:i+512] for i in range(0, len(all_feature_files), 512)]
-                    futures = [executor.submit(lambda x: x, batch) for batch in file_batches]
-                    
-                    for future in as_completed(futures):
-                        batch = future.result()
-                        feature_files.extend(batch)
-                        pbar.update(len(batch))
-            
-            self.feature_files = sorted(feature_files)
+            # Progress bar setup
+            with tqdm(total=len(futures), desc="Filtering dependencies") as pbar:
+                results = {}
+                for future in as_completed(futures):
+                    task_name = futures[future]
+                    try:
+                        results[task_name] = future.result()
+                        pbar.set_postfix_str(f"Completed {task_name}")
+                        pbar.update(1)
+                    except Exception as e:
+                        logger.error(f"Error processing {task_name}: {str(e)}")
+                        raise
 
-            # Load CLIP embedding files
-            self.clip_embedding_files = sorted(glob.glob(os.path.join(
-                self.clip_embedding_path, "*.pt"
-            )))
-            
-            # Add progress bar for CLIP file loading
-            with tqdm(total=len(self.clip_embedding_files), 
-                     desc="Loading CLIP embedding files") as pbar:
-                # Process in batches
-                file_batches = [self.clip_embedding_files[i:i+512] 
-                               for i in range(0, len(self.clip_embedding_files), 512)]
-                
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    futures = []
-                    for batch in file_batches:
-                        futures.append(executor.submit(lambda x: x, batch))
-                    
-                    for future in as_completed(futures):
-                        pbar.update(len(future.result()))
+            # Assign results with type checking
+            self.cluster_files = results.get("Clusters", [])
+            self.dimension_files = results.get("Dimensions", [])
+            self.clip_embedding_files = results.get("CLIP Embeddings", [])
 
-            # Move dimension cache loading before broadcast_data
-            self.dim_cache = self._load_dimension_cache()
+        # 3. Validation gate -------------------------------------------------------------
+        assert len(self.image_files) == len(self.dimension_files), \
+            f"Latent/dimension mismatch: {len(self.image_files)} vs {len(self.dimension_files)}"
+        
+        # 4. Optimized dimension loading -------------------------------------------------
+        def load_dims_batch(file_batch):
+            return [torch.load(f, map_location='cpu') for f in file_batch]
+
+        # Preserve file order using latent file ordering
+        dim_file_map = {os.path.basename(f).replace(".pt", ""): f for f in self.dimension_files}
+        ordered_dim_files = [dim_file_map[base] for base in self.image_files if base in dim_file_map]
+        
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            file_batches = [ordered_dim_files[i:i+512] for i in range(0, len(ordered_dim_files), 512)]
             
-            # After loading feature_files
-            self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                self.feature_files, self.feature_path
-            )
-            
-            # Then create broadcast_data including this new attribute
+            with tqdm(total=len(ordered_dim_files), desc="Loading dimensions") as pbar:
+                futures = [executor.submit(load_dims_batch, batch) for batch in file_batches]
+                dim_cache = []
+                for future in as_completed(futures):
+                    dim_cache.extend(future.result())
+                    pbar.update(len(future.result()))
+                
+        self.dim_cache = torch.stack(dim_cache)
+
+        # 5. Final validation ------------------------------------------------------------
+        assert len(self.image_files) == len(self.dim_cache), \
+            f"Final mismatch: {len(self.image_files)} latents vs {len(self.dim_cache)} dimensions"
+
+        # 6. Broadcast optimized data ----------------------------------------------------
+        if is_main_process():
             broadcast_data = (
                 self.image_files,
-                self.caption_files,
+                [os.path.join(self.config.dataset_path, f"{base}.txt") for base in self.image_files],
                 self.dim_cache,
                 self.clip_embedding_files,
-                self.cumulative_feature_counts  # Now properly initialized
+                self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
             )
-            broadcast_object(broadcast_data)
         else:
-            # Receive dim_cache from main process
-            (self.image_files,
-             self.caption_files,
-             self.dim_cache,  # Add this line
-             self.clip_embedding_files,
-             self.cumulative_feature_counts) = broadcast_object(None)
+            broadcast_data = broadcast_object(None)
 
+        # Load precomputed file lists
+        self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
+        
         # Add latent loading lock initialization
         self._latent_loading_lock = defaultdict(threading.Lock)
 
