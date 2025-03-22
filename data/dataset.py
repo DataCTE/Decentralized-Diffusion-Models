@@ -58,7 +58,7 @@ class DDMDataset(Dataset):
         
         # Initialize logging
         self.logger = logging.getLogger(__name__)
-        
+
         # Load precomputed paths
         self.feature_cache_path = config.feature_cache_path
         self.feature_path = os.path.join(self.feature_cache_path, "features")
@@ -89,7 +89,7 @@ class DDMDataset(Dataset):
                 futures = [executor.submit(get_tensor_length, ff) for ff in self.feature_files]
                 with tqdm(total=len(futures), desc="Loading feature metadata") as pbar:
                     feature_lengths = [] # Local variable for rank 0
-                    for future in as_completed(futures):
+                for future in as_completed(futures):
                         feature_lengths.append(future.result())
                         pbar.update(1)
             self.feature_lengths = feature_lengths # Assign to self for rank 0
@@ -164,7 +164,7 @@ class DDMDataset(Dataset):
                 self.image_files = [self.image_files[i] for i in val_indices]
                 self.caption_files = [self.caption_files[i] for i in val_indices]
                 self.dim_cache = self.dim_cache[val_indices]
-                self.logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for validation split")
+                self.logger.info(f"Rank {get_rank()}: Selected {len(self.image_files)} files for validation split")
         elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
             # For training, exclude validation samples if specified
             val_size = getattr(self.config, 'val_size', 1000)
@@ -179,9 +179,9 @@ class DDMDataset(Dataset):
                 self.image_files = [self.image_files[i] for i in train_indices]
                 self.caption_files = [self.caption_files[i] for i in train_indices]
                 self.dim_cache = self.dim_cache[train_indices]
-                self.logger.info(f"Rank {self.rank}: Selected {len(self.image_files)} files for training split (excluded {val_size} validation files)")
+                self.logger.info(f"Rank {get_rank()}: Selected {len(self.image_files)} files for training split (excluded {val_size} validation files)")
         
-        self.logger.info(f"Rank {self.rank}: Starting bucket assignment for {len(self.image_files)} images...")
+        self.logger.info(f"Rank {get_rank()}: Starting bucket assignment for {len(self.image_files)} images...")
         bucket_start = time.time()
         
         # Calculate aspect ratios
@@ -192,7 +192,7 @@ class DDMDataset(Dataset):
         # Add progress bar for bucket assignment
         pbar_bucket_assign = tqdm(
             range(len(image_aspects)),
-            desc=f"Rank {self.rank}: Assigning buckets",
+            desc=f"Rank {get_rank()}: Assigning buckets",
             unit="image",
             dynamic_ncols=True
         )
@@ -212,13 +212,13 @@ class DDMDataset(Dataset):
                 bucket_counts[i] = count
         
         bucket_time = time.time() - bucket_start
-        self.logger.info(f"Rank {self.rank}: Bucket assignment completed in {bucket_time:.2f}s - {len(bucket_counts)} buckets used")
+        self.logger.info(f"Rank {get_rank()}: Bucket assignment completed in {bucket_time:.2f}s - {len(bucket_counts)} buckets used")
         
         # Log distribution stats
         top_buckets = sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:5]
         for bucket_idx, count in top_buckets:
             bucket_size = tuple(self.bucket_dims[bucket_idx].tolist())
-            self.logger.info(f"Rank {self.rank}: Bucket {bucket_idx} ({bucket_size}): {count} images")
+            self.logger.info(f"Rank {get_rank()}: Bucket {bucket_idx} ({bucket_size}): {count} images")
 
     def _load_latent(self, idx):
         """Load precomputed latent tensor from disk, with caching and thread safety"""
@@ -307,11 +307,11 @@ class DDMDataset(Dataset):
         # Images for this rank
         this_rank_count = 0
         if hasattr(self, 'expert_assignments'):
-            this_rank_count = torch.sum(self.expert_assignments == self.rank).item()
+            this_rank_count = torch.sum(self.expert_assignments == get_rank()).item()
         
         return {
             "status": "complete",
-            "rank": self.rank,
+            "rank": get_rank(),
             "total_images": len(self.image_files),
             "total_buckets": len(bucket_counts),
             "total_experts": len(expert_counts),
