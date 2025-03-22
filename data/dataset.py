@@ -76,13 +76,16 @@ class DDMDataset(Dataset):
         else: # Receive broadcasted metadata on other ranks
             (self.cluster_files, self.feature_files) = broadcast_object(None) # Receive file lists
 
+        # Add latent loading lock initialization
+        self._latent_loading_lock = defaultdict(threading.Lock)
+
         # Limited caches
         self.cluster_cache = OrderedDict()
         self.feature_cache = OrderedDict()
+        self.latent_cache = OrderedDict() # Initialize latent_cache
+        self.clip_embedding_cache = OrderedDict() # Initialize clip_embedding_cache
         self.cache_size = 5  # Keep 5 files in memory at once
-
-        # Add latent loading lock initialization
-        self._latent_loading_lock = defaultdict(threading.Lock)
+        self.clip_embedding_cache_max_size = 5 # Set max size for clip embedding cache
 
         # Initialize bucket dimensions from config
         self.bucket_dims = torch.tensor(config.buckets, dtype=torch.float32)
@@ -246,7 +249,9 @@ class DDMDataset(Dataset):
                 latent = self.latent_cache[latent_path] # Load from cache
             else:
                 latent = torch.load(latent_path, map_location=self.device) # Load from disk
-                self._update_latent_cache(latent_path, latent) # Update cache
+                self.latent_cache[latent_path] = latent # Update cache
+                if len(self.latent_cache) > self.cache_size: # LRU eviction
+                    self.latent_cache.popitem(last=False) # Remove LRU item
             logger.debug(f"Loaded latent tensor shape: {latent.shape} from {latent_path}") # Log shape
         return latent
 
