@@ -131,10 +131,14 @@ class DDMDataset(Dataset):
             else:
                 logger.error(f"Failed to load any dimension files!") # Log if dim_cache is None - removed rank info
 
-            broadcast_object((self.dim_cache,)) # Broadcast dim_cache
+            # Initialize clip embedding metadata
+            self.clip_embedding_files = sorted(glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))) # Load clip embedding file list
+            self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path) # Calculate cumulative counts
+
+            broadcast_object((self.dim_cache, self.cumulative_feature_counts, self.clip_embedding_files)) # Broadcast dim_cache, cumulative_feature_counts, and clip_embedding_files
         else:
             logger.info(f"Receiving broadcasted dim_cache...") # Log before receiving - removed rank info
-            (self.dim_cache,) = broadcast_object(None) # Receive broadcasted dim_cache
+            (self.dim_cache, self.cumulative_feature_counts, self.clip_embedding_files) = broadcast_object(None) # Receive broadcasted dim_cache, cumulative_feature_counts, and clip_embedding_files
             if self.dim_cache is not None:
                 logger.info(f"Received dim_cache successfully. Shape: {self.dim_cache.shape if hasattr(self.dim_cache, 'shape') else 'N/A (None)'}") # Log after successful receive - removed rank info
             else:
@@ -254,6 +258,22 @@ class DDMDataset(Dataset):
                     self.latent_cache.popitem(last=False) # Remove LRU item
             logger.debug(f"Loaded latent tensor shape: {latent.shape} from {latent_path}") # Log shape
         return latent
+
+    def _calculate_cumulative_counts(self, files, path):
+        """Calculates cumulative counts of features in each file for indexing"""
+        cumulative_counts = []
+        count = 0
+        for file in files:
+            file_path = os.path.join(path, file)
+            num_features = self._get_feature_count(file_path) # Use helper to get feature count
+            count += num_features
+            cumulative_counts.append(torch.tensor(count))
+        return torch.stack(cumulative_counts) if cumulative_counts else torch.tensor([])
+
+    def _get_feature_count(self, file_path):
+        """Helper function to load a feature file and get the count of features"""
+        sample_features = torch.load(file_path, map_location='cpu')
+        return sample_features.shape[0]
 
     def _load_clip_embedding(self, idx):
         """Load precomputed CLIP embedding tensor from file, using cache"""
@@ -382,11 +402,6 @@ class DDMDataset(Dataset):
                 self.bucket_samplers[bucket_idx] = SubsetRandomSampler(bucket_indices)
         
         logger.info(f"Created {len(self.bucket_samplers)} bucket-specific samplers")
-
-    def _get_feature_count(self, file_path):
-        """Helper function to load a feature file and get the count of features"""
-        sample_features = torch.load(file_path, map_location='cpu')
-        return sample_features.shape[0]
 
     def clear_cache(self):
         """Explicitly clear all caches to free RAM."""
