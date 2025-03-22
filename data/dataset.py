@@ -147,21 +147,24 @@ class DDMDataset(Dataset):
             # Calculate and store cumulative feature counts before broadcasting
             self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
             
+            # Add bucket_assignments to broadcast data
             broadcast_data = (
                 self.image_files,
                 [os.path.join(self.config.dataset_path, f"{base}.txt") for base in self.image_files],
                 self.dim_cache,  # Keep as tensor
                 self.clip_embedding_files,
-                self.cumulative_feature_counts
+                self.cumulative_feature_counts,
+                self.bucket_assignments  # Add this line
             )
             broadcast_object(broadcast_data)
         else:
-            # Receive tensor directly
+            # Receive including bucket_assignments
             (self.image_files,
              self.caption_files,
-             self.dim_cache,  # Receive as tensor
+             self.dim_cache,
              self.clip_embedding_files,
-             self.cumulative_feature_counts) = broadcast_object(None)
+             self.cumulative_feature_counts,
+             self.bucket_assignments) = broadcast_object(None)  # Add bucket_assignments here
 
         # Load precomputed file lists
         self.caption_files = [os.path.join(self.config.dataset_path, f+".txt") for f in self.image_files]
@@ -314,7 +317,8 @@ class DDMDataset(Dataset):
                 self.caption_files,
                 self.dim_cache,  # Keep as tensor
                 self.clip_embedding_files,
-                self.cumulative_feature_counts
+                self.cumulative_feature_counts,
+                self.bucket_assignments  # Add this line
             )
             broadcast_object(broadcast_data)
         else:
@@ -323,7 +327,8 @@ class DDMDataset(Dataset):
              self.caption_files,
              self.dim_cache,  # Receive as tensor
              self.clip_embedding_files,
-             self.cumulative_feature_counts) = broadcast_object(None)
+             self.cumulative_feature_counts,
+             self.bucket_assignments) = broadcast_object(None)  # Add bucket_assignments here
 
         # Final validation (critical for distributed sync)
         assert len(self.image_files) == len(self.bucket_assignments), \
