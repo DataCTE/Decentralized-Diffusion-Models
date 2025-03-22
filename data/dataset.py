@@ -23,6 +23,7 @@ from utils.distributed import is_main_process, broadcast_object, get_rank, get_l
 from utils.logging import setup_distributed_logger
 from data.transforms import resize_image, normalize
 import threading
+import signal
 
 
 # Setup logging
@@ -42,15 +43,6 @@ def chunks(lst, n):
     """Yield successive n-sized chunks from list"""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
-
-def get_tensor_length(file_path):
-    """Helper function for parallel metadata loading"""
-    try:
-        with open(file_path, 'rb') as f:
-            return torch.load(f, map_location='cpu').shape[0]
-    except Exception as e:
-        logger.error(f"Error loading metadata from {file_path}: {e}")
-        return 0 # Or consider raising the exception to halt training if metadata is critical
 
 class DDMDataset(Dataset):
     """GPU-optimized dataset pipeline for decentralized diffusion models with precomputed latents"""
@@ -76,33 +68,13 @@ class DDMDataset(Dataset):
         
         if is_main_process(): # Only load metadata on rank 0
             # Cluster file metadata with parallel loading
-            self.cluster_files = sorted(glob.glob(os.path.join(self.cluster_path, "*.cluster.pt")))
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [executor.submit(get_tensor_length, cf) for cf in self.cluster_files]
-                with tqdm(total=len(futures), desc="Loading cluster metadata") as pbar:
-                    cluster_lengths = [] # Local variable for rank 0
-                    for future in as_completed(futures):
-                        cluster_lengths.append(future.result())
-                        pbar.update(1)
-            self.cluster_lengths = cluster_lengths # Assign to self for rank 0
-            self.cumulative_clusters = np.cumsum([0] + self.cluster_lengths).tolist()
-
-            # Feature file metadata with parallel loading
-            self.feature_files = sorted(glob.glob(os.path.join(self.feature_path, "*.pt")))
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = [executor.submit(get_tensor_length, ff) for ff in self.feature_files]
-                with tqdm(total=len(futures), desc="Loading feature metadata") as pbar:
-                    feature_lengths = [] # Local variable for rank 0
-                for future in as_completed(futures):
-                        feature_lengths.append(future.result())
-                        pbar.update(1)
-            self.feature_lengths = feature_lengths # Assign to self for rank 0
-            self.cumulative_features = np.cumsum([0] + self.feature_lengths).tolist()
+            self.cluster_files = sorted(glob.glob(os.path.join(self.cluster_path, "cluster_*.pt"))) # Directly load cluster files
+            self.feature_files = sorted(glob.glob(os.path.join(self.feature_path, "*.pt"))) # Directly load feature files
 
             # Broadcast metadata to other ranks
-            broadcast_object((self.cluster_lengths, self.cumulative_clusters, self.feature_lengths, self.cumulative_features))
+            broadcast_object((self.cluster_files, self.feature_files)) # Broadcast file lists
         else: # Receive broadcasted metadata on other ranks
-            (self.cluster_lengths, self.cumulative_clusters, self.feature_lengths, self.cumulative_features) = broadcast_object(None)
+            (self.cluster_files, self.feature_files) = broadcast_object(None) # Receive file lists
 
         # Limited caches
         self.cluster_cache = OrderedDict()
@@ -123,33 +95,33 @@ class DDMDataset(Dataset):
 
     def _load_cluster(self, idx):
         # Find which cluster file contains the index
-        file_idx = bisect.bisect_right(self.cumulative_clusters, idx) - 1
-        file_path = self.cluster_files[file_idx]
-        
+        image_file = self.image_files[idx] # Get image file name
+        cluster_file_name = "cluster_" + image_file.split(os.sep)[-1] + ".cluster.pt" # Construct cluster file name
+        file_path = os.path.join(self.cluster_path, cluster_file_name) # Construct cluster file path
+
         # Load with caching
         if file_path not in self.cluster_cache:
             if len(self.cluster_cache) >= self.cache_size:
                 self.cluster_cache.popitem(last=False)
             self.cluster_cache[file_path] = torch.load(file_path)
-            
-        # Get position within file
-        pos = idx - self.cumulative_clusters[file_idx]
-        return self.cluster_cache[file_path][pos]
+
+        # Get position within file - no longer needed as each file is individual
+        return self.cluster_cache[file_path] # Return entire tensor
 
     def _load_feature(self, idx):
         # Find which feature file contains the index
-        file_idx = bisect.bisect_right(self.cumulative_features, idx) - 1
-        file_path = self.feature_files[file_idx]
-        
+        image_file = self.image_files[idx] # Get image file name
+        feature_file_name = image_file.split(os.sep)[-1] + ".pt" # Construct feature file name
+        file_path = os.path.join(self.feature_path, feature_file_name) # Construct feature file path
+
         # Load with caching
         if file_path not in self.feature_cache:
             if len(self.feature_cache) >= self.cache_size:
                 self.feature_cache.popitem(last=False)
             self.feature_cache[file_path] = torch.load(file_path)
-            
-        # Get position within file
-        pos = idx - self.cumulative_features[file_idx]
-        return self.feature_cache[file_path][pos]
+
+        # Get position within file - no longer needed as each file is individual
+        return self.feature_cache[file_path] # Return entire tensor
 
     def _init_buckets(self):
         """CPU-based bucket initialization"""
@@ -204,7 +176,7 @@ class DDMDataset(Dataset):
 
         pbar_bucket_assign.update(len(image_aspects)) # Complete progress bar
         pbar_bucket_assign.close()
-
+        
     def _load_latent(self, idx):
         """Load precomputed latent tensor from disk, with caching and thread safety"""
         latent_file = self.image_files[idx] + ".latent.pt"
