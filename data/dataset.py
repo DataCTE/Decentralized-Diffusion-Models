@@ -614,7 +614,13 @@ class BucketBatchSampler(torch.utils.data.Sampler):
     """Groups samples by bucket dimensions for efficient batching"""
     
     def __init__(self, bucket_indices, batch_size, device, shuffle=True, drop_last=True):
-        # Converts indices to GPU tensors for faster operations
+        # Add missing attribute assignments
+        self.shuffle = shuffle
+        self.device = device
+        self.drop_last = drop_last
+        self.batch_size = batch_size
+        
+        # Existing initialization
         self.bucket_tensors = {
             bucket: torch.tensor(indices, device=device, dtype=torch.long)
             for bucket, indices in bucket_indices.items()
@@ -632,23 +638,21 @@ class BucketBatchSampler(torch.utils.data.Sampler):
         all_batches = []
         for bucket_idx, indices in self.bucket_tensors.items():
             # Shuffle on GPU using tensor operations
-            if self.shuffle:
+            if self.shuffle:  # Now using properly initialized attribute
                 indices = indices[torch.randperm(len(indices), device=self.device)]
             
             # Split into batches using tensor slicing
             batches = torch.split(indices, self.batch_size)
             
-            # Handle partial batch
+            # Handle partial batch using initialized attribute
             if self.drop_last and (len(indices) % self.batch_size != 0):
                 batches = batches[:-1]
             
             all_batches.extend(batches)
         
-        # Final shuffle across buckets
+        # Final shuffle across buckets using initialized attribute
         if self.shuffle:
-            # Generate permutation on GPU
             perm = torch.randperm(len(all_batches), device=self.device)
-            # Convert to numpy indices for list access
             all_batches = [all_batches[i] for i in perm.cpu().numpy()]
             
         return iter(all_batches)
