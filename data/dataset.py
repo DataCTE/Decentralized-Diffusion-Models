@@ -294,6 +294,7 @@ class DDMDataset(Dataset):
                     with tqdm(total=len(val_indices), desc="Filtering validation files") as pbar:
                         self.image_files = [self.image_files[i] for i in val_indices]
                         self.caption_files = [self.caption_files[i] for i in val_indices]
+                        self.dim_cache = self.dim_cache[val_indices]
                         pbar.update(len(val_indices))
                         
             elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
@@ -315,6 +316,7 @@ class DDMDataset(Dataset):
                     with tqdm(total=len(train_indices), desc="Filtering training files") as pbar:
                         self.image_files = [self.image_files[i] for i in train_indices]
                         self.caption_files = [self.caption_files[i] for i in train_indices]
+                        self.dim_cache = self.dim_cache[train_indices]
                         pbar.update(len(train_indices))
 
             # Add progress bar for bucket assignments
