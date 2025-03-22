@@ -68,11 +68,43 @@ class DDMDataset(Dataset):
         
         if is_main_process(): # Only load metadata on rank 0
             # Cluster file metadata with parallel loading
-            self.cluster_files = sorted(glob.glob(os.path.join(self.cluster_path, "cluster_*.pt"))) # Directly load cluster files
-            self.feature_files = sorted(glob.glob(os.path.join(self.feature_path, "*.pt"))) # Directly load feature files
+            logger.info("Collecting cluster files...")
+            self.cluster_files = []
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                # Get initial file list
+                all_cluster_files = glob.glob(os.path.join(self.cluster_path, "cluster_*.pt"))
+                
+                # Create progress bar
+                with tqdm(total=len(all_cluster_files), desc="Loading cluster metadata", unit="file") as pbar:
+                    # Process files in parallel batches
+                    file_batches = [all_cluster_files[i:i+512] for i in range(0, len(all_cluster_files), 512)]
+                    futures = [executor.submit(lambda x: x, batch) for batch in file_batches]
+                    
+                    for future in as_completed(futures):
+                        batch = future.result()
+                        self.cluster_files.extend(batch)
+                        pbar.update(len(batch))
+            
+            self.cluster_files = sorted(self.cluster_files)
+
+            # Similar progress for feature files
+            feature_files = []
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                all_feature_files = glob.glob(os.path.join(self.feature_path, "*.pt"))
+                
+                with tqdm(total=len(all_feature_files), desc="Loading feature metadata", unit="file") as pbar:
+                    file_batches = [all_feature_files[i:i+512] for i in range(0, len(all_feature_files), 512)]
+                    futures = [executor.submit(lambda x: x, batch) for batch in file_batches]
+                    
+                    for future in as_completed(futures):
+                        batch = future.result()
+                        feature_files.extend(batch)
+                        pbar.update(len(batch))
+            
+            self.feature_files = sorted(feature_files)
 
             # Broadcast metadata to other ranks
-            broadcast_object((self.cluster_files, self.feature_files)) # Broadcast file lists
+            broadcast_object((self.cluster_files, self.feature_files))
         else: # Receive broadcasted metadata on other ranks
             (self.cluster_files, self.feature_files) = broadcast_object(None) # Receive file lists
 
@@ -99,21 +131,24 @@ class DDMDataset(Dataset):
             self.dimension_files = sorted(glob.glob(os.path.join(self.dim_cache_path, "*.pt")))
             logger.info(f"Loading {len(self.dimension_files)} dimension files...")
 
-            # Parallel loading with error handling
+            # Define the batch loading function
             def load_dims_batch(file_batch):
                 return [torch.load(f, map_location='cpu') for f in file_batch]
 
+            # Rest of the existing dimension loading code with progress bars
             with ThreadPoolExecutor(max_workers=8) as executor:
-                # Split files into batches without tqdm
                 file_batches = [self.dimension_files[i:i+512] 
                               for i in range(0, len(self.dimension_files), 512)]
-                futures = [executor.submit(load_dims_batch, batch) for batch in file_batches]
-                dim_cache_list = []
-                for future in futures:
-                    try:
+                
+                with tqdm(total=len(file_batches), desc="Loading dimension batches", unit="batch") as pbar:
+                    futures = []
+                    for batch in file_batches:
+                        futures.append(executor.submit(load_dims_batch, batch))
+                    
+                    dim_cache_list = []
+                    for future in as_completed(futures):
                         dim_cache_list.extend(future.result())
-                    except Exception as e:
-                        logger.error(f"Dimension loading failed: {e}")
+                        pbar.update(1)
 
             self.dim_cache = torch.stack(dim_cache_list)
             
@@ -147,68 +182,88 @@ class DDMDataset(Dataset):
         }
 
     def _load_cluster(self, idx):
-        # Find which cluster file contains the index
-        image_file = self.image_files[idx] # Get image file name
-        cluster_file_name = image_file.split(os.sep)[-1] + ".cluster.pt" # Construct cluster file name
-        file_path = os.path.join(self.cluster_path, cluster_file_name) # Construct cluster file path
-
-        # Load with caching
-        if file_path not in self.cluster_cache:
+        # Get image filename and construct cluster path
+        image_file = self.image_files[idx]
+        cluster_file = os.path.join(self.cluster_path, f"{os.path.basename(image_file)}.cluster.pt")
+        
+        # LRU Caching Mechanism
+        if cluster_file not in self.cluster_cache:
+            # Remove oldest entry if cache full
             if len(self.cluster_cache) >= self.cache_size:
-                self.cluster_cache.popitem(last=False)
-            self.cluster_cache[file_path] = torch.load(file_path)
-
-        # Get position within file - no longer needed as each file is individual
-        return self.cluster_cache[file_path] # Return entire tensor
+                self.cluster_cache.popitem(last=False) 
+            
+            # Load cluster data and add to cache
+            self.cluster_cache[cluster_file] = torch.load(cluster_file)
+        
+        return self.cluster_cache[cluster_file]
 
     def _load_feature(self, idx):
-        # Find which feature file contains the index
-        image_file = self.image_files[idx] # Get image file name
-        feature_file_name = image_file.split(os.sep)[-1] + ".pt" # Construct feature file name
-        file_path = os.path.join(self.feature_path, feature_file_name) # Construct feature file path
-
-        # Load with caching
-        if file_path not in self.feature_cache:
+        # Similar structure but for features
+        image_file = self.image_files[idx]
+        feature_file = os.path.join(self.feature_path, f"{os.path.basename(image_file)}.pt")
+        
+        if feature_file not in self.feature_cache:
             if len(self.feature_cache) >= self.cache_size:
                 self.feature_cache.popitem(last=False)
-            self.feature_cache[file_path] = torch.load(file_path)
-
-        # Get position within file - no longer needed as each file is individual
-        return self.feature_cache[file_path] # Return entire tensor
+            
+            self.feature_cache[feature_file] = torch.load(feature_file)
+        
+        return self.feature_cache[feature_file]
 
     def _init_buckets(self):
         """Distributed-safe bucket initialization with full data sync"""
         if is_main_process():
-            # Main process handles all dataset filtering
+            # Add progress bar for validation/train filtering
             if self.split == 'val' and _GLOBAL_DATASET_CACHE["initialized"]:
-                # If this is the validation dataset and we're using cached data, 
-                # select only a subset for validation
                 val_size = getattr(self.config, 'val_size', 1000)
                 if val_size < len(self.image_files):
-                    # Use deterministic selection to ensure consistency
                     all_indices = np.arange(len(self.image_files))
-                    np.random.seed(42)  # Fixed seed for reproducibility
-                    val_indices = np.random.choice(all_indices, size=val_size, replace=False)
+                    np.random.seed(42)
                     
-                    # Filter files for validation
-                    self.image_files = [self.image_files[i] for i in val_indices]
-                    self.caption_files = [self.caption_files[i] for i in val_indices]
-                    self.dim_cache = self.dim_cache[val_indices]
+                    # Add progress bar for validation sample selection
+                    with tqdm(total=val_size, desc="Selecting validation samples") as pbar:
+                        val_indices = []
+                        while len(val_indices) < val_size:
+                            batch = np.random.choice(all_indices, size=min(1000, val_size-len(val_indices)), replace=False)
+                            val_indices.extend(batch.tolist())
+                            pbar.update(len(batch))
+                        val_indices = np.array(val_indices[:val_size])
+                    
+                    # Add filtering progress bar
+                    with tqdm(total=len(val_indices), desc="Filtering validation files") as pbar:
+                        self.image_files = [self.image_files[i] for i in val_indices]
+                        self.caption_files = [self.caption_files[i] for i in val_indices]
+                        pbar.update(len(val_indices))
+                        
             elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
-                # For training, exclude validation samples if specified
                 val_size = getattr(self.config, 'val_size', 1000)
                 if val_size > 0 and val_size < len(self.image_files):
-                    # Use same deterministic selection as above
                     all_indices = np.arange(len(self.image_files))
-                    np.random.seed(42)  # Fixed seed for reproducibility
-                    val_indices = np.random.choice(all_indices, size=val_size, replace=False)
-                    train_indices = np.setdiff1d(all_indices, val_indices)
+                    np.random.seed(42)
                     
-                    # Filter files for training
-                    self.image_files = [self.image_files[i] for i in train_indices]
-                    self.caption_files = [self.caption_files[i] for i in train_indices]
-                    self.dim_cache = self.dim_cache[train_indices]
-            
+                    # Add progress bar for train sample selection
+                    with tqdm(total=len(all_indices)-val_size, desc="Selecting training samples") as pbar:
+                        train_indices = []
+                        for i in all_indices:
+                            if i not in val_indices:
+                                train_indices.append(i)
+                                pbar.update(1)
+                        train_indices = np.array(train_indices)
+                    
+                    # Add filtering progress bar
+                    with tqdm(total=len(train_indices), desc="Filtering training files") as pbar:
+                        self.image_files = [self.image_files[i] for i in train_indices]
+                        self.caption_files = [self.caption_files[i] for i in train_indices]
+                        pbar.update(len(train_indices))
+
+            # Add progress bar for bucket assignments
+            with tqdm(total=len(self.image_files), desc="Calculating bucket assignments") as pbar:
+                bucket_aspects = self.bucket_dims[:, 0] / self.bucket_dims[:, 1]
+                image_aspects = self.dim_cache[:, 0] / self.dim_cache[:, 1]
+                diffs = torch.abs(image_aspects.unsqueeze(1) - bucket_aspects)
+                self.bucket_assignments = torch.argmin(diffs, dim=1)
+                pbar.update(len(self.image_files))
+
             # Compute bucket assignments (vectorized)
             bucket_aspects = self.bucket_dims[:, 0] / self.bucket_dims[:, 1]
             image_aspects = self.dim_cache[:, 0] / self.dim_cache[:, 1]
@@ -242,26 +297,50 @@ class DDMDataset(Dataset):
         latent_file = self.image_files[idx] + ".latent.pt"
         latent_path = os.path.join(self.latent_path, latent_file)
 
-        with self._latent_loading_lock[idx]: # Thread lock for loading
-            if latent_path in self.latent_cache: # Check cache first
-                latent = self.latent_cache[latent_path] # Load from cache
+        with self._latent_loading_lock[idx]:  # Thread lock for loading
+            if latent_path in self.latent_cache:  # Check cache first
+                latent = self.latent_cache[latent_path]  # Load from cache
             else:
-                latent = torch.load(latent_path, map_location=self.device) # Load from disk
-                self.latent_cache[latent_path] = latent # Update cache
-                if len(self.latent_cache) > self.cache_size: # LRU eviction
-                    self.latent_cache.popitem(last=False) # Remove LRU item
-            logger.debug(f"Loaded latent tensor shape: {latent.shape} from {latent_path}") # Log shape
+                latent = torch.load(latent_path, map_location=self.device)  # Load from disk
+                self.latent_cache[latent_path] = latent  # Update cache
+                
+                # Update progress bar on main process
+                if is_main_process():
+                    # Initialize progress bar if it doesn't exist
+                    if not hasattr(self, '_latent_progress'):
+                        self._latent_progress = tqdm(
+                            total=len(self.image_files),
+                            desc="Loading latent tensors",
+                            unit="file",
+                            position=3,  # Position below other progress bars
+                            leave=False  # Don't persist after completion
+                        )
+                    
+                    # Update with number of cached items (more accurate than +=1)
+                    cached = len(self.latent_cache)
+                    self._latent_progress.n = cached
+                    self._latent_progress.refresh()
+                
+                if len(self.latent_cache) > self.cache_size:  # LRU eviction
+                    self.latent_cache.popitem(last=False)  # Remove LRU item
+
+            logger.debug(f"Loaded latent tensor shape: {latent.shape} from {latent_path}")
         return latent
 
     def _calculate_cumulative_counts(self, files, path):
         """Calculates cumulative counts of features in each file for indexing"""
         cumulative_counts = []
         count = 0
-        for file in files:
-            file_path = os.path.join(path, file)
-            num_features = self._get_feature_count(file_path) # Use helper to get feature count
-            count += num_features
-            cumulative_counts.append(torch.tensor(count))
+        
+        # Add progress bar for cumulative counts
+        with tqdm(total=len(files), desc="Calculating feature counts", unit="file") as pbar:
+            for file in files:
+                file_path = os.path.join(path, file)
+                num_features = self._get_feature_count(file_path)
+                count += num_features
+                cumulative_counts.append(torch.tensor(count))
+                pbar.update(1)
+                
         return torch.stack(cumulative_counts) if cumulative_counts else torch.tensor([])
 
     def _get_feature_count(self, file_path):
@@ -292,17 +371,33 @@ class DDMDataset(Dataset):
 
                 with self._clip_embedding_loading_lock[clip_embedding_file_path]:
                     if self.clip_embedding_cache is not None and clip_embedding_file_path in self.clip_embedding_cache:
-                        # Re-check cache in case it was loaded while waiting for lock
                         clip_embeddings = self.clip_embedding_cache[clip_embedding_file_path]
                         clip_embedding = clip_embeddings[clip_embedding_index_in_file]
                         return clip_embedding
                     else:
+                        # Add loading progress bar (main process only)
+                        if is_main_process():
+                            self._clip_progress = getattr(self, '_clip_progress', None)
+                            if self._clip_progress is None:
+                                self._clip_progress = tqdm(
+                                    total=len(self.clip_embedding_files),
+                                    desc="Loading CLIP embeddings",
+                                    unit="file",
+                                    position=2
+                                )
+                        
                         clip_embeddings = torch.load(clip_embedding_file_path, map_location='cpu')
+                        
                         if self.clip_embedding_cache is not None:
                             self.clip_embedding_cache[clip_embedding_file_path] = clip_embeddings
-                            # Manage cache size - LRU eviction
+                            
+                            # Update progress bar if main process
+                            if is_main_process():
+                                self._clip_progress.update(1)
+                            
+                            # Manage cache size
                             if len(self.clip_embedding_cache) > self.clip_embedding_cache_max_size:
-                                self.clip_embedding_cache.popitem(last=False) # Remove LRU item
+                                self.clip_embedding_cache.popitem(last=False)
 
                         clip_embedding = clip_embeddings[clip_embedding_index_in_file]
                         return clip_embedding
@@ -438,56 +533,44 @@ class CombinedBatchSampler(Sampler):
         return len(self.batch_indices) 
 
 class BucketBatchSampler(torch.utils.data.Sampler):
-    """GPU-optimized bucket batch sampler with tensor-based operations"""
+    """Groups samples by bucket dimensions for efficient batching"""
     
     def __init__(self, bucket_indices, batch_size, device, shuffle=True, drop_last=True):
-        """
-        Args:
-            bucket_indices: Dictionary of {bucket_idx: list of indices}
-            batch_size: Target batch size
-            device: Target device for tensor operations
-            shuffle: Whether to shuffle batches
-            drop_last: Whether to drop last incomplete batch
-        """
-        self.device = device
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        
-        # Convert indices to GPU tensors
+        # Converts indices to GPU tensors for faster operations
         self.bucket_tensors = {
             bucket: torch.tensor(indices, device=device, dtype=torch.long)
             for bucket, indices in bucket_indices.items()
         }
         
-        # Precompute batch counts using GPU ops
-        self.batch_counts = torch.zeros(len(bucket_indices), device=device, dtype=torch.long)
-        for i, (bucket, indices) in enumerate(bucket_indices.items()):
-            count = len(indices) // batch_size if drop_last else math.ceil(len(indices) / batch_size)
-            self.batch_counts[i] = count
-            
-        self.total_batches = torch.sum(self.batch_counts).item()
-        
+        # Precomputes number of batches per bucket
+        self.batch_counts = torch.tensor([
+            len(indices) // batch_size if drop_last 
+            else math.ceil(len(indices) / batch_size)
+            for indices in bucket_indices.values()
+        ], device=device)
+
     def __iter__(self):
-        # Generate batches using GPU-accelerated operations
+        # GPU-accelerated shuffling and batching
         all_batches = []
-        
         for bucket_idx, indices in self.bucket_tensors.items():
-            # Shuffle on GPU if needed
+            # Shuffle on GPU using tensor operations
             if self.shuffle:
                 indices = indices[torch.randperm(len(indices), device=self.device)]
             
-            # Split into batches using tensor operations
+            # Split into batches using tensor slicing
             batches = torch.split(indices, self.batch_size)
             
-            if self.drop_last and len(indices) % self.batch_size != 0:
+            # Handle partial batch
+            if self.drop_last and (len(indices) % self.batch_size != 0):
                 batches = batches[:-1]
-                
+            
             all_batches.extend(batches)
         
-        # Shuffle across buckets if needed
+        # Final shuffle across buckets
         if self.shuffle:
+            # Generate permutation on GPU
             perm = torch.randperm(len(all_batches), device=self.device)
+            # Convert to numpy indices for list access
             all_batches = [all_batches[i] for i in perm.cpu().numpy()]
             
         return iter(all_batches)
