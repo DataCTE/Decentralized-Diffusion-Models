@@ -276,7 +276,7 @@ class DDMDataset(Dataset):
                 
                 # Recalculate cumulative counts AFTER filtering with proper path handling
                 self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                    [os.path.basename(f).replace(".clip_emb.pt", "") for f in self.clip_embedding_files],
+                    self.clip_embedding_files,
                     self.clip_embedding_path
                 )
                 
@@ -319,7 +319,7 @@ class DDMDataset(Dataset):
                 
                 # Recalculate cumulative counts AFTER filtering with proper path handling
                 self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                    [os.path.basename(f).replace(".clip_emb.pt", "") for f in self.clip_embedding_files],
+                    self.clip_embedding_files,
                     self.clip_embedding_path
                 )
                 
@@ -419,10 +419,13 @@ class DDMDataset(Dataset):
         num_workers = min(32, os.cpu_count())
         
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Create future map for parallel processing with proper file extensions
+            # Create future map with proper filename construction
             future_to_idx = {
-                executor.submit(self._get_feature_count, os.path.join(path, f"{base_name}.clip_emb.pt")): i
-                for i, base_name in enumerate(files)
+                executor.submit(
+                    self._get_feature_count, 
+                    os.path.join(path, f"{f}.clip_emb.pt")  # Add extension here
+                ): i 
+                for i, f in enumerate(files)
             }
             
             # Progress bar with manual updates
@@ -664,7 +667,7 @@ class DDMDataset(Dataset):
             
             # Recalculate with verified files
             self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                [os.path.basename(f).replace(".clip_emb.pt", "") for f in valid_clip_files],
+                self.clip_embedding_files,
                 self.clip_embedding_path
             )
             
