@@ -81,6 +81,9 @@ class DDMDataset(Dataset):
         self.feature_cache = OrderedDict()
         self.cache_size = 5  # Keep 5 files in memory at once
 
+        # Initialize bucket dimensions from config
+        self.bucket_dims = torch.tensor(config.buckets, dtype=torch.float32)
+
         # Initialize buckets
         self._init_buckets()
 
