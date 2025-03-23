@@ -61,102 +61,36 @@ class DDMDataset(Dataset):
         self._init_memory_maps()
 
     def _get_distributed_latent_files(self):
-        """Distributed file discovery with memory-mapped index"""
-        # Only rank 0 scans files
+        """Lightweight file counting without loading contents"""
         if self.rank == 0:
-            latent_path = os.path.join(self.latent_dir, "latents.mmap")
-            if os.path.exists(latent_path):
-                # Load precomputed index
-                with open(latent_path, 'rb') as f:
-                    valid_files = [line.strip().decode() for line in f]
-                logger.info(f"Loaded precomputed latent index with {len(valid_files)} entries")
-            else:
-                # Build and cache index
-                all_files = sorted(os.listdir(self.latent_dir))
-                valid_files = []
-                
-                # Process in parallel batches
-                with ThreadPoolExecutor(max_workers=16) as executor:
-                    futures = {
-                        executor.submit(
-                            lambda f: (f, os.path.exists(os.path.join(self.latent_dir, f))),
-                            f
-                        ): f for f in all_files if f.endswith('.latent.pt')
-                    }
-                    
-                    for future in tqdm(as_completed(futures), total=len(futures), desc="Global file scan"):
-                        f, exists = future.result()
-                        if exists:
-                            valid_files.append(f)
-                
-                # Save mmap index as newline-separated bytes
-                with open(latent_path, 'wb') as f:
-                    f.write(b'\n'.join([f.encode() for f in valid_files]))
-                logger.info(f"Cached latent index to {latent_path}")
-
-            # Convert to numpy byte array for broadcasting
-            file_bytes = np.array([f.encode() for f in valid_files], dtype=np.bytes_)
+            count = sum(1 for _ in os.scandir(self.latent_dir) if _.name.endswith('.latent.pt'))
+            count_tensor = torch.tensor([count], dtype=torch.long)
         else:
-            file_bytes = np.empty(0, dtype=np.bytes_)
+            count_tensor = torch.tensor([0], dtype=torch.long)
         
-        # Broadcast file list from rank 0 using numpy arrays
-        file_bytes = broadcast_object(file_bytes, src=0)
-        return [f.decode() for f in file_bytes.tolist()]
+        torch.distributed.broadcast(count_tensor, src=0)
+        return [f"file_{i}.latent.pt" for i in range(count_tensor.item())]
 
     def _load_sharded_clusters(self):
-        """Enforce latent-as-truth cluster loading"""
-        # Use full latent files list as ground truth
-        shard_size = len(self.latent_files) // self.world_size
-        start = self.rank * shard_size
-        end = start + shard_size if self.rank != self.world_size -1 else len(self.latent_files)
-        
-        assignments = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(
-                    lambda f: torch.load(
-                        os.path.join(self.cluster_dir, f.replace('.latent.pt', '.cluster.pt')),
-                        map_location='cpu'
-                    ) if os.path.exists(os.path.join(self.cluster_dir, f.replace('.latent.pt', '.cluster.pt'))) 
-                    else torch.tensor(0, dtype=torch.long),
-                    f
-                ): f for f in self.latent_files[start:end]
-            }
-            
-            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Rank {self.rank} clusters"):
-                assignments.append(future.result())
-
-        assignments = torch.cat(assignments)
-        gathered = [torch.empty_like(assignments) for _ in range(self.world_size)]
-        torch.distributed.all_gather(gathered, assignments)
-        return torch.cat(gathered).long()
+        """Lazy cluster loading placeholder"""
+        return torch.zeros(len(self.latent_files), dtype=torch.long)
 
     def _distributed_bucket_indices(self):
-        """Latent-driven bucket indices with fallbacks"""
+        """Filename-parsed dimensions without loading files"""
         bucket_indices = torch.zeros(len(self.latent_files), dtype=torch.long)
         
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(
-                    lambda f: (f, torch.load(
-                        os.path.join(self.config.feature_cache_path, "dimensions", f.replace('.latent.pt', '.pt')),
-                        map_location='cpu'
-                    ) if os.path.exists(os.path.join(self.config.feature_cache_path, "dimensions", f.replace('.latent.pt', '.pt'))) 
-                    else torch.tensor(self.config.buckets[0])),
-                    f
-                ): f in self.latent_files
-            }
-            
-            dims = []
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Dimensions"):
-                _, dim = future.result()
-                dims.append(dim.numpy())
+        # Extract dimensions from filenames (format: WxH_*.latent.pt)
+        for i, fname in enumerate(self.latent_files):
+            try:
+                dim_part = fname.split('_', 1)[0]
+                w, h = map(int, dim_part.split('x', 1))
+                bucket_idx = next(i for i, (bw, bh) in enumerate(self.config.buckets) 
+                                if bw == w and bh == h)
+                bucket_indices[i] = bucket_idx
+            except:
+                bucket_indices[i] = 0  # Fallback to first bucket
 
-        dim_array = np.stack(dims)
-        for i, (w, h) in enumerate(self.config.buckets):
-            mask = (dim_array[:,0] == w) & (dim_array[:,1] == h)
-            bucket_indices[mask] = i
-
+        # Distributed sync
         gathered = [torch.empty_like(bucket_indices) for _ in range(self.world_size)]
         torch.distributed.all_gather(gathered, bucket_indices)
         return torch.cat(gathered)
@@ -205,11 +139,11 @@ class DDMDataset(Dataset):
                 future.result()
 
     def __getitem__(self, idx):
-        # Guaranteed latent existence
-        latent = torch.load(os.path.join(self.latent_dir, self.latent_files[idx]), 
-                           map_location='cpu', mmap=True)
+        # Lazy load latent
+        latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
+        latent = torch.load(latent_path, map_location='cpu', mmap=True)
         
-        # CLIP with fallback
+        # Lazy load CLIP with fallback
         clip_path = os.path.join(
             self.config.feature_cache_path,
             "clip_embeddings",
@@ -219,11 +153,20 @@ class DDMDataset(Dataset):
             if os.path.exists(clip_path) \
             else torch.zeros(self.config.clip_embedding_dim)
         
+        # Lazy load cluster with fallback
+        cluster_path = os.path.join(
+            self.cluster_dir,
+            self.latent_files[idx].replace('.latent.pt', '.cluster.pt')
+        )
+        expert = torch.load(cluster_path, map_location='cpu').item() \
+            if os.path.exists(cluster_path) \
+            else 0
+
         return {
             'latent': latent,
             'clip_embedding': clip_emb,
             'bucket': self.bucket_assignments[idx],
-            'expert': self.expert_assignments[idx]
+            'expert': expert
         }
 
     def _load_latent(self, idx):
