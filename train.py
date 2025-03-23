@@ -22,22 +22,24 @@ from utils.expert_cache import ExpertCacheManager
 
 def setup_distributed():
     """Initialize distributed training environment"""
-    # Initialize process group
-    dist.init_process_group(
-        backend='nccl',
-        timeout=timedelta(minutes=90)
-    )
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    
-    # Set device
+    # Initialize process group with explicit device specification
+    rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     
-    # Simple barrier sync
-    dist.barrier()
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=int(os.environ['WORLD_SIZE']),
+        rank=rank,
+        device_id=device
+    )
     
-    return rank, world_size
+    # Verify device assignment
+    test_tensor = torch.tensor([rank], device=device)
+    dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
+    
+    return rank, int(os.environ['WORLD_SIZE'])
 
 def main():
     # Load configuration

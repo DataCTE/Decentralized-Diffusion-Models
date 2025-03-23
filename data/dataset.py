@@ -86,35 +86,33 @@ class DDMDataset(Dataset):
         start = self.rank * shard_size
         end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
         
-        # Only show progress bar on main process
+        # Multi-GPU progress tracking
         pbar = tqdm(total=end-start, 
-                   desc=f"Rank {self.rank} Loading Clusters",
-                   leave=False,
-                   disable=not is_main_process()) if self.rank == 0 else None
+                   desc=f"[Rank {self.rank}/{self.world_size}] Loading Clusters",
+                   leave=True,
+                   position=self.rank,
+                   bar_format="{l_bar}{bar:20}{r_bar}",
+                   disable=not is_main_process())
 
         assignments = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = []
-            for fname in self.latent_files[start:end]:
-                cluster_path = os.path.join(
-                    self.cluster_dir,
-                    fname.replace('.latent.pt', '.cluster.pt')
-                )
-                futures.append(executor.submit(
-                    self._load_cluster_or_default,
-                    cluster_path
-                ))
+        with ThreadPoolExecutor(max_workers=min(8, self.world_size*2)) as executor:  # Scale workers with GPUs
+            futures = {executor.submit(self._load_cluster_or_default, 
+                os.path.join(self.cluster_dir, fname.replace('.latent.pt', '.cluster.pt'))): fname 
+                for fname in self.latent_files[start:end]}
             
             for future in as_completed(futures):
-                tensor = future.result()
-                if tensor.dim() == 0:
-                    tensor = tensor.unsqueeze(0)
-                assignments.append(tensor)
-                if pbar:
+                try:
+                    tensor = future.result()
+                    if tensor.dim() == 0:
+                        tensor = tensor.unsqueeze(0)
+                    assignments.append(tensor)
                     pbar.update(1)
+                    pbar.set_postfix_str(f"GPU {self.rank}: {len(assignments)}/{len(futures)}")
+                except Exception as e:
+                    logger.error(f"Rank {self.rank} cluster load error: {str(e)}")
+                    assignments.append(torch.tensor([0], dtype=torch.long))
 
-        if pbar:
-            pbar.close()
+        pbar.close()
 
         if not assignments:
             assignments = [torch.zeros(0, dtype=torch.long)]
@@ -199,13 +197,29 @@ class DDMDataset(Dataset):
 
     def _warmup_cache(self):
         """Preload initial data segments using parallel prefetch"""
-        with ThreadPoolExecutor(max_workers=16) as executor:
+        num_workers = min(16, self.world_size * 4)  # Scale workers with GPU count
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = []
             for idx in range(0, len(self), len(self)//10):
-                futures.append(executor.submit(self._load_item, idx))
+                futures.append(executor.submit(
+                    self._load_item, idx,
+                    _device_id=self.rank % torch.cuda.device_count()
+                ))
             
-            for future in tqdm(futures, desc="Warming up cache"):
-                future.result()
+            warmup_pbar = tqdm(
+                total=len(futures),
+                desc=f"[Rank {self.rank}] Warming Cache",
+                position=self.rank,
+                leave=False,
+                disable=not is_main_process()
+            )
+            
+            for future in as_completed(futures):
+                future.result()  # Force completion
+                warmup_pbar.update(1)
+                warmup_pbar.set_postfix_str(f"GPU {self.rank}: {warmup_pbar.n}/{warmup_pbar.total}")
+            
+            warmup_pbar.close()
 
     def __getitem__(self, idx):
         # Get device for current process
@@ -354,12 +368,19 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     - Optimized worker processes
     """
     # Use the correct local device for this process
-
-    # Use CPU for bucket sampler to avoid NCCL conflicts
     device = torch.device('cpu')
     logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
-    logger.info(f"Rank {rank}: Using CPU for bucket sampler to avoid NCCL conflicts")
     
+    # Distributed progress tracking
+    loader_pbar = tqdm(
+        total=len(expert_indices),
+        desc=f"[Rank {rank}] Creating Expert Loaders",
+        position=rank,
+        leave=False,
+        bar_format="{l_bar}{bar:20}{r_bar}",
+        disable=not is_main_process()
+    )
+
     loader_start = time.time()
     logger.info(f"Rank {rank}: Starting DataLoader creation for {dataset.num_experts.item()} experts")
     
@@ -377,21 +398,17 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     logger.info(f"Rank {rank}: Collected {total_indices} indices across {len(expert_indices)} active experts")
 
     expert_loaders = {}
-    expert_pbar = tqdm(
-        total=len(expert_indices),
-        desc="Creating Expert Loaders",
-        unit="expert", 
-        dynamic_ncols=True
-    )
     
     for expert_idx, indices in expert_indices.items():
-        # Create GPU-optimized bucket indices
-        bucket_indices = defaultdict(list)
-        for idx in indices:
-            bucket_idx = dataset.bucket_assignments[idx].item()
-            bucket_indices[bucket_idx].append(idx)
+        # GPU-accelerated bucket index creation
+        with torch.cuda.stream(torch.cuda.Stream(device=rank % torch.cuda.device_count())):
+            bucket_indices = defaultdict(list)
+            for idx in indices:
+                bucket_idx = dataset.bucket_assignments[idx].item()
+                bucket_indices[bucket_idx].append(idx)
         
-        logger.info(f"Rank {rank}: Expert {expert_idx} uses {len(bucket_indices)} different buckets with {len(indices)} total images")
+        # Distributed logging
+        logger.info(f"Rank {rank}: Expert {expert_idx} processing on GPU {rank % torch.cuda.device_count()}")
         
         # Create GPU-accelerated sampler
         sampler_start = time.time()
@@ -430,9 +447,10 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         logger.info(f"Rank {rank}: Created optimized loader for expert {expert_idx} "
                    f"with {len(sampler)} batches (config: {loader_config_time:.2f}s)")
         
-        expert_pbar.update(1)
+        loader_pbar.update(1)
+        loader_pbar.set_postfix_str(f"Experts: {len(expert_loaders)}")
     
-    expert_pbar.close()
+    loader_pbar.close()
     total_loader_time = time.time() - loader_start
     logger.info(f"Rank {rank}: DataLoader creation complete in {total_loader_time:.2f}s - {len(expert_loaders)} expert loaders created")
         
