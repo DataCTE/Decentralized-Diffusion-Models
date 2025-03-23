@@ -47,11 +47,21 @@ class DDMDataset(Dataset):
         
         # 1. Distributed file discovery
         self.latent_dir = os.path.join(config.feature_cache_path, "latents")
-        self.latent_files = self._get_distributed_latent_files()
+        self.clip_dir = os.path.join(config.feature_cache_path, "clip_embeddings")
+        self.cluster_dir = os.path.join(config.feature_cache_path, "clusters")
+        self.dim_dir = os.path.join(config.feature_cache_path, "dimensions")
+        
+        # Verify all required directories exist
+        self._verify_cache_dirs()
+        
+        # Get latent files with proper extension
+        self.latent_files = sorted([
+            f for f in os.listdir(self.latent_dir) 
+            if f.endswith('.latent.pt')
+        ])
         self.num_samples = len(self.latent_files)
         
         # 2. Sharded cluster loading
-        self.cluster_dir = os.path.join(config.feature_cache_path, "clusters")
         self.expert_assignments = self._load_sharded_clusters()
         
         # 3. Distributed bucket indices
@@ -59,6 +69,26 @@ class DDMDataset(Dataset):
         
         # Initialize memory maps
         self._init_memory_maps()
+
+    def _verify_cache_dirs(self):
+        """Validate cache directory structure"""
+        required_dirs = {
+            'latents': self.latent_dir,
+            'clip_embeddings': self.clip_dir,
+            'clusters': self.cluster_dir,
+            'dimensions': self.dim_dir
+        }
+        
+        for name, path in required_dirs.items():
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Missing required cache directory: {name} ({path})"
+                )
+            if not any(os.scandir(path)):
+                raise ValueError(
+                    f"Cache directory {name} ({path}) is empty. "
+                    "Please generate features first."
+                )
 
     def _get_distributed_latent_files(self):
         """Distributed file discovery with proper device initialization"""
@@ -178,23 +208,35 @@ class DDMDataset(Dataset):
         self._warmup_cache()
 
     def _create_memory_map(self, index_path):
-        """Create memory map index with pointer arithmetic"""
+        """Create memory map index with validation"""
+        # Get file lists with consistent sorting
+        latent_files = sorted(glob.glob(os.path.join(self.latent_dir, "*.latent.pt")))
+        clip_files = sorted(glob.glob(os.path.join(self.clip_dir, "*.clip_emb.pt")))
+        cluster_files = sorted(glob.glob(os.path.join(self.cluster_dir, "*.cluster.pt")))
+        dim_files = sorted(glob.glob(os.path.join(self.dim_dir, "*.pt")))
+        
+        # Verify equal number of files for each feature type
+        file_counts = {
+            'latent': len(latent_files),
+            'clip': len(clip_files),
+            'cluster': len(cluster_files),
+            'dim': len(dim_files)
+        }
+        
+        if len(set(file_counts.values())) != 1:
+            raise ValueError(
+                f"Mismatched feature file counts: {file_counts}. "
+                "All feature types must have the same number of files."
+            )
+
+        # Build index only if needed
         if not os.path.exists(index_path):
-            # Build pointer index
-            ptrs = []
             with open(index_path, 'wb') as f:
-                for ftype in ['latent', 'clip', 'cluster', 'dim']:
-                    files = sorted(glob.glob(os.path.join(
-                        self.config.feature_cache_path,
-                        f"{ftype}s/*.pt"
-                    )))
-                    for file in files:
-                        size = os.path.getsize(file)
+                for lt, cl, cr, dm in zip(latent_files, clip_files, cluster_files, dim_files):
+                    # Write sizes for each feature pair
+                    for path in [lt, cl, cr, dm]:
+                        size = os.path.getsize(path)
                         f.write(struct.pack('Q', size))
-                        ptrs.append((file, 0, size))
-            
-            # Memory map the index
-            return np.memmap(index_path, mode='r', dtype=np.uint64)
         
         return np.memmap(index_path, mode='r', dtype=np.uint64)
 
