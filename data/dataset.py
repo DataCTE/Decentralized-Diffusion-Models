@@ -415,9 +415,7 @@ class DDMDataset(Dataset):
             'latent': latent,
             'clip_embedding': clip_emb,
             'bucket': self.bucket_assignments[idx].cuda(non_blocking=True),
-            'expert': torch.tensor(self.expert_assignments[idx], 
-                                 device='cuda', 
-                                 non_blocking=True)
+            'expert': self.expert_assignments[idx].to(device='cuda')
         }
 
     def _load_latent(self, idx):
