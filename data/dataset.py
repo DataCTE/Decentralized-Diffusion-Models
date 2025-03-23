@@ -70,6 +70,9 @@ class DDMDataset(Dataset):
         # Initialize memory maps
         self._init_memory_maps()
 
+        # Add this line after initializing memory maps
+        self.num_samples = len(self.latent_files)  # Update with final truncated count
+
     def _verify_cache_dirs(self):
         """Validate cache directory structure"""
         required_dirs = {
@@ -354,8 +357,7 @@ class DDMDataset(Dataset):
         latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
         latent = torch.load(latent_path, 
                           map_location=lambda storage, loc: storage.cuda(device_id, non_blocking=True),
-                          mmap=True,
-                          pin_memory=True)
+                          mmap=True)
         
         # Async CLIP loading with stream-aware prefetch
         clip_path = os.path.join(
@@ -366,11 +368,9 @@ class DDMDataset(Dataset):
         with torch.cuda.stream(torch.cuda.Stream(device_id)):
             clip_emb = torch.load(clip_path, 
                                 map_location='cuda', 
-                                mmap=True,
-                                pin_memory=True) if os.path.exists(clip_path) \
+                                mmap=True) if os.path.exists(clip_path) \
                     else torch.zeros(self.config.clip_embedding_dim, 
-                                   device='cuda',
-                                   pin_memory=True)
+                                   device='cuda')
 
         return {
             'latent': latent,
@@ -414,6 +414,14 @@ class DDMDataset(Dataset):
                     ptr[2], 
                     os.POSIX_FADV_WILLNEED
                 )
+
+    def validate_dataset(self):
+        for i in range(len(self)):
+            try:
+                _ = self[i]
+            except Exception as e:
+                logger.error(f"Bad sample at index {i}: {str(e)}")
+                raise
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""

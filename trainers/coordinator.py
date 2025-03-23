@@ -153,8 +153,9 @@ class DDMTrainingCoordinator:
         
         # Shared configuration for DataLoader
         loader_config = {
-            'num_workers': 0,  # Use single-process data loading
-            'pin_memory': False,  # This is safe to use without multiprocessing
+            'num_workers': 0,
+            'pin_memory': False,
+            'persistent_workers': False
         }
         
         # Train dataset
