@@ -442,7 +442,7 @@ class DDMDataset(Dataset):
         return {
             'latent': latent,
             'clip_embedding': clip_emb,
-            'bucket': self.bucket_assignments[idx].cuda(non_blocking=True),
+            'bucket': self.bucket_assignments[idx].cuda(non_blocking=True).unsqueeze(0),
             'expert': self.expert_assignments[idx].to(device='cuda')
         }
 
