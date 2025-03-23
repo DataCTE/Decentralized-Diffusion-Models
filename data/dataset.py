@@ -81,16 +81,55 @@ class DDMDataset(Dataset):
         return [f"{i:08d}.latent.pt" for i in range(count_tensor.item())]
 
     def _load_sharded_clusters(self):
-        """Lazy cluster loading placeholder"""
-        return torch.zeros(len(self.latent_files), dtype=torch.long)
+        """Distributed cluster loading with memory-mapped files"""
+        # Calculate shard boundaries
+        shard_size = len(self.latent_files) // self.world_size
+        start = self.rank * shard_size
+        end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
+        
+        assignments = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = []
+            for fname in self.latent_files[start:end]:
+                cluster_path = os.path.join(
+                    self.cluster_dir,
+                    fname.replace('.latent.pt', '.cluster.pt')
+                )
+                futures.append(executor.submit(
+                    self._load_cluster_or_default,
+                    cluster_path
+                ))
+            
+            for future in tqdm(futures, desc=f"Rank {self.rank} clusters", leave=False):
+                assignments.append(future.result())
+        
+        # Move to GPU for distributed communication
+        assignments = torch.cat(assignments).cuda()
+        
+        # Gather across all ranks
+        gathered = [torch.empty_like(assignments) for _ in range(self.world_size)]
+        torch.distributed.all_gather(gathered, assignments)
+        
+        return torch.cat(gathered).cpu()  # Return CPU tensor for dataset compatibility
+
+    def _load_cluster_or_default(self, path):
+        """Load cluster with fallback and memory mapping"""
+        try:
+            return torch.load(path, map_location='cpu', mmap=True)
+        except (FileNotFoundError, IOError):
+            return torch.tensor(0, dtype=torch.long)
 
     def _distributed_bucket_indices(self):
-        """Filename-parsed dimensions without loading files"""
-        bucket_indices = torch.zeros(len(self.latent_files), dtype=torch.long)
+        """Filename-parsed dimensions with proper device placement"""
+        # Ensure tensors are on GPU for NCCL backend
+        bucket_indices = torch.zeros(len(self.latent_files), 
+                                   dtype=torch.long,
+                                   device=f'cuda:{self.rank}')
         
-        # Extract dimensions from filenames (format: WxH_*.latent.pt)
+        # Extract dimensions from virtual filenames
         for i, fname in enumerate(self.latent_files):
             try:
+                # Parse dimensions from virtual filename format: {W}x{H}_{index}.latent.pt
                 dim_part = fname.split('_', 1)[0]
                 w, h = map(int, dim_part.split('x', 1))
                 bucket_idx = next(i for i, (bw, bh) in enumerate(self.config.buckets) 
@@ -99,10 +138,15 @@ class DDMDataset(Dataset):
             except:
                 bucket_indices[i] = 0  # Fallback to first bucket
 
-        # Distributed sync
-        gathered = [torch.empty_like(bucket_indices) for _ in range(self.world_size)]
+        # Create GPU tensors for gathering
+        gathered = [torch.empty_like(bucket_indices, device=bucket_indices.device) 
+                  for _ in range(self.world_size)]
+        
+        # Distributed sync with NCCL
         torch.distributed.all_gather(gathered, bucket_indices)
-        return torch.cat(gathered)
+        
+        # Move to CPU for dataset operations
+        return torch.cat(gathered).cpu()
 
     def __len__(self):
         return self.num_samples
