@@ -79,12 +79,14 @@ class RouterTrainer:
 
     def train_step(self, batch):
         """Trains router with uniform distribution instead of clustering"""
-        # Get precomputed latents and embeddings
+        # Initialize scaler first
+        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
+        
+        # Then process data
         latents = batch["latent"].to(self.device)
         text_embeds = batch["clip_embedding"].to(self.device)  # Use precomputed CLIP embeddings
         
         # Use mixed precision training if configured
-        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
         with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
             # Sample random timesteps t ∈ [0, 1] (match expert)
             t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
