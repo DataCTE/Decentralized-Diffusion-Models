@@ -63,7 +63,8 @@ class DDMDataset(Dataset):
             latent_path = os.path.join(self.latent_dir, "latents.mmap")
             if os.path.exists(latent_path):
                 # Load precomputed index
-                valid_files = torch.load(latent_path, map_location='cpu')
+                with open(latent_path, 'rb') as f:
+                    valid_files = [line.strip().decode() for line in f]
                 logger.info(f"Loaded precomputed latent index with {len(valid_files)} entries")
             else:
                 # Build and cache index
@@ -84,18 +85,19 @@ class DDMDataset(Dataset):
                         if exists:
                             valid_files.append(f)
                 
-                # Save mmap index
-                torch.save(valid_files, latent_path)
+                # Save mmap index as newline-separated bytes
+                with open(latent_path, 'wb') as f:
+                    f.write(b'\n'.join([f.encode() for f in valid_files]))
                 logger.info(f"Cached latent index to {latent_path}")
 
-            # Convert to tensor for broadcasting
-            file_tensor = torch.tensor(valid_files, dtype=torch.string)
+            # Convert to numpy byte array for broadcasting
+            file_bytes = np.array([f.encode() for f in valid_files], dtype=np.bytes_)
         else:
-            file_tensor = torch.empty(0, dtype=torch.string)
+            file_bytes = np.empty(0, dtype=np.bytes_)
         
-        # Broadcast file list from rank 0
-        file_tensor = broadcast_object(file_tensor, src=0)
-        return [f.decode('utf-8') for f in file_tensor.tolist()]
+        # Broadcast file list from rank 0 using numpy arrays
+        file_bytes = broadcast_object(file_bytes, src=0)
+        return [f.decode() for f in file_bytes.tolist()]
 
     def _load_sharded_clusters(self):
         """Sharded cluster loading using memory mapping with batched access"""
