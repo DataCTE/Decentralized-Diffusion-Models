@@ -245,15 +245,52 @@ class DDMDataset(Dataset):
         
         logger.warning(f"Using truncated file counts to {min_count} (original: {file_counts})")
 
-        # Build index only if needed
+        # Build index only if needed - handle empty file case
         if not os.path.exists(index_path):
-            with open(index_path, 'wb') as f:
-                for lt, cl, cr, dm in zip(latent_files, clip_files, cluster_files, dim_files):
-                    # Write sizes for each feature pair
-                    for path in [lt, cl, cr, dm]:
-                        size = os.path.getsize(path)
-                        f.write(struct.pack('Q', size))
-        
+            # Only create index on main process
+            if is_main_process():
+                logger.info(f"Creating new index file at {index_path}")
+                try:
+                    with open(index_path, 'wb') as f:
+                        for lt, cl, cr, dm in zip(latent_files, clip_files, cluster_files, dim_files):
+                            # Verify files exist before writing to index
+                            for path in [lt, cl, cr, dm]:
+                                if not os.path.exists(path):
+                                    raise FileNotFoundError(f"Missing feature file: {path}")
+                                size = os.path.getsize(path)
+                                if size == 0:
+                                    raise ValueError(f"Empty file detected: {path}")
+                                f.write(struct.pack('Q', size))
+                    # Verify index file was created properly
+                    if os.path.getsize(index_path) == 0:
+                        raise RuntimeError("Created empty index file")
+                except Exception as e:
+                    if os.path.exists(index_path):
+                        os.remove(index_path)
+                    raise
+
+            # Wait for main process to create index
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        # Verify index file exists and has content
+        if os.path.getsize(index_path) == 0:
+            raise ValueError(f"Index file {index_path} is empty")
+
+        # Load memory map with retries
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                mmap = np.memmap(index_path, mode='r', dtype=np.uint64)
+                if len(mmap) > 0:
+                    return mmap
+                logger.warning(f"Empty mmap detected on attempt {attempt+1}, retrying...")
+                time.sleep(0.5)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Failed to create memory map after {max_retries} attempts: {str(e)}")
+                time.sleep(1)
+
         return np.memmap(index_path, mode='r', dtype=np.uint64)
 
     def _warmup_cache(self):
