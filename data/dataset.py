@@ -228,19 +228,22 @@ class DDMDataset(Dataset):
         cluster_files = sorted(glob.glob(os.path.join(self.cluster_dir, "*.cluster.pt")))
         dim_files = sorted(glob.glob(os.path.join(self.dim_dir, "*.pt")))
         
-        # Verify equal number of files for each feature type
+        # Find the minimum count across all feature types
         file_counts = {
             'latent': len(latent_files),
             'clip': len(clip_files),
             'cluster': len(cluster_files),
             'dim': len(dim_files)
         }
+        min_count = min(file_counts.values())
         
-        if len(set(file_counts.values())) != 1:
-            raise ValueError(
-                f"Mismatched feature file counts: {file_counts}. "
-                "All feature types must have the same number of files."
-            )
+        # Truncate all lists to the minimum count
+        latent_files = latent_files[:min_count]
+        clip_files = clip_files[:min_count]
+        cluster_files = cluster_files[:min_count]
+        dim_files = dim_files[:min_count]
+        
+        logger.warning(f"Using truncated file counts to {min_count} (original: {file_counts})")
 
         # Build index only if needed
         if not os.path.exists(index_path):
