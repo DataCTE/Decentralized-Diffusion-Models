@@ -82,13 +82,13 @@ class ExpertTrainer(BaseTrainer):
         as described in Section 3.2 of the paper.
         """
         # Get scaler based on config
-        scaler = torch.cuda.amp.GradScaler('cuda') if self.config.use_mixed_precision else None
+        scaler = torch.amp.GradScaler("cuda", enabled=self.config.use_mixed_precision)
         
         # Get images from batch (already in latent space)
         latents = batch["latent"].to(self.device)  # Directly use precomputed latents
         text_embeds = batch["clip_embedding"].to(self.device)  # Directly use dataset's CLIP embeddings
         
-        with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
+        with torch.autocast(device_type="cuda", enabled=self.config.use_mixed_precision):
             # Sample random timesteps t ∈ [0, 1] (Section 3.2)
             t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
             t = t_indices.float() / 1000.0  # Normalize to [0, 1]
