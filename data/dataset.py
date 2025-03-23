@@ -63,6 +63,9 @@ class DDMDataset(Dataset):
         self.clip_embedding_path = os.path.join(self.feature_cache_path, "clip_embeddings")
         self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions")
 
+        # Initialize locks dictionary for clip embeddings
+        self._clip_embedding_loading_lock = defaultdict(threading.Lock)
+
         # 1. Latent-first initialization -------------------------------------------------
         latent_files = sorted(os.listdir(self.latent_path))
         self.image_files = [f.replace(".latent.pt", "") for f in latent_files]
@@ -452,21 +455,27 @@ class DDMDataset(Dataset):
 
     def _load_clip_embedding(self, idx):
         """Load precomputed CLIP embedding tensor from file, using cache"""
-        # Add bounds checking
+        # Add bounds checking first
         if idx >= self.cumulative_feature_counts[-1]:
             self.logger.error(f"Requested index {idx} exceeds total features {self.cumulative_feature_counts[-1]}")
-            return torch.zeros_like(next(iter(self.clip_embedding_cache.values()))[0])
+            return torch.zeros(self.config.clip_embedding_dim)
 
-        # Find the first index where cumulative_counts > idx
-        file_idx = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item() - 1
+        # Find the correct file index using left-bound search
+        file_idx = torch.searchsorted(self.cumulative_feature_counts, idx, right=False).item() - 1
         file_idx = max(0, min(file_idx, len(self.clip_embedding_files) - 1))
 
-        # Calculate index within file
-        idx_in_file = idx - self.cumulative_feature_counts[file_idx].item()
-        if idx_in_file < 0:
-            self.logger.error(f"Negative index calculation: {idx} - {self.cumulative_feature_counts[file_idx]} = {idx_in_file}")
-            return torch.zeros_like(next(iter(self.clip_embedding_cache.values()))[0])
+        # Calculate index within file with bounds checking
+        start_idx = self.cumulative_feature_counts[file_idx].item()
+        if file_idx + 1 < len(self.cumulative_feature_counts):
+            end_idx = self.cumulative_feature_counts[file_idx+1].item()
+        else:
+            end_idx = self.cumulative_feature_counts[-1].item()
+            
+        if idx < start_idx or idx >= end_idx:
+            self.logger.error(f"Index {idx} out of range for file {file_idx} (range {start_idx}-{end_idx})")
+            return torch.zeros(self.config.clip_embedding_dim)
 
+        idx_in_file = idx - start_idx
         file_path = os.path.join(self.clip_embedding_path, self.clip_embedding_files[file_idx])
 
         # Locking and caching mechanism
