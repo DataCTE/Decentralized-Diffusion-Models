@@ -94,7 +94,7 @@ class DDMDataset(Dataset):
                    leave=True,
                    position=self.rank,
                    bar_format="{l_bar}{bar:20}{r_bar}",
-                   disable=not is_main_process())
+                   disable=False if self.rank < 8 else True)
 
         assignments = []
         with ThreadPoolExecutor(max_workers=min(8, self.world_size*2)) as executor:  # Scale workers with GPUs
@@ -199,7 +199,7 @@ class DDMDataset(Dataset):
 
     def _warmup_cache(self):
         """Preload initial data segments using parallel prefetch"""
-        num_workers = min(16, self.world_size * 4)  # Scale workers with GPU count
+        num_workers = min(16, self.world_size * 4)
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = []
             for idx in range(0, len(self), len(self)//10):
@@ -213,7 +213,7 @@ class DDMDataset(Dataset):
                 desc=f"[Rank {self.rank}] Warming Cache",
                 position=self.rank,
                 leave=False,
-                disable=not is_main_process()
+                disable=not is_main_process() and self.rank != 0
             )
             
             for future in as_completed(futures):
