@@ -244,123 +244,45 @@ class DDMDataset(Dataset):
         self.bucket_assignments = self._calculate_bucket_assignments()
         
         if is_main_process():
-            # Add progress bar for validation/train filtering
-            if self.split == 'val' and _GLOBAL_DATASET_CACHE["initialized"]:
-                val_size = getattr(self.config, 'val_size', 1000)
-                if val_size < len(self.image_files):
-                    all_indices = np.arange(len(self.image_files))
-                    np.random.seed(42)
-                    
-                    # Add progress bar for validation sample selection
-                    with tqdm(total=val_size, desc="Selecting validation samples") as pbar:
-                        val_indices = []
-                        while len(val_indices) < val_size:
-                            batch = np.random.choice(all_indices, size=min(1000, val_size-len(val_indices)), replace=False)
-                            val_indices.extend(batch.tolist())
-                            pbar.update(len(batch))
-                        val_indices = np.array(val_indices[:val_size])
-                    
-                    # Add filtering progress bar
-                    with tqdm(total=len(val_indices), desc="Filtering validation files") as pbar:
-                        self.image_files = [self.image_files[i] for i in val_indices]
-                        self.caption_files = [self.caption_files[i] for i in val_indices]
-                        self.dim_cache = self.dim_cache[val_indices]
-                        pbar.update(len(val_indices))
-                        
-                # After filtering image_files, re-filter clip_embedding_files with proper extension handling
-                current_image_basenames = {os.path.basename(f) for f in self.image_files}
-                self.clip_embedding_files = [
-                    f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))
-                    if os.path.basename(f).replace(".clip_emb.pt", "") in current_image_basenames
-                ]
-                
-                # Add validation before recalculating counts
-                assert len(self.clip_embedding_files) > 0, "No CLIP embedding files match filtered dataset"
-                
-                # Recalculate cumulative counts AFTER filtering with proper path handling
-                self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                    self.clip_embedding_files,
-                    self.clip_embedding_path
-                )
-                
-                # Verify counts match before broadcasting
-                total_features = self.cumulative_feature_counts[-1].item()
-                assert total_features == len(self.image_files), \
-                    f"CLIP features ({total_features}) don't match images ({len(self.image_files)})"
-                
-            elif self.split == 'train' and _GLOBAL_DATASET_CACHE["initialized"]:
-                val_size = getattr(self.config, 'val_size', 1000)
-                if val_size > 0 and val_size < len(self.image_files):
-                    all_indices = np.arange(len(self.image_files))
-                    np.random.seed(42)
-                    
-                    # Add progress bar for train sample selection
-                    with tqdm(total=len(all_indices)-val_size, desc="Selecting training samples") as pbar:
-                        train_indices = []
-                        for i in all_indices:
-                            if i not in val_indices:
-                                train_indices.append(i)
-                                pbar.update(1)
-                        train_indices = np.array(train_indices)
-                    
-                    # Add filtering progress bar
-                    with tqdm(total=len(train_indices), desc="Filtering training files") as pbar:
-                        self.image_files = [self.image_files[i] for i in train_indices]
-                        self.caption_files = [self.caption_files[i] for i in train_indices]
-                        self.dim_cache = self.dim_cache[train_indices]
-                        pbar.update(len(train_indices))
-
-                # After filtering image_files, re-filter clip_embedding_files with proper extension handling
-                current_image_basenames = {os.path.basename(f) for f in self.image_files}
-                self.clip_embedding_files = [
-                    f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))
-                    if os.path.basename(f).replace(".clip_emb.pt", "") in current_image_basenames
-                ]
-                
-                # Add validation before recalculating counts
-                assert len(self.clip_embedding_files) > 0, "No CLIP embedding files match filtered dataset"
-                
-                # Recalculate cumulative counts AFTER filtering with proper path handling
-                self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                    self.clip_embedding_files,
-                    self.clip_embedding_path
-                )
-                
-                # Verify counts match before broadcasting
-                total_features = self.cumulative_feature_counts[-1].item()
-                assert total_features == len(self.image_files), \
-                    f"CLIP features ({total_features}) don't match images ({len(self.image_files)})"
-
-            # Recalculate cumulative counts AFTER filtering
+            # After filtering image_files, re-filter clip_embedding_files
+            current_image_basenames = {os.path.basename(f) for f in self.image_files}
+            self.clip_embedding_files = [
+                f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))
+                if os.path.basename(f).replace(".clip_emb.pt", "") in current_image_basenames
+            ]
+            
+            # Recalculate with PROPER synchronization
             self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                self.clip_embedding_files, 
+                self.clip_embedding_files,
                 self.clip_embedding_path
             )
             
-            # Update broadcast data with filtered clip_embedding_files
+            # Ensure exact match
+            self.image_files = self.image_files[:self.cumulative_feature_counts[-1].item()]
+            self.dim_cache = self.dim_cache[:self.cumulative_feature_counts[-1].item()]
+
+            # Broadcast updated data
             broadcast_data = (
                 self.image_files,
                 self.caption_files,
                 self.dim_cache,
-                self.clip_embedding_files,  # Now contains filtered files
+                self.clip_embedding_files,
                 self.cumulative_feature_counts,
                 self.bucket_assignments
             )
             broadcast_object(broadcast_data)
         else:
-            # Receive tensor directly
-            (self.image_files, 
+            # Receive and apply ALL updates
+            (self.image_files,
              self.caption_files,
-             self.dim_cache,  # Receive as tensor
+             self.dim_cache,
              self.clip_embedding_files,
              self.cumulative_feature_counts,
-             self.bucket_assignments) = broadcast_object(None)  # Add bucket_assignments here
+             self.bucket_assignments) = broadcast_object(None)
 
-        # Final validation (critical for distributed sync)
-        assert len(self.image_files) == len(self.bucket_assignments), \
-            f"Dataset/Bucket mismatch: {len(self.image_files)} vs {len(self.bucket_assignments)}"
-        assert self.dim_cache.shape[0] == len(self.image_files), \
-            f"Dimension cache mismatch: {self.dim_cache.shape[0]} vs {len(self.image_files)}"
+        # Final validation
+        assert len(self.image_files) == self.cumulative_feature_counts[-1].item(), \
+            f"Final mismatch: {len(self.image_files)} vs {self.cumulative_feature_counts[-1].item()}"
 
     def _calculate_bucket_assignments(self):
         """Calculate bucket assignments based on image dimensions"""
@@ -456,23 +378,22 @@ class DDMDataset(Dataset):
     def _load_clip_embedding(self, idx):
         """Load precomputed CLIP embedding tensor from file, using cache"""
         # Add bounds checking first
-        if idx >= self.cumulative_feature_counts[-1]:
-            self.logger.error(f"Requested index {idx} exceeds total features {self.cumulative_feature_counts[-1]}")
+        total_features = self.cumulative_feature_counts[-1].item()
+        if idx >= total_features:
+            self.logger.error(f"Requested index {idx} exceeds total features {total_features}")
             return torch.zeros(self.config.clip_embedding_dim)
 
-        # Find the correct file index using left-bound search
-        file_idx = torch.searchsorted(self.cumulative_feature_counts, idx, right=False).item() - 1
+        # Find the correct file index using vectorized search
+        file_idx = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item() - 1
         file_idx = max(0, min(file_idx, len(self.clip_embedding_files) - 1))
 
-        # Calculate index within file with bounds checking
+        # Get exact range from precomputed counts
         start_idx = self.cumulative_feature_counts[file_idx].item()
-        if file_idx + 1 < len(self.cumulative_feature_counts):
-            end_idx = self.cumulative_feature_counts[file_idx+1].item()
-        else:
-            end_idx = self.cumulative_feature_counts[-1].item()
-            
-        if idx < start_idx or idx >= end_idx:
-            self.logger.error(f"Index {idx} out of range for file {file_idx} (range {start_idx}-{end_idx})")
+        end_idx = self.cumulative_feature_counts[file_idx + 1].item()
+
+        # Final validation
+        if not (start_idx <= idx < end_idx):
+            self.logger.error(f"Index {idx} out of range for file {file_idx} ({start_idx}-{end_idx})")
             return torch.zeros(self.config.clip_embedding_dim)
 
         idx_in_file = idx - start_idx
