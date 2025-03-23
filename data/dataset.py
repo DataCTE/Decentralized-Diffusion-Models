@@ -173,6 +173,16 @@ class DDMDataset(Dataset):
                                    dtype=torch.long,
                                    device=f'cuda:{self.rank}')
         
+        # Create progress bar only on main process
+        pbar = tqdm(
+            total=len(self.latent_files),
+            desc=f"Parsing buckets (Rank {self.rank})" if self.rank != 0 else "Assigning buckets",
+            leave=False,
+            bar_format="{l_bar}{bar:20}{r_bar}",
+            disable=not is_main_process(),
+            position=0
+        )
+
         # Extract dimensions from virtual filenames
         for i, fname in enumerate(self.latent_files):
             try:
@@ -184,6 +194,9 @@ class DDMDataset(Dataset):
                 bucket_indices[i] = bucket_idx
             except:
                 bucket_indices[i] = 0  # Fallback to first bucket
+            pbar.update(1)
+
+        pbar.close()
 
         # Create GPU tensors for gathering
         gathered = [torch.empty_like(bucket_indices, device=bucket_indices.device) 
