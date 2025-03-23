@@ -84,17 +84,23 @@ class DDMDataset(Dataset):
         return [f"{i:08d}.latent.pt" for i in range(count_tensor.item())]
 
     def _load_sharded_clusters(self):
-        """Distributed cluster loading with proper tensor dimensions"""
+        """Distributed cluster loading with thread-safe progress"""
         shard_size = len(self.latent_files) // self.world_size
         start = self.rank * shard_size
         end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
 
-        # Unified progress bar only on main process
-        pbar = tqdm(total=end-start,
-                   desc="Loading clusters",
-                   leave=False,
-                   bar_format="{l_bar}{bar:20}{r_bar}",
-                   disable=not is_main_process())
+        # Synchronize before starting progress bars
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        pbar = tqdm(
+            total=end-start,
+            desc="Loading clusters" + (f" (Rank {self.rank})" if self.rank != 0 else ""),
+            leave=False,
+            bar_format="{l_bar}{bar:20}{r_bar}",
+            disable=not is_main_process(),
+            position=0  # Force all progress bars to use same line position
+        )
 
         assignments = []
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -193,12 +199,18 @@ class DDMDataset(Dataset):
         return np.memmap(index_path, mode='r', dtype=np.uint64)
 
     def _warmup_cache(self):
-        """Preload initial data segments using parallel prefetch"""
-        # Unified progress bar only on main process
-        warmup_pbar = tqdm(total=len(self)//10,
-                         desc="Warming cache",
-                         leave=False,
-                         disable=not is_main_process())
+        """Thread-safe cache warming with proper synchronization"""
+        # Synchronize processes before starting
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        warmup_pbar = tqdm(
+            total=len(self)//10,
+            desc="Warming cache" + (f" (Rank {self.rank})" if self.rank != 0 else ""),
+            leave=False,
+            disable=not is_main_process(),
+            position=0  # Unified position for all ranks
+        )
 
         with ThreadPoolExecutor(max_workers=16) as executor:
             futures = []

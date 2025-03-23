@@ -116,41 +116,36 @@ class DDMTrainingCoordinator:
                 logger.warning(f"Enforced latent_channels=16 for 16ch-VAE compatibility")
     
     def _init_parallel_components(self):
-        """Initialize critical components with async dataset loading"""
+        """Initialize critical components with proper thread safety"""
         pbar = None
-        if self.rank == 0:  # Only create progress bar on main process
+        if self.rank == 0:
             pbar = tqdm(
-                total=2,  # Reduced from 3 to 2 (router and experts only)
+                total=2,
                 desc="Initializing Components",
                 dynamic_ncols=True,
                 bar_format="{l_bar}{bar:20}{r_bar}"
             )
 
-        # Use ThreadPoolExecutor for better resource management
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            # Submit data loading separately without tracking
-            data_future = executor.submit(self._init_data_loaders)
-            
-            # Only track these two components in progress bar
+        # Initialize dataset FIRST in main thread to ensure tqdm safety
+        self._init_data_loaders()
+
+        # Then parallelize other components
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
                 executor.submit(self._init_router): "router",
                 executor.submit(self._init_expert_indices): "experts"
             }
 
             try:
-                # Process completion with progress updates
                 for future in concurrent.futures.as_completed(futures):
                     component = futures[future]
-                    future.result()  # Raise exceptions if any
-                    if pbar is not None and self.rank == 0:  # Ensure we only update on rank 0
+                    future.result()
+                    if pbar and self.rank == 0:
                         pbar.update(1)
                         pbar.set_postfix_str(f"Completed: {component}")
             finally:
-                if pbar is not None:
+                if pbar:
                     pbar.close()
-            
-            # Ensure data loading completes before continuing
-            data_future.result()
     
     def _init_data_loaders(self):
         """Initialize data loaders without multiprocessing to avoid pickling requirements"""
