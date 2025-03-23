@@ -409,6 +409,23 @@ class DDMDataset(Dataset):
                           map_location=lambda storage, loc: storage.cuda(device_id, non_blocking=True),
                           mmap=True)
         
+        # Validate latent dimensions against bucket
+        bucket_idx = self.bucket_assignments[idx].item()
+        expected_shape = self.config.buckets[bucket_idx]
+        vae_scale_factor = self.config.vae_scale_factor
+        expected_latent_shape = (
+            expected_shape[0] // vae_scale_factor,
+            expected_shape[1] // vae_scale_factor
+        )
+        
+        if latent.shape[-2:] != expected_latent_shape:
+            # Handle dimension mismatch by finding correct bucket
+            actual_shape = (latent.shape[-1]*vae_scale_factor, 
+                           latent.shape[-2]*vae_scale_factor)
+            bucket_idx = next((i for i, (w,h) in enumerate(self.config.buckets)
+                              if w == actual_shape[0] and h == actual_shape[1]), 0)
+            self.bucket_assignments[idx] = bucket_idx  # Update bucket assignment
+
         # Async CLIP loading with stream-aware prefetch
         clip_path = os.path.join(
             self.config.feature_cache_path,

@@ -187,9 +187,27 @@ class DDMTrainingCoordinator:
                     drop_last=False
                 )
                 
+                # Modify DataLoader creation to use custom collate
+                def collate_fn(batch):
+                    # Group by actual dimensions
+                    grouped = defaultdict(list)
+                    for item in batch:
+                        key = (item['latent'].shape[-2], item['latent'].shape[-1])
+                        grouped[key].append(item)
+                    
+                    # Return batches with consistent dimensions
+                    for group in grouped.values():
+                        return {
+                            'latent': torch.cat([i['latent'] for i in group]),
+                            'clip_embedding': torch.cat([i['clip_embedding'] for i in group]),
+                            'bucket': torch.cat([i['bucket'] for i in group]),
+                            'expert': torch.cat([i['expert'] for i in group])
+                        }
+                
                 self.train_loader = DataLoader(
                     train_dataset,
                     batch_sampler=batch_sampler,
+                    collate_fn=collate_fn,
                     **loader_config
                 )
                 if self.rank == 0:
