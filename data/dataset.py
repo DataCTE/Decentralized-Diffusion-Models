@@ -66,13 +66,15 @@ class DDMDataset(Dataset):
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend='nccl')
 
+        device = torch.device(f'cuda:{self.rank}')  # Use explicit device assignment
+
         if self.rank == 0:
             # Use generator to avoid loading all filenames into memory
             count = sum(1 for _ in os.scandir(self.latent_dir) 
                        if _.name.endswith('.latent.pt'))
-            count_tensor = torch.tensor([count], dtype=torch.long).cuda()
+            count_tensor = torch.tensor([count], dtype=torch.long, device=device)
         else:
-            count_tensor = torch.zeros(1, dtype=torch.long).cuda()
+            count_tensor = torch.zeros(1, dtype=torch.long, device=device)
 
         # Broadcast using NCCL backend
         torch.distributed.broadcast(count_tensor, src=0)
