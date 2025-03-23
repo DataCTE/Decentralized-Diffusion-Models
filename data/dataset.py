@@ -67,10 +67,11 @@ class DDMDataset(Dataset):
             torch.distributed.init_process_group(backend='nccl')
 
         device = torch.device(f'cuda:{self.rank}')  # Use explicit device assignment
+        torch.cuda.set_device(device) # Ensure device is set for this process
 
         if self.rank == 0:
             # Use generator to avoid loading all filenames into memory
-            count = sum(1 for _ in os.scandir(self.latent_dir) 
+            count = sum(1 for _ in os.scandir(self.latent_dir)
                        if _.name.endswith('.latent.pt'))
             count_tensor = torch.tensor([count], dtype=torch.long, device=device)
         else:
