@@ -412,7 +412,7 @@ class DDMDataset(Dataset):
         # Validate latent dimensions against bucket
         bucket_idx = self.bucket_assignments[idx].item()
         expected_shape = self.config.buckets[bucket_idx]
-        vae_scale_factor = self.config.vae_scale_factor
+        vae_scale_factor = self.config.vae_scaling_factor
         expected_latent_shape = (
             expected_shape[0] // vae_scale_factor,
             expected_shape[1] // vae_scale_factor
