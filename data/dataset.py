@@ -443,7 +443,7 @@ class DDMDataset(Dataset):
             'latent': latent,
             'clip_embedding': clip_emb,
             'bucket': self.bucket_assignments[idx].cuda(non_blocking=True).unsqueeze(0),
-            'expert': self.expert_assignments[idx].to(device='cuda')
+            'expert': self.expert_assignments[idx].to(device='cuda').unsqueeze(0)
         }
 
     def _load_latent(self, idx):
