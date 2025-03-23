@@ -90,7 +90,7 @@ class DDMDataset(Dataset):
         end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
 
         # Unified progress bar only on main process
-        pbar = tqdm(total=end-start, 
+        pbar = tqdm(total=end-start,
                    desc="Loading clusters",
                    leave=False,
                    bar_format="{l_bar}{bar:20}{r_bar}",
@@ -360,7 +360,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     # Use the correct local device for this process
     device = torch.device('cpu')
     logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
-    
+
     # Distributed progress tracking
     loader_pbar = tqdm(
         total=len(expert_indices),
@@ -368,27 +368,27 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         position=rank,
         leave=False,
         bar_format="{l_bar}{bar:20}{r_bar}",
-        disable=False
+        disable=not is_main_process()
     )
 
     loader_start = time.time()
     logger.info(f"Rank {rank}: Starting DataLoader creation for {dataset.num_experts.item()} experts")
-    
+
     # Get expert assignments directly from GPU tensor
     expert_assignments = dataset.expert_assignments.cpu().numpy()
     expert_indices = defaultdict(list)
-    
+
     # Use vectorized operations for expert index collection
     for idx in np.nditer(np.where(expert_assignments >= 0)):
         expert_idx = expert_assignments[idx]
         expert_indices[expert_idx].append(idx.item())
-    
+
     # Log expert distribution stats
     total_indices = sum(len(indices) for indices in expert_indices.values())
     logger.info(f"Rank {rank}: Collected {total_indices} indices across {len(expert_indices)} active experts")
 
     expert_loaders = {}
-    
+
     for expert_idx, indices in expert_indices.items():
         # GPU-accelerated bucket index creation
         with torch.cuda.stream(torch.cuda.Stream(device=rank % torch.cuda.device_count())):
@@ -396,10 +396,10 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             for idx in indices:
                 bucket_idx = dataset.bucket_assignments[idx].item()
                 bucket_indices[bucket_idx].append(idx)
-        
+
         # Distributed logging
         logger.info(f"Rank {rank}: Expert {expert_idx} processing on GPU {rank % torch.cuda.device_count()}")
-        
+
         # Create GPU-accelerated sampler
         sampler_start = time.time()
         sampler = BucketBatchSampler(
@@ -411,7 +411,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         )
         sampler_time = time.time() - sampler_start
         logger.info(f"Rank {rank}: Created sampler for expert {expert_idx} in {sampler_time:.2f}s")
-        
+
         # Configure loader with GPU optimizations
         loader_config_start = time.time()
         loader = DataLoader(
@@ -421,7 +421,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             pin_memory=True
         )
         loader_config_time = time.time() - loader_config_start
-        
+
         # Warmup pipeline (no need to load directly to GPU here)
         warmup_start = time.time()
         try:
@@ -432,16 +432,16 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             logger.info(f"Rank {rank}: Warmup for expert {expert_idx} completed in {warmup_time:.2f}s")
         except Exception as e:
             logger.warning(f"Rank {rank}: Warmup failed for expert {expert_idx}: {str(e)}. This is non-critical and training will continue.")
-        
+
         expert_loaders[expert_idx] = loader
         logger.info(f"Rank {rank}: Created optimized loader for expert {expert_idx} "
                    f"with {len(sampler)} batches (config: {loader_config_time:.2f}s)")
-        
+
         loader_pbar.update(1)
         loader_pbar.set_postfix_str(f"Experts: {len(expert_loaders)}")
-    
+
     loader_pbar.close()
     total_loader_time = time.time() - loader_start
     logger.info(f"Rank {rank}: DataLoader creation complete in {total_loader_time:.2f}s - {len(expert_loaders)} expert loaders created")
-        
+
     return expert_loaders 
