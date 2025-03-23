@@ -61,15 +61,24 @@ class DDMDataset(Dataset):
         self._init_memory_maps()
 
     def _get_distributed_latent_files(self):
-        """Lightweight file counting without loading contents"""
+        """Distributed file discovery with proper device initialization"""
+        # Ensure distributed is initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
         if self.rank == 0:
-            count = sum(1 for _ in os.scandir(self.latent_dir) if _.name.endswith('.latent.pt'))
-            count_tensor = torch.tensor([count], dtype=torch.long)
+            # Use generator to avoid loading all filenames into memory
+            count = sum(1 for _ in os.scandir(self.latent_dir) 
+                       if _.name.endswith('.latent.pt'))
+            count_tensor = torch.tensor([count], dtype=torch.long).cuda()
         else:
-            count_tensor = torch.tensor([0], dtype=torch.long)
-        
+            count_tensor = torch.zeros(1, dtype=torch.long).cuda()
+
+        # Broadcast using NCCL backend
         torch.distributed.broadcast(count_tensor, src=0)
-        return [f"file_{i}.latent.pt" for i in range(count_tensor.item())]
+        
+        # Generate virtual filenames to avoid storing actual paths
+        return [f"{i:08d}.latent.pt" for i in range(count_tensor.item())]
 
     def _load_sharded_clusters(self):
         """Lazy cluster loading placeholder"""
