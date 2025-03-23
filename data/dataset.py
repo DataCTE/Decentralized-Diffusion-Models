@@ -11,6 +11,7 @@ import logging
 import time  
 import glob
 import bisect
+import struct
 
 import io
 import torchvision.transforms as transforms
@@ -55,6 +56,9 @@ class DDMDataset(Dataset):
         
         # 3. Distributed bucket indices
         self.bucket_assignments = self._distributed_bucket_indices()
+        
+        # Initialize memory maps
+        self._init_memory_maps()
 
     def _get_distributed_latent_files(self):
         """Distributed file discovery with memory-mapped index"""
@@ -100,59 +104,59 @@ class DDMDataset(Dataset):
         return [f.decode() for f in file_bytes.tolist()]
 
     def _load_sharded_clusters(self):
-        """Sharded cluster loading from individual files"""
-        # Get all cluster files that match latent files
-        cluster_files = [
-            f.replace('.latent.pt', '.cluster.pt')
-            for f in self.latent_files
-            if os.path.exists(os.path.join(self.cluster_dir, f.replace('.latent.pt', '.cluster.pt')))
-        ]
-        
-        # Calculate shard boundaries
-        shard_size = len(cluster_files) // self.world_size
+        """Enforce latent-as-truth cluster loading"""
+        # Use full latent files list as ground truth
+        shard_size = len(self.latent_files) // self.world_size
         start = self.rank * shard_size
-        end = start + shard_size if self.rank != self.world_size -1 else len(cluster_files)
+        end = start + shard_size if self.rank != self.world_size -1 else len(self.latent_files)
         
         assignments = []
-        # Process files in parallel batches
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = {
                 executor.submit(
-                    lambda f: torch.load(os.path.join(self.cluster_dir, f), map_location='cpu'),
+                    lambda f: torch.load(
+                        os.path.join(self.cluster_dir, f.replace('.latent.pt', '.cluster.pt')),
+                        map_location='cpu'
+                    ) if os.path.exists(os.path.join(self.cluster_dir, f.replace('.latent.pt', '.cluster.pt'))) 
+                    else torch.tensor(0, dtype=torch.long),
                     f
-                ): f for f in cluster_files[start:end]
+                ): f for f in self.latent_files[start:end]
             }
             
-            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Rank {self.rank} loading clusters"):
-                try:
-                    cluster_data = future.result()
-                    assignments.append(cluster_data)
-                except Exception as e:
-                    logger.warning(f"Failed to load cluster file: {str(e)}")
-                    continue
-        
-        # Gather all shards
-        if assignments:
-            assignments = torch.cat(assignments)
-        else:
-            assignments = torch.empty(0, dtype=torch.long)
-            
+            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Rank {self.rank} clusters"):
+                assignments.append(future.result())
+
+        assignments = torch.cat(assignments)
         gathered = [torch.empty_like(assignments) for _ in range(self.world_size)]
         torch.distributed.all_gather(gathered, assignments)
         return torch.cat(gathered).long()
 
     def _distributed_bucket_indices(self):
-        """Optimized bucket index calculation using precomputed metadata"""
-        # Load precomputed dimensions from memory-mapped array
-        dim_mmap = np.load(os.path.join(self.latent_dir, "dimensions.npy"), mmap_mode='r')
-        bucket_indices = torch.zeros(len(dim_mmap), dtype=torch.long)
+        """Latent-driven bucket indices with fallbacks"""
+        bucket_indices = torch.zeros(len(self.latent_files), dtype=torch.long)
         
-        # Vectorized bucket assignment
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(
+                    lambda f: (f, torch.load(
+                        os.path.join(self.config.feature_cache_path, "dimensions", f.replace('.latent.pt', '.pt')),
+                        map_location='cpu'
+                    ) if os.path.exists(os.path.join(self.config.feature_cache_path, "dimensions", f.replace('.latent.pt', '.pt'))) 
+                    else torch.tensor(self.config.buckets[0])),
+                    f
+                ): f in self.latent_files
+            }
+            
+            dims = []
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Dimensions"):
+                _, dim = future.result()
+                dims.append(dim.numpy())
+
+        dim_array = np.stack(dims)
         for i, (w, h) in enumerate(self.config.buckets):
-            mask = (dim_mmap[:,0] == w) & (dim_mmap[:,1] == h)
+            mask = (dim_array[:,0] == w) & (dim_array[:,1] == h)
             bucket_indices[mask] = i
-        
-        # Gather all indices
+
         gathered = [torch.empty_like(bucket_indices) for _ in range(self.world_size)]
         torch.distributed.all_gather(gathered, bucket_indices)
         return torch.cat(gathered)
@@ -160,18 +164,60 @@ class DDMDataset(Dataset):
     def __len__(self):
         return self.num_samples
 
+    def _init_memory_maps(self):
+        """Initialize memory maps for all data types"""
+        # Create unified memory map index
+        index_path = os.path.join(self.config.feature_cache_path, "mmap_index.bin")
+        self.mmap_handles = self._create_memory_map(index_path)
+        
+        # Preload first 10% of data for each type
+        self._warmup_cache()
+
+    def _create_memory_map(self, index_path):
+        """Create memory map index with pointer arithmetic"""
+        if not os.path.exists(index_path):
+            # Build pointer index
+            ptrs = []
+            with open(index_path, 'wb') as f:
+                for ftype in ['latent', 'clip', 'cluster', 'dim']:
+                    files = sorted(glob.glob(os.path.join(
+                        self.config.feature_cache_path,
+                        f"{ftype}s/*.pt"
+                    )))
+                    for file in files:
+                        size = os.path.getsize(file)
+                        f.write(struct.pack('Q', size))
+                        ptrs.append((file, 0, size))
+            
+            # Memory map the index
+            return np.memmap(index_path, mode='r', dtype=np.uint64)
+        
+        return np.memmap(index_path, mode='r', dtype=np.uint64)
+
+    def _warmup_cache(self):
+        """Preload initial data segments using parallel prefetch"""
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = []
+            for idx in range(0, len(self), len(self)//10):
+                futures.append(executor.submit(self._load_item, idx))
+            
+            for future in tqdm(futures, desc="Warming up cache"):
+                future.result()
+
     def __getitem__(self, idx):
-        # Memory-mapped loading with batched prefetch
+        # Guaranteed latent existence
         latent = torch.load(os.path.join(self.latent_dir, self.latent_files[idx]), 
                            map_location='cpu', mmap=True)
         
-        # CLIP embeddings use pointer-based access
+        # CLIP with fallback
         clip_path = os.path.join(
             self.config.feature_cache_path,
             "clip_embeddings",
             self.latent_files[idx].replace('.latent.pt', '.clip_emb.pt')
         )
-        clip_emb = torch.load(clip_path, map_location='cpu', mmap=True)
+        clip_emb = torch.load(clip_path, map_location='cpu', mmap=True) \
+            if os.path.exists(clip_path) \
+            else torch.zeros(self.config.clip_embedding_dim)
         
         return {
             'latent': latent,
@@ -179,6 +225,40 @@ class DDMDataset(Dataset):
             'bucket': self.bucket_assignments[idx],
             'expert': self.expert_assignments[idx]
         }
+
+    def _load_latent(self, idx):
+        """Direct memory access with pointer arithmetic"""
+        ptr = self.mmap_handles[idx * 4]
+        mmap = np.memmap(ptr[0], mode='r', offset=ptr[1], shape=(ptr[2],))
+        return torch.from_numpy(np.frombuffer(mmap, dtype=np.float32))
+
+    def _load_clip(self, idx):
+        """CLIP embedding with async prefetch"""
+        ptr = self.mmap_handles[idx * 4 + 1]
+        mmap = np.memmap(ptr[0], mode='r', offset=ptr[1], shape=(ptr[2],))
+        return torch.from_numpy(np.frombuffer(mmap, dtype=np.float32))
+
+    def _prefetch_next_batch(self):
+        """Background prefetch of next anticipated batch"""
+        if not hasattr(self, '_prefetch_executor'):
+            self._prefetch_executor = ThreadPoolExecutor(max_workers=4)
+            
+        # Predict next access pattern
+        next_indices = range(self.last_idx, self.last_idx + self.config.batch_size)
+        self._prefetch_executor.submit(self._prefetch_indices, next_indices)
+
+    def _prefetch_indices(self, indices):
+        """Prefetch specific indices using POSIX_FADV_WILLNEED"""
+        for idx in indices:
+            if idx >= len(self):
+                continue
+            for ptr in self.mmap_handles[idx*4:(idx+1)*4]:
+                os.posix_fadvise(
+                    ptr[0].fileno(), 
+                    ptr[1], 
+                    ptr[2], 
+                    os.POSIX_FADV_WILLNEED
+                )
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
