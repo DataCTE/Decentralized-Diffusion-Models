@@ -159,17 +159,26 @@ class DDMTrainingCoordinator:
         }
         
         # Train dataset
+        print(f"[Rank {self.rank}] Initializing training dataset...")
         train_dataset = DDMDataset(self.config, 'train')
-        
+        print(f"[Rank {self.rank}] Training dataset initialized with {len(train_dataset)} samples")
+
         # Create bucket indices directly from bucket_assignments
         if hasattr(train_dataset, 'bucket_assignments'):
+            print(f"[Rank {self.rank}] Generating bucket indices...")
             bucket_indices = defaultdict(list)
             for idx, bucket_idx in enumerate(train_dataset.bucket_assignments.cpu().numpy()):
                 bucket_indices[int(bucket_idx)].append(idx)
-            
+                if idx < 5:  # Print first 5 assignments
+                    print(f"Sample {idx} assigned to bucket {bucket_idx}")
+
             # Use our existing BucketBatchSampler
             if bucket_indices:
                 debug_print(f"Creating BucketBatchSampler with batch size {self.config.batch_size}", self.rank)
+                print(f"[Rank {self.rank}] Bucket distribution:")
+                for bidx, indices in bucket_indices.items():
+                    print(f"Bucket {bidx}: {len(indices)} samples")
+                
                 batch_sampler = BucketBatchSampler(
                     bucket_indices=bucket_indices,
                     batch_size=self.config.batch_size,
@@ -231,47 +240,44 @@ class DDMTrainingCoordinator:
     
     def train(self, num_steps):
         """Train the DDM system for the specified number of steps"""
-        if num_steps <= 0:
-            logger.warning(f"Invalid step count {num_steps}, skipping training")
-            return
-            
-        logger.info(f"Starting DDM training for {num_steps} steps on rank {self.rank}")
+        print(f"[Rank {self.rank}] Starting training with {num_steps} steps")
+        print(f"[Rank {self.rank}] First 5 latent files: {self.train_loader.dataset.latent_files[:5]}")
         
         # Initialize flow matcher on first use
         if self.flow_matcher is None:
-            self.flow_matcher = DecentralizedFlowMatcher(
-                sigma=getattr(self.config, 'sigma', 0.5),
-                loss_type=getattr(self.config, 'loss_type', 'huber')
-            )
-        
-        # Watch models in wandb if requested and not done yet
-        if self.rank == 0 and self.wandb_enabled and hasattr(self, 'wandb_watch_model') and self.wandb_watch_model:
-            import wandb
-            # Watch the router model
-            wandb.watch(
-                self.router.router, 
-                log=self.wandb_watch_model,
-                log_freq=getattr(self.config, 'wandb_log_every', 1)
-            )
-            # We'd need to watch expert models too, but they're managed by cache_manager
-        
+            print(f"[Rank {self.rank}] Initializing flow matcher...")
+            
         # Train loop implementing the DDM training approach
-        global_step = 0  # Initialize global step counter
+        global_step = 0
         start_time = time.time()
         
         for step in range(num_steps):
-            # Get a batch by creating a fresh iterator each time to avoid pickling issues
             try:
+                print(f"\n[Rank {self.rank}] Step {step}: Getting batch...")
                 batch = next(iter(self.train_loader))
+                print(f"[Rank {self.rank}] Batch keys: {batch.keys()}")
+                print(f"[Rank {self.rank}] Batch shapes:")
+                for k, v in batch.items():
+                    print(f"{k}: {v.shape if hasattr(v, 'shape') else type(v)}")
+                    
             except Exception as e:
-                logger.error(f"Error getting batch at step {step}: {str(e)}")
-                continue
+                print(f"[Rank {self.rank}] Critical error in step {step}:")
+                print(f"Exception type: {type(e).__name__}")
+                print(f"Error message: {str(e)}")
+                print(f"Current latent files count: {len(self.train_loader.dataset.latent_files)}")
+                print(f"Attempted index: {e.args[1] if len(e.args) > 1 else 'N/A'}")
+                raise
             
             step_start_time = time.time()
             
             # Joint training of experts and router
-            expert_loss = self.train_experts(batch)  # Updates experts
-            router_loss = self.train_router(batch)   # Updates router
+            print(f"[Rank {self.rank}] Training experts...")
+            expert_loss = self.train_experts(batch)
+            print(f"[Rank {self.rank}] Expert loss: {expert_loss:.4f}")
+            
+            print(f"[Rank {self.rank}] Training router...")
+            router_loss = self.train_router(batch)
+            print(f"[Rank {self.rank}] Router loss: {router_loss:.4f}")
             
             step_duration = time.time() - step_start_time
             global_step += 1

@@ -69,9 +69,26 @@ class DDMDataset(Dataset):
         
         # Initialize memory maps
         self._init_memory_maps()
+        
+        # Add validation after initialization
+        print(f"[Rank {self.rank}] Final dataset stats:")
+        print(f"Total samples: {len(self)}")
+        print(f"Latent files count: {len(self.latent_files)}")
+        print(f"First latent path: {os.path.join(self.latent_dir, self.latent_files[0])}")
+        print(f"Last latent path: {os.path.join(self.latent_dir, self.latent_files[-1])}")
 
-        # Add this line after initializing memory maps
-        self.num_samples = len(self.latent_files)  # Update with final truncated count
+        # Validate indices
+        if len(self.latent_files) > 0:
+            try:
+                _ = self[0]
+                _ = self[len(self)-1]
+                print(f"[Rank {self.rank}] Initial samples loaded successfully")
+            except Exception as e:
+                print(f"[Rank {self.rank}] Initial sample loading failed: {str(e)}")
+                raise
+
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     def _verify_cache_dirs(self):
         """Validate cache directory structure"""
@@ -309,6 +326,22 @@ class DDMDataset(Dataset):
         if len(mmap) == 0:
             raise RuntimeError(f"Memory map loaded empty index from {index_path}")
             
+        # Update the file lists to match truncated counts
+        self.latent_files = [os.path.basename(f) for f in latent_files]
+        self.clip_files = [os.path.basename(f) for f in clip_files]
+        self.cluster_files = [os.path.basename(f) for f in cluster_files]
+        self.dim_files = [os.path.basename(f) for f in dim_files]
+        
+        print(f"[Rank {get_rank()}] Dataset truncation report:")
+        print(f"Original counts: {file_counts}")
+        print(f"Truncated to: {min_count} samples")
+        
+        print(f"Updated latent files count: {len(self.latent_files)}")
+        print(f"Updated clip files count: {len(self.clip_files)}")
+        
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
         return mmap
 
     def _warmup_cache(self):
@@ -350,6 +383,12 @@ class DDMDataset(Dataset):
             return False
 
     def __getitem__(self, idx):
+        # Add index validation
+        if idx >= len(self):
+            raise IndexError(f"Index {idx} out of range for dataset with size {len(self)}")
+            
+        print(f"[Rank {self.rank}] Loading index {idx} - {self.latent_files[idx]}")
+        
         # Get device for current process
         device_id = torch.cuda.current_device()
         
@@ -467,9 +506,16 @@ class BucketBatchSampler(torch.utils.data.Sampler):
         ], device=device)
 
     def __iter__(self):
+        print(f"[Rank {torch.distributed.get_rank()}] Initializing BucketBatchSampler with:")
+        print(f"Total buckets: {len(self.bucket_tensors)}")
+        print(f"Batch size: {self.batch_size}")
+        print(f"Shuffle: {self.shuffle}")
+        
         # GPU-accelerated shuffling and batching
         all_batches = []
         for bucket_idx, indices in self.bucket_tensors.items():
+            print(f"Processing bucket {bucket_idx} with {len(indices)} samples")
+            
             # Shuffle on GPU using tensor operations
             if self.shuffle:  # Now using properly initialized attribute
                 indices = indices[torch.randperm(len(indices), device=self.device)]
@@ -504,6 +550,12 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     device = torch.device('cpu')
     logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
 
+    # Debug prints for initialization
+    print(f"\n[Rank {rank}] ===== EXPERT LOADER INITIALIZATION =====")
+    print(f"[Rank {rank}] Total dataset samples: {len(dataset)}")
+    print(f"[Rank {rank}] Dataset latent files: {len(dataset.latent_files)}")
+    print(f"[Rank {rank}] First 5 expert assignments: {dataset.expert_assignments[:5]}")
+
     # Distributed progress tracking
     loader_pbar = tqdm(
         total=len(expert_indices),
@@ -524,67 +576,102 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     # Use vectorized operations for expert index collection
     for idx in np.nditer(np.where(expert_assignments >= 0)):
         expert_idx = expert_assignments[idx]
+        # Add index validation
+        if idx >= len(dataset):
+            print(f"[Rank {rank}] WARNING: Invalid index {idx} in expert {expert_idx}")
+            continue
         expert_indices[expert_idx].append(idx.item())
 
-    # Log expert distribution stats
+    # Log expert distribution stats with validation
     total_indices = sum(len(indices) for indices in expert_indices.values())
-    logger.info(f"Rank {rank}: Collected {total_indices} indices across {len(expert_indices)} active experts")
+    print(f"[Rank {rank}] Collected {total_indices} valid indices across {len(expert_indices)} experts")
+    print(f"[Rank {rank}] Expert index ranges:")
+    for expert_idx, indices in expert_indices.items():
+        print(f"  Expert {expert_idx}: {len(indices)} samples")
+        if indices:
+            print(f"    First index: {indices[0]}, Last index: {indices[-1]}")
+            if indices[-1] >= len(dataset):
+                print(f"    ERROR: Last index {indices[-1]} exceeds dataset size {len(dataset)}")
 
     expert_loaders = {}
 
     for expert_idx, indices in expert_indices.items():
+        print(f"\n[Rank {rank}] Processing expert {expert_idx}")
+        print(f"[Rank {rank}] Total samples: {len(indices)}")
+        
         # GPU-accelerated bucket index creation
         with torch.cuda.stream(torch.cuda.Stream(device=rank % torch.cuda.device_count())):
             bucket_indices = defaultdict(list)
+            valid_count = 0
             for idx in indices:
+                if idx >= len(dataset.bucket_assignments):
+                    print(f"[Rank {rank}] WARNING: Index {idx} out of range for bucket assignments")
+                    continue
                 bucket_idx = dataset.bucket_assignments[idx].item()
                 bucket_indices[bucket_idx].append(idx)
+                valid_count += 1
+            print(f"[Rank {rank}] Valid indices for bucketing: {valid_count}/{len(indices)}")
 
         # Distributed logging
         logger.info(f"Rank {rank}: Expert {expert_idx} processing on GPU {rank % torch.cuda.device_count()}")
 
         # Create GPU-accelerated sampler
         sampler_start = time.time()
-        sampler = BucketBatchSampler(
-            bucket_indices=bucket_indices,
-            batch_size=config.expert_batch_size,
-            device=device,
-            shuffle=True,
-            drop_last=True
-        )
-        sampler_time = time.time() - sampler_start
-        logger.info(f"Rank {rank}: Created sampler for expert {expert_idx} in {sampler_time:.2f}s")
+        try:
+            sampler = BucketBatchSampler(
+                bucket_indices=bucket_indices,
+                batch_size=config.expert_batch_size,
+                device=device,
+                shuffle=True,
+                drop_last=True
+            )
+            print(f"[Rank {rank}] Sampler created with {len(sampler)} batches")
+        except Exception as e:
+            print(f"[Rank {rank}] ERROR creating sampler:")
+            print(f"Exception: {str(e)}")
+            print(f"Bucket indices: {list(bucket_indices.keys())}")
+            raise
 
         # Configure loader with GPU optimizations
         loader_config_start = time.time()
-        loader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=0,  # No worker processes = no pickling needed
-            pin_memory=True
-        )
-        loader_config_time = time.time() - loader_config_start
+        try:
+            loader = DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                num_workers=0,
+                pin_memory=True
+            )
+            print(f"[Rank {rank}] DataLoader created successfully")
+        except Exception as e:
+            print(f"[Rank {rank}] ERROR creating DataLoader:")
+            print(f"Exception: {str(e)}")
+            print(f"Sampler indices: {list(sampler)[0] if len(sampler) > 0 else 'empty'}")
+            raise
 
-        # Warmup pipeline (no need to load directly to GPU here)
+        # Warmup pipeline
         warmup_start = time.time()
         try:
+            print(f"[Rank {rank}] Warming up loader...")
             for _ in range(1):
-                next(iter(loader), None)
-                break
-            warmup_time = time.time() - warmup_start
-            logger.info(f"Rank {rank}: Warmup for expert {expert_idx} completed in {warmup_time:.2f}s")
+                batch = next(iter(loader))
+                print(f"[Rank {rank}] Warmup batch shapes:")
+                for k, v in batch.items():
+                    print(f"  {k}: {v.shape if hasattr(v, 'shape') else type(v)}")
+            print(f"[Rank {rank}] Warmup successful")
         except Exception as e:
-            logger.warning(f"Rank {rank}: Warmup failed for expert {expert_idx}: {str(e)}. This is non-critical and training will continue.")
+            print(f"[Rank {rank}] Warmup failed:")
+            print(f"Exception: {str(e)}")
+            print(f"Failing indices: {list(sampler)[0] if len(sampler) > 0 else 'empty'}")
+            if hasattr(e, 'args') and len(e.args) > 1:
+                print(f"Problematic index: {e.args[1]}")
+            print("Skipping warmup, continuing with training...")
 
         expert_loaders[expert_idx] = loader
-        logger.info(f"Rank {rank}: Created optimized loader for expert {expert_idx} "
-                   f"with {len(sampler)} batches (config: {loader_config_time:.2f}s)")
-
         loader_pbar.update(1)
-        loader_pbar.set_postfix_str(f"Experts: {len(expert_loaders)}")
 
     loader_pbar.close()
-    total_loader_time = time.time() - loader_start
-    logger.info(f"Rank {rank}: DataLoader creation complete in {total_loader_time:.2f}s - {len(expert_loaders)} expert loaders created")
+    print(f"\n[Rank {rank}] ===== LOADER INITIALIZATION COMPLETE =====")
+    print(f"[Rank {rank}] Created {len(expert_loaders)} expert loaders")
+    print(f"[Rank {rank}] Total initialization time: {time.time() - loader_start:.2f}s")
 
     return expert_loaders 
