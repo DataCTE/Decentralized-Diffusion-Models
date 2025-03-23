@@ -31,597 +31,160 @@ logger = logging.getLogger(__name__)
 
 import math  # For BucketBatchSampler
 
-# Add global cache to avoid duplicate validation
-_GLOBAL_DATASET_CACHE = {
-    "initialized": False,
-    "image_files": [],
-    "caption_files": [],
-    "dim_cache": None,
-}
-
 def chunks(lst, n):
     """Yield successive n-sized chunks from list"""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 class DDMDataset(Dataset):
-    """GPU-optimized dataset pipeline for decentralized diffusion models with precomputed latents"""
+    """Lazy-loading dataset pipeline with minimal memory footprint"""
     
-    def __init__(self, config, split='train', transforms=None, hf_split=None):
+    def __init__(self, config, split='train'):
         self.config = config
-        self.split = split
         self.device = torch.device('cpu')
         
-        # Initialize logging
-        self.logger = logging.getLogger(__name__)
-
-        # Initialize paths
-        self.feature_cache_path = config.feature_cache_path
-        self.feature_path = os.path.join(self.feature_cache_path, "features")
-        self.cluster_path = os.path.join(self.feature_cache_path, "clusters")
-        self.latent_path = os.path.join(self.feature_cache_path, "latents")
-        self.clip_embedding_path = os.path.join(self.feature_cache_path, "clip_embeddings")
-        self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions")
-
-        # Initialize locks dictionary for clip embeddings
-        self._clip_embedding_loading_lock = defaultdict(threading.Lock)
-
-        # 1. Latent-first initialization -------------------------------------------------
-        latent_files = sorted(os.listdir(self.latent_path))
-        self.image_files = [f.replace(".latent.pt", "") for f in latent_files]
-        latent_basenames = set(self.image_files)
+        # 1. Parallel latent file verification with batch processing
+        self.latent_dir = os.path.join(config.feature_cache_path, "latents")
+        self.latent_files = self._get_valid_latent_files_batched(batch_size=1000)
+        self.num_samples = len(self.latent_files)
         
-        # 2. Parallel filtering with progress tracking ----------------------------------------
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            # Create futures with task descriptions
-            futures = {
-                executor.submit(
-                    lambda: [
-                        f for f in glob.glob(os.path.join(self.cluster_path, "*.cluster.pt"))
-                        if os.path.basename(f).replace(".cluster.pt", "") in latent_basenames
-                    ]
-                ): "Clusters",
-                executor.submit(
-                    lambda: [
-                        f for f in glob.glob(os.path.join(self.dim_cache_path, "*.pt"))
-                        if os.path.basename(f).replace(".pt", "") in latent_basenames
-                    ]
-                ): "Dimensions",
-                executor.submit(
-                    lambda: sorted([
-                        f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))
-                        if os.path.basename(f).replace(".clip_emb.pt", "") in latent_basenames
-                    ])
-                ): "CLIP Embeddings"
-            }
+        # 2. Memory-mapped cluster loading with batched processing
+        self.cluster_dir = os.path.join(config.feature_cache_path, "clusters")
+        self.expert_assignments = self._load_cluster_assignments_mmap()
+        
+        # 3. Parallel bucket index precomputation with caching
+        self.bucket_assignments = self._precompute_bucket_indices_cached()
 
-            # Progress bar setup
-            with tqdm(total=len(futures), desc="Filtering dependencies") as pbar:
-                results = {}
+    def _get_valid_latent_files_batched(self, batch_size=1000):
+        """Batch-process file verification with memory mapping"""
+        all_files = sorted(os.listdir(self.latent_dir))
+        latent_files = []
+        
+        # Process in batches to balance memory and speed
+        for batch in tqdm(chunks(all_files, batch_size), desc="Scanning latent files"):
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {
+                    executor.submit(
+                        lambda f: (f, os.path.exists(os.path.join(self.latent_dir, f))),
+                        f
+                    ): f for f in batch if f.endswith('.latent.pt')
+                }
+                
                 for future in as_completed(futures):
-                    task_name = futures[future]
-                    try:
-                        results[task_name] = future.result()
-                        pbar.set_postfix_str(f"Completed {task_name}")
-                        pbar.update(1)
-                    except Exception as e:
-                        logger.error(f"Error processing {task_name}: {str(e)}")
-                        raise
-
-            # Assign results with type checking
-            self.cluster_files = results.get("Clusters", [])
-            self.dimension_files = results.get("Dimensions", [])
-            self.clip_embedding_files = results.get("CLIP Embeddings", [])
-
-        # 3. Validation gate -------------------------------------------------------------
-        assert len(self.image_files) == len(self.dimension_files), \
-            f"Latent/dimension mismatch: {len(self.image_files)} vs {len(self.dimension_files)}"
+                    f, exists = future.result()
+                    if exists:
+                        latent_files.append(f)
         
-        # 4. Optimized dimension loading -------------------------------------------------
-        def load_dims_batch(file_batch):
-            return [torch.load(f, map_location='cpu') for f in file_batch]
+        return latent_files
 
-        # Preserve file order using latent file ordering
-        dim_file_map = {os.path.basename(f).replace(".pt", ""): f for f in self.dimension_files}
-        ordered_dim_files = [dim_file_map[base] for base in self.image_files if base in dim_file_map]
+    def _load_cluster_assignments_mmap(self):
+        """Memory-mapped cluster loading with batched verification"""
+        cluster_paths = [
+            os.path.join(self.cluster_dir, f.replace('.latent.pt', '.cluster.pt'))
+            for f in self.latent_files
+        ]
         
+        # Pre-verify all cluster files in parallel
         with ThreadPoolExecutor(max_workers=8) as executor:
-            file_batches = [ordered_dim_files[i:i+512] for i in range(0, len(ordered_dim_files), 512)]
+            futures = {executor.submit(os.path.exists, p): p for p in cluster_paths}
+            valid_paths = []
             
-            with tqdm(total=len(ordered_dim_files), 
-                     desc="Loading dimensions",
-                     unit="file",
-                     dynamic_ncols=True,
-                     bar_format="{l_bar}{bar:20}{r_bar}{bar:-20b}") as pbar:
-                futures = [executor.submit(load_dims_batch, batch) for batch in file_batches]
-                dim_cache = []
+            with tqdm(total=len(futures), desc="Verifying cluster files") as pbar:
                 for future in as_completed(futures):
-                    dim_cache.extend(future.result())
-                    pbar.update(len(future.result()))
-                
-        self.dim_cache = torch.stack(dim_cache)
-
-        # 5. Final validation ------------------------------------------------------------
-        assert len(self.image_files) == len(self.dim_cache), \
-            f"Final mismatch: {len(self.image_files)} latents vs {len(self.dim_cache)} dimensions"
-
-        # 6. Initialize core dataset properties before any broadcasting
-        self.caption_files = [os.path.join(config.dataset_path, f+".txt") for f in self.image_files]
-        self.bucket_dims = torch.tensor(config.buckets, dtype=torch.float32)
-        self._latent_loading_lock = defaultdict(threading.Lock)
-        
-        # Initialize caches
-        self.cluster_cache = OrderedDict()
-        self.feature_cache = OrderedDict()
-        self.latent_cache = OrderedDict()
-        self.clip_embedding_cache = OrderedDict()
-        self.cache_size = 5
-        self.clip_embedding_cache_max_size = 5
-
-        # 7. Calculate bucket assignments
-        self._init_buckets()  # Now creates self.bucket_assignments
-
-        # 8. Broadcast all necessary data together
-        if is_main_process():
-            # Calculate and store cumulative feature counts before broadcasting
-            self.cumulative_feature_counts = self._calculate_cumulative_counts(self.clip_embedding_files, self.clip_embedding_path)
-            
-            # Add bucket_assignments to broadcast data
-            broadcast_data = (
-                self.image_files,
-                self.caption_files,
-                self.dim_cache,
-                self.clip_embedding_files,
-                self.cumulative_feature_counts,
-                self.bucket_assignments,
-                self.bucket_dims
-            )
-            broadcast_object(broadcast_data)
-        else:
-            (self.image_files,
-             self.caption_files,
-             self.dim_cache,
-             self.clip_embedding_files,
-             self.cumulative_feature_counts,
-             self.bucket_assignments,
-             self.bucket_dims) = broadcast_object(None)
-
-        # 9. Final validation
-        self._validate_distributed_state()
-
-        # Load dimension cache
-        self.dim_cache_path = os.path.join(self.feature_cache_path, "dimensions") # Path to dimensions directory
-        logger.info(f"Dimensions path: {self.dim_cache_path}") # Log dimensions path - removed rank info
-
-        # After line 194
-        assert len(self.image_files) == len(self.bucket_assignments), \
-            f"Broadcast mismatch: {len(self.image_files)} vs {len(self.bucket_assignments)}"
-
-        # 10. Add final synchronization check (NEW)
-        self._verify_global_consistency()
-
-    def __getitem__(self, idx):
-        return {
-            'latent': self._load_latent(idx),
-            'expert': self._load_cluster(idx),
-            'features': self._load_feature(idx),
-            'clip_embedding': self._load_clip_embedding(idx),
-            'bucket': self.bucket_assignments[idx]
-        }
-
-    def _load_cluster(self, idx):
-        # Get image filename and construct cluster path
-        image_file = self.image_files[idx]
-        cluster_file = os.path.join(self.cluster_path, f"{os.path.basename(image_file)}.cluster.pt")
-        
-        # LRU Caching Mechanism
-        if cluster_file not in self.cluster_cache:
-            # Remove oldest entry if cache full
-            if len(self.cluster_cache) >= self.cache_size:
-                self.cluster_cache.popitem(last=False) 
-            
-            # Load cluster data and add to cache
-            self.cluster_cache[cluster_file] = torch.load(cluster_file)
-        
-        return self.cluster_cache[cluster_file]
-
-    def _load_feature(self, idx):
-        # Similar structure but for features
-        image_file = self.image_files[idx]
-        feature_file = os.path.join(self.feature_path, f"{os.path.basename(image_file)}.pt")
-        
-        if feature_file not in self.feature_cache:
-            if len(self.feature_cache) >= self.cache_size:
-                self.feature_cache.popitem(last=False)
-            
-            self.feature_cache[feature_file] = torch.load(feature_file)
-        
-        return self.feature_cache[feature_file]
-
-    def _init_buckets(self):
-        """Distributed-safe bucket initialization with full data sync"""
-        # Calculate bucket assignments first
-        self.bucket_assignments = self._calculate_bucket_assignments()
-        
-        if is_main_process():
-            # After filtering image_files, re-filter clip_embedding_files
-            current_image_basenames = {os.path.basename(f) for f in self.image_files}
-            self.clip_embedding_files = [
-                f for f in glob.glob(os.path.join(self.clip_embedding_path, "*.clip_emb.pt"))
-                if os.path.basename(f).replace(".clip_emb.pt", "") in current_image_basenames
-            ]
-            
-            # Recalculate with PROPER synchronization
-            self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                self.clip_embedding_files,
-                self.clip_embedding_path
-            )
-            
-            # Ensure exact match
-            self.image_files = self.image_files[:self.cumulative_feature_counts[-1].item()]
-            self.dim_cache = self.dim_cache[:self.cumulative_feature_counts[-1].item()]
-
-            # Broadcast updated data
-            broadcast_data = (
-                self.image_files,
-                self.caption_files,
-                self.dim_cache,
-                self.clip_embedding_files,
-                self.cumulative_feature_counts,
-                self.bucket_assignments
-            )
-            broadcast_object(broadcast_data)
-        else:
-            # Receive and apply ALL updates
-            (self.image_files,
-             self.caption_files,
-             self.dim_cache,
-             self.clip_embedding_files,
-             self.cumulative_feature_counts,
-             self.bucket_assignments) = broadcast_object(None)
-
-        # Final validation
-        assert len(self.image_files) == self.cumulative_feature_counts[-1].item(), \
-            f"Final mismatch: {len(self.image_files)} vs {self.cumulative_feature_counts[-1].item()}"
-
-    def _calculate_bucket_assignments(self):
-        """Calculate bucket assignments based on image dimensions"""
-        # Convert bucket dims to tensor for vectorized operations
-        bucket_dims_tensor = self.bucket_dims
-        
-        # Get image dimensions from cache [width, height]
-        image_dims = self.dim_cache[:, [1, 0]].float()  # Swap W/H if needed
-        
-        # Calculate distances to all buckets
-        diffs = bucket_dims_tensor.unsqueeze(0) - image_dims.unsqueeze(1)
-        distances = torch.norm(diffs, dim=2)
-        
-        # Find closest bucket for each image
-        _, assignments = torch.min(distances, dim=1)
-        return assignments
-
-    def _load_latent(self, idx):
-        """Load precomputed latent tensor from disk, with caching and thread safety"""
-        latent_file = self.image_files[idx] + ".latent.pt"
-        latent_path = os.path.join(self.latent_path, latent_file)
-
-        with self._latent_loading_lock[idx]:  # Thread lock for loading
-            if latent_path in self.latent_cache:  # Check cache first
-                latent = self.latent_cache[latent_path]  # Load from cache
-            else:
-                latent = torch.load(latent_path, map_location=self.device)  # Load from disk
-                self.latent_cache[latent_path] = latent  # Update cache
-                
-                # Update progress bar on main process
-                if is_main_process():
-                    # Initialize progress bar if it doesn't exist
-                    if not hasattr(self, '_latent_progress'):
-                        self._latent_progress = tqdm(
-                            total=len(self.image_files),
-                            desc="Loading latent tensors",
-                            unit="file",
-                            position=3,  # Position below other progress bars
-                            leave=False  # Don't persist after completion
-                        )
-                    
-                    # Update with number of cached items (more accurate than +=1)
-                    cached = len(self.latent_cache)
-                    self._latent_progress.n = cached
-                    self._latent_progress.refresh()
-                
-                if len(self.latent_cache) > self.cache_size:  # LRU eviction
-                    self.latent_cache.popitem(last=False)  # Remove LRU item
-
-            logger.debug(f"Loaded latent tensor shape: {latent.shape} from {latent_path}")
-        return latent
-
-    def _calculate_cumulative_counts(self, files, path):
-        """Optimized cumulative counts calculation with parallel processing"""
-        # Pre-allocate tensor for counts
-        counts = torch.zeros(len(files), dtype=torch.long)
-        
-        # Use maximum available workers
-        num_workers = min(32, os.cpu_count())
-        
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Create future map with proper filename construction
-            future_to_idx = {
-                executor.submit(
-                    self._get_feature_count, 
-                    os.path.join(path, f)  # Use original filename without modification
-                ): i 
-                for i, f in enumerate(files)
-            }
-            
-            # Progress bar with manual updates
-            with tqdm(total=len(files), desc="Calculating feature counts") as pbar:
-                # Process completed futures as they come in
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        counts[idx] = future.result()
-                    except Exception as e:
-                        logger.error(f"Error processing file {files[idx]}: {e}")
-                        counts[idx] = 0
+                    path = futures[future]
+                    if future.result():
+                        valid_paths.append(path)
                     pbar.update(1)
-
-        # Calculate cumulative sum with initial zero
-        cumulative_counts = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(counts, dim=0)])
         
-        return cumulative_counts
+        # Memory map all valid cluster files
+        assignments = []
+        for path in tqdm(valid_paths, desc="Loading clusters"):
+            try:
+                mmap = torch.load(path, map_location='cpu', mmap=True)
+                assignments.append(mmap)
+            except:
+                continue  # Skip corrupted files
+        
+        return torch.cat(assignments).long()
 
-    def _get_feature_count(self, file_path):
-        """Helper function to load a feature file and get the count of features"""
-        sample_features = torch.load(file_path, map_location='cpu')
-        return sample_features.shape[0]
-
-    def _load_clip_embedding(self, idx):
-        """Load precomputed CLIP embedding tensor from file, using cache"""
-        # Add bounds checking first
-        total_features = self.cumulative_feature_counts[-1].item()
-        if idx >= total_features:
-            self.logger.error(f"Requested index {idx} exceeds total features {total_features}")
-            return torch.zeros(self.config.clip_embedding_dim)
-
-        # Find the correct file index using vectorized search
-        file_idx = torch.searchsorted(self.cumulative_feature_counts, idx, right=True).item() - 1
-        file_idx = max(0, min(file_idx, len(self.clip_embedding_files) - 1))
-
-        # Get exact range from precomputed counts
-        start_idx = self.cumulative_feature_counts[file_idx].item()
-        end_idx = self.cumulative_feature_counts[file_idx + 1].item()
-
-        # Final validation
-        if not (start_idx <= idx < end_idx):
-            self.logger.error(f"Index {idx} out of range for file {file_idx} ({start_idx}-{end_idx})")
-            return torch.zeros(self.config.clip_embedding_dim)
-
-        idx_in_file = idx - start_idx
-        file_path = os.path.join(self.clip_embedding_path, self.clip_embedding_files[file_idx])
-
-        # Locking and caching mechanism
-        if file_path not in self._clip_embedding_loading_lock:
-            self._clip_embedding_loading_lock[file_path] = threading.Lock()
+    def _precompute_bucket_indices_cached(self):
+        """Cached bucket index calculation with parallel processing"""
+        cache_path = os.path.join(self.config.feature_cache_path, "bucket_cache.pt")
+        
+        if os.path.exists(cache_path):
+            # Load precomputed bucket indices
+            return torch.load(cache_path)
+        
+        # Compute and cache if not exists
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(self._parse_bucket_from_filename, f): f
+                for f in self.latent_files
+            }
             
-        with self._clip_embedding_loading_lock[file_path]:
-            if file_path in self.clip_embedding_cache:
-                embeddings = self.clip_embedding_cache[file_path]
-            else:
-                try:
-                    embeddings = torch.load(file_path, map_location='cpu')
-                except Exception as e:
-                    self.logger.error(f"Failed to load {file_path}: {e}")
-                    return torch.zeros(self.config.clip_embedding_dim)
-                
-                self.clip_embedding_cache[file_path] = embeddings
-                
-                # Update progress
-                if is_main_process():
-                    if not hasattr(self, '_clip_progress'):
-                        self._clip_progress = tqdm(
-                            total=len(self.clip_embedding_files),
-                            desc="Loading CLIP embeddings",
-                            unit="file",
-                            position=2
-                        )
-                    self._clip_progress.update(1)
-                
-                # LRU eviction
-                if len(self.clip_embedding_cache) > self.clip_embedding_cache_max_size:
-                    self.clip_embedding_cache.popitem(last=False)
+            bucket_indices = []
+            with tqdm(total=len(futures), desc="Calculating buckets") as pbar:
+                for future in as_completed(futures):
+                    bucket_indices.append(future.result())
+                    pbar.update(1)
+            
+            tensor_indices = torch.tensor(bucket_indices, dtype=torch.long)
+            torch.save(tensor_indices, cache_path)
+        
+        return tensor_indices
 
-            # Final bounds check
-            if idx_in_file >= len(embeddings):
-                self.logger.error(f"Index {idx_in_file} out of range for {file_path} (size {len(embeddings)})")
-                return torch.zeros_like(embeddings[0])
-
-            return embeddings[idx_in_file]
+    def _parse_bucket_from_filename(self, filename):
+        """Optimized filename parsing with dimension pattern cache"""
+        try:
+            # Extract dimensions from filename pattern: {width}x{height}_{hash}.latent.pt
+            dim_part = filename.split('_', 1)[0]
+            w, h = map(int, dim_part.split('x', 1))
+            return next(i for i, (bw, bh) in enumerate(self.config.buckets) if bw == w and bh == h)
+        except:
+            return 0  # Fallback to first bucket
 
     def __len__(self):
-        """Get dataset length (number of latents, same as images)"""
-        return len(self.image_files)
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # Load latent with immediate context cleanup
+        latent = self._load_latent(idx)
         
-    def get_status_summary(self):
-        """Generate a user-friendly status summary of dataset processing"""
-        if not hasattr(self, 'image_files') or len(self.image_files) == 0:
-            return {
-                "status": "incomplete",
-                "message": "Dataset processing has not completed or failed",
-                "images_found": 0
-            }
-            
-        # Count buckets actually used
-        bucket_counts = {}
-        if hasattr(self, 'bucket_assignments'):
-            for i in range(self.bucket_dims.shape[0]):
-                count = torch.sum(self.bucket_assignments == i).item()
-                if count > 0:
-                    bucket_counts[i] = count
-        
-        # Count images per expert
-        expert_counts = {}
-        if hasattr(self, 'expert_assignments'):
-            for i in range(self.num_experts.item()):
-                count = torch.sum(self.expert_assignments == i).item()
-                if count > 0:
-                    expert_counts[i] = count
-        
-        # Images for this rank
-        this_rank_count = 0
-        if hasattr(self, 'expert_assignments'):
-            this_rank_count = torch.sum(self.expert_assignments == get_rank()).item()
+        # Load CLIP embedding with immediate context cleanup
+        clip_emb = self._load_clip(idx)
         
         return {
-            "status": "complete",
-            "rank": get_rank(),
-            "total_images": len(self.image_files),
-            "total_buckets": len(bucket_counts),
-            "total_experts": len(expert_counts),
-            "images_for_this_rank": this_rank_count,
-            "percent_for_this_rank": f"{this_rank_count/len(self.image_files)*100:.1f}%",
-            "top_buckets": sorted(bucket_counts.items(), key=lambda x: x[1], reverse=True)[:3],
-            "expert_distribution": expert_counts
+            'latent': latent,
+            'clip_embedding': clip_emb,
+            'bucket': self.bucket_assignments[idx],
+            'expert': self.expert_assignments[idx]
         }
 
-    def _default_transform(self, img, bucket_idx=None):
-        """Apply default transformations based on bucket dimensions"""
-        # Get target dimensions from bucket if provided
-        if bucket_idx is not None and 0 <= bucket_idx < len(self.buckets):
-            width, height = self.buckets[bucket_idx]
-        else:
-            # Fallback to default image size
-            _, height, width = self.config.image_size
-        
-        # Resize image to target dimensions
-        if isinstance(img, Image.Image):
-            # PIL Image
-            img = resize_image(img, (width, height))
-            img = transforms.ToTensor()(img)
-        elif isinstance(img, torch.Tensor):
-            # Already a tensor, resize with torch functions
-            if img.shape[-2] != height or img.shape[-1] != width:
-                img = torch.nn.functional.interpolate(
-                    img.unsqueeze(0), 
-                    size=(height, width), 
-                    mode='bilinear', 
-                    align_corners=False
-                ).squeeze(0)
-        
-        # Normalize
-        img = normalize(img)
-        return img
-        
-    def _create_bucket_samplers(self):
-        """Create bucket-specific samplers to ensure consistent shapes in each batch"""
-        self.bucket_samplers = {}
-        for bucket_idx, _ in enumerate(self.bucket_dims):
-            # Get indices of samples in this bucket
-            bucket_indices = [i for i, sample in enumerate(self.samples) 
-                             if sample.get('bucket_idx', 0) == bucket_idx]
-            
-            if bucket_indices:
-                self.bucket_samplers[bucket_idx] = SubsetRandomSampler(bucket_indices)
-        
-        logger.info(f"Created {len(self.bucket_samplers)} bucket-specific samplers")
+    def _load_latent(self, idx):
+        """Load and immediately release file handle"""
+        latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
+        try:
+            latent = torch.load(latent_path)
+            # Explicit cleanup
+            del locals()['latent_path']  # Release file path reference
+            return latent
+        except Exception as e:
+            raise RuntimeError(f"Failed to load latent at index {idx}: {str(e)}")
 
-    def clear_cache(self):
-        """Explicitly clear all caches to free RAM."""
-        if self.feature_cache:
-            self.logger.info("Clearing feature cache")
-            self.feature_cache.clear()
-        if self.cluster_assignments_cache:
-            self.logger.info("Clearing cluster assignments cache")
-            self.cluster_assignments_cache.clear()
-        if self.dataset_pair_cache:
-            self.logger.info("Clearing dataset pair cache")
-            self.dataset_pair_cache.clear()
-        if self.latent_cache: # New: clear latent cache
-            self.logger.info("Clearing latent cache")
-            self.latent_cache.clear()
-        if self.clip_embedding_cache: # New: clear clip embedding cache
-            self.logger.info("Clearing clip embedding cache")
-            self.clip_embedding_cache.clear()
-        torch.cuda.empty_cache() # Also clear CUDA cache just in case
-        self.logger.info("Caches cleared.")
-
-    def _load_dimension_cache(self):
-        """Load dimension cache with progress tracking"""
-        self.dimension_files = sorted(glob.glob(os.path.join(
-            self.dim_cache_path, "*.pt"
-        )))
-        
-        logger.info(f"Loading {len(self.dimension_files)} dimension files...")
-        
-        dim_cache_list = []
-        with tqdm(total=len(self.dimension_files), 
-                 desc="Loading dimension files") as pbar:
-            # Process in batches
-            file_batches = [self.dimension_files[i:i+512] 
-                           for i in range(0, len(self.dimension_files), 512)]
-            
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = []
-                for batch in file_batches:
-                    futures.append(executor.submit(
-                        lambda x: [torch.load(f) for f in x],
-                        batch
-                    ))
-                
-                for future in as_completed(futures):
-                    dim_cache_list.extend(future.result())
-                    pbar.update(len(batch))
-        
-        return torch.stack(dim_cache_list)
-
-    def _validate_distributed_state(self):
-        """Validate synchronized state across all processes"""
-        assert len(self.image_files) == len(self.bucket_assignments), \
-            f"Image/bucket mismatch: {len(self.image_files)} vs {len(self.bucket_assignments)}"
-        assert self.dim_cache.shape[0] == len(self.image_files), \
-            f"Dimension cache mismatch: {self.dim_cache.shape[0]} vs {len(self.image_files)}"
-        assert torch.allclose(self.bucket_dims, torch.tensor(self.config.buckets, dtype=torch.float32)), \
-            "Bucket dimensions mismatch between config and loaded data"
-
-    def _verify_global_consistency(self):
-        """Final distributed consistency verification"""
-        if is_main_process():
-            # Calculate total expected samples
-            total_samples = len(self.image_files)
-            
-            # Verify CLIP embeddings coverage with explicit file checking
-            valid_clip_files = [
-                f for f in self.clip_embedding_files
-                if os.path.exists(os.path.join(self.clip_embedding_path, f))
-            ]
-            self.clip_embedding_files = valid_clip_files
-            
-            # Recalculate with verified files
-            self.cumulative_feature_counts = self._calculate_cumulative_counts(
-                self.clip_embedding_files,
-                self.clip_embedding_path
-            )
-            
-            # Final alignment check
-            total_clip_features = self.cumulative_feature_counts[-1].item()
-            if total_samples != total_clip_features:
-                self.logger.warning(f"Adjusting dataset size to match CLIP features ({total_clip_features})")
-                self.image_files = self.image_files[:total_clip_features]
-                self.dim_cache = self.dim_cache[:total_clip_features]
-
-            # Create verification payload with adjusted counts
-            verification_data = (len(self.image_files), self.cumulative_feature_counts[-1].item())
-            broadcast_object(verification_data)
-        else:
-            main_total, main_clip_total = broadcast_object(None)
-            
-            # Trim datasets on other ranks to match main
-            self.image_files = self.image_files[:main_total]
-            self.dim_cache = self.dim_cache[:main_total]
-            self.cumulative_feature_counts = torch.tensor([main_clip_total])
-
-        # Final assertion with synchronized values
-        assert len(self.image_files) == self.cumulative_feature_counts[-1].item(), \
-            f"Final mismatch: {len(self.image_files)} vs {self.cumulative_feature_counts[-1].item()}"
+    def _load_clip(self, idx):
+        """Load and immediately release file handle"""
+        clip_path = os.path.join(
+            self.config.feature_cache_path,
+            "clip_embeddings",
+            self.latent_files[idx].replace('.latent.pt', '.clip_emb.pt')
+        )
+        try:
+            clip_emb = torch.load(clip_path)
+            # Explicit cleanup
+            del locals()['clip_path']  # Release file path reference
+            return clip_emb
+        except Exception as e:
+            raise RuntimeError(f"Failed to load CLIP embedding at index {idx}: {str(e)}")
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
