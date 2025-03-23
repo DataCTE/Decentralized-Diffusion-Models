@@ -25,7 +25,6 @@ from data.transforms import resize_image, normalize
 import threading
 import signal
 
-
 # Setup logging
 logger = logging.getLogger(__name__)
 
@@ -37,121 +36,110 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 class DDMDataset(Dataset):
-    """Lazy-loading dataset pipeline with minimal memory footprint"""
+    """Distributed-optimized dataset pipeline without Redis"""
     
     def __init__(self, config, split='train'):
         self.config = config
         self.device = torch.device('cpu')
+        self.rank = get_rank()
+        self.world_size = get_world_size()
         
-        # 1. Parallel latent file verification with batch processing
+        # 1. Distributed file discovery
         self.latent_dir = os.path.join(config.feature_cache_path, "latents")
-        self.latent_files = self._get_valid_latent_files_batched(batch_size=1000)
+        self.latent_files = self._get_distributed_latent_files()
         self.num_samples = len(self.latent_files)
         
-        # 2. Memory-mapped cluster loading with batched processing
+        # 2. Sharded cluster loading
         self.cluster_dir = os.path.join(config.feature_cache_path, "clusters")
-        self.expert_assignments = self._load_cluster_assignments_mmap()
+        self.expert_assignments = self._load_sharded_clusters()
         
-        # 3. Parallel bucket index precomputation with caching
-        self.bucket_assignments = self._precompute_bucket_indices_cached()
+        # 3. Distributed bucket indices
+        self.bucket_assignments = self._distributed_bucket_indices()
 
-    def _get_valid_latent_files_batched(self, batch_size=1000):
-        """Batch-process file verification with memory mapping"""
-        all_files = sorted(os.listdir(self.latent_dir))
-        latent_files = []
-        
-        # Process in batches to balance memory and speed
-        for batch in tqdm(chunks(all_files, batch_size), desc="Scanning latent files"):
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = {
-                    executor.submit(
-                        lambda f: (f, os.path.exists(os.path.join(self.latent_dir, f))),
-                        f
-                    ): f for f in batch if f.endswith('.latent.pt')
-                }
+    def _get_distributed_latent_files(self):
+        """Distributed file discovery with memory-mapped index"""
+        # Only rank 0 scans files
+        if self.rank == 0:
+            latent_path = os.path.join(self.latent_dir, "latents.mmap")
+            if os.path.exists(latent_path):
+                # Load precomputed index
+                valid_files = torch.load(latent_path, map_location='cpu')
+                logger.info(f"Loaded precomputed latent index with {len(valid_files)} entries")
+            else:
+                # Build and cache index
+                all_files = sorted(os.listdir(self.latent_dir))
+                valid_files = []
                 
-                for future in as_completed(futures):
-                    f, exists = future.result()
-                    if exists:
-                        latent_files.append(f)
-        
-        return latent_files
+                # Process in parallel batches
+                with ThreadPoolExecutor(max_workers=16) as executor:
+                    futures = {
+                        executor.submit(
+                            lambda f: (f, os.path.exists(os.path.join(self.latent_dir, f))),
+                            f
+                        ): f for f in all_files if f.endswith('.latent.pt')
+                    }
+                    
+                    for future in tqdm(as_completed(futures), total=len(futures), desc="Global file scan"):
+                        f, exists = future.result()
+                        if exists:
+                            valid_files.append(f)
+                
+                # Save mmap index
+                torch.save(valid_files, latent_path)
+                logger.info(f"Cached latent index to {latent_path}")
 
-    def _load_cluster_assignments_mmap(self):
-        """Memory-mapped cluster loading with batched verification"""
-        cluster_paths = [
-            os.path.join(self.cluster_dir, f.replace('.latent.pt', '.cluster.pt'))
-            for f in self.latent_files
-        ]
+            # Convert to tensor for broadcasting
+            file_tensor = torch.tensor(valid_files, dtype=torch.string)
+        else:
+            file_tensor = torch.empty(0, dtype=torch.string)
         
-        # Pre-verify all cluster files in parallel
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(os.path.exists, p): p for p in cluster_paths}
-            valid_paths = []
-            
-            with tqdm(total=len(futures), desc="Verifying cluster files") as pbar:
-                for future in as_completed(futures):
-                    path = futures[future]
-                    if future.result():
-                        valid_paths.append(path)
-                    pbar.update(1)
-        
-        # Memory map all valid cluster files
-        assignments = []
-        for path in tqdm(valid_paths, desc="Loading clusters"):
-            try:
-                mmap = torch.load(path, map_location='cpu', mmap=True)
-                assignments.append(mmap)
-            except:
-                continue  # Skip corrupted files
-        
-        return torch.cat(assignments).long()
+        # Broadcast file list from rank 0
+        file_tensor = broadcast_object(file_tensor, src=0)
+        return [f.decode('utf-8') for f in file_tensor.tolist()]
 
-    def _precompute_bucket_indices_cached(self):
-        """Cached bucket index calculation with parallel processing"""
-        cache_path = os.path.join(self.config.feature_cache_path, "bucket_cache.pt")
+    def _load_sharded_clusters(self):
+        """Sharded cluster loading using memory mapping with batched access"""
+        # Memory map the entire cluster directory
+        cluster_mmap = np.load(os.path.join(self.cluster_dir, "clusters.npy"), mmap_mode='r')
         
-        if os.path.exists(cache_path):
-            # Load precomputed bucket indices
-            return torch.load(cache_path)
+        # Calculate shard boundaries using pointer arithmetic
+        ptr_start = self.rank * (len(cluster_mmap) // self.world_size)
+        ptr_end = (self.rank + 1) * (len(cluster_mmap) // self.world_size) if self.rank != self.world_size -1 else len(cluster_mmap)
         
-        # Compute and cache if not exists
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(self._parse_bucket_from_filename, f): f
-                for f in self.latent_files
-            }
-            
-            bucket_indices = []
-            with tqdm(total=len(futures), desc="Calculating buckets") as pbar:
-                for future in as_completed(futures):
-                    bucket_indices.append(future.result())
-                    pbar.update(1)
-            
-            tensor_indices = torch.tensor(bucket_indices, dtype=torch.long)
-            torch.save(tensor_indices, cache_path)
-        
-        return tensor_indices
+        # Direct memory mapping access
+        return torch.from_numpy(cluster_mmap[ptr_start:ptr_end]).long()
 
-    def _parse_bucket_from_filename(self, filename):
-        """Optimized filename parsing with dimension pattern cache"""
-        try:
-            # Extract dimensions from filename pattern: {width}x{height}_{hash}.latent.pt
-            dim_part = filename.split('_', 1)[0]
-            w, h = map(int, dim_part.split('x', 1))
-            return next(i for i, (bw, bh) in enumerate(self.config.buckets) if bw == w and bh == h)
-        except:
-            return 0  # Fallback to first bucket
+    def _distributed_bucket_indices(self):
+        """Optimized bucket index calculation using precomputed metadata"""
+        # Load precomputed dimensions from memory-mapped array
+        dim_mmap = np.load(os.path.join(self.latent_dir, "dimensions.npy"), mmap_mode='r')
+        bucket_indices = torch.zeros(len(dim_mmap), dtype=torch.long)
+        
+        # Vectorized bucket assignment
+        for i, (w, h) in enumerate(self.config.buckets):
+            mask = (dim_mmap[:,0] == w) & (dim_mmap[:,1] == h)
+            bucket_indices[mask] = i
+        
+        # Gather all indices
+        gathered = [torch.empty_like(bucket_indices) for _ in range(self.world_size)]
+        torch.distributed.all_gather(gathered, bucket_indices)
+        return torch.cat(gathered)
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # Load latent with immediate context cleanup
-        latent = self._load_latent(idx)
+        # Memory-mapped loading with batched prefetch
+        latent = torch.load(os.path.join(self.latent_dir, self.latent_files[idx]), 
+                           map_location='cpu', mmap=True)
         
-        # Load CLIP embedding with immediate context cleanup
-        clip_emb = self._load_clip(idx)
+        # CLIP embeddings use pointer-based access
+        clip_path = os.path.join(
+            self.config.feature_cache_path,
+            "clip_embeddings",
+            self.latent_files[idx].replace('.latent.pt', '.clip_emb.pt')
+        )
+        clip_emb = torch.load(clip_path, map_location='cpu', mmap=True)
         
         return {
             'latent': latent,
@@ -159,32 +147,6 @@ class DDMDataset(Dataset):
             'bucket': self.bucket_assignments[idx],
             'expert': self.expert_assignments[idx]
         }
-
-    def _load_latent(self, idx):
-        """Load and immediately release file handle"""
-        latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
-        try:
-            latent = torch.load(latent_path)
-            # Explicit cleanup
-            del locals()['latent_path']  # Release file path reference
-            return latent
-        except Exception as e:
-            raise RuntimeError(f"Failed to load latent at index {idx}: {str(e)}")
-
-    def _load_clip(self, idx):
-        """Load and immediately release file handle"""
-        clip_path = os.path.join(
-            self.config.feature_cache_path,
-            "clip_embeddings",
-            self.latent_files[idx].replace('.latent.pt', '.clip_emb.pt')
-        )
-        try:
-            clip_emb = torch.load(clip_path)
-            # Explicit cleanup
-            del locals()['clip_path']  # Release file path reference
-            return clip_emb
-        except Exception as e:
-            raise RuntimeError(f"Failed to load CLIP embedding at index {idx}: {str(e)}")
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
