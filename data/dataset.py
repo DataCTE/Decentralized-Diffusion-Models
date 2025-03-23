@@ -134,10 +134,13 @@ class DDMDataset(Dataset):
         return [f"{i:08d}.latent.pt" for i in range(count_tensor.item())]
 
     def _load_sharded_clusters(self):
-        """Distributed cluster loading with thread-safe progress"""
-        shard_size = len(self.latent_files) // self.world_size
+        """Distributed cluster loading with size alignment"""
+        total_samples = len(self.latent_files)
+        
+        # Calculate equal shard sizes using ceiling division
+        shard_size = (total_samples + self.world_size - 1) // self.world_size
         start = self.rank * shard_size
-        end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
+        end = min(start + shard_size, total_samples)
 
         # Synchronize before starting progress bars
         if torch.distributed.is_initialized():
@@ -149,7 +152,7 @@ class DDMDataset(Dataset):
             leave=False,
             bar_format="{l_bar}{bar:20}{r_bar}",
             disable=not is_main_process(),
-            position=0  # Force all progress bars to use same line position
+            position=0
         )
 
         assignments = []
@@ -160,23 +163,26 @@ class DDMDataset(Dataset):
             
             for future in as_completed(futures):
                 tensor = future.result()
-                if tensor.dim() == 0:
-                    tensor = tensor.unsqueeze(0)
                 assignments.append(tensor)
                 pbar.update(1)
 
         pbar.close()
 
-        if not assignments:
-            assignments = [torch.zeros(0, dtype=torch.long)]
-        
+        # Pad with zeros if necessary to maintain equal shard sizes
+        current_count = len(assignments)
+        if current_count < shard_size:
+            padding = [torch.tensor([0], dtype=torch.long) for _ in range(shard_size - current_count)]
+            assignments.extend(padding)
+
         assignments = torch.cat(assignments).cuda()
         
-        # Distributed sync
+        # Distributed sync with padding
         gathered = [torch.empty_like(assignments) for _ in range(self.world_size)]
         torch.distributed.all_gather(gathered, assignments)
         
-        return torch.cat(gathered).cpu()
+        # Concatenate and trim to actual total_samples
+        full_assignments = torch.cat(gathered).cpu()
+        return full_assignments[:total_samples]
 
     def _load_cluster_or_default(self, path):
         """Load cluster with dimension enforcement"""
