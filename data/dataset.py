@@ -87,32 +87,26 @@ class DDMDataset(Dataset):
         shard_size = len(self.latent_files) // self.world_size
         start = self.rank * shard_size
         end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
-        
-        # Show progress for all ranks with proper positioning
+
+        # Unified progress bar only on main process
         pbar = tqdm(total=end-start, 
-                   desc=f"Rank {self.rank} Loading Clusters",
+                   desc="Loading clusters",
                    leave=False,
-                   position=self.rank,  # Unique position per rank
                    bar_format="{l_bar}{bar:20}{r_bar}",
-                   disable=False)  # Enable for all ranks
+                   disable=not is_main_process())
 
         assignments = []
-        with ThreadPoolExecutor(max_workers=min(8, self.world_size*2)) as executor:  # Scale workers with GPUs
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(self._load_cluster_or_default, 
                 os.path.join(self.cluster_dir, fname.replace('.latent.pt', '.cluster.pt'))): fname 
                 for fname in self.latent_files[start:end]}
             
             for future in as_completed(futures):
-                try:
-                    tensor = future.result()
-                    if tensor.dim() == 0:
-                        tensor = tensor.unsqueeze(0)
-                    assignments.append(tensor)
-                    pbar.update(1)
-                    pbar.set_postfix_str(f"GPU {self.rank}: {len(assignments)}/{len(futures)}")
-                except Exception as e:
-                    logger.error(f"Rank {self.rank} cluster load error: {str(e)}")
-                    assignments.append(torch.tensor([0], dtype=torch.long))
+                tensor = future.result()
+                if tensor.dim() == 0:
+                    tensor = tensor.unsqueeze(0)
+                assignments.append(tensor)
+                pbar.update(1)
 
         pbar.close()
 
@@ -199,30 +193,22 @@ class DDMDataset(Dataset):
 
     def _warmup_cache(self):
         """Preload initial data segments using parallel prefetch"""
-        num_workers = min(16, self.world_size * 4)
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Unified progress bar only on main process
+        warmup_pbar = tqdm(total=len(self)//10,
+                         desc="Warming cache",
+                         leave=False,
+                         disable=not is_main_process())
+
+        with ThreadPoolExecutor(max_workers=16) as executor:
             futures = []
             for idx in range(0, len(self), len(self)//10):
-                futures.append(executor.submit(
-                    self._load_item, idx,
-                    _device_id=self.rank % torch.cuda.device_count()
-                ))
-            
-            # Show warmup progress for all ranks
-            warmup_pbar = tqdm(
-                total=len(futures),
-                desc=f"Rank {self.rank} Warming Cache",
-                position=self.rank,  # Unique position per rank
-                leave=False,
-                disable=False
-            )
+                futures.append(executor.submit(self._load_item, idx))
             
             for future in as_completed(futures):
-                future.result()  # Force completion
+                future.result()
                 warmup_pbar.update(1)
-                warmup_pbar.set_postfix_str(f"GPU {self.rank}: {warmup_pbar.n}/{warmup_pbar.total}")
-            
-            warmup_pbar.close()
+
+        warmup_pbar.close()
 
     def __getitem__(self, idx):
         # Get device for current process
