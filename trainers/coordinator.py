@@ -274,8 +274,7 @@ class DDMTrainingCoordinator:
             step_start_time = time.time()
             
             # Joint training of experts and router
-            expert_loss = self.train_experts(batch)  # Updates experts
-            router_loss = self.train_router(batch)   # Updates router
+            expert_loss, router_loss = self.train_step(batch)
             
             step_duration = time.time() - step_start_time
             global_step += 1
@@ -329,6 +328,31 @@ class DDMTrainingCoordinator:
             
             # Flush any remaining logs
             self.flush_wandb_logs()
+    
+    def train_step(self, batch):
+        # Initialize scaler on first use
+        if not hasattr(self, 'scaler'):
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
+        
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self.config.use_mixed_precision):
+            # Forward passes
+            expert_loss = self.train_experts(batch)
+            router_loss = self.train_router(batch)
+            total_loss = expert_loss + router_loss
+        
+        # Scaled backward pass
+        self.scaler.scale(total_loss).backward()
+        
+        # Optimizer step with gradient clipping
+        if self.config.grad_clip > 0:
+            self.scaler.unscale_(self.router.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.grad_clip)
+        
+        self.scaler.step(self.router.optimizer)
+        self.scaler.update()
+        self.router.optimizer.zero_grad(set_to_none=True)
+        
+        return expert_loss, router_loss
     
     def train_experts(self, batch):
         """Train expert models using the DDM approach"""

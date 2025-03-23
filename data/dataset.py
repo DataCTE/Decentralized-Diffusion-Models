@@ -200,34 +200,38 @@ class DDMDataset(Dataset):
                 future.result()
 
     def __getitem__(self, idx):
-        # Lazy load latent
-        latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
-        latent = torch.load(latent_path, map_location='cpu', mmap=True)
+        # Get device for current process
+        device_id = torch.cuda.current_device()
         
-        # Lazy load CLIP with fallback
+        # Lazy load latent with direct GPU transfer
+        latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
+        latent = torch.load(latent_path, 
+                          map_location=lambda storage, loc: storage.cuda(device_id, non_blocking=True),
+                          mmap=True,
+                          pin_memory=True)
+        
+        # Async CLIP loading with stream-aware prefetch
         clip_path = os.path.join(
             self.config.feature_cache_path,
             "clip_embeddings",
             self.latent_files[idx].replace('.latent.pt', '.clip_emb.pt')
         )
-        clip_emb = torch.load(clip_path, map_location='cpu', mmap=True) \
-            if os.path.exists(clip_path) \
-            else torch.zeros(self.config.clip_embedding_dim)
-        
-        # Lazy load cluster with fallback
-        cluster_path = os.path.join(
-            self.cluster_dir,
-            self.latent_files[idx].replace('.latent.pt', '.cluster.pt')
-        )
-        expert = torch.load(cluster_path, map_location='cpu').item() \
-            if os.path.exists(cluster_path) \
-            else 0
+        with torch.cuda.stream(torch.cuda.Stream(device_id)):
+            clip_emb = torch.load(clip_path, 
+                                map_location='cuda', 
+                                mmap=True,
+                                pin_memory=True) if os.path.exists(clip_path) \
+                    else torch.zeros(self.config.clip_embedding_dim, 
+                                   device='cuda',
+                                   pin_memory=True)
 
         return {
             'latent': latent,
             'clip_embedding': clip_emb,
-            'bucket': self.bucket_assignments[idx],
-            'expert': expert
+            'bucket': self.bucket_assignments[idx].cuda(non_blocking=True),
+            'expert': torch.tensor(self.expert_assignments[idx], 
+                                 device='cuda', 
+                                 non_blocking=True)
         }
 
     def _load_latent(self, idx):
