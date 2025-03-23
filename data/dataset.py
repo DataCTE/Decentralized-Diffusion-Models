@@ -88,13 +88,13 @@ class DDMDataset(Dataset):
         start = self.rank * shard_size
         end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
         
-        # Multi-GPU progress tracking
+        # Multi-GPU progress tracking (only show on rank 0)
         pbar = tqdm(total=end-start, 
-                   desc=f"[Rank {self.rank}/{self.world_size}] Loading Clusters",
-                   leave=True,
-                   position=self.rank,
+                   desc=f"[Global Rank {self.rank}] Loading Clusters",
+                   leave=False,
+                   position=0,  # Fixed position for rank 0
                    bar_format="{l_bar}{bar:20}{r_bar}",
-                   disable=False if self.rank < 8 else True)
+                   disable=self.rank != 0)  # Only enable on rank 0
 
         assignments = []
         with ThreadPoolExecutor(max_workers=min(8, self.world_size*2)) as executor:  # Scale workers with GPUs
@@ -208,12 +208,13 @@ class DDMDataset(Dataset):
                     _device_id=self.rank % torch.cuda.device_count()
                 ))
             
+            # Only show warmup progress on rank 0
             warmup_pbar = tqdm(
                 total=len(futures),
-                desc=f"[Rank {self.rank}] Warming Cache",
-                position=self.rank,
+                desc=f"[Global Rank {self.rank}] Warming Cache",
+                position=0,
                 leave=False,
-                disable=not is_main_process() and self.rank != 0
+                disable=self.rank != 0
             )
             
             for future in as_completed(futures):
