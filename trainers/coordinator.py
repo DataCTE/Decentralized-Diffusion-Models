@@ -118,7 +118,7 @@ class DDMTrainingCoordinator:
     def _init_parallel_components(self):
         """Initialize critical components with async dataset loading"""
         pbar = None
-        if self.rank == 0:
+        if self.rank == 0:  # Only create progress bar on main process
             pbar = tqdm(
                 total=2,  # Reduced from 3 to 2 (router and experts only)
                 desc="Initializing Components",
@@ -142,7 +142,7 @@ class DDMTrainingCoordinator:
                 for future in concurrent.futures.as_completed(futures):
                     component = futures[future]
                     future.result()  # Raise exceptions if any
-                    if pbar is not None:
+                    if pbar is not None and self.rank == 0:  # Ensure we only update on rank 0
                         pbar.update(1)
                         pbar.set_postfix_str(f"Completed: {component}")
             finally:

@@ -211,6 +211,19 @@ class DDMDataset(Dataset):
 
         warmup_pbar.close()
 
+    def _load_item(self, idx):
+        """Load a single item for cache warming"""
+        try:
+            # Just access the item to load it into cache
+            latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
+            if os.path.exists(latent_path):
+                # Load with mmap but don't keep in memory
+                _ = torch.load(latent_path, map_location='cpu', mmap=True)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to warm cache for index {idx}: {str(e)}")
+            return False
+
     def __getitem__(self, idx):
         # Get device for current process
         device_id = torch.cuda.current_device()
