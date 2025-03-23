@@ -83,15 +83,15 @@ class RouterTrainer:
 
     def train_step(self, batch):
         """Trains router with uniform distribution instead of clustering"""
-        images = batch["image"].to(self.device)
+        # Changed from "image" to "latent" to match dataset output
+        latents = batch["latent"].to(self.device)
         
         # Use mixed precision training if configured
         scaler = torch.amp.GradScaler('cuda', enabled=getattr(self.config, 'use_mixed_precision', False))
         with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
-            # VAE encoding (match expert trainer flow)
-            with torch.no_grad():
-                latents = self.vae.encode(images)
-                
+            # Remove VAE encoding since we already have latents
+            # (Original line 93: latents = self.vae.encode(images))
+            
             # Sample random timesteps t ∈ [0, 1] (match expert)
             t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
             t = t_indices.float() / 1000.0  # Normalize to [0, 1]
@@ -105,7 +105,7 @@ class RouterTrainer:
             targets = batch["expert"].to(self.device)
             
             # Generate dummy text embeddings for router training
-            batch_size = images.shape[0]
+            batch_size = latents.shape[0]
             dummy_text_embeds = torch.randn(batch_size, self.config.clip_embedding_dim, device=self.device)
 
             # Get router predictions

@@ -81,7 +81,7 @@ class ExpertTrainer(BaseTrainer):
         This trains an expert model using the flow matching objective
         as described in Section 3.2 of the paper.
         """
-        images = batch["image"].to(self.device)
+        images = batch["latent"].to(self.device)
         
         # Use mixed precision training if configured
         scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
