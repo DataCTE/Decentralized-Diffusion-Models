@@ -332,6 +332,11 @@ class DDMDataset(Dataset):
         self.cluster_files = [os.path.basename(f) for f in cluster_files]
         self.dim_files = [os.path.basename(f) for f in dim_files]
         
+        # Truncate expert assignments to match the final dataset size
+        self.expert_assignments = self.expert_assignments[:min_count]
+        self.bucket_assignments = self.bucket_assignments[:min_count]
+        self.num_samples = min_count  # Update the total sample count
+        
         print(f"[Rank {get_rank()}] Dataset truncation report:")
         print(f"Original counts: {file_counts}")
         print(f"Truncated to: {min_count} samples")
