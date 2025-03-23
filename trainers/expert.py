@@ -81,14 +81,14 @@ class ExpertTrainer(BaseTrainer):
         This trains an expert model using the flow matching objective
         as described in Section 3.2 of the paper.
         """
-        images = batch["latent"].to(self.device)
+        # Get scaler based on config
+        scaler = torch.cuda.amp.GradScaler() if self.config.use_mixed_precision else None
         
-        # Use mixed precision training if configured
-        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
+        # Get images from batch (already in latent space)
+        latents = batch["latent"].to(self.device)  # Directly use precomputed latents
+        text_embeds = batch["clip_embedding"].to(self.device)  # Directly use dataset's CLIP embeddings
+        
         with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
-            # VAE encoding (paper section 4.1)
-            latents = self.vae.encode(images)
-            
             # Sample random timesteps t ∈ [0, 1] (Section 3.2)
             t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
             t = t_indices.float() / 1000.0  # Normalize to [0, 1]
@@ -100,9 +100,6 @@ class ExpertTrainer(BaseTrainer):
             alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)[:,None,None,None]
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * noise
-            
-            # Text conditioning (paper section 4.1)
-            text_embeds = self.clip.encode(batch["caption"])
             
             # Expert prediction of flow field u_t(x_t) (Equation 6)
             pred_flow = self.expert(latent_t, t_indices, text_embeds)

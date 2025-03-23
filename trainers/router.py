@@ -57,10 +57,6 @@ class RouterTrainer:
         if rank == 0:
             print(f"Initialized SHARDED Router across {self.world_size} GPUs")
         
-        # Add VAE for latent encoding
-        from data.vae import VAEWrapper
-        self.vae = VAEWrapper(device, config)
-        
         # Paper-recommended optimizer settings
         self.optimizer = AdamW8bit(
             self.router.parameters(),
@@ -83,15 +79,13 @@ class RouterTrainer:
 
     def train_step(self, batch):
         """Trains router with uniform distribution instead of clustering"""
-        # Changed from "image" to "latent" to match dataset output
+        # Get precomputed latents and embeddings
         latents = batch["latent"].to(self.device)
+        text_embeds = batch["clip_embedding"].to(self.device)  # Use precomputed CLIP embeddings
         
         # Use mixed precision training if configured
-        scaler = torch.amp.GradScaler('cuda', enabled=getattr(self.config, 'use_mixed_precision', False))
+        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
         with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
-            # Remove VAE encoding since we already have latents
-            # (Original line 93: latents = self.vae.encode(images))
-            
             # Sample random timesteps t ∈ [0, 1] (match expert)
             t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
             t = t_indices.float() / 1000.0  # Normalize to [0, 1]
@@ -103,13 +97,9 @@ class RouterTrainer:
             
             # Get actual cluster assignments from dataset
             targets = batch["expert"].to(self.device)
-            
-            # Generate dummy text embeddings for router training
-            batch_size = latents.shape[0]
-            dummy_text_embeds = torch.randn(batch_size, self.config.clip_embedding_dim, device=self.device)
 
-            # Get router predictions
-            logits = self.router(latent_t, t_indices, dummy_text_embeds)  # Pass dummy text embeddings
+            # Get router predictions using real text embeddings
+            logits = self.router(latent_t, t_indices, text_embeds)  # Use actual CLIP embeddings
             
             # Compute loss
             loss = self.criterion(logits, targets)
