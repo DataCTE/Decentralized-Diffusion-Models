@@ -324,8 +324,8 @@ class DDMTrainingCoordinator:
                 self.save_checkpoint(step)
             
             # Explicitly clear dataset cache to manage RAM
-            if step % 200 == 0: # Clear cache every 200 steps (adjust as needed)
-                self.train_loader.dataset.clear_cache()
+            # if step % 200 == 0: # Clear cache every 200 steps (adjust as needed)
+            #     self.train_loader.dataset.clear_cache()
         
         # Log final training stats
         total_duration = time.time() - start_time

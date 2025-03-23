@@ -80,7 +80,7 @@ class RouterTrainer:
     def train_step(self, batch):
         """Trains router with uniform distribution instead of clustering"""
         # Initialize scaler first
-        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
+        scaler = torch.amp.GradScaler(device_type='cuda', enabled=self.config.use_mixed_precision)
         
         # Then process data
         latents = batch["latent"].to(self.device)

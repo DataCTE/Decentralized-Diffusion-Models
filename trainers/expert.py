@@ -82,7 +82,7 @@ class ExpertTrainer(BaseTrainer):
         as described in Section 3.2 of the paper.
         """
         # Get scaler based on config
-        scaler = torch.cuda.amp.GradScaler() if self.config.use_mixed_precision else None
+        scaler = torch.amp.GradScaler(device_type='cuda') if self.config.use_mixed_precision else None
         
         # Get images from batch (already in latent space)
         latents = batch["latent"].to(self.device)  # Directly use precomputed latents

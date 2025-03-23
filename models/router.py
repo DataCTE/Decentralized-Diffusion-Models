@@ -89,60 +89,55 @@ class RouterModel(nn.Module):
             nn.init.normal_(self.classifier[-1].weight, std=0.02)
             nn.init.zeros_(self.classifier[-1].bias)
 
-    def forward(self, x, t, text_embeddings):
+    def forward(self, x, t, text_embeddings=None):
         """
         Args:
             x: Input tensor [B, C, H, W]
             t: Timestep tensor [B,]
-            text_embeddings: Text embeddings for conditioning
+            text_embeddings: Text embeddings [B, seq_len, clip_dim]
         Returns:
             logits: Expert logits [B, num_experts]
         """
         batch_size = x.shape[0]
         
-        # Patch embedding
-        x = self.embedder(x)  # [B, D, H', W']
+        # 1. Process visual input (paper section 3.3)
+        # Patch embedding with proper dimension handling
+        x = self.embedder(x)  # [B, D, h, w]
         
-        # Spatial attention processing with manual softmax
-        attn_features = self.spatial_attention(x)  # [B, D, H', W']
-        x = attn_features.mean(dim=(2, 3))  # Global average pooling to [B, D]
-        #print(f"Shape of x after pooling: {x.shape}")
-        x = x.reshape(batch_size, -1)  # Ensure x is [B, D] after spatial pooling - still keep reshape for safety
+        # Spatial attention pooling (paper eq. 5)
+        attn_weights = torch.sigmoid(self.spatial_attention(x))
+        x = (x * attn_weights).mean(dim=(2,3))  # [B, D]
         
-        # Timestep embedding - ensure float dtype
-        t_float = t.float() if t.dtype != torch.float32 else t
-        t_float = t_float.to(self.time_embedder.mlp[0].weight.dtype)
-        t_emb = self.time_embedder(t_float)  # [B, D] - Removed unsqueeze here
+        # 2. Timestep embedding (paper appendix A.3)
+        t_emb = self.time_embedder(t)  # [B, D]
+        x = x + t_emb
         
-        # Add timestep information
-        x = x + t_emb  # [B, D]
+        # 3. Text conditioning (paper section 4.1)
+        if text_embeddings is not None:
+            # Pool text embeddings across sequence dimension
+            text_pooled = text_embeddings.mean(dim=1)  # [B, clip_dim]
+            text_proj = self.text_embed_proj(text_pooled)  # [B, D]
+            
+            # Concatenate visual+time and text features
+            x = torch.cat([
+                x.unsqueeze(1),  # [B, 1, D]
+                text_proj.unsqueeze(1)  # [B, 1, D]
+            ], dim=1)  # [B, 2, D]
+        else:
+            x = x.unsqueeze(1)  # [B, 1, D]
         
-        # Add text embedding integration
-        text_emb = self.text_embed_proj(text_embeddings)  # Project text embeddings
-        x = x + text_emb  # Add projected text embeddings
+        # 4. Add learnable CLS token (paper section 3.3)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [B, 1, D]
+        x = torch.cat([cls_tokens, x], dim=1)  # [B, 3, D]
         
-        # Expand to sequence for transformer blocks
-        x = x.unsqueeze(1)  # [B, 1, D] - Re-introduce unsqueeze here
-        
-        # Add CLS token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        #print(f"Shape of cls_tokens: {cls_tokens.shape}")
-        #print(f"Shape of x before cat: {x.shape}")
-        x = torch.cat([cls_tokens, x], dim=1)  # [B, 2, D] - Concatenate directly, cls_tokens and x are both [B, 1, D] now
-        
-        # Apply transformer blocks
+        # 5. Transformer processing
         for block in self.blocks:
             x = block(x)
-            
-        # Get CLS token output only
+        
+        # 6. Final classification
         cls_output = x[:, 0]  # [B, D]
-        cls_output = cls_output.reshape(batch_size, -1) # Ensure cls_output is [B, D] before classifier
+        logits = self.classifier(cls_output)
         
-        # Apply classifier to get logits
-        logits = self.classifier(cls_output)  # [B, num_experts]
-        
-        # Apply temperature scaling for better calibration
-        # Lower temperature gives sharper distribution
         return logits / self.temperature
     
     def update_temperature(self):
