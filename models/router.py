@@ -117,10 +117,9 @@ class RouterModel(nn.Module):
         # Add timestep information
         x = x + t_emb  # [B, D]
         
-        # Modified text embedding integration (only change needed)
-        text_pooled = text_embeddings.mean(dim=1)  # [B, 768]
-        text_proj = self.text_embed_proj(text_pooled)  # [B, D]
-        x = x + text_proj
+        # Add text embedding integration
+        text_emb = self.text_embed_proj(text_embeddings)  # Project text embeddings
+        x = x + text_emb  # Add projected text embeddings
         
         # Expand to sequence for transformer blocks
         x = x.unsqueeze(1)  # [B, 1, D] - Re-introduce unsqueeze here
