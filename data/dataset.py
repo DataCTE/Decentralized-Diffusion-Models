@@ -86,7 +86,12 @@ class DDMDataset(Dataset):
         start = self.rank * shard_size
         end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
         
-        # Load with dimension enforcement
+        # Only show progress bar on main process
+        pbar = tqdm(total=end-start, 
+                   desc=f"Rank {self.rank} Loading Clusters",
+                   leave=False,
+                   disable=not is_main_process()) if self.rank == 0 else None
+
         assignments = []
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = []
@@ -100,17 +105,20 @@ class DDMDataset(Dataset):
                     cluster_path
                 ))
             
-            for future in tqdm(futures, desc=f"Rank {self.rank} clusters", leave=False):
-                # Ensure 1D tensor shape
+            for future in as_completed(futures):
                 tensor = future.result()
                 if tensor.dim() == 0:
                     tensor = tensor.unsqueeze(0)
                 assignments.append(tensor)
+                if pbar:
+                    pbar.update(1)
 
-        # Verify tensor dimensions before concatenation
+        if pbar:
+            pbar.close()
+
         if not assignments:
-            assignments = [torch.zeros(0, dtype=torch.long)]  # Empty placeholder
-            
+            assignments = [torch.zeros(0, dtype=torch.long)]
+        
         assignments = torch.cat(assignments).cuda()
         
         # Distributed sync
