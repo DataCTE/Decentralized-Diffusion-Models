@@ -100,16 +100,46 @@ class DDMDataset(Dataset):
         return [f.decode() for f in file_bytes.tolist()]
 
     def _load_sharded_clusters(self):
-        """Sharded cluster loading using memory mapping with batched access"""
-        # Memory map the entire cluster directory
-        cluster_mmap = np.load(os.path.join(self.cluster_dir, "clusters.npy"), mmap_mode='r')
+        """Sharded cluster loading from individual files"""
+        # Get all cluster files that match latent files
+        cluster_files = [
+            f.replace('.latent.pt', '.cluster.pt')
+            for f in self.latent_files
+            if os.path.exists(os.path.join(self.cluster_dir, f.replace('.latent.pt', '.cluster.pt')))
+        ]
         
-        # Calculate shard boundaries using pointer arithmetic
-        ptr_start = self.rank * (len(cluster_mmap) // self.world_size)
-        ptr_end = (self.rank + 1) * (len(cluster_mmap) // self.world_size) if self.rank != self.world_size -1 else len(cluster_mmap)
+        # Calculate shard boundaries
+        shard_size = len(cluster_files) // self.world_size
+        start = self.rank * shard_size
+        end = start + shard_size if self.rank != self.world_size -1 else len(cluster_files)
         
-        # Direct memory mapping access
-        return torch.from_numpy(cluster_mmap[ptr_start:ptr_end]).long()
+        assignments = []
+        # Process files in parallel batches
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(
+                    lambda f: torch.load(os.path.join(self.cluster_dir, f), map_location='cpu'),
+                    f
+                ): f for f in cluster_files[start:end]
+            }
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Rank {self.rank} loading clusters"):
+                try:
+                    cluster_data = future.result()
+                    assignments.append(cluster_data)
+                except Exception as e:
+                    logger.warning(f"Failed to load cluster file: {str(e)}")
+                    continue
+        
+        # Gather all shards
+        if assignments:
+            assignments = torch.cat(assignments)
+        else:
+            assignments = torch.empty(0, dtype=torch.long)
+            
+        gathered = [torch.empty_like(assignments) for _ in range(self.world_size)]
+        torch.distributed.all_gather(gathered, assignments)
+        return torch.cat(gathered).long()
 
     def _distributed_bucket_indices(self):
         """Optimized bucket index calculation using precomputed metadata"""
