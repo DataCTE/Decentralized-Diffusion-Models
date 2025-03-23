@@ -81,12 +81,12 @@ class DDMDataset(Dataset):
         return [f"{i:08d}.latent.pt" for i in range(count_tensor.item())]
 
     def _load_sharded_clusters(self):
-        """Distributed cluster loading with memory-mapped files"""
-        # Calculate shard boundaries
+        """Distributed cluster loading with proper tensor dimensions"""
         shard_size = len(self.latent_files) // self.world_size
         start = self.rank * shard_size
         end = start + shard_size if self.rank != self.world_size - 1 else len(self.latent_files)
         
+        # Load with dimension enforcement
         assignments = []
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = []
@@ -101,23 +101,31 @@ class DDMDataset(Dataset):
                 ))
             
             for future in tqdm(futures, desc=f"Rank {self.rank} clusters", leave=False):
-                assignments.append(future.result())
-        
-        # Move to GPU for distributed communication
+                # Ensure 1D tensor shape
+                tensor = future.result()
+                if tensor.dim() == 0:
+                    tensor = tensor.unsqueeze(0)
+                assignments.append(tensor)
+
+        # Verify tensor dimensions before concatenation
+        if not assignments:
+            assignments = [torch.zeros(0, dtype=torch.long)]  # Empty placeholder
+            
         assignments = torch.cat(assignments).cuda()
         
-        # Gather across all ranks
+        # Distributed sync
         gathered = [torch.empty_like(assignments) for _ in range(self.world_size)]
         torch.distributed.all_gather(gathered, assignments)
         
-        return torch.cat(gathered).cpu()  # Return CPU tensor for dataset compatibility
+        return torch.cat(gathered).cpu()
 
     def _load_cluster_or_default(self, path):
-        """Load cluster with fallback and memory mapping"""
+        """Load cluster with dimension enforcement"""
         try:
-            return torch.load(path, map_location='cpu', mmap=True)
-        except (FileNotFoundError, IOError):
-            return torch.tensor(0, dtype=torch.long)
+            cluster = torch.load(path, map_location='cpu', mmap=True)
+            return cluster.view(-1)  # Ensure 1D tensor
+        except (FileNotFoundError, IOError, RuntimeError):
+            return torch.tensor([0], dtype=torch.long)  # 1D tensor
 
     def _distributed_bucket_indices(self):
         """Filename-parsed dimensions with proper device placement"""
