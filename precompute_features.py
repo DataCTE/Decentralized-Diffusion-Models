@@ -23,6 +23,7 @@ from tqdm.auto import tqdm
 import shutil
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from datetime import datetime, timedelta
 
 class FeatureGenerator:
     def __init__(self, config):
@@ -50,7 +51,7 @@ class FeatureGenerator:
             dir_path.mkdir(parents=True)
 
     def process_image(self, img_path):
-        """Handle mixed precision and missing captions"""
+        """Handle corrupt images and grayscale conversions"""
         try:
             # Check for caption file first
             caption_path = Path(img_path).with_suffix('.txt')
@@ -66,10 +67,10 @@ class FeatureGenerator:
 
             # Process regardless of existing files
             with Image.open(img_path) as img:
-                # Convert to RGB if needed
-                if img.mode in ('RGBA', 'LA'):
-                    img = img.convert('RGB')
+                # Handle corrupt images and various color modes
+                img = img.convert('RGB')  # Force RGB conversion for all images
                 orig_w, orig_h = img.size
+                
                 # Calculate nearest bucket
                 bucket_idx = self._get_bucket_index(orig_w, orig_h)
                 features = {
@@ -101,15 +102,27 @@ class FeatureGenerator:
             return self.clip.encode([caption]).cpu()
 
     def _extract_dino_features(self, img):
-        """DINO feature extraction"""
-        prep_img = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])(img).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            return self.dino(prep_img).cpu()
+        """Robust DINO feature extraction with channel validation"""
+        try:
+            # Convert to RGB tensor with 3 channels
+            img_rgb = img.convert('RGB')
+            prep_img = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),  # Handle grayscale
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])(img_rgb).unsqueeze(0).to(self.device)
+            
+            # Validate channel dimensions
+            if prep_img.shape[1] != 3:
+                raise ValueError(f"Invalid channel count: {prep_img.shape[1]}")
+            
+            with torch.no_grad():
+                return self.dino(prep_img).cpu()
+        except Exception as e:
+            print(f"DINO extraction failed: {str(e)}")
+            return torch.zeros(1, 1024)  # Return zero features for corrupt images
 
     def _save_features(self, base_name, features):
         """Force-save features with rank ID"""
@@ -182,10 +195,14 @@ class FeatureGenerator:
         return min(distances)[1]
 
 def main():
-    # Initialize distributed processing
-    dist.init_process_group(backend='nccl')
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    # Initialize distributed processing with explicit device mapping
+    rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        timeout=timedelta(seconds=30)  # Add timeout
+    )
     
     config = get_config()
     processor = FeatureGenerator(config)
@@ -194,21 +211,30 @@ def main():
     all_images = [str(p) for p in Path(config.dataset_path).rglob('*') 
                  if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
     
-    # Distribute images evenly
-    chunk = len(all_images) // world_size
+    # Distribute images evenly with proper device awareness
+    chunk = len(all_images) // dist.get_world_size()
     local_images = all_images[rank*chunk : (rank+1)*chunk]
     
-    # Process with progress
-    with tqdm(total=len(local_images), desc=f"Rank {rank}", position=rank) as pbar:
+    # Process with device-aware progress
+    with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
         for img_path in local_images:
             if processor.process_image(img_path):
                 pbar.update(1)
     
-    # Cluster on rank 0
-    dist.barrier()
-    if rank == 0:
-        processor.run_clustering()
+    # Synchronize with device specification
+    if dist.get_world_size() > 1:
+        dist.barrier(device_ids=[rank])  # Explicit device ID
     
+    # Cluster on rank 0 with error handling
+    if rank == 0:
+        try:
+            processor.run_clustering()
+        except Exception as e:
+            print(f"Clustering failed: {str(e)}")
+            dist.destroy_process_group()
+            raise
+    
+    # Graceful shutdown
     dist.destroy_process_group()
 
 if __name__ == "__main__":
