@@ -433,11 +433,15 @@ class DDMDataset(Dataset):
             self.latent_files[idx].replace('.latent.pt', '.clip_emb.pt')
         )
         with torch.cuda.stream(torch.cuda.Stream(device_id)):
-            clip_emb = torch.load(clip_path, 
-                                map_location='cuda', 
+            clip_emb = torch.load(clip_path,
+                                map_location='cuda',
                                 mmap=True) if os.path.exists(clip_path) \
-                    else torch.zeros(self.config.clip_embedding_dim, 
-                                   device='cuda')
+                    else torch.zeros(
+                        1,  # Add batch dimension
+                        self.config.max_token_length,  # Add sequence length dimension
+                        self.config.clip_embedding_dim,
+                        device='cuda'
+                    )
 
         return {
             'latent': latent,
