@@ -52,11 +52,11 @@ class VAEWrapper:
         Returns:
             [B, C, H/8, W/8] tensor of latents
         """
-        # Ensure images are on the correct device
+        # Add graph-safe memory handling
         if images.device != self.device:
             images = images.to(self.device)
             
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=images.dtype == torch.float16):
             # Handle potential OOM by processing in batches if needed
             if images.shape[0] > 8 and hasattr(self.config, 'vae_batch_size'):
                 # Process in batches to avoid OOM

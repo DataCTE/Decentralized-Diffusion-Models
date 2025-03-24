@@ -174,6 +174,7 @@ DEFAULT_CONFIG = {
     
     # ===== Shape Test Controls =====
     'bypass_cluster_validation': False, # Flag to bypass cluster size validation, set to True in shape_test.py
+    'use_cuda_graphs': False,
 }
 
 def get_config(config_path=None):

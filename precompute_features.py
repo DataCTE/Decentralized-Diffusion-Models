@@ -45,7 +45,11 @@ class UnifiedPreprocessor:
                                      dtype=torch.int64,
                                      pin_memory=True)
         
-        # Enable CUDA graphs for model inference
+        # Initialize CUDA graph reference as None
+        self.vae_cuda_graph = None
+        
+        # Add memory cleanup before graph capture
+        torch.cuda.empty_cache()
         self._capture_cuda_graphs()
 
     def _create_directories(self):
@@ -198,7 +202,7 @@ class UnifiedPreprocessor:
             return self.dino(prep_img).cpu()
 
     def _extract_vae_latent(self, img):
-        """Extract VAE latent with bucket-aware preprocessing"""
+        """Handle CUDA graph fallback"""
         # Get original dimensions
         w, h = img.size
         
@@ -208,7 +212,10 @@ class UnifiedPreprocessor:
         
         img_tensor = transforms.ToTensor()(resized_img).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            return self.vae.encode(img_tensor).cpu()
+            if self.vae_cuda_graph is not None:
+                return self.vae_cuda_graph(img_tensor)
+            else:
+                return self.vae.encode(img_tensor).cpu()
 
     def _extract_clip_embedding(self, caption):
         """Extract CLIP text embedding from actual caption"""
@@ -298,10 +305,29 @@ class UnifiedPreprocessor:
 
     def _capture_cuda_graphs(self):
         """Capture static computation graphs for model inference"""
-        static_input = torch.randn(1, 3, 256, 256, device='cuda', dtype=self.dtype)
-        self.vae_cuda_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.vae_cuda_graph):
-            self.static_vae_output = self.vae.encode(static_input)
+        if self.config.use_cuda_graphs:
+            try:
+                static_input = torch.randn(1, 3, 256, 256, device='cuda', dtype=self.dtype)
+                self.vae_cuda_graph = torch.cuda.CUDAGraph()
+                
+                # Warmup before capture
+                with torch.cuda.stream(torch.cuda.Stream()):
+                    _ = self.vae.encode(static_input)
+                
+                # Clear memory cache before capture
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                
+                # Actual capture
+                with torch.cuda.graph(self.vae_cuda_graph):
+                    self.static_vae_output = self.vae.encode(static_input)
+            
+            except RuntimeError as e:
+                print(f"CUDA graph capture failed: {str(e)}")
+                print("Falling back to standard VAE inference without graphs")
+                self.vae_cuda_graph = None
+        else:
+            self.vae_cuda_graph = None
 
 def main():
     # Create default config if none provided
