@@ -301,7 +301,9 @@ class UnifiedPreprocessor:
             self.static_vae_output = self.vae(static_input)
 
 def main():
-    config = get_config()
+    # Create default config if none provided
+    config = get_config()  # Now works without arguments
+    
     preprocessor = UnifiedPreprocessor(config)
     
     # Discover all potential images

@@ -176,49 +176,51 @@ DEFAULT_CONFIG = {
     'bypass_cluster_validation': False, # Flag to bypass cluster size validation, set to True in shape_test.py
 }
 
-def get_config(config_path):
-    """Load config from a Python file."""
-    
-    # Check if file exists
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    
-    # Load the module dynamically
-    config_name = os.path.basename(config_path).replace('.py', '')
-    spec = importlib.util.spec_from_file_location(config_name, config_path)
-    config_module = importlib.util.module_from_spec(spec)
-    sys.modules[config_name] = config_module
-    spec.loader.exec_module(config_module)
-    
-    # Create a namespace for the config
-    config = SimpleNamespace()
-    
-    # Add all non-hidden attributes from the config module
-    for key in dir(config_module):
-        if not key.startswith('_'):
-            setattr(config, key, getattr(config_module, key))
-    
-    # Add default values for any missing required fields
-    defaults = DEFAULT_CONFIG
-    
-    # Add defaults only if not already set
-    for key, value in defaults.items():
-        if not hasattr(config, key):
-            setattr(config, key, value)
-    
-    # Create required directories
-    os.makedirs(config.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(config.output_dir, 'checkpoints'), exist_ok=True)
-    os.makedirs(os.path.join(config.output_dir, 'samples'), exist_ok=True)
-    os.makedirs(os.path.join(config.output_dir, 'logs'), exist_ok=True)
-    
-    # Derive image_size from the first bucket if not explicitly set
-    if not hasattr(config, 'image_size') and hasattr(config, 'buckets') and config.buckets:
-        w, h = config.buckets[0]
-        config.image_size = (3, h, w)
-        logger.info(f"Derived image_size {config.image_size} from first bucket")
-    
-    return config
+def get_config(config_path=None):
+    """Load config from a Python file or create default config"""
+    if config_path:
+        # Check if file exists
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        # Load the module dynamically
+        config_name = os.path.basename(config_path).replace('.py', '')
+        spec = importlib.util.spec_from_file_location(config_name, config_path)
+        config_module = importlib.util.module_from_spec(spec)
+        sys.modules[config_name] = config_module
+        spec.loader.exec_module(config_module)
+        
+        # Create a namespace for the config
+        config = SimpleNamespace()
+        
+        # Add all non-hidden attributes from the config module
+        for key in dir(config_module):
+            if not key.startswith('_'):
+                setattr(config, key, getattr(config_module, key))
+        
+        # Add default values for any missing required fields
+        defaults = DEFAULT_CONFIG
+        
+        # Add defaults only if not already set
+        for key, value in defaults.items():
+            if not hasattr(config, key):
+                setattr(config, key, value)
+        
+        # Create required directories
+        os.makedirs(config.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(config.output_dir, 'checkpoints'), exist_ok=True)
+        os.makedirs(os.path.join(config.output_dir, 'samples'), exist_ok=True)
+        os.makedirs(os.path.join(config.output_dir, 'logs'), exist_ok=True)
+        
+        # Derive image_size from the first bucket if not explicitly set
+        if not hasattr(config, 'image_size') and hasattr(config, 'buckets') and config.buckets:
+            w, h = config.buckets[0]
+            config.image_size = (3, h, w)
+            logger.info(f"Derived image_size {config.image_size} from first bucket")
+        
+        return config
+    else:
+        return create_default_config()
 
 def create_default_config():
     """Create a default configuration."""
