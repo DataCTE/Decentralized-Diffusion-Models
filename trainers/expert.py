@@ -4,6 +4,7 @@ import torch
 from bitsandbytes.optim import AdamW8bit
 import math
 import os
+import torch.nn.functional as F
 
 from models.mmdit import ExpertMMDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
@@ -68,11 +69,22 @@ class ExpertTrainer(BaseTrainer):
             print(f"Initialized SHARDED Expert {expert_idx} across {world_size} GPUs")
 
     def compute_loss(self, batch):
-        return self.flow_matcher.compute_loss(
-            self.expert(batch['x_t'], batch['t']),
-            batch['x0'],
-            batch['t']
-        )
+        # Paper's per-expert loss calculation
+        x0 = batch["latent"].to(self.device)
+        t = torch.rand(x0.size(0), device=self.device)  # t ~ U[0,1]
+        
+        # Forward process using paper's cosine schedule
+        alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)[:,None,None,None]
+        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+        noise = torch.randn_like(x0)
+        xt = alpha_t * x0 + sigma_t * noise
+        
+        # Expert forward pass with cluster conditioning
+        pred = self.expert(xt, (t * 1000).long(), text_embeds=None, cluster_ids=batch["expert"])
+        
+        # Flow matching target calculation
+        target = (x0 - alpha_t * xt) / (sigma_t**2 + 1e-7)
+        return F.mse_loss(pred, target)
 
     def train_step(self, batch):
         """
@@ -101,8 +113,16 @@ class ExpertTrainer(BaseTrainer):
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * noise
             
-            # Expert prediction of flow field u_t(x_t) (Equation 6)
-            pred_flow = self.expert(latent_t, t_indices, text_embeds)
+            # Add cluster IDs from dataset
+            cluster_ids = batch["expert"].to(self.device)  # Assuming dataset returns expert/cluster IDs
+            
+            # Modified expert call with cluster IDs
+            pred_flow = self.expert(
+                latent_t, 
+                t_indices, 
+                text_embeds,
+                cluster_ids=cluster_ids  # Add cluster IDs parameter
+            )
             
             # The target flow field v_t(x_t) (Equation 4)
             target_flow = self.flow_matcher.compute_flow_matching_target(

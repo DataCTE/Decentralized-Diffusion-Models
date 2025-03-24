@@ -27,34 +27,34 @@ DEFAULT_CONFIG = {
     'use_mixed_precision': True,
     'resume_checkpoint': None,  # Add resume checkpoint path (None = don't resume)
     
-    # ===== DDM Model parameters =====
-    'num_experts': 8,
-    'ffn_dim': 3072,    # 4x hidden_dim
-    'hidden_dim': 768,  # ExpertMMDiT uses hidden_dim instead of hidden_size
-    'num_heads': 12,
-    'num_layers': 12,
-    'patch_size': 16,
-    'qk_rmsnorm': True,
-
-    # ===== VAE and CLIP parameters =====
-    'vae_model': "AuraDiffusion/16ch-vae",
-    'latent_channels': 16,  # Specific to 16ch-VAE
-    'vae_scaling_factor': 0.18215,  # Seen in data/vae.py
+    # ===== CLIP Configuration =====
     'clip_model': "openai/clip-vit-large-patch14",
-    'max_token_length': 77,  # Standard CLIP token length
-    'clip_embedding_dim': 768, # Assuming CLIP embedding dim is 768 for ViT-Large-Patch14
+    'clip_embedding_dim': 768,  # ViT-L/14 output dim
+    'max_token_length': 77,     # CLIP standard
+
+    # ===== Flux MMDiT Architecture =====
+    'hidden_dim': 768,          # Transformer hidden size
+    'num_heads': 12,            # Attention heads per layer
+    'num_layers': 24,           # Total transformer blocks
+    'patch_size': 2,            # Input patch dimension 
+    'mlp_ratio': 4.0,           # FFN expansion factor
+    'qkv_bias': True,           # Enable QKV projection biases
+    'qk_rmsnorm': True,         # Use RMSNorm for Q/K projections
+
+    # ===== Expert Configuration =====
+    'num_experts': 8,           # Number of data clusters
+    'cluster_embed_dim': 256,   # Expert specialization dimension
+    'expert_specialization': 'timestep',  # Cluster conditioning type
     
-    
-    # ===== Router parameters =====
+    # ===== VAE Configuration =====
+    'vae_model': "AuraDiffusion/16ch-vae",
+    'latent_channels': 16,      # VAE output channels
+    'vae_scaling_factor': 0.18215,
+
+    # ===== Router Network =====
     'router_hidden_size': 512,
     'router_num_heads': 8,
     'router_num_layers': 4,
-    'router': {
-        'input_dim': 768,  # Should match your text encoder output dimension
-        'hidden_dim': 512,
-        'output_dim': 8,   # Should match number of experts
-        'num_layers': 3
-    },
     
     # ===== Dataset parameters =====
     'dataset_path': '/home/alex/workspace/datasets/danbooru2025',
@@ -163,12 +163,14 @@ DEFAULT_CONFIG = {
     'enable_checkpointing': True,
     
     # Add to DEFAULT_CONFIG
-    'expert_specialization': 'timestep',  # or 'text' for conditional models
     'dynamic_expert_count': 2,
     'expert_selection_strategy': 'top_k',
     'max_sampling_experts': 2,  # Maximum experts to use in sampling
     'max_experts_in_memory': 2,  # Number of experts to keep in GPU memory
-    'num_fine_clusters': 1024, # Add missing num_fine_clusters here
+    'num_fine_clusters': 1024,  # For initial KMeans clustering
+    'min_cluster_samples': 50000,  # Minimum samples per expert cluster
+    'kmeans_restarts': 3,  # Number of KMeans restarts
+    'cluster_linkage': 'average',  # Hierarchical clustering method
     
     # ===== Shape Test Controls =====
     'bypass_cluster_validation': False, # Flag to bypass cluster size validation, set to True in shape_test.py

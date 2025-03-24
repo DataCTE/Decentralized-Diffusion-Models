@@ -68,9 +68,8 @@ def ddm_sample(
             selected_weights = router_weights
             selected_indices = torch.arange(num_clusters, device=device).expand(batch_size, -1)
         elif inference_strategy == "top_k":
-            # Top-k experts
+            # Greedy top-k expert selection
             selected_weights, selected_indices = router_weights.topk(top_k, dim=-1)
-            selected_weights = F.softmax(selected_weights / temperature, dim=-1)
         elif inference_strategy == "sample":
             # Stochastic sampling
             if torch.isnan(router_weights).any() or torch.isinf(router_weights).any() or (router_weights < 0).any():
@@ -108,94 +107,33 @@ def ddm_sample(
             selected_weights = sorted_weights[mask]
             selected_indices = sorted_indices[mask]
         elif inference_strategy == "oracle" and true_clusters is not None:
-            # Oracle selection (for evaluation only)
+            # Ground truth expert usage (for validation)
             selected_indices = true_clusters
             selected_weights = torch.ones_like(selected_indices, dtype=torch.float32)
+        elif inference_strategy == "stochastic":
+            # Stochastic expert sampling
+            selected_indices = torch.multinomial(router_weights, 1).squeeze(-1)
         else:
             raise ValueError(f"Invalid inference strategy: {inference_strategy}")
 
-        combined_pred = torch.zeros_like(x)
-        active_experts = set()
+        # Paper's batched expert execution
+        expert_outputs = []
+        for expert_idx in selected_indices.unique():
+            mask = selected_indices == expert_idx
+            expert = experts[expert_idx]
+            expert_outputs.append(expert(x[mask], timestep[mask], text_embeddings[mask]))
+        
+        # Combine predictions
+        pred = torch.zeros_like(x)
+        for idx, out in zip(selected_indices.unique(), expert_outputs):
+            pred[selected_indices == idx] = out
 
-        # Process selected experts - Batch-first approach
-        for batch_idx in range(batch_size): # Iterate over batch dimension
-            sample_pred = torch.zeros_like(x[batch_idx:batch_idx+1]) # Initialize prediction for this sample
-            active_experts_sample = set() # Track active experts for this sample
-
-            num_experts_per_sample = 0
-            if inference_strategy == "sample":
-                num_experts_per_sample = 1
-            elif inference_strategy in ["top_k", "full", "nucleus"]:
-                if selected_indices.ndim == 1: # Handle case where selected_indices is 1D for nucleus in some cases
-                    num_experts_per_sample = 1
-                elif selected_indices.ndim == 2:
-                    num_experts_per_sample = selected_indices.size(1)
-                else:
-                    raise ValueError(f"Unexpected dimensions for selected_indices in {inference_strategy}: {selected_indices.ndim}")
-            else:
-                raise ValueError(f"Invalid inference strategy: {inference_strategy}")
-
-
-            for i in range(num_experts_per_sample):
-                expert_idx_sample = None
-                if inference_strategy == "sample":
-                    cluster_index_sample = selected_indices[batch_idx:batch_idx+1] # Get cluster index for this sample
-                    expert_idx_sample = cluster_index_sample.item()
-                elif inference_strategy in ["top_k", "full", "nucleus"]:
-                    if selected_indices.ndim == 1:
-                        cluster_index_sample = selected_indices[batch_idx:batch_idx+1] # Handle 1D case for nucleus
-                        expert_idx_sample = cluster_index_sample[i].item() # Still need index 'i' even if 1D to align with loop
-                    elif selected_indices.ndim == 2:
-                        cluster_index_sample = selected_indices[batch_idx, i]
-                        expert_idx_sample = cluster_index_sample.item()
-                    else:
-                        raise ValueError(f"Unexpected dimensions for selected_indices in {inference_strategy}: {selected_indices.ndim}")
-
-
-                expert_idx = expert_idx_sample # Get the expert index for the current sample and expert iteration
-                mask = torch.tensor([True], device=device) # Mask is now just for this sample (size 1)
-
-                expert = experts[expert_idx]
-                active_experts_sample.add(expert_idx)
-
-
-                # Classifier-free guidance
-                sample_x = x[batch_idx:batch_idx+1] # Get sample x
-                if text_embeddings is not None and cfg_scale > 1.0:
-                    x_in = torch.cat([sample_x, sample_x]) # Use sample_x here
-                    t_in = timestep[batch_idx:batch_idx+1].repeat(2)
-                    emb_in = torch.cat([uncond_embeddings[batch_idx:batch_idx+1], text_embeddings[batch_idx:batch_idx+1]])
-
-                    preds = expert(x_in, t_in, emb_in).chunk(2)
-                    pred = preds[0] + cfg_scale * (preds[1] - preds[0])
-                else:
-                    pred = expert(sample_x, timestep[batch_idx:batch_idx+1], text_embeddings[batch_idx:batch_idx+1])
-
-                # Apply strategy-specific weighting
-                weight = 1.0 # Weight is 1.0 per expert for now, adjust if needed for strategies other than sample
-                if inference_strategy == "sample":
-                    weight_sample = selected_weights[batch_idx:batch_idx+1].view(-1, 1, 1, 1) # Get weight for sample
-                    weight = weight_sample # Assign sample-specific weight
-                elif inference_strategy in ["top_k", "full", "nucleus"]:
-                    if selected_weights.ndim == 1: # Handle 1D weights for nucleus if needed
-                         weight_sample = selected_weights[batch_idx:batch_idx+1].view(-1, 1, 1, 1) # Get weight for sample
-                         weight = weight_sample
-                    elif selected_weights.ndim == 2:
-                        weight_sample = selected_weights[batch_idx, i].view(-1, 1, 1, 1) # Get weight for sample and expert
-                        weight = weight_sample
-                    else:
-                        raise ValueError(f"Unexpected dimensions for selected_weights in {inference_strategy}: {selected_weights.ndim}")
-
-
-                sample_pred += pred * weight # Accumulate prediction for this sample
-            combined_pred[batch_idx:batch_idx+1] = sample_pred # Assign sample prediction to combined prediction
-
-        #print("Shape of combined_pred before ddim_step:", combined_pred.shape)
+        #print("Shape of combined_pred before ddim_step:", pred.shape)
         #print("Shape of timestep before ddim_step:", timestep.shape)
 
         # DDIM update step
         x = ddim_step(
-            lambda x_t, t, c: combined_pred,
+            lambda x_t, t, c: pred,
             x,
             timestep,
             torch.full_like(timestep, t+1) if t < num_steps-1 else None,

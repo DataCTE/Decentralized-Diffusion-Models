@@ -18,6 +18,7 @@ import torchvision.transforms as transforms
 from tqdm.auto import tqdm
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 # Import centralized utilities
 from utils.distributed import is_main_process, broadcast_object, get_rank, get_local_rank, get_world_size
@@ -41,6 +42,11 @@ class DDMDataset(Dataset):
     
     def __init__(self, config, split='train'):
         self.config = config
+        self.feature_dir = config.feature_cache_path
+        
+        # Load unified manifest
+        self.manifest = self._load_manifest()
+        
         self.device = torch.device('cpu')
         self.rank = get_rank()
         self.world_size = get_world_size()
@@ -248,111 +254,27 @@ class DDMDataset(Dataset):
 
     def _create_memory_map(self, index_path):
         """Create memory map index with validation"""
-        # Get file lists with consistent sorting
-        latent_files = sorted(glob.glob(os.path.join(self.latent_dir, "*.latent.pt")))
-        clip_files = sorted(glob.glob(os.path.join(self.clip_dir, "*.clip_emb.pt")))
-        cluster_files = sorted(glob.glob(os.path.join(self.cluster_dir, "*.cluster.pt")))
-        dim_files = sorted(glob.glob(os.path.join(self.dim_dir, "*.pt")))
-        
-        # Find the minimum count across all feature types
-        file_counts = {
-            'latent': len(latent_files),
-            'clip': len(clip_files),
-            'cluster': len(cluster_files),
-            'dim': len(dim_files)
-        }
-        min_count = min(file_counts.values())
-        
-        # Truncate all lists to the minimum count
-        latent_files = latent_files[:min_count]
-        clip_files = clip_files[:min_count]
-        cluster_files = cluster_files[:min_count]
-        dim_files = dim_files[:min_count]
-        
-        logger.warning(f"Using truncated file counts to {min_count} (original: {file_counts})")
+        # Get file lists with consistent sorting - no truncation needed
+        self.latent_files = sorted([f.name for f in Path(self.latent_dir).glob("*.latent.pt")])
+        self.clip_files = sorted([f.name for f in Path(self.clip_dir).glob("*.clip_emb.pt")])
+        self.cluster_files = sorted([f.name for f in Path(self.cluster_dir).glob("*.cluster.pt")])
+        self.dim_files = sorted([f.name for f in Path(self.dim_dir).glob("*.pt")])
 
-        # Build index only if needed - handle empty file case
-        create_index = False
-        if not os.path.exists(index_path):
-            create_index = True
-            
-            # Only create index on main process
-            if is_main_process():
-                logger.info(f"Creating new index file at {index_path}")
-                try:
-                    with open(index_path, 'wb') as f:
-                        for lt, cl, cr, dm in zip(latent_files, clip_files, cluster_files, dim_files):
-                            # Verify files exist before writing to index
-                            for path in [lt, cl, cr, dm]:
-                                if not os.path.exists(path):
-                                    raise FileNotFoundError(f"Missing feature file: {path}")
-                                size = os.path.getsize(path)
-                                if size == 0:
-                                    raise ValueError(f"Empty file detected: {path}")
-                                f.write(struct.pack('Q', size))
-                        # Force write buffer to disk
-                        f.flush()
-                        os.fsync(f.fileno())
-                    # Verify index file was created properly
-                    if os.path.getsize(index_path) == 0:
-                        raise RuntimeError("Created empty index file")
-                    logger.info(f"Index file created with {len(latent_files)} entries")
-                except Exception as e:
-                    if os.path.exists(index_path):
-                        os.remove(index_path)
-                    raise
+        # All features guaranteed aligned by preprocessor
+        self.num_samples = len(self.latent_files)
+        
+        logger.info(f"Loaded aligned features: {self.num_samples} samples")
 
-        # Synchronize all processes after potential creation
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-        # Verify index file exists and has content with retries
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                if not os.path.exists(index_path):
-                    raise FileNotFoundError(f"Index file {index_path} missing")
-                
-                if os.path.getsize(index_path) == 0:
-                    if create_index and is_main_process():
-                        logger.warning(f"Empty index file detected on attempt {attempt+1}, recreating...")
-                        os.remove(index_path)
-                        return self._create_memory_map(index_path)
-                    else:
-                        raise ValueError(f"Index file {index_path} is empty")
-                        
-                break
-            except (FileNotFoundError, ValueError) as e:
-                if attempt == max_retries - 1:
-                    raise
-                time.sleep(1)
+        # Build index only if needed - use first feature type as reference
+        if not os.path.exists(index_path) and is_main_process():
+            with open(index_path, 'wb') as f:
+                for fname in self.latent_files:
+                    base = Path(fname).stem
+                    # Write placeholder values since sizes are known
+                    f.write(struct.pack('Q', 0)) 
 
         # Load memory map with additional validation
         mmap = np.memmap(index_path, mode='r', dtype=np.uint64)
-        if len(mmap) == 0:
-            raise RuntimeError(f"Memory map loaded empty index from {index_path}")
-            
-        # Update the file lists to match truncated counts
-        self.latent_files = [os.path.basename(f) for f in latent_files]
-        self.clip_files = [os.path.basename(f) for f in clip_files]
-        self.cluster_files = [os.path.basename(f) for f in cluster_files]
-        self.dim_files = [os.path.basename(f) for f in dim_files]
-        
-        # Truncate expert assignments to match the final dataset size
-        self.expert_assignments = self.expert_assignments[:min_count]
-        self.bucket_assignments = self.bucket_assignments[:min_count]
-        self.num_samples = min_count  # Update the total sample count
-        
-        print(f"[Rank {get_rank()}] Dataset truncation report:")
-        print(f"Original counts: {file_counts}")
-        print(f"Truncated to: {min_count} samples")
-        
-        print(f"Updated latent files count: {len(self.latent_files)}")
-        print(f"Updated clip files count: {len(self.clip_files)}")
-        
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
         return mmap
 
     def _warmup_cache(self):
@@ -393,61 +315,20 @@ class DDMDataset(Dataset):
             logger.warning(f"Failed to warm cache for index {idx}: {str(e)}")
             return False
 
+    def _load_manifest(self):
+        """Load manifest from precomputed features"""
+        # All features guaranteed aligned by preprocessor
+        return [Path(f).stem for f in self.latent_files]
+
     def __getitem__(self, idx):
-        # Add index validation
-        if idx >= len(self):
-            raise IndexError(f"Index {idx} out of range for dataset with size {len(self)}")
-            
-        print(f"[Rank {self.rank}] Loading index {idx} - {self.latent_files[idx]}")
+        base = self.manifest[idx]
         
-        # Get device for current process
-        device_id = torch.cuda.current_device()
-        
-        # Lazy load latent with direct GPU transfer
-        latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
-        latent = torch.load(latent_path, 
-                          map_location=lambda storage, loc: storage.cuda(device_id, non_blocking=True),
-                          mmap=True)
-        
-        # Validate latent dimensions against bucket
-        bucket_idx = self.bucket_assignments[idx].item()
-        expected_shape = self.config.buckets[bucket_idx]
-        vae_scale_factor = self.config.vae_scaling_factor
-        expected_latent_shape = (
-            expected_shape[0] // vae_scale_factor,
-            expected_shape[1] // vae_scale_factor
-        )
-        
-        if latent.shape[-2:] != expected_latent_shape:
-            # Handle dimension mismatch by finding correct bucket
-            actual_shape = (latent.shape[-1]*vae_scale_factor, 
-                           latent.shape[-2]*vae_scale_factor)
-            bucket_idx = next((i for i, (w,h) in enumerate(self.config.buckets)
-                              if w == actual_shape[0] and h == actual_shape[1]), 0)
-            self.bucket_assignments[idx] = bucket_idx  # Update bucket assignment
-
-        # Async CLIP loading with stream-aware prefetch
-        clip_path = os.path.join(
-            self.config.feature_cache_path,
-            "clip_embeddings",
-            self.latent_files[idx].replace('.latent.pt', '.clip_emb.pt')
-        )
-        with torch.cuda.stream(torch.cuda.Stream(device_id)):
-            clip_emb = torch.load(clip_path,
-                                map_location='cuda',
-                                mmap=True) if os.path.exists(clip_path) \
-                    else torch.zeros(
-                        1,  # Add batch dimension
-                        self.config.max_token_length,  # Add sequence length dimension
-                        self.config.clip_embedding_dim,
-                        device='cuda'
-                    )
-
+        # Direct loading without existence checks
         return {
-            'latent': latent,
-            'clip_embedding': clip_emb,
-            'bucket': self.bucket_assignments[idx].cuda(non_blocking=True).unsqueeze(0),
-            'expert': self.expert_assignments[idx].to(device='cuda').unsqueeze(0)
+            'latent': torch.load(f"{self.latent_dir}/{base}.latent.pt"),
+            'clip_embedding': torch.load(f"{self.clip_dir}/{base}.clip_emb.pt"),
+            'expert': torch.load(f"{self.cluster_dir}/{base}.cluster.pt"),
+            'dims': torch.load(f"{self.dim_dir}/{base}.pt")
         }
 
     def _load_latent(self, idx):

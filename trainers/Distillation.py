@@ -182,7 +182,8 @@ class DiffusionDistiller:
                                 pred = expert(
                                     noisy_images[idx:idx+1],
                                     timesteps[idx:idx+1],
-                                    text_embeds[idx:idx+1] if text_embeds else None
+                                    text_embeds[idx:idx+1] if text_embeds else None,
+                                    cluster_ids=expert_indices[idx]
                                 )
                             expert_preds.append(pred)
                         
@@ -336,7 +337,7 @@ class DiffusionDistiller:
                     t_idx = timesteps[idx:idx+1]
                     text_idx = text_embeds[idx:idx+1] if text_embeds else None
                     
-                    expert_pred = expert(x_idx, t_idx, text_idx)
+                    expert_pred = expert(x_idx, t_idx, text_idx, cluster_ids=expert_indices[idx])
                     teacher_pred[idx:idx+1] = expert_pred
                 
                 # Compute loss

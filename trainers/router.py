@@ -57,6 +57,10 @@ class RouterTrainer:
         if rank == 0:
             print(f"Initialized SHARDED Router across {self.world_size} GPUs")
         
+        # Add VAE for latent encoding
+        from data.vae import VAEWrapper
+        self.vae = VAEWrapper(device, config)
+        
         # Paper-recommended optimizer settings
         self.optimizer = AdamW8bit(
             self.router.parameters(),
@@ -78,38 +82,30 @@ class RouterTrainer:
         )
 
     def train_step(self, batch):
-        """Trains router with uniform distribution instead of clustering"""
-        # Initialize scaler first
-        scaler = torch.amp.GradScaler("cuda", enabled=self.config.use_mixed_precision)
+        """Train router with actual text embeddings per paper section 3.3"""
+        # Use precomputed latents from dataset instead of re-encoding
+        latents = batch["latent"].to(self.device)  # Direct latent access
+        targets = batch["expert"].to(self.device)
+        text_embeds = batch["clip_embedding"].to(self.device)
         
-        # Then process data
-        latents = batch["latent"].to(self.device)
-        text_embeds = batch["clip_embedding"].to(self.device)  # Use precomputed CLIP embeddings
-        
-        # Use mixed precision training if configured
-        with torch.autocast(device_type="cuda", enabled=self.config.use_mixed_precision):
-            # Sample random timesteps t ∈ [0, 1] (match expert)
+        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
+        with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
+            # Remove VAE encoding - use precomputed latents directly
             t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
-            t = t_indices.float() / 1000.0  # Normalize to [0, 1]
+            t = t_indices.float() / 1000.0
             
-            # Forward process using cosine schedule (match expert)
+            # Forward process using precomputed latents as x0
             alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)[:,None,None,None]
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             latent_t = alpha_t * latents + sigma_t * torch.randn_like(latents)
             
-            # Get actual cluster assignments from dataset
-            targets = batch["expert"].to(self.device)
-
-            # Get router predictions using real text embeddings
-            logits = self.router(latent_t, t_indices, text_embeds)  # Use actual CLIP embeddings
+            logits = self.router(latent_t, t_indices, text_embeds)
             
-            # Compute loss
             loss = self.criterion(logits, targets)
         
         # Optimize with gradient isolation
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
-        scaler.unscale_(self.optimizer)
         
         # Apply gradient clipping if configured
         if hasattr(self.config, 'max_grad_norm') and self.config.max_grad_norm > 0:

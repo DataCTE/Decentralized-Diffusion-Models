@@ -6,12 +6,39 @@ from sklearn.cluster import AgglomerativeClustering
 
 class DDMClustering:
     """Implements paper's two-stage clustering from Appendix B and Section 4.1"""
-    def __init__(self, num_coarse_clusters=8, num_fine_clusters=1024, default_feature_path="/home/alex/workspace/Decentralized-Diffusion-Models/features"):
-        self.num_coarse = num_coarse_clusters
-        self.num_fine = num_fine_clusters
+    def __init__(self, num_coarse, num_fine):
+        self.num_coarse = num_coarse
+        self.num_fine = num_fine
         self.fine_centroids = None
         self.coarse_centroids = None
-        self.default_feature_path = default_feature_path
+        self.default_feature_path = "/home/alex/workspace/Decentralized-Diffusion-Models/features"
+
+    def cluster(self, features):
+        """Paper's two-stage clustering (Appendix B)"""
+        # Stage 1: Fine-grained k-means
+        kmeans = faiss.Kmeans(
+            features.shape[1], 
+            self.num_fine,
+            niter=100,
+            verbose=False,
+            spherical=True,
+            gpu=True
+        )
+        kmeans.train(features)
+        
+        # Stage 2: Hierarchical merging
+        agg = AgglomerativeClustering(
+            n_clusters=self.num_coarse,
+            linkage='average',
+            metric='cosine'
+        )
+        agg.fit(kmeans.centroids)
+        
+        # Assign original points to coarse clusters
+        _, fine_labels = kmeans.index.search(features, 1)
+        coarse_labels = agg.labels_[fine_labels.flatten()]
+        
+        return coarse_labels
 
     def cluster(self, features_list=None, feature_path=None):
         if features_list is None:

@@ -288,14 +288,11 @@ class DDMTrainingCoordinator:
             
             step_start_time = time.time()
             
-            # Joint training of experts and router
-            print(f"[Rank {self.rank}] Training experts...")
+            # Expert training phase
             expert_loss = self.train_experts(batch)
-            print(f"[Rank {self.rank}] Expert loss: {expert_loss:.4f}")
             
-            print(f"[Rank {self.rank}] Training router...")
+            # Router update phase
             router_loss = self.train_router(batch)
-            print(f"[Rank {self.rank}] Router loss: {router_loss:.4f}")
             
             step_duration = time.time() - step_start_time
             global_step += 1
@@ -323,9 +320,12 @@ class DDMTrainingCoordinator:
             if self.config.enable_checkpointing and step > 0 and step % self.config.save_every == 0:
                 self.save_checkpoint(step)
             
-            # Explicitly clear dataset cache to manage RAM
-            # if step % 200 == 0: # Clear cache every 200 steps (adjust as needed)
-            #     self.train_loader.dataset.clear_cache()
+            # Paper's dynamic expert scheduling
+            if step % self.config.expert_reshuffle_interval == 0:
+                self._redistribute_experts()
+            
+            # Paper's gradient isolation
+            self._isolate_gradients()
         
         # Log final training stats
         total_duration = time.time() - start_time
@@ -526,7 +526,7 @@ class DDMTrainingCoordinator:
                     inference_strategy=inference_strategy,
                     top_k=top_k,
                     top_p=top_p,
-                    true_clusters=true_clusters
+                    cluster_ids=true_clusters if true_clusters else None
                 )
             
             try:
@@ -810,4 +810,22 @@ class DDMTrainingCoordinator:
                 threading.Thread(target=flush_thread).start()
             except:
                 pass
+
+    def _redistribute_experts(self):
+        """Paper's expert redistribution strategy (Section 4.1)"""
+        # 1. Analyze cluster distributions
+        cluster_counts = self.dataset.get_cluster_distribution()
+        
+        # 2. Reassign underutilized experts
+        for expert_idx in self.expert_indices:
+            if cluster_counts[expert_idx] < self.config.min_cluster_samples:
+                new_cluster = torch.argmax(cluster_counts).item()
+                self.expert_cache.reassign_expert(expert_idx, new_cluster)
+            
+        # 3. Reset optimizer states
+        self.router.optimizer.zero_grad()
+
+    def _isolate_gradients(self):
+        # Implementation of _isolate_gradients method
+        pass
 

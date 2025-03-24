@@ -1,526 +1,1017 @@
-"""DiT implementation for Decentralized Diffusion Models (Paper Section 3.2)"""
-
-from __future__ import annotations
-from typing import Tuple
+from dataclasses import dataclass
 
 import torch
-from torch import nn
-from torch import Tensor
-import torch.nn.functional as F
-from torch.nn import Module, ModuleList
+from einops import rearrange, repeat
+from torch import Tensor, nn
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokenizer
+import math
 
-from einops import rearrange, repeat, pack, unpack
-from einops.layers.torch import Rearrange
 
-from x_transformers.attend import Attend
-from x_transformers import (
-    RMSNorm,
-    FeedForward
-)
+import os
 
-from hyper_connections import (
-    HyperConnections,
-    Residual
-)
+import cv2
+import numpy as np
 
-from models.embeddings import TimestepEmbedder
 
-# helpers
+from PIL import Image
+from safetensors.torch import load_file as load_sft
+from transformers import AutoModelForDepthEstimation, AutoProcessor, SiglipImageProcessor, SiglipVisionModel
 
-def exists(v):
-    return v is not None
+def print_load_warning(missing: list[str], unexpected: list[str]) -> None:
+    if len(missing) > 0 and len(unexpected) > 0:
+        print(f"Got {len(missing)} missing keys:\n\t" + "\n\t".join(missing))
+        print("\n" + "-" * 79 + "\n")
+        print(f"Got {len(unexpected)} unexpected keys:\n\t" + "\n\t".join(unexpected))
+    elif len(missing) > 0:
+        print(f"Got {len(missing)} missing keys:\n\t" + "\n\t".join(missing))
+    elif len(unexpected) > 0:
+        print(f"Got {len(unexpected)} unexpected keys:\n\t" + "\n\t".join(unexpected))
 
-def default(v, d):
-    return v if exists(v) else d
 
-def softclamp(t, value):
-    return (t / value).tanh() * value
 
-def modulate(x, shift, scale):
-    """Applies modulation to the input"""
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
+    q, k = apply_rope(q, k, pe)
 
-# rmsnorm
+    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    x = rearrange(x, "B H L D -> B L (H D)")
 
-class MultiHeadRMSNorm(Module):
-    def __init__(self, dim, heads = 1):
+    return x
+
+
+def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
+    assert dim % 2 == 0
+    scale = torch.arange(0, dim, 2, dtype=pos.dtype, device=pos.device) / dim
+    omega = 1.0 / (theta**scale)
+    out = torch.einsum("...n,d->...nd", pos, omega)
+    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
+    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+    return out.float()
+
+
+def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+
+@dataclass
+class AutoEncoderParams:
+    resolution: int
+    in_channels: int
+    ch: int
+    out_ch: int
+    ch_mult: list[int]
+    num_res_blocks: int
+    z_channels: int
+    scale_factor: float
+    shift_factor: float
+
+
+def swish(x: Tensor) -> Tensor:
+    return x * torch.sigmoid(x)
+
+
+class AttnBlock(nn.Module):
+    def __init__(self, in_channels: int):
         super().__init__()
-        self.scale = dim ** 0.5
-        self.gamma = nn.Parameter(torch.ones(heads, 1, dim))
+        self.in_channels = in_channels
+
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+
+        self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+    def attention(self, h_: Tensor) -> Tensor:
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+
+        b, c, h, w = q.shape
+        q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
+        k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
+        v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
+        h_ = nn.functional.scaled_dot_product_attention(q, k, v)
+
+        return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.proj_out(self.attention(x))
+
+
+class ResnetBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+        out_channels = in_channels if out_channels is None else out_channels
+        self.out_channels = out_channels
+
+        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        if self.in_channels != self.out_channels:
+            self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
-        return F.normalize(x, dim = -1) * self.gamma * self.scale
+        h = x
+        h = self.norm1(h)
+        h = swish(h)
+        h = self.conv1(h)
 
-# attention
+        h = self.norm2(h)
+        h = swish(h)
+        h = self.conv2(h)
 
-class JointAttention(Module):
+        if self.in_channels != self.out_channels:
+            x = self.nin_shortcut(x)
+
+        return x + h
+
+
+class Downsample(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        # no asymmetric padding in torch conv, must do it ourselves
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
+
+    def forward(self, x: Tensor):
+        pad = (0, 1, 0, 1)
+        x = nn.functional.pad(x, pad, mode="constant", value=0)
+        x = self.conv(x)
+        return x
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x: Tensor):
+        x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+        x = self.conv(x)
+        return x
+
+
+class Encoder(nn.Module):
     def __init__(
         self,
-        *,
-        dim_inputs: tuple[int, ...],
-        dim_head = 64,
-        heads = 8,
-        qk_rmsnorm = False,
-        flash = False,
-        softclamp = False,
-        softclamp_value = 50.,
-        attend_kwargs: dict = dict()
+        resolution: int,
+        in_channels: int,
+        ch: int,
+        ch_mult: list[int],
+        num_res_blocks: int,
+        z_channels: int,
     ):
         super().__init__()
-        """
-        ein notation
+        self.ch = ch
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        # downsampling
+        self.conv_in = nn.Conv2d(in_channels, self.ch, kernel_size=3, stride=1, padding=1)
 
-        b - batch
-        h - heads
-        n - sequence
-        d - feature dimension
-        """
+        curr_res = resolution
+        in_ch_mult = (1,) + tuple(ch_mult)
+        self.in_ch_mult = in_ch_mult
+        self.down = nn.ModuleList()
+        block_in = self.ch
+        for i_level in range(self.num_resolutions):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_in = ch * in_ch_mult[i_level]
+            block_out = ch * ch_mult[i_level]
+            for _ in range(self.num_res_blocks):
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
+                block_in = block_out
+            down = nn.Module()
+            down.block = block
+            down.attn = attn
+            if i_level != self.num_resolutions - 1:
+                down.downsample = Downsample(block_in)
+                curr_res = curr_res // 2
+            self.down.append(down)
 
-        dim_inner = dim_head * heads
+        # middle
+        self.mid = nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
+        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
 
-        num_inputs = len(dim_inputs)
-        self.num_inputs = num_inputs
+        # end
+        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
+        self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
 
-        self.to_qkv = ModuleList([nn.Linear(dim_input, dim_inner * 3, bias = False) for dim_input in dim_inputs])
+    def forward(self, x: Tensor) -> Tensor:
+        # downsampling
+        hs = [self.conv_in(x)]
+        for i_level in range(self.num_resolutions):
+            for i_block in range(self.num_res_blocks):
+                h = self.down[i_level].block[i_block](hs[-1])
+                if len(self.down[i_level].attn) > 0:
+                    h = self.down[i_level].attn[i_block](h)
+                hs.append(h)
+            if i_level != self.num_resolutions - 1:
+                hs.append(self.down[i_level].downsample(hs[-1]))
 
-        self.split_heads = Rearrange('b n (qkv h d) -> qkv b h n d', h = heads, qkv = 3)
+        # middle
+        h = hs[-1]
+        h = self.mid.block_1(h)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h)
+        # end
+        h = self.norm_out(h)
+        h = swish(h)
+        h = self.conv_out(h)
+        return h
 
-        self.attend = Attend(
-            flash = flash,
-            softclamp_logits = softclamp,
-            logit_softclamp_value = softclamp_value,
-            **attend_kwargs
-        )
 
-        self.merge_heads = Rearrange('b h n d -> b n (h d)')
-
-        self.to_out = ModuleList([nn.Linear(dim_inner, dim_input, bias = False) for dim_input in dim_inputs])
-
-        self.qk_rmsnorm = qk_rmsnorm
-        self.q_rmsnorms = ModuleList([])
-        self.k_rmsnorms = ModuleList([])
-
-        if qk_rmsnorm:
-            self.q_rmsnorms = ModuleList([MultiHeadRMSNorm(dim_head, heads = heads) for _ in range(num_inputs)])
-            self.k_rmsnorms = ModuleList([MultiHeadRMSNorm(dim_head, heads = heads) for _ in range(num_inputs)])
-
-        self.register_buffer('dummy', torch.tensor(0), persistent = False)
-
-    def forward(
-        self,
-        inputs: tuple[Tensor],
-        masks: tuple[Tensor | None] | None = None
-    ):
-
-        device = self.dummy.device
-
-        assert len(inputs) == self.num_inputs
-
-        masks = default(masks, (None,) * self.num_inputs)
-
-        # project each modality separately for qkv
-        # also handle masks, assume None means attend to all tokens
-
-        all_qkvs = []
-        all_masks = []
-
-        for x, mask, to_qkv, q_rmsnorm, k_rmsnorm in zip(inputs, masks, self.to_qkv, self.q_rmsnorms, self.k_rmsnorms):
-
-            qkv = to_qkv(x)
-            qkv = self.split_heads(qkv)
-
-            # optional qk rmsnorm per modality
-
-            if self.qk_rmsnorm:
-                q, k, v = qkv
-                q = q_rmsnorm(q)
-                k = k_rmsnorm(k)
-                qkv = torch.stack((q, k, v))
-
-            all_qkvs.append(qkv)
-
-            # handle mask per modality
-
-            if not exists(mask):
-                mask = torch.ones(x.shape[:2], device = device, dtype = torch.bool)
-
-            all_masks.append(mask)
-
-        # combine all qkv and masks
-
-        all_qkvs, packed_shape = pack(all_qkvs, 'qkv b h * d')
-        all_masks, _ = pack(all_masks, 'b *')
-
-        # attention
-
-        q, k, v = all_qkvs
-
-        outs, *_ = self.attend(q, k, v, mask = all_masks)
-
-        # merge heads and then separate by modality for combine heads projection
-
-        outs = self.merge_heads(outs)
-        outs = unpack(outs, packed_shape, 'b * d')
-
-        # separate combination of heads for each modality
-
-        all_outs = []
-
-        for out, to_out in zip(outs, self.to_out):
-            out = to_out(out)
-            all_outs.append(out)
-
-        return tuple(all_outs)
-
-class MMDiTBlock(nn.Module):
+class Decoder(nn.Module):
     def __init__(
         self,
-        *,
-        dim_text,
-        dim_image,
-        dim_cond = None,
-        dim_head = 64,
-        heads = 8,
-        qk_rmsnorm = False,
-        flash_attn = False,
-        num_residual_streams = 1,
-        ff_kwargs: dict = dict()
+        ch: int,
+        out_ch: int,
+        ch_mult: list[int],
+        num_res_blocks: int,
+        in_channels: int,
+        resolution: int,
+        z_channels: int,
     ):
         super().__init__()
+        self.ch = ch
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        self.ffactor = 2 ** (self.num_resolutions - 1)
 
-        residual_klass = Residual if num_residual_streams == 1 else HyperConnections
+        # compute in_ch_mult, block_in and curr_res at lowest res
+        block_in = ch * ch_mult[self.num_resolutions - 1]
+        curr_res = resolution // 2 ** (self.num_resolutions - 1)
+        self.z_shape = (1, z_channels, curr_res, curr_res)
 
-        self.text_attn_residual_fn = residual_klass(num_residual_streams, dim = dim_text)
-        self.text_ff_residual_fn = residual_klass(num_residual_streams, dim = dim_text)
+        # z to block_in
+        self.conv_in = nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
 
-        self.image_attn_residual_fn = residual_klass(num_residual_streams, dim = dim_image)
-        self.image_ff_residual_fn = residual_klass(num_residual_streams, dim = dim_image)
+        # middle
+        self.mid = nn.Module()
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
+        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
 
-        has_cond = exists(dim_cond)
-        self.has_cond = has_cond
+        # upsampling
+        self.up = nn.ModuleList()
+        for i_level in reversed(range(self.num_resolutions)):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_out = ch * ch_mult[i_level]
+            for _ in range(self.num_res_blocks + 1):
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
+                block_in = block_out
+            up = nn.Module()
+            up.block = block
+            up.attn = attn
+            if i_level != 0:
+                up.upsample = Upsample(block_in)
+                curr_res = curr_res * 2
+            self.up.insert(0, up)  # prepend to get consistent order
 
-        if has_cond:
-            dim_gammas = (
-                *((dim_text,) * 4),
-                *((dim_image,) * 4)
-            )
+        # end
+        self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
+        self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
-            dim_betas = (
-                *((dim_text,) * 2),
-                *((dim_image,) * 2),
-            )
+    def forward(self, z: Tensor) -> Tensor:
+        # get dtype for proper tracing
+        upscale_dtype = next(self.up.parameters()).dtype
 
-            self.cond_dims = (*dim_gammas, *dim_betas)
+        # z to block_in
+        h = self.conv_in(z)
 
-            to_cond_linear = nn.Linear(dim_cond, sum(self.cond_dims))
+        # middle
+        h = self.mid.block_1(h)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h)
 
-            self.to_cond = nn.Sequential(
-                Rearrange('b d -> b 1 d'),
-                nn.SiLU(),
-                to_cond_linear
-            )
+        # cast to proper dtype
+        h = h.to(upscale_dtype)
+        # upsampling
+        for i_level in reversed(range(self.num_resolutions)):
+            for i_block in range(self.num_res_blocks + 1):
+                h = self.up[i_level].block[i_block](h)
+                if len(self.up[i_level].attn) > 0:
+                    h = self.up[i_level].attn[i_block](h)
+            if i_level != 0:
+                h = self.up[i_level].upsample(h)
 
-            nn.init.zeros_(to_cond_linear.weight)
-            nn.init.zeros_(to_cond_linear.bias)
-            nn.init.constant_(to_cond_linear.bias[:sum(dim_gammas)], 1.)
+        # end
+        h = self.norm_out(h)
+        h = swish(h)
+        h = self.conv_out(h)
+        return h
 
-        self.text_attn_layernorm = nn.LayerNorm(dim_text, elementwise_affine = not has_cond)
-        self.image_attn_layernorm = nn.LayerNorm(dim_image, elementwise_affine = not has_cond)
 
-        self.text_ff_layernorm = nn.LayerNorm(dim_text, elementwise_affine = not has_cond)
-        self.image_ff_layernorm = nn.LayerNorm(dim_image, elementwise_affine = not has_cond)
+class DiagonalGaussian(nn.Module):
+    def __init__(self, sample: bool = True, chunk_dim: int = 1):
+        super().__init__()
+        self.sample = sample
+        self.chunk_dim = chunk_dim
 
-        self.joint_attn = JointAttention(
-            dim_inputs = (dim_text, dim_image),
-            dim_head = dim_head,
-            heads = heads,
-            flash = flash_attn,
-            qk_rmsnorm = qk_rmsnorm
+    def forward(self, z: Tensor) -> Tensor:
+        mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
+        if self.sample:
+            std = torch.exp(0.5 * logvar)
+            return mean + std * torch.randn_like(mean)
+        else:
+            return mean
+
+
+class AutoEncoder(nn.Module):
+    def __init__(self, params: AutoEncoderParams):
+        super().__init__()
+        self.params = params
+        self.encoder = Encoder(
+            resolution=params.resolution,
+            in_channels=params.in_channels,
+            ch=params.ch,
+            ch_mult=params.ch_mult,
+            num_res_blocks=params.num_res_blocks,
+            z_channels=params.z_channels,
+        )
+        self.decoder = Decoder(
+            resolution=params.resolution,
+            in_channels=params.in_channels,
+            ch=params.ch,
+            out_ch=params.out_ch,
+            ch_mult=params.ch_mult,
+            num_res_blocks=params.num_res_blocks,
+            z_channels=params.z_channels,
+        )
+        self.reg = DiagonalGaussian()
+
+        self.scale_factor = params.scale_factor
+        self.shift_factor = params.shift_factor
+
+    def encode(self, x: Tensor) -> Tensor:
+        z = self.reg(self.encoder(x))
+        z = self.scale_factor * (z - self.shift_factor)
+        return z
+
+    def decode(self, z: Tensor) -> Tensor:
+        z = z / self.scale_factor + self.shift_factor
+        return self.decoder(z)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.decode(self.encode(x))
+    
+
+
+class HFEmbedder(nn.Module):
+    def __init__(self, version: str, max_length: int, **hf_kwargs):
+        super().__init__()
+        self.is_clip = version.startswith("openai")
+        self.max_length = max_length
+        self.output_key = "pooler_output" if self.is_clip else "last_hidden_state"
+
+        if self.is_clip:
+            self.tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(version, max_length=max_length)
+            self.hf_module: CLIPTextModel = CLIPTextModel.from_pretrained(version, **hf_kwargs)
+        else:
+            self.tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained(version, max_length=max_length)
+            self.hf_module: T5EncoderModel = T5EncoderModel.from_pretrained(version, **hf_kwargs)
+
+        self.hf_module = self.hf_module.eval().requires_grad_(False)
+
+    def forward(self, text: list[str]) -> Tensor:
+        batch_encoding = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=self.max_length,
+            return_length=False,
+            return_overflowing_tokens=False,
+            padding="max_length",
+            return_tensors="pt",
         )
 
-        self.text_ff = FeedForward(dim_text, **ff_kwargs)
-        self.image_ff = FeedForward(dim_image, **ff_kwargs)
+        outputs = self.hf_module(
+            input_ids=batch_encoding["input_ids"].to(self.hf_module.device),
+            attention_mask=None,
+            output_hidden_states=False,
+        )
+        return outputs[self.output_key]
 
-    def forward(
+
+class DepthImageEncoder:
+    depth_model_name = "LiheYoung/depth-anything-large-hf"
+
+    def __init__(self, device):
+        self.device = device
+        self.depth_model = AutoModelForDepthEstimation.from_pretrained(self.depth_model_name).to(device)
+        self.processor = AutoProcessor.from_pretrained(self.depth_model_name)
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        hw = img.shape[-2:]
+
+        img = torch.clamp(img, -1.0, 1.0)
+        img_byte = ((img + 1.0) * 127.5).byte()
+
+        img = self.processor(img_byte, return_tensors="pt")["pixel_values"]
+        depth = self.depth_model(img.to(self.device)).predicted_depth
+        depth = repeat(depth, "b h w -> b 3 h w")
+        depth = torch.nn.functional.interpolate(depth, hw, mode="bicubic", antialias=True)
+
+        depth = depth / 127.5 - 1.0
+        return depth
+
+
+class CannyImageEncoder:
+    def __init__(
         self,
-        *,
-        text_tokens,
-        image_tokens,
-        text_mask = None,
-        time_cond = None,
-        skip_feedforward_text_tokens = True
+        device,
+        min_t: int = 50,
+        max_t: int = 200,
     ):
-        assert not (exists(time_cond) ^ self.has_cond), 'time condition must be passed in if dim_cond is set at init. it should not be passed in if not set'
+        self.device = device
+        self.min_t = min_t
+        self.max_t = max_t
 
-        if self.has_cond:
-            (
-                text_pre_attn_gamma,
-                text_post_attn_gamma,
-                text_pre_ff_gamma,
-                text_post_ff_gamma,
-                image_pre_attn_gamma,
-                image_post_attn_gamma,
-                image_pre_ff_gamma,
-                image_post_ff_gamma,
-                text_pre_attn_beta,
-                text_pre_ff_beta,
-                image_pre_attn_beta,
-                image_pre_ff_beta,
-            ) = self.to_cond(time_cond).split(self.cond_dims, dim = -1)
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        assert img.shape[0] == 1, "Only batch size 1 is supported"
 
-        # attention - text branch
+        img = rearrange(img[0], "c h w -> h w c")
+        img = torch.clamp(img, -1.0, 1.0)
+        img_np = ((img + 1.0) * 127.5).numpy().astype(np.uint8)
 
-        text_tokens, add_text_residual = self.text_attn_residual_fn(text_tokens)
-        text_tokens = self.text_attn_layernorm(text_tokens)
+        # Apply Canny edge detection
+        canny = cv2.Canny(img_np, self.min_t, self.max_t)
 
-        if self.has_cond:
-            text_tokens = text_tokens * text_pre_attn_gamma + text_pre_attn_beta
+        # Convert back to torch tensor and reshape
+        canny = torch.from_numpy(canny).float() / 127.5 - 1.0
+        canny = rearrange(canny, "h w -> 1 1 h w")
+        canny = repeat(canny, "b 1 ... -> b 3 ...")
+        return canny.to(self.device)
 
-        # attention - image branch
 
-        image_tokens, add_image_residual = self.image_attn_residual_fn(image_tokens)
-        image_tokens = self.image_attn_layernorm(image_tokens)
+class ReduxImageEncoder(nn.Module):
+    siglip_model_name = "google/siglip-so400m-patch14-384"
 
-        if self.has_cond:
-            image_tokens = image_tokens * image_pre_attn_gamma + image_pre_attn_beta
+    def __init__(
+        self,
+        device,
+        redux_dim: int = 1152,
+        txt_in_features: int = 4096,
+        redux_path: str | None = os.getenv("FLUX_REDUX"),
+        dtype=torch.bfloat16,
+    ) -> None:
+        assert redux_path is not None, "Redux path must be provided"
 
-        # joint attention
+        super().__init__()
 
-        text_tokens, image_tokens = self.joint_attn(
-            inputs = (text_tokens, image_tokens),
-            masks = (text_mask, None)
+        self.redux_dim = redux_dim
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
+        self.dtype = dtype
+
+        with self.device:
+            self.redux_up = nn.Linear(redux_dim, txt_in_features * 3, dtype=dtype)
+            self.redux_down = nn.Linear(txt_in_features * 3, txt_in_features, dtype=dtype)
+
+            sd = load_sft(redux_path, device=str(device))
+            missing, unexpected = self.load_state_dict(sd, strict=False, assign=True)
+            print_load_warning(missing, unexpected)
+
+            self.siglip = SiglipVisionModel.from_pretrained(self.siglip_model_name).to(dtype=dtype)
+        self.normalize = SiglipImageProcessor.from_pretrained(self.siglip_model_name)
+
+    def __call__(self, x: Image.Image) -> torch.Tensor:
+        imgs = self.normalize.preprocess(images=[x], do_resize=True, return_tensors="pt", do_convert_rgb=True)
+
+        _encoded_x = self.siglip(**imgs.to(device=self.device, dtype=self.dtype)).last_hidden_state
+
+        projected_x = self.redux_down(nn.functional.silu(self.redux_up(_encoded_x)))
+
+        return projected_x
+    
+
+class EmbedND(nn.Module):
+    def __init__(self, dim: int, theta: int, axes_dim: list[int]):
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+        self.axes_dim = axes_dim
+
+    def forward(self, ids: Tensor) -> Tensor:
+        n_axes = ids.shape[-1]
+        emb = torch.cat(
+            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            dim=-3,
         )
 
-        if self.has_cond:
-            text_tokens = text_tokens * text_post_attn_gamma
-            image_tokens = image_tokens * image_post_attn_gamma
+        return emb.unsqueeze(1)
 
-        text_tokens = add_text_residual(text_tokens)
-        image_tokens = add_image_residual(image_tokens)
 
-        if skip_feedforward_text_tokens:
-            return text_tokens, image_tokens
+def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
+    """
+    Create sinusoidal timestep embeddings.
+    :param t: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an (N, D) Tensor of positional embeddings.
+    """
+    t = time_factor * t
+    half = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+        t.device
+    )
 
-        # feedforward - text branch
+    args = t[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    if torch.is_floating_point(t):
+        embedding = embedding.to(t)
+    return embedding
 
-        text_tokens, add_text_residual = self.text_ff_residual_fn(text_tokens)
-        text_tokens = self.text_ff_layernorm(text_tokens)
 
-        if self.has_cond:
-            text_tokens = text_tokens * text_pre_ff_gamma + text_pre_ff_beta
+class MLPEmbedder(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int):
+        super().__init__()
+        self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
+        self.silu = nn.SiLU()
+        self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
 
-        text_tokens = self.text_ff(text_tokens)
+    def forward(self, x: Tensor) -> Tensor:
+        return self.out_layer(self.silu(self.in_layer(x)))
 
-        if self.has_cond:
-            text_tokens = text_tokens * text_post_ff_gamma
 
-        text_tokens = add_text_residual(text_tokens)
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim))
 
-        # feedforward - image branch
+    def forward(self, x: Tensor):
+        x_dtype = x.dtype
+        x = x.float()
+        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        return (x * rrms).to(dtype=x_dtype) * self.scale
 
-        image_tokens, add_image_residual = self.image_ff_residual_fn(image_tokens)
-        image_tokens = self.image_ff_layernorm(image_tokens)
 
-        if self.has_cond:
-            image_tokens = image_tokens * image_pre_ff_gamma + image_pre_ff_beta
+class QKNorm(torch.nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.query_norm = RMSNorm(dim)
+        self.key_norm = RMSNorm(dim)
 
-        image_tokens = self.image_ff(image_tokens)
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        q = self.query_norm(q)
+        k = self.key_norm(k)
+        return q.to(v), k.to(v)
 
-        if self.has_cond:
-            image_tokens = image_tokens * image_post_ff_gamma
 
-        image_tokens = add_image_residual(image_tokens)
+class SelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
 
-        return text_tokens, image_tokens
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.norm = QKNorm(head_dim)
+        self.proj = nn.Linear(dim, dim)
 
-class FinalLayer(nn.Module):
-    """Final layer with adaLN modulation"""
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def forward(self, x: Tensor, pe: Tensor) -> Tensor:
+        qkv = self.qkv(x)
+        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        q, k = self.norm(q, k, v)
+        x = attention(q, k, v, pe=pe)
+        x = self.proj(x)
+        return x
+
+
+@dataclass
+class ModulationOut:
+    shift: Tensor
+    scale: Tensor
+    gate: Tensor
+
+
+class Modulation(nn.Module):
+    def __init__(self, dim: int, double: bool):
+        super().__init__()
+        self.is_double = double
+        self.multiplier = 6 if double else 3
+        self.lin = nn.Linear(dim, self.multiplier * dim, bias=True)
+
+    def forward(self, vec: Tensor) -> tuple[ModulationOut, ModulationOut | None]:
+        out = self.lin(nn.functional.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
+
+        return (
+            ModulationOut(*out[:3]),
+            ModulationOut(*out[3:]) if self.is_double else None,
+        )
+
+
+class DoubleStreamBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False):
+        super().__init__()
+
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+        self.img_mod = Modulation(hidden_size, double=True)
+        self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
+
+        self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+
+        self.txt_mod = Modulation(hidden_size, double=True)
+        self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
+
+        self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> tuple[Tensor, Tensor]:
+        img_mod1, img_mod2 = self.img_mod(vec)
+        txt_mod1, txt_mod2 = self.txt_mod(vec)
+
+        # prepare image for attention
+        img_modulated = self.img_norm1(img)
+        img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
+        img_qkv = self.img_attn.qkv(img_modulated)
+        img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+
+        # prepare txt for attention
+        txt_modulated = self.txt_norm1(txt)
+        txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
+        txt_qkv = self.txt_attn.qkv(txt_modulated)
+        txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+
+        # run actual attention
+        q = torch.cat((txt_q, img_q), dim=2)
+        k = torch.cat((txt_k, img_k), dim=2)
+        v = torch.cat((txt_v, img_v), dim=2)
+
+        attn = attention(q, k, v, pe=pe)
+        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
+
+        # calculate the img bloks
+        img = img + img_mod1.gate * self.img_attn.proj(img_attn)
+        img = img + img_mod2.gate * self.img_mlp((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift)
+
+        # calculate the txt bloks
+        txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
+        txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
+        return img, txt
+
+
+class SingleStreamBlock(nn.Module):
+    """
+    A DiT block with parallel linear layers as described in
+    https://arxiv.org/abs/2302.05442 and adapted modulation interface.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qk_scale: float | None = None,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_size
+        self.num_heads = num_heads
+        head_dim = hidden_size // num_heads
+        self.scale = qk_scale or head_dim**-0.5
+
+        self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        # qkv and mlp_in
+        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim)
+        # proj and mlp_out
+        self.linear2 = nn.Linear(hidden_size + self.mlp_hidden_dim, hidden_size)
+
+        self.norm = QKNorm(head_dim)
+
+        self.hidden_size = hidden_size
+        self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        self.mlp_act = nn.GELU(approximate="tanh")
+        self.modulation = Modulation(hidden_size, double=False)
+
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
+        mod, _ = self.modulation(vec)
+        x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
+        qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
+
+        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        q, k = self.norm(q, k, v)
+
+        # compute attention
+        attn = attention(q, k, v, pe=pe)
+        # compute activation in mlp stream, cat again and run second linear layer
+        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        return x + mod.gate * output
+
+
+class LastLayer(nn.Module):
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
-        # Ensure we always output exactly out_channels
-        self.linear = nn.Linear(hidden_size, patch_size**2 * out_channels)
-        self.patch_size = patch_size
-        self.out_channels = out_channels
-        
-        # Initialize to zero
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.linear.weight, 0)
-        nn.init.constant_(self.linear.bias, 0)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
 
-    def forward(self, x, c):
-        # Get AdaLN modulation parameters
-        hidden_size = x.shape[-1]
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        
-        # Apply modulation
-        x = modulate(self.norm_final(x), shift, scale)
-        
-        # Project to output and ensure output dimensions are consistent
-        x = self.linear(x)  # [B, N, P*P*C]
-        
-        # Optional: Verify output shape consistency
-        batch_size, n_tokens, features = x.shape
-        expected_features = self.patch_size**2 * self.out_channels
-        if features != expected_features:
-            print(f"Warning: Features dimension {features} doesn't match expected {expected_features}")
-            # Adjust by padding or truncating if needed
-            if features < expected_features:
-                pad_size = expected_features - features
-                padding = torch.zeros((batch_size, n_tokens, pad_size), device=x.device, dtype=x.dtype)
-                x = torch.cat([x, padding], dim=2)
-            else:
-                x = x[:, :, :expected_features]
-                
-        return x
-
-class ExpertMMDiT(nn.Module):
-    """Implements expert model using MMDiT blocks"""
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_dim = config.hidden_dim # Assuming hidden_dim still refers to image embedding dimension
-        self.patch_size = config.patch_size
-        self.in_channels = config.latent_channels  # VAE latent channels (16)
-        self.out_channels = config.latent_channels  # Predict latent noise
-        self.num_layers = config.num_layers
-        self.num_heads = config.num_heads
-        self.ffn_dim = config.ffn_dim
-        self.clip_embedding_dim = 768 # Assuming CLIP embedding dim is still 768
-        self.router_hidden_size = config.router_hidden_size # Assuming router_hidden_size is still relevant for conditioning
-
-        # Embeddings
-        self.x_embedder = nn.Conv2d(
-            self.in_channels,
-            self.hidden_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size
-        )
-        self.t_embedder = TimestepEmbedder(self.hidden_dim) # Use hidden_dim for time embedding dim
-
-        # Text projection - assuming text projection is still needed to project CLIP embeddings
-        self.text_projection = nn.Linear(self.clip_embedding_dim, self.router_hidden_size) # Project CLIP embeddings to router hidden dim for conditioning
-
-        # MMDiT blocks - using MMDiTBlock (renamed DiTBlock)
-        self.blocks = ModuleList([
-            MMDiTBlock( # Changed from MMDiTBlockInternal to MMDiTBlock
-                dim_image = self.hidden_dim, # Image embedding dimension
-                dim_text = self.router_hidden_size, # Corrected: Parameter name to dim_text
-                dim_cond = self.hidden_dim, # Time conditioning dimension (using hidden_dim)
-                dim_head = self.config.num_heads, # Assuming num_heads is still relevant
-                heads = self.config.num_heads, # Assuming heads is still relevant
-                qk_rmsnorm = config.qk_rmsnorm, # Assuming qk_rmsnorm is in config
-                ff_kwargs=dict(mult=self.config.ffn_dim/config.hidden_dim) # Assuming ffn_dim ratio is still relevant
-            )
-            for _ in range(self.num_layers)
-        ])
-
-        # Final layer - remains the same
-        self.final_layer = FinalLayer(self.hidden_dim, self.patch_size, self.out_channels)
-
-        # Initialize weights - remains mostly the same
-        self.initialize_weights()
-
-        # Enable gradient checkpointing - remains the same
-        self.use_gradient_checkpointing = config.use_gradient_checkpointing
-
-    def initialize_weights(self):
-        # Initialize patch embedding - remains the same
-        nn.init.xavier_uniform_(self.x_embedder.weight)
-        nn.init.zeros_(self.x_embedder.bias)
-
-        # Initialize timestep embedding MLP - using router_hidden_size now
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # Initialize text projection - remains the same
-        nn.init.normal_(self.text_projection.weight, std=0.02)
-        nn.init.zeros_(self.text_projection.bias)
-
-        # Note: Block adaLN modulation layers are already initialized in MMDiTBlock
-
-    def get_position_embeddings(self, h, w, device):
-        """Generate position embeddings for arbitrary grid sizes"""
-        grid_indices = torch.stack(torch.meshgrid(
-            torch.arange(h, device=device),
-            torch.arange(w, device=device),
-            indexing='ij'
-        ), dim=-1).float()  # [H, W, 2]
-        
-        # Calculate embeddings for each dimension
-        omega = torch.arange(self.hidden_dim // 4, device=device) / (self.hidden_dim // 4 - 1)
-        omega = 1. / (10000 ** omega)
-        
-        # Calculate embeddings
-        y_embed = grid_indices[..., 0:1] * omega
-        x_embed = grid_indices[..., 1:2] * omega
-        
-        # Combine embeddings and flatten
-        pos_embed = torch.cat([
-            torch.sin(y_embed), torch.cos(y_embed),
-            torch.sin(x_embed), torch.cos(x_embed)
-        ], dim=-1).reshape(h * w, self.hidden_dim).unsqueeze(0)  # [1, H*W, D]
-        
-        return pos_embed
-            
-    def unpatchify(self, x, h, w):
-        """Reshape patches back to image with explicit h/w dimensions"""
-        batch_size = x.shape[0]
-        
-        # Reshape to [B, H, W, patch_size, patch_size, C]
-        x = x.reshape(batch_size, h, w, self.patch_size, self.patch_size, self.out_channels)
-        
-        # Permute and reshape to image
-        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-        x = x.reshape(batch_size, self.out_channels, 
-                     h * self.patch_size, w * self.patch_size)
+    def forward(self, x: Tensor, vec: Tensor) -> Tensor:
+        shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
+        x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
+        x = self.linear(x)
         return x
     
-    def forward(self, x, t, text_embeds):
-        cond_vector = self.t_embedder(t)
 
-        # Patch embedding - remains the same
-        x = self.x_embedder(x)  # [B, D, H', W']
-        batch_size, hidden_size, h, w = x.shape
-        x = x.reshape(batch_size, hidden_size, h * w).transpose(1, 2) # [B, N, D] - Reshape to [B, N, D]
-
-        text_embeds = self.text_projection(text_embeds) # Project text embeddings - adjust if needed
-
-        # MMDiT blocks - forward pass through MMDiT blocks
-        for block in self.blocks:
-            text_embeds, x = block( # MMDiTBlock now expects and returns text_embeds and image_tokens (x)
-                image_tokens = x,
-                text_tokens = text_embeds,
-                time_cond = cond_vector, # Pass timestep conditioning
-                text_mask = None # Assuming no text mask needed for now
+def replace_linear_with_lora(
+    module: nn.Module,
+    max_rank: int,
+    scale: float = 1.0,
+) -> None:
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            new_lora = LinearLora(
+                in_features=child.in_features,
+                out_features=child.out_features,
+                bias=child.bias,
+                rank=max_rank,
+                scale=scale,
+                dtype=child.weight.dtype,
+                device=child.weight.device,
             )
 
-        x = self.final_layer(x, cond_vector) # Final layer still takes image tokens (x) and cond_vector
-        x = self.unpatchify(x, h, w) # Unpatchify to get back to image shape
-        return x
+            new_lora.weight = child.weight
+            new_lora.bias = child.bias if child.bias is not None else None
 
-    def debug_tensor_shapes(self, prefix="", **tensors):
-        """Debug tensor shapes during training"""
-        if not self.training or torch.rand(1).item() > 0.01:  # Only log occasionally during training
-            return
+            setattr(module, name, new_lora)
+        else:
+            replace_linear_with_lora(
+                module=child,
+                max_rank=max_rank,
+                scale=scale,
+            )
+
+
+class LinearLora(nn.Linear):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool,
+        rank: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        lora_bias: bool = True,
+        scale: float = 1.0,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias is not None,
+            device=device,
+            dtype=dtype,
+            *args,
+            **kwargs,
+        )
+
+        assert isinstance(scale, float), "scale must be a float"
+
+        self.scale = scale
+        self.rank = rank
+        self.lora_bias = lora_bias
+        self.dtype = dtype
+        self.device = device
+
+        if rank > (new_rank := min(self.out_features, self.in_features)):
+            self.rank = new_rank
+
+        self.lora_A = nn.Linear(
+            in_features=in_features,
+            out_features=self.rank,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.lora_B = nn.Linear(
+            in_features=self.rank,
+            out_features=out_features,
+            bias=self.lora_bias,
+            dtype=dtype,
+            device=device,
+        )
+
+    def set_scale(self, scale: float) -> None:
+        assert isinstance(scale, float), "scalar value must be a float"
+        self.scale = scale
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        base_out = super().forward(input)
+
+        _lora_out_B = self.lora_B(self.lora_A(input))
+        lora_update = _lora_out_B * self.scale
+
+        return base_out + lora_update
+
+@dataclass
+class FluxParams:
+    in_channels: int
+    out_channels: int
+    vec_in_dim: int
+    context_in_dim: int
+    hidden_size: int
+    mlp_ratio: float
+    num_heads: int
+    depth: int
+    depth_single_blocks: int
+    axes_dim: list[int]
+    theta: int
+    qkv_bias: bool
+    guidance_embed: bool
+
+
+class Flux(nn.Module):
+    """
+    Transformer model for flow matching on sequences.
+    """
+
+    def __init__(self, params: FluxParams):
+        super().__init__()
+
+        self.params = params
+        self.in_channels = params.in_channels
+        self.out_channels = params.out_channels
+        if params.hidden_size % params.num_heads != 0:
+            raise ValueError(
+                f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}"
+            )
+        pe_dim = params.hidden_size // params.num_heads
+        if sum(params.axes_dim) != pe_dim:
+            raise ValueError(f"Got {params.axes_dim} but expected positional dim {pe_dim}")
+        self.hidden_size = params.hidden_size
+        self.num_heads = params.num_heads
+        self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
+        self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
+        self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
+        self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size)
+        self.guidance_in = (
+            MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else nn.Identity()
+        )
+        self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
+
+        self.double_blocks = nn.ModuleList(
+            [
+                DoubleStreamBlock(
+                    self.hidden_size,
+                    self.num_heads,
+                    mlp_ratio=params.mlp_ratio,
+                    qkv_bias=params.qkv_bias,
+                )
+                for _ in range(params.depth)
+            ]
+        )
+
+        self.single_blocks = nn.ModuleList(
+            [
+                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
+                for _ in range(params.depth_single_blocks)
+            ]
+        )
+
+        self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
+
+    def forward(
+        self,
+        img: Tensor,
+        img_ids: Tensor,
+        txt: Tensor,
+        txt_ids: Tensor,
+        timesteps: Tensor,
+        y: Tensor,
+        guidance: Tensor | None = None,
+    ) -> Tensor:
+        if img.ndim != 3 or txt.ndim != 3:
+            raise ValueError("Input img and txt tensors must have 3 dimensions.")
+
+        # running on sequences img
+        img = self.img_in(img)
+        vec = self.time_in(timestep_embedding(timesteps, 256))
+        if self.params.guidance_embed:
+            if guidance is None:
+                raise ValueError("Didn't get guidance strength for guidance distilled model.")
+            vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
+        vec = vec + self.vector_in(y)
+        txt = self.txt_in(txt)
+
+        ids = torch.cat((txt_ids, img_ids), dim=1)
+        pe = self.pe_embedder(ids)
+
+        for block in self.double_blocks:
+            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+
+        img = torch.cat((txt, img), 1)
+        for block in self.single_blocks:
+            img = block(img, vec=vec, pe=pe)
+        img = img[:, txt.shape[1] :, ...]
+
+        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+        return img
+
+
+class FluxLoraWrapper(Flux):
+    def __init__(
+        self,
+        lora_rank: int = 128,
+        lora_scale: float = 1.0,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.lora_rank = lora_rank
+
+        replace_linear_with_lora(
+            self,
+            max_rank=lora_rank,
+            scale=lora_scale,
+        )
+
+    def set_lora_scale(self, scale: float) -> None:
+        for module in self.modules():
+            if isinstance(module, LinearLora):
+                module.set_scale(scale=scale)
+
+@dataclass
+class ExpertMMDiTParams(FluxParams):
+    num_clusters: int = 8  # Number of data clusters/experts
+    cluster_embed_dim: int = 256  # Dimension for cluster embeddings
+
+class ExpertMMDiT(Flux):
+    """Implements paper's expert specialization (Section 3.2)"""
+    def __init__(self, params: ExpertMMDiTParams):
+        super().__init__(params)
+        self.num_clusters = params.num_clusters
         
-        rank = 0
-        if torch.distributed.is_initialized():  # Check initialization first
-            rank = torch.distributed.get_rank()
+        # Cluster embedding table (Equation 5)
+        self.cluster_embed = nn.Embedding(
+            params.num_clusters, 
+            params.cluster_embed_dim
+        )
         
-        lines = [f"[Rank {rank}] {prefix} Tensor Shapes:"]
-        for name, tensor in tensors.items():
-            if tensor is None:
-                lines.append(f"  - {name}: None")
-            else:
-                lines.append(f"  - {name}: {tensor.shape}")
+        # Projection for combining cluster emb + original vector
+        self.vec_proj = nn.Linear(
+            params.vec_in_dim * 2,  # Cluster + original vector
+            params.vec_in_dim
+        )
         
-        message = "\n".join(lines)
-        print(message)
+        # Initialize with small weights to prevent abrupt changes
+        nn.init.normal_(self.cluster_embed.weight, std=0.02)
+        nn.init.zeros_(self.vec_proj.weight)
+        nn.init.zeros_(self.vec_proj.bias)
+
+    def forward(
+        self,
+        img: Tensor,
+        img_ids: Tensor,
+        txt: Tensor,
+        txt_ids: Tensor,
+        timesteps: Tensor,
+        y: Tensor,
+        cluster_ids: Tensor,  # [B] cluster indices per sample
+        guidance: Tensor | None = None,
+    ) -> Tensor:
+        # Get cluster embeddings [B, D]
+        cluster_emb = self.cluster_embed(cluster_ids)
         
-        return message 
+        # Combine with original conditioning vector
+        combined_vec = torch.cat([y, cluster_emb], dim=-1)
+        y = self.vec_proj(combined_vec)
+        
+        # Remainder of forward pass as original Flux
+        return super().forward(
+            img=img,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            timesteps=timesteps,
+            y=y,
+            guidance=guidance
+        )
