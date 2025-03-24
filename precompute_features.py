@@ -134,10 +134,28 @@ class FeatureGenerator:
 
     def run_clustering(self):
         """Global clustering after feature collection"""
-        # Load all features across ranks
+        # Wait for all ranks to finish writing
+        dist.barrier()
+        
+        # Load all features across ranks with error handling
         features = []
-        for f in (self.feature_dir/"dino_features").glob("*.pt"):
-            features.append(torch.load(f))
+        feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
+        
+        with tqdm(total=len(feature_files), desc="Loading features") as pbar:
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                futures = {executor.submit(self._safe_load_feature, f): f for f in feature_files}
+                for future in as_completed(futures):
+                    try:
+                        feat = future.result()
+                        if feat is not None:
+                            features.append(feat)
+                        pbar.update(1)
+                    except Exception as e:
+                        print(f"Skipping corrupted file: {str(e)}")
+
+        if not features:
+            raise RuntimeError("No valid features found for clustering")
+        
         full_features = torch.cat(features).numpy()
         
         # Paper's exact clustering parameters
@@ -160,6 +178,25 @@ class FeatureGenerator:
         _, labels = kmeans.index.search(full_features, 1)
         cluster_labels = agg.labels_[labels.flatten()]
         torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
+
+    def _safe_load_feature(self, path):
+        """Load features with validation and retries"""
+        try:
+            # Check file size first
+            if path.stat().st_size < 100:
+                raise ValueError(f"Corrupted small file: {path}")
+            
+            # Load with device mapping
+            data = torch.load(path, map_location='cpu')
+            
+            # Validate tensor shape
+            if data.shape != (1, 1024):
+                raise ValueError(f"Invalid feature shape {data.shape} in {path}")
+            
+            return data
+        except (EOFError, RuntimeError, ValueError) as e:
+            print(f"Failed to load {path}: {str(e)}")
+            return None
 
     def _get_bucket_index(self, width, height):
         """Find best matching bucket using config parameters"""
