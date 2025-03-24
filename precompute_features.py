@@ -21,6 +21,8 @@ from concurrent.futures import as_completed
 from collections import defaultdict
 from tqdm.auto import tqdm
 import shutil
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 class UnifiedPreprocessor:
     def __init__(self, config):
@@ -53,6 +55,9 @@ class UnifiedPreprocessor:
         # Add memory cleanup before graph capture
         torch.cuda.empty_cache()
         self._capture_cuda_graphs()
+
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
 
     def _create_directories(self):
         """Create all required feature directories"""
@@ -220,20 +225,28 @@ class UnifiedPreprocessor:
             return self.clip.encode([caption]).cpu()
 
     def _save_features(self, base_name, features):
-        """Save all features with UUID-based filenames"""
-        torch.save(features['latent'], f"{self.feature_dir}/latents/{base_name}.pt")
-        torch.save(features['clip'], f"{self.feature_dir}/clip/{base_name}.pt")
-        torch.save(features['dims'], f"{self.feature_dir}/dims/{base_name}.pt")
-        torch.save(features['dino'], f"{self.feature_dir}/dino_features/{base_name}.pt")
+        """Add rank-specific filenames for collision avoidance"""
+        rank_suffix = f"_rank{self.rank}"
+        torch.save(features['latent'], f"{self.feature_dir}/latents/{base_name}{rank_suffix}.pt")
+        torch.save(features['clip'], f"{self.feature_dir}/clip/{base_name}{rank_suffix}.pt")
+        torch.save(features['dims'], f"{self.feature_dir}/dims/{base_name}{rank_suffix}.pt")
+        torch.save(features['dino'], f"{self.feature_dir}/dino_features/{base_name}{rank_suffix}.pt")
 
     def run_clustering(self):
         """Add clustering progress tracking"""
         dino_features = self._load_dino_features()
         
+        # After local clustering
+        gathered_features = [torch.zeros_like(dino_features) for _ in range(self.world_size)]
+        dist.all_gather(gathered_features, dino_features)
+        
+        full_features = torch.cat(gathered_features)
+        # Proceed with clustering on full dataset
+        
         # Stage 1: Fine-grained KMeans with paper settings
         print("Performing fine-grained KMeans clustering...")
         kmeans = faiss.Kmeans(
-            dino_features.shape[1],
+            full_features.shape[1],
             self.config.num_fine_clusters,  # Should be 1024 per paper
             niter=100,
             gpu=True,
@@ -249,7 +262,7 @@ class UnifiedPreprocessor:
                 pbar.update(1)
                 pbar.set_postfix({"iteration": it+1, "status": "Optimizing"})
                 
-            kmeans.train(dino_features, callback=kmeans_callback)
+            kmeans.train(full_features, callback=kmeans_callback)
         
         # Stage 2: Hierarchical clustering with balanced merging
         print("Performing hierarchical clustering...")
@@ -267,7 +280,7 @@ class UnifiedPreprocessor:
             pbar.update(1)
             
             pbar.set_postfix({"status": "Assigning Clusters"})
-            _, fine_labels = kmeans.index.search(dino_features, 1)
+            _, fine_labels = kmeans.index.search(full_features, 1)
             pbar.update(1)
             
             pbar.set_postfix({"status": "Merging Clusters"})
@@ -379,39 +392,49 @@ class UnifiedPreprocessor:
             self.vae_cuda_graph = None
 
 def main():
-    # Clean existing feature directories
+    # Load config first
     config = get_config()
-    dirs = ['latents', 'clip', 'clusters', 'dims', 'dino_features']
-    for d in dirs:
-        shutil.rmtree(Path(config.feature_cache_path)/d, ignore_errors=True)
-        (Path(config.feature_cache_path)/d).mkdir(parents=True, exist_ok=True)
     
-    preprocessor = UnifiedPreprocessor(config)
+    # Initialize distributed processing
+    dist.init_process_group(backend='nccl')
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     
-    # Discover all potential images
-    raw_images = [str(p) for p in Path(config.dataset_path).rglob('*') 
+    # Clean directories only on main process
+    if rank == 0:
+        dirs = ['latents', 'clip', 'clusters', 'dims', 'dino_features']
+        for d in dirs:
+            shutil.rmtree(Path(config.feature_cache_path)/d, ignore_errors=True)
+            (Path(config.feature_cache_path)/d).mkdir(parents=True, exist_ok=True)
+    dist.barrier()
+
+    # Split dataset across GPUs
+    all_images = [str(p) for p in Path(config.dataset_path).rglob('*') 
                  if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
+    chunk_size = len(all_images) // world_size
+    local_images = all_images[rank*chunk_size : (rank+1)*chunk_size]
+
+    # Process local shard
+    preprocessor = UnifiedPreprocessor(config)
+    local_valid = preprocessor._validate_image_caption_pairs(local_images)
     
-    # Validate pairs before processing
-    valid_images = preprocessor._validate_image_caption_pairs(raw_images)
+    with tqdm(total=len(local_valid), desc=f"GPU {rank} Progress", position=rank) as pbar:
+        for img_path in local_valid:
+            try:
+                success = preprocessor.process_image(img_path)
+                pbar.update(1)
+                pbar.set_postfix({"success_rate": pbar.n/(pbar.n + pbar.last_print_n)}) 
+            except Exception as e:
+                print(f"Rank {rank} failed on {img_path}: {str(e)}")
     
-    # Global progress tracking
-    with tqdm(total=len(valid_images), desc="Total Progress") as main_pbar:
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(preprocessor.process_image, p): p 
-                      for p in valid_images}
-            
-            for future in as_completed(futures):
-                main_pbar.update(1)
-                result = future.result()
-                main_pbar.set_postfix({
-                    "completed": main_pbar.n,
-                    "remaining": len(valid_images) - main_pbar.n
-                })
+    # Synchronize after processing
+    dist.barrier()
     
-    # Post-processing validation
-    preprocessor.validate_dataset()
-    preprocessor.run_clustering()
+    # Only rank 0 does clustering
+    if rank == 0:
+        preprocessor.run_clustering()
+    
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     main() 
