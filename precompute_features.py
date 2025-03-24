@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from concurrent.futures import as_completed
 from collections import defaultdict
+from tqdm.auto import tqdm
 
 class UnifiedPreprocessor:
     def __init__(self, config):
@@ -150,8 +151,11 @@ class UnifiedPreprocessor:
             return path, False
 
     def process_image(self, img_path):
-        """Process with pair validation and deterministic UUIDs"""
+        """Add individual progress tracking"""
         try:
+            # Initialize per-image progress
+            pbar = tqdm(total=4, desc=f"Processing {Path(img_path).name}", leave=False)
+            
             # Generate deterministic UUID from image-caption pair
             with open(img_path, 'rb') as f:
                 img_hash = hashlib.md5(f.read()).hexdigest()
@@ -166,6 +170,7 @@ class UnifiedPreprocessor:
                 (Path(self.feature_dir)/ext/f"{base_name}.pt").exists()
                 for ext in ["latents", "clip", "dims", "dino_features"]
             ):
+                pbar.close()
                 return True
             
             # Load caption text
@@ -181,10 +186,27 @@ class UnifiedPreprocessor:
                     'dims': torch.tensor(img.size, dtype=torch.int16)
                 }
             
+            pbar.update(1)
+            pbar.set_postfix({"stage": "DINO Features"})
+            features['dino'] = self._extract_dino_features(img)
+            
+            pbar.update(1)
+            pbar.set_postfix({"stage": "VAE Encoding"})
+            features['latent'] = self._extract_vae_latent(img)
+            
+            pbar.update(1)
+            pbar.set_postfix({"stage": "CLIP Embedding"})
+            features['clip'] = self._extract_clip_embedding(caption)
+            
+            pbar.update(1)
+            pbar.set_postfix({"stage": "Saving"})
             self._save_features(base_name, features)
+            
+            pbar.close()
             return True
             
         except Exception as e:
+            pbar.close()
             # Clean up any partial features
             for ext in ["latents", "clip", "dims", "dino_features"]:
                 (Path(self.feature_dir)/ext/f"{base_name}.pt").unlink(missing_ok=True)
@@ -230,7 +252,7 @@ class UnifiedPreprocessor:
         torch.save(features['dino'], f"{self.feature_dir}/dino_features/{base_name}.pt")
 
     def run_clustering(self):
-        """Improved two-stage clustering with paper parameters"""
+        """Add clustering progress tracking"""
         dino_features = self._load_dino_features()
         
         # Stage 1: Fine-grained KMeans with paper settings
@@ -245,7 +267,14 @@ class UnifiedPreprocessor:
             max_points_per_centroid=10000,
             nredo=3  # Paper uses 3 restarts
         )
-        kmeans.train(dino_features)
+        
+        # Stage 1: KMeans with progress
+        with tqdm(total=100, desc="KMeans Clustering") as pbar:
+            def kmeans_callback(it):
+                pbar.update(1)
+                pbar.set_postfix({"iteration": it+1, "status": "Optimizing"})
+                
+            kmeans.train(dino_features, callback=kmeans_callback)
         
         # Stage 2: Hierarchical clustering with balanced merging
         print("Performing hierarchical clustering...")
@@ -255,17 +284,32 @@ class UnifiedPreprocessor:
             metric='cosine',
             compute_full_tree=True  # Paper recommends full tree for balance
         )
-        agg.fit(kmeans.centroids)
         
-        # Paper's assignment strategy (section 4.1)
-        _, fine_labels = kmeans.index.search(dino_features, 1)
-        cluster_labels = agg.labels_[fine_labels.flatten()]
+        # Stage 2: Hierarchical clustering
+        with tqdm(total=3, desc="Hierarchical Clustering") as pbar:
+            pbar.set_postfix({"status": "Building Tree"})
+            agg.fit(kmeans.centroids)
+            pbar.update(1)
+            
+            pbar.set_postfix({"status": "Assigning Clusters"})
+            _, fine_labels = kmeans.index.search(dino_features, 1)
+            pbar.update(1)
+            
+            pbar.set_postfix({"status": "Merging Clusters"})
+            cluster_labels = agg.labels_[fine_labels.flatten()]
+            pbar.update(1)
+        
         self._save_clusters(cluster_labels)
 
     def _load_dino_features(self):
-        """Load all DINO features for clustering"""
+        """Add loading progress"""
         feature_files = list((Path(self.feature_dir)/"dino_features").glob("*.pt"))
-        return torch.cat([torch.load(f) for f in tqdm(feature_files, desc="Loading DINO features")])
+        features = []
+        with tqdm(total=len(feature_files), desc="Loading Features") as pbar:
+            for f in feature_files:
+                features.append(torch.load(f))
+                pbar.update(1)
+        return torch.cat(features)
 
     def _save_clusters(self, labels):
         """Save cluster assignments with UUID mapping"""
@@ -274,18 +318,22 @@ class UnifiedPreprocessor:
             torch.save(torch.tensor(label), f"{self.feature_dir}/clusters/{f.stem}.pt")
 
     def validate_dataset(self):
-        """Ensure 1:1 correspondence of all features"""
+        """Add validation progress"""
+        cluster_files = list((Path(self.feature_dir)/"clusters").glob("*.pt"))
         valid = 0
-        for f in tqdm((Path(self.feature_dir)/"latents").glob("*.pt"), desc="Validating"):
-            base = f.stem
-            required = [
-                f"{self.feature_dir}/clip/{base}.pt",
-                f"{self.feature_dir}/clusters/{base}.pt",
-                f"{self.feature_dir}/dims/{base}.pt"
-            ]
-            if all(os.path.exists(p) for p in required):
-                valid += 1
-        print(f"Dataset validation: {valid} complete samples")
+        
+        with tqdm(total=len(cluster_files), desc="Validating Files") as pbar:
+            for f in cluster_files:
+                base = f.stem
+                required = [
+                    f"{self.feature_dir}/clip/{base}.pt",
+                    f"{self.feature_dir}/clusters/{base}.pt",
+                    f"{self.feature_dir}/dims/{base}.pt"
+                ]
+                if all(os.path.exists(p) for p in required):
+                    valid += 1
+                pbar.update(1)
+                pbar.set_postfix({"valid": valid})
 
     def process_batch(self, img_batch, caption_batch):
         # Overlap preprocessing and model execution
@@ -304,28 +352,25 @@ class UnifiedPreprocessor:
         self._save_features_async(latents, clip_embs)
 
     def _capture_cuda_graphs(self):
-        """Capture static computation graphs for model inference"""
+        """Add CUDA graph progress"""
         if self.config.use_cuda_graphs:
-            try:
-                static_input = torch.randn(1, 3, 256, 256, device='cuda', dtype=self.dtype)
-                self.vae_cuda_graph = torch.cuda.CUDAGraph()
-                
+            with tqdm(total=3, desc="Optimizing VAE") as pbar:
+                pbar.set_postfix({"stage": "Warmup"})
                 # Warmup before capture
                 with torch.cuda.stream(torch.cuda.Stream()):
-                    _ = self.vae.encode(static_input)
+                    _ = self.vae.encode(torch.randn(1, 3, 256, 256, device='cuda', dtype=self.dtype))
+                pbar.update(1)
                 
-                # Clear memory cache before capture
+                pbar.set_postfix({"stage": "Memory Cleanup"})
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+                pbar.update(1)
                 
+                pbar.set_postfix({"stage": "Capturing Graph"})
                 # Actual capture
                 with torch.cuda.graph(self.vae_cuda_graph):
-                    self.static_vae_output = self.vae.encode(static_input)
-            
-            except RuntimeError as e:
-                print(f"CUDA graph capture failed: {str(e)}")
-                print("Falling back to standard VAE inference without graphs")
-                self.vae_cuda_graph = None
+                    self.static_vae_output = self.vae.encode(torch.randn(1, 3, 256, 256, device='cuda', dtype=self.dtype))
+                pbar.update(1)
         else:
             self.vae_cuda_graph = None
 
@@ -342,10 +387,19 @@ def main():
     # Validate pairs before processing
     valid_images = preprocessor._validate_image_caption_pairs(raw_images)
     
-    # Process only validated pairs
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(preprocessor.process_image, p) for p in valid_images]
-        results = [f.result() for f in tqdm(futures, desc="Processing images")]
+    # Global progress tracking
+    with tqdm(total=len(valid_images), desc="Total Progress") as main_pbar:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(preprocessor.process_image, p): p 
+                      for p in valid_images}
+            
+            for future in as_completed(futures):
+                main_pbar.update(1)
+                result = future.result()
+                main_pbar.set_postfix({
+                    "completed": main_pbar.n,
+                    "remaining": len(valid_images) - main_pbar.n
+                })
     
     # Post-processing validation
     preprocessor.validate_dataset()
