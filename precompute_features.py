@@ -66,6 +66,9 @@ class FeatureGenerator:
 
             # Process regardless of existing files
             with Image.open(img_path) as img:
+                # Convert to RGB if needed
+                if img.mode in ('RGBA', 'LA'):
+                    img = img.convert('RGB')
                 orig_w, orig_h = img.size
                 # Calculate nearest bucket
                 bucket_idx = self._get_bucket_index(orig_w, orig_h)
@@ -86,7 +89,9 @@ class FeatureGenerator:
 
     def _extract_vae_latent(self, img):
         """Direct latent encoding without caching"""
-        img_tensor = transforms.ToTensor()(img.resize((512, 512))).unsqueeze(0).to(self.device)
+        # Ensure RGB and proper tensor format
+        img_rgb = img.convert('RGB')
+        img_tensor = transforms.ToTensor()(img_rgb.resize((512, 512))).unsqueeze(0).to(self.device)
         with torch.no_grad():
             return self.vae.encode(img_tensor).cpu()
 
