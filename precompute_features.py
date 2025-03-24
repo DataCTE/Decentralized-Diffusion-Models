@@ -24,6 +24,18 @@ import shutil
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datetime import datetime, timedelta
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+class ImageDataset(Dataset):
+    def __init__(self, image_paths):
+        self.image_paths = image_paths
+        
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        return self.image_paths[idx]
 
 class FeatureGenerator:
     def __init__(self, config):
@@ -32,10 +44,15 @@ class FeatureGenerator:
         self.world_size = dist.get_world_size()
         self.device = torch.device(f'cuda:{self.rank}')
         
-        # Initialize models directly without safety checks
-        self.vae = VAEWrapper(self.device, config)
-        self.clip = CLIPTextEncoder(self.device, config)
-        self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).eval()
+        # Add batch processing parameters
+        self.batch_size = 16  # Adjust based on GPU memory
+        self.num_workers = 8  # Number of parallel CPU workers
+        self.prefetch_factor = 2  # Number of batches to prefetch
+        
+        # Initialize models with mixed precision
+        self.vae = VAEWrapper(self.device, config).half()
+        self.clip = CLIPTextEncoder(self.device, config).half()
+        self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).half().eval()
         
         # Create feature directories aggressively
         self.feature_dir = Path(config.feature_cache_path)
@@ -56,79 +73,86 @@ class FeatureGenerator:
         # Wait for rank 0 to finish setup
         dist.barrier()
 
-    def process_image(self, img_path):
-        """Handle corrupt images and grayscale conversions"""
+    def process_batch(self, batch_paths):
+        """Process a batch of images in parallel"""
+        batch_data = []
+        valid_paths = []
+        
+        # Parallel loading and validation
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = {executor.submit(self._load_and_validate, p): p for p in batch_paths}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    valid_paths.append(result[0])
+                    batch_data.append(result[1])
+        
+        if not valid_paths:
+            return 0
+
+        # Batch processing
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            # Process VAE in batch
+            img_tensors = torch.cat([d['img'] for d in batch_data])
+            latents = self.vae.encode(img_tensors).cpu()
+            
+            # Process CLIP in batch
+            texts = [d['text'] for d in batch_data]
+            clip_embeds = self.clip.encode(texts).cpu()
+            
+            # Process DINO in batch
+            dino_imgs = torch.cat([d['dino_img'] for d in batch_data])
+            dino_features = self.dino(dino_imgs).cpu()
+        
+        # Parallel saving
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            for i, path in enumerate(valid_paths):
+                features = {
+                    'latent': latents[i],
+                    'clip': clip_embeds[i],
+                    'dino': dino_features[i],
+                    'dims': batch_data[i]['dims'],
+                    'bucket': batch_data[i]['bucket']
+                }
+                executor.submit(self._save_features, path, features)
+        
+        return len(valid_paths)
+
+    def _load_and_validate(self, img_path):
+        """Parallel loading and preprocessing"""
         try:
-            # Check for caption file first
             caption_path = Path(img_path).with_suffix('.txt')
             if not caption_path.exists():
-                return False
-            
-            # Generate deterministic UUID
-            with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
-                img_hash = hashlib.md5(f.read()).hexdigest()
-                text_hash = hashlib.md5(cf.read()).hexdigest()
-            
-            base_name = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
+                return None
 
-            # Process regardless of existing files
+            # Load and preprocess image
             with Image.open(img_path) as img:
-                # Handle corrupt images and various color modes
-                img = img.convert('RGB')  # Force RGB conversion for all images
+                img = img.convert('RGB')
                 orig_w, orig_h = img.size
                 
-                # Calculate nearest bucket
-                bucket_idx = self._get_bucket_index(orig_w, orig_h)
-                features = {
-                    'latent': self._extract_vae_latent(img),
-                    'clip': self._extract_clip_embedding(caption_path.read_text()),
-                    'dino': self._extract_dino_features(img),
-                    'dims': torch.tensor(img.size, dtype=torch.int16),
-                    'bucket': torch.tensor(bucket_idx, dtype=torch.int16)
+                # VAE preprocessing
+                vae_img = transforms.ToTensor()(img.resize((512, 512))).unsqueeze(0)
+                
+                # DINO preprocessing
+                dino_img = transforms.Compose([
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])(img).unsqueeze(0)
+
+            return (
+                img_path,
+                {
+                    'img': vae_img,
+                    'text': caption_path.read_text(),
+                    'dino_img': dino_img,
+                    'dims': torch.tensor([orig_w, orig_h], dtype=torch.int16),
+                    'bucket': self._get_bucket_index(orig_w, orig_h)
                 }
-            
-            # Save with rank-specific naming
-            self._save_features(base_name, features)
-            return True
+            )
         except Exception as e:
-            print(f"Rank {self.rank} failed {img_path}: {str(e)}", flush=True)
-            return False
-
-    def _extract_vae_latent(self, img):
-        """Direct latent encoding without caching"""
-        # Ensure RGB and proper tensor format
-        img_rgb = img.convert('RGB')
-        img_tensor = transforms.ToTensor()(img_rgb.resize((512, 512))).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            return self.vae.encode(img_tensor).cpu()
-
-    def _extract_clip_embedding(self, caption):
-        """Raw text embedding without validation"""
-        with torch.no_grad():
-            return self.clip.encode([caption]).cpu()
-
-    def _extract_dino_features(self, img):
-        """Robust DINO feature extraction with channel validation"""
-        try:
-            # Convert to RGB tensor with 3 channels
-            img_rgb = img.convert('RGB')
-            prep_img = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),  # Handle grayscale
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])(img_rgb).unsqueeze(0).to(self.device)
-            
-            # Validate channel dimensions
-            if prep_img.shape[1] != 3:
-                raise ValueError(f"Invalid channel count: {prep_img.shape[1]}")
-            
-            with torch.no_grad():
-                return self.dino(prep_img).cpu()
-        except Exception as e:
-            print(f"DINO extraction failed: {str(e)}")
-            return torch.zeros(1, 1024)  # Return zero features for corrupt images
+            return None
 
     def _save_features(self, base_name, features):
         """Force-save features with rank ID"""
@@ -238,13 +262,21 @@ class FeatureGenerator:
         return min(distances)[1]
 
 def main():
-    # Initialize distributed processing with explicit device mapping
+    # Initialize distributed processing with explicit NCCL settings
     rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(rank)
+    
+    # Configure NCCL environment variables
+    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+    os.environ['NCCL_SOCKET_TIMEOUT'] = '600000'  # 10 minute timeout
+    os.environ['NCCL_BLOCKING_WAIT'] = '1'
+    
     dist.init_process_group(
         backend='nccl',
-        init_method='env://',
-        timeout=timedelta(seconds=30)  # Add timeout
+        init_method='tcp://127.0.0.1:54321',  # Explicit TCP init
+        world_size=int(os.environ['WORLD_SIZE']),
+        rank=rank,
+        timeout=timedelta(minutes=90)  # Increased timeout
     )
     
     config = get_config()
@@ -258,15 +290,27 @@ def main():
     chunk = len(all_images) // dist.get_world_size()
     local_images = all_images[rank*chunk : (rank+1)*chunk]
     
-    # Process with device-aware progress
-    with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
-        for img_path in local_images:
-            if processor.process_image(img_path):
-                pbar.update(1)
+    # Create optimized data loader
+    dataset = ImageDataset(local_images)
+    sampler = DistributedSampler(dataset, shuffle=False)
+    loader = DataLoader(
+        dataset,
+        batch_size=processor.batch_size,
+        sampler=sampler,
+        num_workers=processor.num_workers,
+        prefetch_factor=processor.prefetch_factor,
+        pin_memory=True
+    )
+    
+    # Process with batched pipeline
+    with tqdm(total=len(dataset), desc=f"GPU {rank}", position=rank) as pbar:
+        for batch in loader:
+            processed = processor.process_batch(batch)
+            pbar.update(processed)
     
     # Synchronize with device specification
     if dist.get_world_size() > 1:
-        dist.barrier(device_ids=[rank])  # Explicit device ID
+        dist.barrier(device_ids=[rank], async_op=False)  # Explicit device sync
     
     # Cluster on rank 0 with error handling
     if rank == 0:
