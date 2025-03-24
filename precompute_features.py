@@ -252,7 +252,7 @@ def main():
         init_method='tcp://127.0.0.1:54321',  # Explicit TCP init
         world_size=int(os.environ['WORLD_SIZE']),
         rank=rank,
-        timeout=timedelta(minutes=90)  # Increased timeout
+        timeout=timedelta(minutes=3)  # Increased timeout
     )
     
     config = get_config()
@@ -266,32 +266,39 @@ def main():
     chunk = len(all_images) // dist.get_world_size()
     local_images = all_images[rank*chunk : (rank+1)*chunk]
     
-    # Process with device-aware progress
-    with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
-        try:
+    try:
+        # Main processing loop
+        with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
             for img_path in local_images:
                 if processor.process_image(img_path):
                     pbar.update(1)
-        except Exception as e:
-            print(f"Rank {rank} failed: {str(e)}")
-            dist.destroy_process_group()
-            raise
-    
-    # Synchronize with device specification
-    if dist.get_world_size() > 1:
-        dist.barrier(device_ids=[rank], async_op=False)  # Explicit device sync
-    
-    # Cluster on rank 0 with error handling
-    if rank == 0:
-        try:
-            processor.run_clustering()
-        except Exception as e:
-            print(f"Clustering failed: {str(e)}")
-            dist.destroy_process_group()
-            raise
-    
-    # Graceful shutdown
-    dist.destroy_process_group()
+
+        # Add final completion marker per rank
+        torch.save({'status': 'done'}, processor.feature_dir/f"status_rank{rank}.pt")
+        
+        # Wait for all ranks to finish processing
+        if dist.get_world_size() > 1:
+            dist.barrier()
+
+        # Cluster only after all ranks confirm completion
+        if rank == 0:
+            # Check all status files exist first
+            all_done = all((processor.feature_dir/f"status_rank{r}.pt").exists() 
+                         for r in range(dist.get_world_size()))
+            
+            if all_done:
+                processor.run_clustering()
+            else:
+                raise RuntimeError("Not all ranks completed processing")
+
+    except Exception as e:
+        print(f"Rank {rank} failed: {str(e)}")
+    finally:
+        # Cleanup status files
+        if rank == 0:
+            for r in range(dist.get_world_size()):
+                (processor.feature_dir/f"status_rank{r}.pt").unlink(missing_ok=True)
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main() 
