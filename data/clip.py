@@ -12,6 +12,7 @@ class CLIPTextEncoder:
     def __init__(self, device, config):
         self.device = device
         self.config = config
+        self.precision = torch.float16 if config.use_mixed_precision else torch.float32
         
         # Handle model loading paths
         clip_model_path = config.clip_model
@@ -23,10 +24,11 @@ class CLIPTextEncoder:
         
         try:
             # Load CLIP text encoder from config
-            self.text_encoder = CLIPTextModel.from_pretrained(
-                clip_model_path,
-                torch_dtype=torch.float16 if hasattr(config, 'use_mixed_precision') and config.use_mixed_precision else torch.float32
-            ).to(device)
+            self.model = CLIPTextModel.from_pretrained(clip_model_path).to(device)
+            self.model.eval()
+            
+            if config.use_mixed_precision:
+                self.model.half()
             
             # Load tokenizer - try both specialized CLIP tokenizer and AutoTokenizer
             try:
@@ -37,8 +39,7 @@ class CLIPTextEncoder:
                 self.tokenizer = AutoTokenizer.from_pretrained(clip_model_path)
             
             # Set to evaluation mode and freeze parameters
-            self.text_encoder.eval()
-            for param in self.text_encoder.parameters():
+            for param in self.model.parameters():
                 param.requires_grad_(False)
                 
             logger.info(f"CLIP text encoder loaded successfully")
@@ -50,47 +51,10 @@ class CLIPTextEncoder:
             logger.error(f"Error loading CLIP: {str(e)}")
             raise RuntimeError(f"Failed to load CLIP: {str(e)}")
             
-    def encode(self, prompts, return_pooled=False):
-        """
-        Encode text prompts to embeddings
-        
-        Args:
-            prompts: List of text prompts or single text prompt
-            return_pooled: Whether to return pooled embeddings (for classifier-free guidance)
-            
-        Returns:
-            Text embeddings tensor or tuple of (embeddings, pooled_embeddings)
-        """
-        if isinstance(prompts, str):
-            prompts = [prompts]
-            
-        with torch.no_grad():
-            # Tokenize and move to device
-            text_inputs = self.tokenizer(
-                prompts, 
-                padding="max_length", 
-                max_length=self.max_length, 
-                truncation=True, 
-                return_tensors="pt"
-            ).to(self.device)
-            
-            # Get text embeddings from CLIP
-            if return_pooled:
-                outputs = self.text_encoder(**text_inputs, output_hidden_states=True)
-                # Get both sequence embeddings and pooled embedding
-                text_embeddings = outputs.last_hidden_state
-                pooled_embeddings = outputs.pooler_output
-                
-                # Return embeddings in float16 format for consistency
-                return (
-                    text_embeddings.to(dtype=torch.float16 if hasattr(self.config, 'use_mixed_precision') and self.config.use_mixed_precision else torch.float32),
-                    pooled_embeddings.to(dtype=torch.float16 if hasattr(self.config, 'use_mixed_precision') and self.config.use_mixed_precision else torch.float32)
-                )
-            else:
-                text_embeddings = self.text_encoder(**text_inputs).last_hidden_state
-                
-                # Return embeddings in appropriate format for consistency
-                return text_embeddings.to(dtype=torch.float16 if hasattr(self.config, 'use_mixed_precision') and self.config.use_mixed_precision else torch.float32)
+    def encode(self, text):
+        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+            inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+            return self.model(inputs.input_ids.to(self.device)).last_hidden_state.to(torch.float32)
     
     def encode_with_uncond(self, prompts):
         """

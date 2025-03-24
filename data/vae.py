@@ -12,6 +12,7 @@ class VAEWrapper:
     def __init__(self, device, config):
         self.device = device
         self.config = config
+        self.precision = torch.float16 if config.use_mixed_precision else torch.float32
         
         # Handle model loading paths
         vae_model_path = config.vae_model
@@ -23,16 +24,13 @@ class VAEWrapper:
         
         try:
             # Load VAE from specified repository
-            self.vae = AutoencoderKL.from_pretrained(
-                vae_model_path,
-                torch_dtype=torch.float16 if hasattr(config, 'use_mixed_precision') and config.use_mixed_precision else torch.float32
-            ).to(device)
+            self.model = AutoencoderKL.from_pretrained(vae_model_path).to(device)
+            self.model.eval()
             
-            # Set to evaluation mode and freeze parameters
-            self.vae.eval()
-            for param in self.vae.parameters():
-                param.requires_grad_(False)
-                
+            # Explicitly convert model weights to match precision
+            if config.use_mixed_precision:
+                self.model.half()
+            
             # VAE scaling factor (commonly used with Stable Diffusion VAEs)
             self.scaling_factor = getattr(config, 'vae_scaling_factor', 0.18215)
             
@@ -42,40 +40,10 @@ class VAEWrapper:
             logger.error(f"Error loading VAE: {str(e)}")
             raise RuntimeError(f"Failed to load VAE: {str(e)}")
             
-    def encode(self, images):
-        """
-        Encode images to latent space
-        
-        Args:
-            images: [B, C, H, W] tensor of images in range [-1, 1]
-            
-        Returns:
-            [B, C, H/8, W/8] tensor of latents
-        """
-        # Add graph-safe memory handling
-        if images.device != self.device:
-            images = images.to(self.device)
-            
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=images.dtype == torch.float16):
-            # Handle potential OOM by processing in batches if needed
-            if images.shape[0] > 8 and hasattr(self.config, 'vae_batch_size'):
-                # Process in batches to avoid OOM
-                batch_size = self.config.vae_batch_size
-                latents = []
-                
-                for i in range(0, images.shape[0], batch_size):
-                    batch_images = images[i:i+batch_size]
-                    batch_latents = self.vae.encode(batch_images).latent_dist.sample()
-                    latents.append(batch_latents)
-                    
-                latents = torch.cat(latents, dim=0)
-            else:
-                # Process all images at once
-                latents = self.vae.encode(images).latent_dist.sample()
-                
-            # Scale latents according to VAE convention
-            latents = latents * self.scaling_factor
-            return latents
+    def encode(self, x):
+        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+            x = x.to(self.device, dtype=self.precision)
+            return self.model.encode(x).latent_dist.sample().to(torch.float32)
     
     def decode(self, latents):
         """
@@ -103,13 +71,13 @@ class VAEWrapper:
                 
                 for i in range(0, latents.shape[0], batch_size):
                     batch_latents = latents[i:i+batch_size]
-                    batch_images = self.vae.decode(batch_latents).sample
+                    batch_images = self.model.decode(batch_latents).sample
                     images.append(batch_images)
                     
                 images = torch.cat(images, dim=0)
             else:
                 # Process all latents at once
-                images = self.vae.decode(latents).sample
+                images = self.model.decode(latents).sample
                 
             return images
             

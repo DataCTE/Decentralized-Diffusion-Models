@@ -50,14 +50,18 @@ class FeatureGenerator:
             dir_path.mkdir(parents=True)
 
     def process_image(self, img_path):
-        """Process image without any existence checks"""
+        """Handle mixed precision and missing captions"""
         try:
-            # Generate deterministic UUID
-            with open(img_path, 'rb') as f:
-                img_hash = hashlib.md5(f.read()).hexdigest()
+            # Check for caption file first
             caption_path = Path(img_path).with_suffix('.txt')
-            with open(caption_path, 'rb') as f:
-                text_hash = hashlib.md5(f.read()).hexdigest()
+            if not caption_path.exists():
+                return False
+            
+            # Generate deterministic UUID
+            with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
+                img_hash = hashlib.md5(f.read()).hexdigest()
+                text_hash = hashlib.md5(cf.read()).hexdigest()
+            
             base_name = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
 
             # Process regardless of existing files
