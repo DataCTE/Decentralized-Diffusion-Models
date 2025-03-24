@@ -81,8 +81,12 @@ class UnifiedPreprocessor:
         # Stage 2: Set intersection using bitmask operations
         valid_mask = self._vectorized_intersection(image_stems, caption_stems)
         
+        # Convert NumPy array to list before indexing
+        valid_indices = np.where(valid_mask)[0]
+        valid_images = [image_paths[i] for i in valid_indices]
+        
         # Stage 3: Batched content validation using memory mapping
-        return self._batched_content_validation(image_paths[valid_mask])
+        return self._batched_content_validation(valid_images)
 
     def _batch_discovery(self, image_paths):
         """Matrix-based file discovery with SIMD optimizations"""
