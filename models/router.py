@@ -48,8 +48,12 @@ class RouterModel(nn.Module):
         # Timestep embedding
         self.time_embedder = TimestepEmbedder(config.router_hidden_size)
         
-        # Text embedding projection
-        self.text_embed_proj = nn.Linear(config.clip_embedding_dim, config.router_hidden_size)
+        # Text embedding projection - add sequence dimension handling
+        self.text_embed_proj = nn.Sequential(
+            nn.Linear(config.clip_embedding_dim, config.router_hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.router_hidden_size, config.router_hidden_size)
+        )
         
         # Attention blocks (simplified compared to the DiT)
         self.blocks = nn.ModuleList([
@@ -103,46 +107,33 @@ class RouterModel(nn.Module):
         # Patch embedding
         x = self.embedder(x)  # [B, D, H', W']
         
-        # Spatial attention processing with manual softmax
-        attn_features = self.spatial_attention(x)  # [B, D, H', W']
-        x = attn_features.mean(dim=(2, 3))  # Global average pooling to [B, D]
-        #print(f"Shape of x after pooling: {x.shape}")
-        x = x.reshape(batch_size, -1)  # Ensure x is [B, D] after spatial pooling - still keep reshape for safety
+        # Spatial attention processing
+        attn_features = self.spatial_attention(x)
+        x = attn_features.mean(dim=(2, 3))  # [B, D]
         
-        # Timestep embedding - ensure float dtype
-        t_float = t.float() if t.dtype != torch.float32 else t
-        t_float = t_float.to(self.time_embedder.mlp[0].weight.dtype)
-        t_emb = self.time_embedder(t_float)  # [B, D] - Removed unsqueeze here
+        # Timestep embedding
+        t_emb = self.time_embedder(t.float())  # [B, D]
+        x = x + t_emb
+
+        # Text embedding integration with sequence reduction
+        text_emb = self.text_embed_proj(text_embeddings.mean(dim=1))  # [B, D]
+        x = x + text_emb
+
+        # Prepare for transformer
+        x = x.unsqueeze(1)  # [B, 1, D]
         
-        # Add timestep information
-        x = x + t_emb  # [B, D]
-        
-        # Add text embedding integration
-        text_emb = self.text_embed_proj(text_embeddings)  # Project text embeddings
-        x = x + text_emb  # Add projected text embeddings
-        
-        # Expand to sequence for transformer blocks
-        x = x.unsqueeze(1)  # [B, 1, D] - Re-introduce unsqueeze here
-        
-        # Add CLS token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        #print(f"Shape of cls_tokens: {cls_tokens.shape}")
-        #print(f"Shape of x before cat: {x.shape}")
-        x = torch.cat([cls_tokens, x], dim=1)  # [B, 2, D] - Concatenate directly, cls_tokens and x are both [B, 1, D] now
-        
+        # Add CLS token with proper dimension check
+        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # [B, 1, D]
+        x = torch.cat([cls_tokens, x], dim=1)  # [B, 2, D]
+
         # Apply transformer blocks
         for block in self.blocks:
             x = block(x)
             
-        # Get CLS token output only
-        cls_output = x[:, 0]  # [B, D]
-        cls_output = cls_output.reshape(batch_size, -1) # Ensure cls_output is [B, D] before classifier
+        # Final processing
+        cls_output = x[:, 0]
+        logits = self.classifier(cls_output)
         
-        # Apply classifier to get logits
-        logits = self.classifier(cls_output)  # [B, num_experts]
-        
-        # Apply temperature scaling for better calibration
-        # Lower temperature gives sharper distribution
         return logits / self.temperature
     
     def update_temperature(self):
