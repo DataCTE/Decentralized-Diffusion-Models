@@ -24,6 +24,7 @@ import shutil
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datetime import datetime, timedelta
+import time
 
 class FeatureGenerator:
     def __init__(self, config):
@@ -240,31 +241,47 @@ class FeatureGenerator:
 def main():
     # Initialize distributed processing with explicit NCCL settings
     rank = int(os.environ['LOCAL_RANK'])
+    print(f"Rank {rank} starting initialization")  # Add debug print
+    
+    # Set device first
     torch.cuda.set_device(rank)
+    device = torch.device(f'cuda:{rank}')
     
     # Configure NCCL environment variables
     os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
-    os.environ['NCCL_SOCKET_TIMEOUT'] = '600000'  # 10 minute timeout
-    os.environ['NCCL_BLOCKING_WAIT'] = '1'
+    os.environ['NCCL_DEBUG'] = 'WARN'  # Add NCCL debug output
     
+    # Initialize process group first
+    print(f"Rank {rank} initializing process group")
     dist.init_process_group(
         backend='nccl',
-        init_method='tcp://127.0.0.1:54321',  # Explicit TCP init
+        init_method='env://',  # Use automatic environment initialization
         world_size=int(os.environ['WORLD_SIZE']),
         rank=rank,
-        timeout=timedelta(minutes=3)  # Increased timeout
+        timeout=timedelta(minutes=3)
     )
     
+    # Load config after distributed init
     config = get_config()
-    processor = FeatureGenerator(config)
     
-    # Get all images without validation
+    # Verify dataset path exists
+    if rank == 0:
+        if not Path(config.dataset_path).exists():
+            raise FileNotFoundError(f"Dataset path {config.dataset_path} not found")
+    
+    # Get all images - add progress bar
+    if rank == 0:
+        print("Scanning dataset directory...")
     all_images = [str(p) for p in Path(config.dataset_path).rglob('*') 
                  if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
     
-    # Distribute images evenly with proper device awareness
-    chunk = len(all_images) // dist.get_world_size()
-    local_images = all_images[rank*chunk : (rank+1)*chunk]
+    # Distribute images
+    chunk_size = len(all_images) // dist.get_world_size()
+    local_images = all_images[rank*chunk_size : (rank+1)*chunk_size]
+    print(f"Rank {rank} received {len(local_images)} images to process")
+    
+    # Initialize feature generator
+    processor = FeatureGenerator(config)
     
     try:
         # Main processing loop
@@ -282,14 +299,22 @@ def main():
 
         # Cluster only after all ranks confirm completion
         if rank == 0:
-            # Check all status files exist first
-            all_done = all((processor.feature_dir/f"status_rank{r}.pt").exists() 
-                         for r in range(dist.get_world_size()))
-            
-            if all_done:
+            try:
+                # Add timeout for status check
+                start_time = time.time()
+                while not all((processor.feature_dir/f"status_rank{r}.pt").exists() 
+                            for r in range(dist.get_world_size())):
+                    if time.time() - start_time > 300:  # 5 minute timeout
+                        raise TimeoutError("Not all ranks completed within 5 minutes")
+                    time.sleep(1)
+                
                 processor.run_clustering()
-            else:
-                raise RuntimeError("Not all ranks completed processing")
+            except Exception as e:
+                print(f"Clustering failed: {str(e)}")
+        else:
+            # Non-zero ranks wait for final signal
+            while not (processor.feature_dir/"clusters/final_clusters.pt").exists():
+                time.sleep(1)
 
     except Exception as e:
         print(f"Rank {rank} failed: {str(e)}")
@@ -298,6 +323,7 @@ def main():
         if rank == 0:
             for r in range(dist.get_world_size()):
                 (processor.feature_dir/f"status_rank{r}.pt").unlink(missing_ok=True)
+        dist.barrier()
         dist.destroy_process_group()
 
 if __name__ == "__main__":
