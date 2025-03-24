@@ -64,11 +64,11 @@ DEFAULT_CONFIG = {
     'max_size': 1024,  # Maximum image dimension
     'val_size': 1000,
     'buckets': [
-        (512, 512),   # Square format
-        (576, 448),   # Landscape
+        (512, 512),   # Square
+        (576, 448),   # Landscape 
         (448, 576),   # Portrait
-        (640, 384),   # Wide
-        (384, 640),   # Tall
+        (640, 384),   # Wide landscape
+        (384, 640),   # Tall portrait
     ],
     'validation_batch_size': 4,  # Reduced from 1000 to prevent OOM
     'num_workers': 8,  # Reduced from 8 to prevent I/O bottlenecks
@@ -175,6 +175,15 @@ DEFAULT_CONFIG = {
     # ===== Shape Test Controls =====
     'bypass_cluster_validation': False, # Flag to bypass cluster size validation, set to True in shape_test.py
     'use_cuda_graphs': False,
+
+    # Add to DEFAULT_CONFIG
+    'bucket_scale': 64,  # Base scaling factor for buckets
+    'min_bucket_dim': 256,  # Minimum dimension for any bucket
+    'bucket_thresholds': {  # Aspect ratio groupings
+        'square': (0.9, 1.1),
+        'portrait': (0.4, 0.9), 
+        'landscape': (1.1, 2.5)
+    },
 }
 
 def get_config(config_path=None):

@@ -56,6 +56,7 @@ class DDMDataset(Dataset):
         self.clip_dir = os.path.join(config.feature_cache_path, "clip_embeddings")
         self.cluster_dir = os.path.join(config.feature_cache_path, "clusters")
         self.dim_dir = os.path.join(config.feature_cache_path, "dimensions")
+        self.bucket_dir = os.path.join(config.feature_cache_path, "buckets")
         
         # Verify all required directories exist
         self._verify_cache_dirs()
@@ -199,45 +200,27 @@ class DDMDataset(Dataset):
             return torch.tensor([0], dtype=torch.long)  # 1D tensor
 
     def _distributed_bucket_indices(self):
-        """Filename-parsed dimensions with proper device placement"""
-        # Ensure tensors are on GPU for NCCL backend
-        bucket_indices = torch.zeros(len(self.latent_files), 
-                                   dtype=torch.long,
-                                   device=f'cuda:{self.rank}')
+        """Load precomputed bucket indices"""
+        bucket_files = sorted([
+            f for f in os.listdir(self.bucket_dir)
+            if f.endswith('.pt')
+        ])
         
-        # Create progress bar only on main process
-        pbar = tqdm(
-            total=len(self.latent_files),
-            desc=f"Parsing buckets (Rank {self.rank})" if self.rank != 0 else "Assigning buckets",
-            leave=False,
-            bar_format="{l_bar}{bar:20}{r_bar}",
-            disable=not is_main_process(),
-            position=0
-        )
-
-        # Extract dimensions from virtual filenames
-        for i, fname in enumerate(self.latent_files):
-            try:
-                # Parse dimensions from virtual filename format: {W}x{H}_{index}.latent.pt
-                dim_part = fname.split('_', 1)[0]
-                w, h = map(int, dim_part.split('x', 1))
-                bucket_idx = next(i for i, (bw, bh) in enumerate(self.config.buckets) 
-                                if bw == w and bh == h)
-                bucket_indices[i] = bucket_idx
-            except:
-                bucket_indices[i] = 0  # Fallback to first bucket
-            pbar.update(1)
-
-        pbar.close()
-
-        # Create GPU tensors for gathering
-        gathered = [torch.empty_like(bucket_indices, device=bucket_indices.device) 
-                  for _ in range(self.world_size)]
+        # Direct loading without filename parsing
+        bucket_indices = torch.zeros(len(bucket_files), dtype=torch.long, device=self.device)
         
-        # Distributed sync with NCCL
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(torch.load, os.path.join(self.bucket_dir, fname)): i
+                for i, fname in enumerate(bucket_files)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                bucket_indices[idx] = future.result().item()
+        
+        # Distributed sync
+        gathered = [torch.empty_like(bucket_indices) for _ in range(self.world_size)]
         torch.distributed.all_gather(gathered, bucket_indices)
-        
-        # Move to CPU for dataset operations
         return torch.cat(gathered).cpu()
 
     def __len__(self):

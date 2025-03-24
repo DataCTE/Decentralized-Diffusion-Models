@@ -42,7 +42,7 @@ class FeatureGenerator:
 
     def _force_create_dirs(self):
         """Overwrite any existing feature directories"""
-        dirs = ['latents', 'clip', 'clusters', 'dims', 'dino_features']
+        dirs = ['latents', 'clip', 'clusters', 'dims', 'dino_features', 'buckets']
         for d in dirs:
             dir_path = self.feature_dir/d
             if dir_path.exists():
@@ -62,11 +62,15 @@ class FeatureGenerator:
 
             # Process regardless of existing files
             with Image.open(img_path) as img:
+                orig_w, orig_h = img.size
+                # Calculate nearest bucket
+                bucket_idx = self._get_bucket_index(orig_w, orig_h)
                 features = {
                     'latent': self._extract_vae_latent(img),
                     'clip': self._extract_clip_embedding(caption_path.read_text()),
                     'dino': self._extract_dino_features(img),
-                    'dims': torch.tensor(img.size, dtype=torch.int16)
+                    'dims': torch.tensor(img.size, dtype=torch.int16),
+                    'bucket': torch.tensor(bucket_idx, dtype=torch.int16)
                 }
             
             # Save with rank-specific naming
@@ -104,6 +108,7 @@ class FeatureGenerator:
         torch.save(features['clip'], self.feature_dir/f"clip/{base_name}_rank{self.rank}.pt")
         torch.save(features['dino'], self.feature_dir/f"dino_features/{base_name}_rank{self.rank}.pt")
         torch.save(features['dims'], self.feature_dir/f"dims/{base_name}_rank{self.rank}.pt")
+        torch.save(features['bucket'], self.feature_dir/f"buckets/{base_name}_rank{self.rank}.pt")
 
     def run_clustering(self):
         """Global clustering after feature collection"""
@@ -133,6 +138,39 @@ class FeatureGenerator:
         _, labels = kmeans.index.search(full_features, 1)
         cluster_labels = agg.labels_[labels.flatten()]
         torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
+
+    def _get_bucket_index(self, width, height):
+        """Find best matching bucket using config parameters"""
+        aspect = width / height
+        config = self.config
+        
+        # 1. Determine aspect ratio group
+        aspect_group = None
+        for group, (min_ratio, max_ratio) in config.bucket_thresholds.items():
+            if min_ratio <= aspect <= max_ratio:
+                aspect_group = group
+                break
+            
+        # 2. Calculate scaled dimensions
+        scale = config.bucket_scale
+        scaled_w = round(width / scale) * scale
+        scaled_h = round(height / scale) * scale
+        
+        # 3. Find matching bucket
+        for idx, (bw, bh) in enumerate(config.buckets):
+            if aspect_group == 'square' and bw == bh and scaled_w == bw and scaled_h == bh:
+                return idx
+            elif aspect_group == 'portrait' and bw < bh and scaled_w == bw and scaled_h == bh:
+                return idx
+            elif aspect_group == 'landscape' and bw > bh and scaled_w == bw and scaled_h == bh:
+                return idx
+            
+        # Fallback to nearest bucket
+        distances = [
+            (abs(scaled_w - bw) + abs(scaled_h - bh), idx)
+            for idx, (bw, bh) in enumerate(config.buckets)
+        ]
+        return min(distances)[1]
 
 def main():
     # Initialize distributed processing
