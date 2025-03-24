@@ -42,13 +42,19 @@ class FeatureGenerator:
         self._force_create_dirs()
 
     def _force_create_dirs(self):
-        """Overwrite any existing feature directories"""
+        """Safer directory creation with existence checks"""
         dirs = ['latents', 'clip', 'clusters', 'dims', 'dino_features', 'buckets']
-        for d in dirs:
-            dir_path = self.feature_dir/d
-            if dir_path.exists():
-                shutil.rmtree(dir_path)
-            dir_path.mkdir(parents=True)
+        
+        # Only have rank 0 handle directory creation
+        if self.rank == 0:
+            for d in dirs:
+                dir_path = self.feature_dir/d
+                if dir_path.exists():
+                    shutil.rmtree(dir_path, ignore_errors=True)
+                dir_path.mkdir(parents=True, exist_ok=True)
+        
+        # Wait for rank 0 to finish setup
+        dist.barrier()
 
     def process_image(self, img_path):
         """Handle corrupt images and grayscale conversions"""
