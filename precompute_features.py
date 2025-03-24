@@ -43,7 +43,7 @@ class FeatureGenerator:
         self._force_create_dirs()
         
         # Add batch processing buffers
-        self.batch_size = 8  # Images per batch
+        self.batch_size = 16  # Images per batch
         self.image_buffer = []
         self.caption_buffer = []
 
