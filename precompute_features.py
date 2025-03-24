@@ -41,6 +41,11 @@ class FeatureGenerator:
         # Create feature directories aggressively
         self.feature_dir = Path(config.feature_cache_path)
         self._force_create_dirs()
+        
+        # Add batch processing buffers
+        self.batch_size = 8  # Images per batch
+        self.image_buffer = []
+        self.caption_buffer = []
 
     def _force_create_dirs(self):
         """Safer directory creation with existence checks"""
@@ -58,7 +63,22 @@ class FeatureGenerator:
         dist.barrier()
 
     def process_image(self, img_path):
-        """Handle corrupt images and grayscale conversions"""
+        """Batch image processing"""
+        self.image_buffer.append(img_path)
+        if len(self.image_buffer) >= self.batch_size:
+            self._process_batch()
+            
+    def _process_batch(self):
+        """Parallel batch feature extraction"""
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(self._single_process, path) 
+                      for path in self.image_buffer]
+            for future in as_completed(futures):
+                future.result()  # Handle exceptions here
+        self.image_buffer.clear()
+
+    def _single_process(self, img_path):
+        """Actual processing moved here"""
         try:
             # Check for caption file first
             caption_path = Path(img_path).with_suffix('.txt')
@@ -239,26 +259,30 @@ class FeatureGenerator:
         return min(distances)[1]
 
 def main():
-    # Initialize distributed processing with explicit NCCL settings
+    # Initialize distributed processing with explicit device settings
     rank = int(os.environ['LOCAL_RANK'])
-    print(f"Rank {rank} starting initialization")  # Add debug print
+    print(f"Rank {rank} starting initialization")
     
-    # Set device first
+    # Critical NCCL environment variables
+    os.environ["NCCL_ALGO"] = "RING"  # More reliable for small messages
+    os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
+    os.environ["NCCL_SOCKET_NTHREADS"] = "4"
+    os.environ["NCCL_MIN_NCHANNELS"] = "12"
+    os.environ["NCCL_DEBUG"] = "INFO"
+    os.environ["NCCL_SOCKET_TIMEOUT"] = "300000"  # 5 minute timeout
+    
+    # Set device BEFORE initializing process group
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
     
-    # Configure NCCL environment variables
-    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
-    os.environ['NCCL_DEBUG'] = 'WARN'  # Add NCCL debug output
-    
-    # Initialize process group first
+    # Initialize process group with TCP store
     print(f"Rank {rank} initializing process group")
     dist.init_process_group(
         backend='nccl',
-        init_method='env://',  # Use automatic environment initialization
+        init_method='tcp://127.0.0.1:29500',  # Explicit TCP initialization
         world_size=int(os.environ['WORLD_SIZE']),
         rank=rank,
-        timeout=timedelta(minutes=3)
+        timeout=timedelta(minutes=10)  # Increased timeout
     )
     
     # Load config after distributed init
@@ -287,8 +311,8 @@ def main():
         # Main processing loop
         with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
             for img_path in local_images:
-                if processor.process_image(img_path):
-                    pbar.update(1)
+                processor.process_image(img_path)
+                pbar.update(1)
 
         # Add final completion marker per rank
         torch.save({'status': 'done'}, processor.feature_dir/f"status_rank{rank}.pt")
