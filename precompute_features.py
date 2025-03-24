@@ -43,7 +43,7 @@ class FeatureGenerator:
         self._force_create_dirs()
         
         # Add batch processing buffers
-        self.batch_size = 16  # Images per batch
+        self.batch_size = 32  # Images per batch
         self.image_buffer = []
         self.caption_buffer = []
 
@@ -324,21 +324,26 @@ def main():
         # Cluster only after all ranks confirm completion
         if rank == 0:
             try:
-                # Add timeout for status check
-                start_time = time.time()
-                while not all((processor.feature_dir/f"status_rank{r}.pt").exists() 
-                            for r in range(dist.get_world_size())):
-                    if time.time() - start_time > 300:  # 5 minute timeout
-                        raise TimeoutError("Not all ranks completed within 5 minutes")
-                    time.sleep(1)
+                # Remove timeout and use infinite retry
+                print("Waiting for all ranks to finish processing...")
+                while True:
+                    completed = sum(1 for r in range(dist.get_world_size()) 
+                                  if (processor.feature_dir/f"status_rank{r}.pt").exists())
+                    if completed == dist.get_world_size():
+                        break
+                    print(f"Waiting for {dist.get_world_size() - completed} ranks...")
+                    time.sleep(10)  # Check every 10 seconds
                 
+                print("All ranks completed, starting clustering...")
                 processor.run_clustering()
+                
             except Exception as e:
                 print(f"Clustering failed: {str(e)}")
         else:
-            # Non-zero ranks wait for final signal
+            # Non-zero ranks wait indefinitely for final signal
+            print(f"Rank {rank} waiting for clustering results...")
             while not (processor.feature_dir/"clusters/final_clusters.pt").exists():
-                time.sleep(1)
+                time.sleep(30)  # Check every 30 seconds
 
     except Exception as e:
         print(f"Rank {rank} failed: {str(e)}")
