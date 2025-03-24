@@ -143,4 +143,8 @@ class VAEWrapper:
         # VAE typically upsamples by a factor of 8
         pixel_height = latent_height * 8
         pixel_width = latent_width * 8
-        return (pixel_height, pixel_width) 
+        return (pixel_height, pixel_width)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode input tensor to latent space"""
+        return self.encode(x) 

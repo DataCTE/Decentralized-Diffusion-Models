@@ -301,7 +301,7 @@ class UnifiedPreprocessor:
         static_input = torch.randn(1, 3, 256, 256, device='cuda', dtype=self.dtype)
         self.vae_cuda_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.vae_cuda_graph):
-            self.static_vae_output = self.vae(static_input)
+            self.static_vae_output = self.vae.encode(static_input)
 
 def main():
     # Create default config if none provided
