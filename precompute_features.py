@@ -87,7 +87,7 @@ class UnifiedPreprocessor:
     def _batch_discovery(self, image_paths):
         """Matrix-based file discovery with SIMD optimizations"""
         # Use NumPy for vectorized string operations
-        image_paths = np.array(image_paths, dtype=np.unicode_)
+        image_paths = np.array(image_paths, dtype=np.str_)
         caption_paths = np.char.replace(image_paths, '.jpg', '.txt')
         caption_paths = np.char.replace(caption_paths, '.png', '.txt')
         caption_paths = np.char.replace(caption_paths, '.webp', '.txt')
