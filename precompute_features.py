@@ -27,6 +27,9 @@ class UnifiedPreprocessor:
         self.feature_dir = config.feature_cache_path
         self._create_directories()
         
+        # Add dtype determination based on config
+        self.dtype = torch.float16 if config.use_mixed_precision else torch.float32
+        
         # Initialize models
         self.vae = VAEWrapper(self.device, config)
         self.clip = CLIPTextEncoder(self.device, config)
@@ -36,7 +39,7 @@ class UnifiedPreprocessor:
         # Pre-allocate pinned memory buffers
         self.buffer_size = config.batch_size * 4
         self.image_buffer = torch.empty((self.buffer_size, 3, 256, 256), 
-                                      dtype=self.dtype, 
+                                      dtype=self.dtype,
                                       pin_memory=True)
         self.text_buffer = torch.empty((self.buffer_size, 77),
                                      dtype=torch.int64,
