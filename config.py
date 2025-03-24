@@ -279,37 +279,27 @@ def estimate_model_size(config, model_type="expert"):
         from models.router import RouterModel # Import locally
         dummy_model = RouterModel(config).to(device) # Create RouterModel
         model_name = "RouterModel"
+        dummy_input = [
+            torch.randn(
+                config.batch_size,
+                config.latent_channels,
+                config.image_size[1] // config.patch_size,
+                config.image_size[2] // config.patch_size,
+                device=device
+            ),  # x
+            torch.randint(0, 1000, (config.batch_size,), device=device),  # t
+            # Fixed text embedding shape to match CLIP output [B, seq_len, dim]
+            torch.randn(
+                config.batch_size, 
+                config.max_token_length,  # Typically 77
+                config.clip_embedding_dim,
+                device=device
+            )  # text_embeds
+        ]
     else:
         raise ValueError(f"Invalid model_type: {model_type}. Must be 'expert' or 'router'.")
 
     if TORCHINFO_AVAILABLE:
-        dummy_input = None
-        if model_type == "expert":
-            dummy_input = [
-                torch.randn(
-                    config.batch_size,
-                    config.latent_channels,
-                    config.image_size[1] // config.patch_size, # Corrected input size
-                    config.image_size[2] // config.patch_size, # Corrected input size,
-                    device=device
-                ), # x
-                torch.randint(0, 1000, (config.batch_size,), device=device), # t
-                torch.randn(config.batch_size, config.clip_embedding_dim, device=device) # text_embeds
-            ]
-        elif model_type == "router":
-            dummy_input = [
-                torch.randn(
-                    config.batch_size,
-                    config.latent_channels,
-                    config.image_size[1] // config.patch_size, # Corrected input size
-                    config.image_size[2] // config.patch_size, # Corrected input size,
-                    device=device
-                ), # x
-                torch.randint(0, 1000, (config.batch_size,), device=device), # t
-                torch.randn(config.batch_size, config.clip_embedding_dim, device=device) # text_embeds
-            ]
-
-
         model_summary = summary(
             dummy_model,
             dtypes=[torch.float32],
