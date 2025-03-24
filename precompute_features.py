@@ -20,6 +20,7 @@ import hashlib
 from concurrent.futures import as_completed
 from collections import defaultdict
 from tqdm.auto import tqdm
+import shutil
 
 class UnifiedPreprocessor:
     def __init__(self, config):
@@ -155,12 +156,12 @@ class UnifiedPreprocessor:
             return path, False
 
     def process_image(self, img_path):
-        """Add individual progress tracking"""
+        """Process image without checking existing features"""
         try:
-            # Initialize per-image progress
+            print(f"Processing {img_path}")
             pbar = tqdm(total=4, desc=f"Processing {Path(img_path).name}", leave=False)
             
-            # Generate deterministic UUID from image-caption pair
+            # Generate new UUID without checking existing files
             with open(img_path, 'rb') as f:
                 img_hash = hashlib.md5(f.read()).hexdigest()
             caption_path = Path(img_path).with_suffix('.txt')
@@ -168,19 +169,7 @@ class UnifiedPreprocessor:
                 text_hash = hashlib.md5(f.read()).hexdigest()
             pair_hash = hashlib.md5((img_hash + text_hash).encode()).hexdigest()
             base_name = uuid.UUID(pair_hash).hex
-            
-            # Skip if all features exist
-            if all(
-                (Path(self.feature_dir)/ext/f"{base_name}.pt").exists()
-                for ext in ["latents", "clip", "dims", "dino_features"]
-            ):
-                pbar.close()
-                return True
-            
-            # Load caption text
-            with open(caption_path, 'r', encoding='utf-8') as f:
-                caption = f.read().strip()
-            
+
             # Process image and text
             with Image.open(img_path) as img:
                 features = {
@@ -189,31 +178,13 @@ class UnifiedPreprocessor:
                     'clip': self._extract_clip_embedding(caption),
                     'dims': torch.tensor(img.size, dtype=torch.int16)
                 }
-            
-            pbar.update(1)
-            pbar.set_postfix({"stage": "DINO Features"})
-            features['dino'] = self._extract_dino_features(img)
-            
-            pbar.update(1)
-            pbar.set_postfix({"stage": "VAE Encoding"})
-            features['latent'] = self._extract_vae_latent(img)
-            
-            pbar.update(1)
-            pbar.set_postfix({"stage": "CLIP Embedding"})
-            features['clip'] = self._extract_clip_embedding(caption)
-            
-            pbar.update(1)
-            pbar.set_postfix({"stage": "Saving"})
+
+            # Force overwrite all features
             self._save_features(base_name, features)
-            
-            pbar.close()
             return True
             
         except Exception as e:
-            pbar.close()
-            # Clean up any partial features
-            for ext in ["latents", "clip", "dims", "dino_features"]:
-                (Path(self.feature_dir)/ext/f"{base_name}.pt").unlink(missing_ok=True)
+            print(f"Failed to process {img_path}: {str(e)}")
             return False
 
     def _extract_dino_features(self, img):
@@ -306,20 +277,49 @@ class UnifiedPreprocessor:
         self._save_clusters(cluster_labels)
 
     def _load_dino_features(self):
-        """Add loading progress"""
-        feature_files = list((Path(self.feature_dir)/"dino_features").glob("*.pt"))
+        """Add validation for empty features"""
+        feature_dir = Path(self.feature_dir)/"dino_features"
+        
+        # Check if directory exists and has files
+        if not feature_dir.exists():
+            raise FileNotFoundError(f"DINO features directory {feature_dir} not found")
+        
+        feature_files = list(feature_dir.glob("*.pt"))
+        if not feature_files:
+            raise ValueError("No DINO features found. Did feature extraction run correctly?")
+        
+        # Load with progress and validation
         features = []
         with tqdm(total=len(feature_files), desc="Loading Features") as pbar:
             for f in feature_files:
-                features.append(torch.load(f))
+                try:
+                    feat = torch.load(f)
+                    if feat.numel() == 0:
+                        print(f"Warning: Empty feature file {f.name}")
+                        continue
+                    features.append(feat)
+                except Exception as e:
+                    print(f"Error loading {f.name}: {str(e)}")
                 pbar.update(1)
+        
+        if not features:
+            raise RuntimeError("All feature files were empty or corrupted")
+        
         return torch.cat(features)
 
     def _save_clusters(self, labels):
-        """Save cluster assignments with UUID mapping"""
-        features = list((Path(self.feature_dir)/"dino_features").glob("*.pt"))
+        """Overwrite existing clusters"""
+        feature_dir = Path(self.feature_dir)/"dino_features"
+        cluster_dir = Path(self.feature_dir)/"clusters"
+        
+        # Clean existing clusters
+        for f in cluster_dir.glob("*.pt"):
+            f.unlink()
+        
+        # Save new clusters
+        features = list(feature_dir.glob("*.pt"))
         for f, label in zip(features, labels):
-            torch.save(torch.tensor(label), f"{self.feature_dir}/clusters/{f.stem}.pt")
+            torch.save(torch.tensor(label), cluster_dir/f"{f.stem}.pt")
 
     def validate_dataset(self):
         """Add validation progress"""
@@ -379,8 +379,12 @@ class UnifiedPreprocessor:
             self.vae_cuda_graph = None
 
 def main():
-    # Create default config if none provided
-    config = get_config()  # Now works without arguments
+    # Clean existing feature directories
+    config = get_config()
+    dirs = ['latents', 'clip', 'clusters', 'dims', 'dino_features']
+    for d in dirs:
+        shutil.rmtree(Path(config.feature_cache_path)/d, ignore_errors=True)
+        (Path(config.feature_cache_path)/d).mkdir(parents=True, exist_ok=True)
     
     preprocessor = UnifiedPreprocessor(config)
     
