@@ -34,37 +34,17 @@ class ExpertTrainer(BaseTrainer):
         self.world_size = world_size
         
         # Initialize base model first
-        base_model = ExpertMMDiT(config)
+        self.expert = ExpertMMDiT(config)
         
-        # Verify model is not already wrapped
-        if isinstance(base_model, FSDP):
-            raise ValueError("Expert model came pre-wrapped with FSDP")
+        # Don't wrap with FSDP here - let cache manager handle it
         
-        # Then apply FSDP wrapping
-        self.expert = wrap_model_with_fsdp(
-            base_model,
-            config,
-            param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
-            rank=rank
+        # Use standard optimizer initially - will be reconfigured when FSDP is applied
+        self.optimizer = AdamW8bit(
+            self.expert.parameters(),
+            lr=config.learning_rate,
+            betas=config.adam_betas,
+            weight_decay=config.weight_decay
         )
-        
-        # Use centralized optimizer configuration for FSDP compatibility
-        if is_dist_initialized() and isinstance(self.expert, FSDP):
-            self.optimizer = configure_optimizer_for_fsdp(
-                self.expert,
-                AdamW8bit,
-                lr=config.learning_rate,
-                betas=config.adam_betas,
-                weight_decay=config.weight_decay
-            )
-        else:
-            # Fallback for non-FSDP mode
-            self.optimizer = AdamW8bit(
-                self.expert.parameters(),
-                lr=config.learning_rate,
-                betas=config.adam_betas,
-                weight_decay=config.weight_decay
-            )
         
         # Paper-defined components
         self.flow_matcher = DecentralizedFlowMatcher(

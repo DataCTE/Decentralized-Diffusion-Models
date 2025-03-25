@@ -5,8 +5,9 @@ import logging
 import threading
 from collections import OrderedDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from trainers.expert import wrap_model_with_fsdp
+from trainers.expert import wrap_model_with_fsdp, configure_optimizer_for_fsdp
 import torch.distributed as dist
+from torch.optim.adam import AdamW8bit
 logger = logging.getLogger(__name__)
 
 class ExpertCacheManager:
@@ -58,17 +59,27 @@ class ExpertCacheManager:
                     self._add_to_cache(expert_idx, expert)
                     return expert
 
-                # Create new expert with proper FSDP wrapping
+                # Create new expert
                 expert = expert_factory_fn(expert_idx)
                 
-                # Verify FSDP wrapping
+                # Only wrap with FSDP if not already wrapped
                 if not isinstance(expert, FSDP):
                     expert = wrap_model_with_fsdp(
-                        expert,
+                        expert.expert if hasattr(expert, 'expert') else expert,
                         self.config,
                         param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
                         rank=self.rank
                     )
+                    
+                    # Reconfigure optimizer for FSDP if needed
+                    if hasattr(expert, 'optimizer'):
+                        expert.optimizer = configure_optimizer_for_fsdp(
+                            expert,
+                            AdamW8bit,
+                            lr=self.config.learning_rate,
+                            betas=self.config.adam_betas,
+                            weight_decay=self.config.weight_decay
+                        )
                 
                 self._add_to_cache(expert_idx, expert)
                 return expert
