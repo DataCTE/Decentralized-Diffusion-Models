@@ -153,75 +153,52 @@ class DDMTrainingCoordinator:
         
         # Shared configuration for DataLoader
         loader_config = {
-            'num_workers': 0,
-            'pin_memory': False,
-            'persistent_workers': False
+            'num_workers': 0,  # Disable multiprocessing
+            'pin_memory': False
         }
         
-        # Train dataset
-        print(f"[Rank {self.rank}] Initializing training dataset...")
+        # Initialize training dataset
         train_dataset = DDMDataset(self.config, 'train')
-        print(f"[Rank {self.rank}] Training dataset initialized with {len(train_dataset)} samples")
-
-        # Create bucket indices directly from bucket_assignments
+        
+        # Create bucket-aware sampler if bucket assignments are available
         if hasattr(train_dataset, 'bucket_assignments'):
-            print(f"[Rank {self.rank}] Generating bucket indices...")
-            bucket_indices = defaultdict(list)
-            for idx, bucket_idx in enumerate(train_dataset.bucket_assignments.cpu().numpy()):
-                bucket_indices[int(bucket_idx)].append(idx)
-                if idx < 5:  # Print first 5 assignments
-                    print(f"Sample {idx} assigned to bucket {bucket_idx}")
-
-            # Use our existing BucketBatchSampler
-            if bucket_indices:
-                debug_print(f"Creating BucketBatchSampler with batch size {self.config.batch_size}", self.rank)
-                print(f"[Rank {self.rank}] Bucket distribution:")
-                for bidx, indices in bucket_indices.items():
-                    print(f"Bucket {bidx}: {len(indices)} samples")
+            debug_print(f"Creating BucketBatchSampler with batch size {self.config.batch_size}", self.rank)
+            
+            batch_sampler = BucketBatchSampler(
+                dataset=train_dataset,
+                batch_size=self.config.batch_size,
+                device='cpu',  # Use CPU for initial setup
+                shuffle=True,
+                drop_last=False
+            )
+            
+            # Modify DataLoader creation to use custom collate
+            def collate_fn(batch):
+                # Group by actual dimensions
+                grouped = defaultdict(list)
+                for item in batch:
+                    key = (item['latent'].shape[-2], item['latent'].shape[-1])
+                    grouped[key].append(item)
                 
-                batch_sampler = BucketBatchSampler(
-                    bucket_indices=bucket_indices,
-                    batch_size=self.config.batch_size,
-                    device='cpu',  # Use CPU for initial setup
-                    shuffle=True,
-                    drop_last=False
-                )
-                
-                # Modify DataLoader creation to use custom collate
-                def collate_fn(batch):
-                    # Group by actual dimensions
-                    grouped = defaultdict(list)
-                    for item in batch:
-                        key = (item['latent'].shape[-2], item['latent'].shape[-1])
-                        grouped[key].append(item)
-                    
-                    # Return batches with consistent dimensions
-                    for group in grouped.values():
-                        return {
-                            'latent': torch.cat([i['latent'] for i in group]),
-                            'clip_embedding': torch.cat([i['clip_embedding'] for i in group]),
-                            'bucket': torch.cat([i['bucket'] for i in group]),
-                            'expert': torch.cat([i['expert'] for i in group])
-                        }
-                
-                self.train_loader = DataLoader(
-                    train_dataset,
-                    batch_sampler=batch_sampler,
-                    collate_fn=collate_fn,
-                    **loader_config
-                )
-                if self.rank == 0:
-                    logger.info(f"Created bucket-aware DataLoader with {len(bucket_indices)} buckets and batch size {self.config.batch_size}")
-            else:
-                # Fallback to simple loader with batch_size=1
-                self.train_loader = DataLoader(
-                    train_dataset,
-                    batch_size=1,
-                    shuffle=True,
-                    **loader_config
-                )
+                # Return batches with consistent dimensions
+                for group in grouped.values():
+                    return {
+                        'latent': torch.cat([i['latent'] for i in group]),
+                        'clip_embedding': torch.cat([i['clip_embedding'] for i in group]),
+                        'bucket': torch.cat([i['bucket'] for i in group]),
+                        'expert': torch.cat([i['expert'] for i in group])
+                    }
+            
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=collate_fn,
+                **loader_config
+            )
+            if self.rank == 0:
+                logger.info(f"Created bucket-aware DataLoader with batch size {self.config.batch_size}")
         else:
-            # Fallback to simple loader if bucket_assignments isn't available
+            # Fallback to simple loader with batch_size=1
             self.train_loader = DataLoader(
                 train_dataset,
                 batch_size=1,

@@ -261,21 +261,25 @@ class CombinedBatchSampler(Sampler):
 class BucketBatchSampler(torch.utils.data.Sampler):
     """Groups samples by bucket dimensions for efficient batching"""
     
-    def __init__(self, dataset, batch_size, shuffle=True, drop_last=True):
+    def __init__(self, dataset, batch_size, bucket_indices=None, device='cpu', shuffle=True, drop_last=True):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
+        self.device = device
         
-        # Group indices by bucket
-        self.bucket_indices = defaultdict(list)
-        for idx in range(len(dataset)):
-            bucket = dataset.bucket_assignments[idx].item()
-            self.bucket_indices[bucket].append(idx)
+        # Group indices by bucket if not provided
+        if bucket_indices is None:
+            self.bucket_indices = defaultdict(list)
+            for idx in range(len(dataset)):
+                bucket = dataset.bucket_assignments[idx].item()
+                self.bucket_indices[bucket].append(idx)
+        else:
+            self.bucket_indices = bucket_indices
         
         # Convert lists to tensors
         self.bucket_tensors = {
-            bucket: torch.tensor(indices, device='cuda')
+            bucket: torch.tensor(indices, device=self.device)
             for bucket, indices in self.bucket_indices.items()
         }
         
