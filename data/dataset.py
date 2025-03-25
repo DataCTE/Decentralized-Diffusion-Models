@@ -227,14 +227,21 @@ class DDMDataset(Dataset):
         """Compute and cache cluster statistics"""
         if self.cluster_assignments is None:
             logger.warning("No cluster assignments found - using uniform distribution")
-            self.cluster_counts = torch.ones(self.config.num_experts, device=self.device)
+            self.cluster_counts = torch.ones(self.config.num_experts, dtype=torch.long, device=self.device)
             return
 
-        # Count samples per cluster
-        unique_clusters, counts = torch.unique(self.cluster_assignments, return_counts=True)
+        # Count samples per cluster - ensure long dtype
+        unique_clusters, counts = torch.unique(
+            self.cluster_assignments, 
+            return_counts=True
+        )
         
-        # Initialize counts tensor
-        self.cluster_counts = torch.zeros(self.config.num_experts, device=self.device)
+        # Initialize counts tensor with matching dtype
+        self.cluster_counts = torch.zeros(
+            self.config.num_experts, 
+            dtype=counts.dtype,  # Match the dtype of counts
+            device=self.device
+        )
         
         # Fill in actual counts
         self.cluster_counts[unique_clusters] = counts
