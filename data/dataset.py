@@ -106,6 +106,10 @@ class DDMDataset(Dataset):
             # since we're loading numpy arrays
             cluster_assignments = torch.load(cluster_path, weights_only=False)
             
+            # Convert numpy array to tensor if needed
+            if isinstance(cluster_assignments, np.ndarray):
+                cluster_assignments = torch.from_numpy(cluster_assignments)
+            
             # Validate cluster assignments
             num_clusters = cluster_assignments.max().item() + 1
             if num_clusters != self.config.num_experts:
