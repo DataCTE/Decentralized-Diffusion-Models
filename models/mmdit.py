@@ -977,22 +977,16 @@ class ExpertMMDiT(Flux):
         super().__init__(params)
         self.num_clusters = params.num_clusters
         
-        # Cluster embedding table (Equation 5)
-        self.cluster_embed = nn.Embedding(
-            params.num_clusters, 
-            params.cluster_embed_dim
-        )
+        # Initialize cluster embeddings
+        self.cluster_embed = nn.Embedding(params.num_clusters, params.cluster_embed_dim)
         
-        # Projection for combining cluster emb + original vector
-        self.vec_proj = nn.Linear(
-            params.vec_in_dim + params.cluster_embed_dim,  # Changed: Correct input dimension
-            params.vec_in_dim
-        )
+        # Add this new projection layer to match dimensions
+        self.cluster_projection = nn.Linear(params.cluster_embed_dim, params.vec_in_dim)
         
-        # Initialize with small weights to prevent abrupt changes
+        # Initialize weights properly
         nn.init.normal_(self.cluster_embed.weight, std=0.02)
-        nn.init.zeros_(self.vec_proj.weight)
-        nn.init.zeros_(self.vec_proj.bias)
+        nn.init.normal_(self.cluster_projection.weight, std=0.02)
+        nn.init.zeros_(self.cluster_projection.bias)
 
     def forward(
         self,
@@ -1015,12 +1009,16 @@ class ExpertMMDiT(Flux):
         print(f"[DEBUG MMDiT] cluster_ids shape: {cluster_ids.shape}")
         
         try:
-            # Get cluster embeddings [B, D]
+            # Get cluster embeddings [B, cluster_embed_dim]
             cluster_embeddings = self.cluster_embed(cluster_ids)
             print(f"[DEBUG MMDiT] cluster_embeddings shape: {cluster_embeddings.shape}")
             
-            # Merge with conditioning
-            combined_cond = y + cluster_embeddings
+            # Project cluster embeddings to match conditioning dimension [B, vec_in_dim]
+            projected_embeddings = self.cluster_projection(cluster_embeddings)
+            print(f"[DEBUG MMDiT] projected_embeddings shape: {projected_embeddings.shape}")
+            
+            # Now we can safely add the tensors with matching dimensions
+            combined_cond = y + projected_embeddings
             print(f"[DEBUG MMDiT] combined_cond shape: {combined_cond.shape}")
             
             # Continue with regular forward logic
