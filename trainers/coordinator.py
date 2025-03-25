@@ -109,6 +109,9 @@ class DDMTrainingCoordinator:
         else:
             logger.info("Sampling disabled in config")
         
+        # Add this after component initialization
+        self._init_data_loaders()  # Initialize data loaders
+        
         # Final initialization sync
         total_init_time = time.time() - init_start_time
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
