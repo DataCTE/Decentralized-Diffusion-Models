@@ -122,8 +122,9 @@ class RouterModel(nn.Module):
         t_emb = self.time_embedder(timesteps.float())  # [B, D]
         x = x + t_emb
 
-        # Text embedding integration with sequence reduction
-        text_emb = self.text_embed_proj(txt.mean(dim=1))  # [B, D]
+        # Text embedding integration - Changed: Project text before mean reduction
+        text_emb = self.text_embed_proj(txt)  # [B, L, D]
+        text_emb = text_emb.mean(dim=1)  # [B, D]
         x = x + text_emb
 
         # Prepare for transformer
