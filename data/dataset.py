@@ -82,6 +82,11 @@ class DDMDataset(Dataset):
             logger.info(f"[Rank {self.rank}] Loaded expert assignments with shape: {self.expert_assignments.shape}")
             if torch.isnan(self.expert_assignments).any():
                 raise ValueError(f"[Rank {self.rank}] NaN values found in expert assignments")
+            if len(self.expert_assignments) == 0:
+                raise ValueError(f"[Rank {self.rank}] Empty expert assignments loaded")
+            if self.expert_assignments.device.type != 'cuda':
+                logger.warning(f"[Rank {self.rank}] Expert assignments not on CUDA device")
+                self.expert_assignments = self.expert_assignments.cuda()
         else:
             raise ValueError(f"[Rank {self.rank}] Failed to load expert assignments")
 
@@ -158,12 +163,34 @@ class DDMDataset(Dataset):
                 all_clusters = torch.load(cluster_path, weights_only=False)
                 if not isinstance(all_clusters, torch.Tensor):
                     all_clusters = torch.tensor(all_clusters)
-                chunks = torch.chunk(all_clusters, self.world_size)
+                
+                # Convert to CUDA tensor for efficient operations
+                all_clusters = all_clusters.cuda()
+                
+                # Calculate chunk size and create list of chunks
+                chunk_size = len(all_clusters) // self.world_size
+                chunks = [all_clusters[i:i + chunk_size] for i in range(0, len(all_clusters), chunk_size)]
+                
+                # Handle any remaining elements
+                if len(chunks) < self.world_size:
+                    chunks.extend([chunks[-1].clone() for _ in range(self.world_size - len(chunks))])
+                elif len(chunks) > self.world_size:
+                    chunks = chunks[:self.world_size]
+                    
                 # Get size of first chunk to broadcast
                 chunk_size = chunks[0].size()
+                
+                # Ensure all chunks are the same size
+                for i in range(1, len(chunks)):
+                    if chunks[i].size(0) < chunks[0].size(0):
+                        chunks[i] = torch.cat([chunks[i], chunks[i][-1].unsqueeze(0).repeat(chunks[0].size(0) - chunks[i].size(0), 1)])
+                    elif chunks[i].size(0) > chunks[0].size(0):
+                        chunks[i] = chunks[i][:chunks[0].size(0)]
+                    
             except Exception as e:
                 logger.error(f"Error loading clusters on rank 0: {str(e)}")
                 chunk_size = None
+                chunks = None
         else:
             chunk_size = None
             chunks = None
@@ -181,15 +208,19 @@ class DDMDataset(Dataset):
             
             # Scatter the chunks
             try:
-                dist.scatter(local_clusters, chunks if self.rank == 0 else None, src=0)
+                # Convert tuple to list for scatter operation
+                scatter_list = chunks if self.rank == 0 else None
+                dist.scatter(local_clusters, scatter_list, src=0)
+                logger.info(f"[Rank {self.rank}] Successfully received cluster chunk of shape {local_clusters.shape}")
+                return local_clusters
+                
             except Exception as e:
                 logger.error(f"Error in scatter on rank {self.rank}: {str(e)}")
                 raise
 
-            return local_clusters
         else:
             logger.warning("Distributed not initialized, returning empty clusters")
-            return torch.tensor([])
+            return torch.tensor([], device='cuda')
 
     def _distributed_bucket_indices(self):
         """Load precomputed bucket indices with rank suffixes"""
