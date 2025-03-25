@@ -33,13 +33,18 @@ logger = logging.getLogger(__name__)
 import math  # For BucketBatchSampler
 import torch.distributed as dist
 
+from queue import Queue, Full
+from threading import Thread, Event
+import lmdb
+import pickle
+
 def chunks(lst, n):
     """Yield successive n-sized chunks from list"""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 class DDMDataset(Dataset):
-    """Distributed-optimized dataset pipeline without Redis"""
+    """Distributed-optimized dataset pipeline with lazy loading and prefetching"""
     
     def __init__(self, config, split='train'):
         self.config = config
@@ -48,350 +53,178 @@ class DDMDataset(Dataset):
         self.rank = get_rank()
         self.world_size = get_world_size()
         
-        # 1. Distributed file discovery
+        # Cache directories
         self.latent_dir = os.path.join(config.feature_cache_path, "latents")
         self.clip_dir = os.path.join(config.feature_cache_path, "clip")
         self.cluster_dir = os.path.join(config.feature_cache_path, "clusters")
         self.dim_dir = os.path.join(config.feature_cache_path, "dims")
         self.bucket_dir = os.path.join(config.feature_cache_path, "buckets")
         
-        # Verify all required directories exist
+        # Verify directories exist
         self._verify_cache_dirs()
         
-        # Initialize latent files first - match the rank-specific pattern
-        self.latent_files = []
-        for r in range(self.world_size):
-            rank_files = sorted([
-                f for f in os.listdir(self.latent_dir) 
-                if f.endswith(f'_rank{r}.pt')
-            ])
-            self.latent_files.extend(rank_files)
-            
+        # Only discover files for this rank
+        pattern = f"*_rank{self.rank}.pt"
+        self.latent_files = sorted(glob.glob(os.path.join(self.latent_dir, pattern)))
         self.num_samples = len(self.latent_files)
-        logger.info(f"[Rank {self.rank}] Found {self.num_samples} total latent files")
         
-        # Now load manifest since latent_files is initialized
-        self.manifest = self._load_manifest()
+        # Initialize prefetch cache
+        self.cache = {}
+        self.prefetch_size = 50
+        self.prefetch_queue = Queue(maxsize=self.prefetch_size)
+        self.stop_prefetch = Event()
         
-        # 2. Load clusters from the single combined file
-        self.expert_assignments = self._load_clusters()
+        # Start prefetch thread
+        self.prefetch_thread = Thread(target=self._prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
         
-        # 3. Load bucket assignments
+        # Load clusters as memory mapped file
+        self.expert_assignments = self._lazy_load_clusters()
+        
+        # Load bucket assignments from preprocessed files
         self.bucket_assignments = self._load_bucket_assignments()
         
-        # Initialize memory maps
-        self._init_memory_maps()
-        
-        # Add validation after initialization
-        print(f"[Rank {self.rank}] Final dataset stats:")
-        print(f"Total samples: {len(self)}")
-        print(f"Latent files count: {len(self.latent_files)}")
-        if self.latent_files:
-            print(f"First latent path: {os.path.join(self.latent_dir, self.latent_files[0])}")
-            print(f"Last latent path: {os.path.join(self.latent_dir, self.latent_files[-1])}")
+        logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples")
+        logger.info(f"[Rank {self.rank}] Found {len(set(self.bucket_assignments))} unique buckets")
 
     def _verify_cache_dirs(self):
         """Validate cache directory structure"""
         required_dirs = {
             'latents': self.latent_dir,
-            'clip_embeddings': self.clip_dir,
+            'clip': self.clip_dir,
             'clusters': self.cluster_dir,
-            'dimensions': self.dim_dir
+            'dims': self.dim_dir
         }
         
         for name, path in required_dirs.items():
             if not os.path.exists(path):
-                raise FileNotFoundError(
-                    f"Missing required cache directory: {name} ({path})"
-                )
-            if not any(os.scandir(path)):
-                raise ValueError(
-                    f"Cache directory {name} ({path}) is empty. "
-                    "Please generate features first."
-                )
+                raise FileNotFoundError(f"Missing required cache directory: {name} ({path})")
 
-    def _get_distributed_latent_files(self):
-        """Distributed file discovery with proper device initialization"""
-        # Ensure distributed is initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
-
-        device = torch.device(f'cuda:{self.rank}')  # Use explicit device assignment
-        torch.cuda.set_device(device) # Ensure device is set for this process
-
-        if self.rank == 0:
-            # Use generator to avoid loading all filenames into memory
-            count = sum(1 for _ in os.scandir(self.latent_dir)
-                       if _.name.endswith('.latent.pt'))
-            count_tensor = torch.tensor([count], dtype=torch.long, device=device)
-        else:
-            count_tensor = torch.zeros(1, dtype=torch.long, device=device)
-
-        # Broadcast using NCCL backend
-        torch.distributed.broadcast(count_tensor, src=0)
-        
-        # Generate virtual filenames to avoid storing actual paths
-        return [f"{i:08d}.latent.pt" for i in range(count_tensor.item())]
-
-    def _load_sharded_clusters(self):
-        """Load clusters from single file with distributed sharding"""
-        cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
-        
-        if self.rank == 0:
-            try:
-                # Explicitly set weights_only=False for numpy array loading
-                all_clusters = torch.load(cluster_path, weights_only=False)
-                if not isinstance(all_clusters, torch.Tensor):
-                    all_clusters = torch.tensor(all_clusters)
-                
-                # Convert to CUDA tensor for efficient operations
-                all_clusters = all_clusters.cuda()
-                
-                # Calculate chunk size and create list of chunks
-                chunk_size = len(all_clusters) // self.world_size
-                chunks = [all_clusters[i:i + chunk_size] for i in range(0, len(all_clusters), chunk_size)]
-                
-                # Handle any remaining elements
-                if len(chunks) < self.world_size:
-                    chunks.extend([chunks[-1].clone() for _ in range(self.world_size - len(chunks))])
-                elif len(chunks) > self.world_size:
-                    chunks = chunks[:self.world_size]
-                    
-                # Get size of first chunk to broadcast
-                chunk_size = chunks[0].size()
-                
-                # Ensure all chunks are the same size
-                for i in range(1, len(chunks)):
-                    if chunks[i].size(0) < chunks[0].size(0):
-                        chunks[i] = torch.cat([chunks[i], chunks[i][-1].unsqueeze(0).repeat(chunks[0].size(0) - chunks[i].size(0), 1)])
-                    elif chunks[i].size(0) > chunks[0].size(0):
-                        chunks[i] = chunks[i][:chunks[0].size(0)]
-                    
-            except Exception as e:
-                logger.error(f"Error loading clusters on rank 0: {str(e)}")
-                chunk_size = None
-                chunks = None
-        else:
-            chunk_size = None
-            chunks = None
-
-        # Broadcast chunk size from rank 0 to all ranks
-        if torch.distributed.is_initialized():
-            if self.rank == 0:
-                chunk_size = torch.tensor(list(chunk_size), dtype=torch.long, device='cuda')
-            else:
-                chunk_size = torch.zeros(2, dtype=torch.long, device='cuda')
-            torch.distributed.broadcast(chunk_size, src=0)
-            
-            # Initialize local_clusters with proper size on all ranks
-            local_clusters = torch.zeros(chunk_size.tolist(), device='cuda')
-            
-            # Scatter the chunks
-            try:
-                # Convert tuple to list for scatter operation
-                scatter_list = chunks if self.rank == 0 else None
-                dist.scatter(local_clusters, scatter_list, src=0)
-                logger.info(f"[Rank {self.rank}] Successfully received cluster chunk of shape {local_clusters.shape}")
-                return local_clusters
-                
-            except Exception as e:
-                logger.error(f"Error in scatter on rank {self.rank}: {str(e)}")
-                raise
-
-        else:
-            logger.warning("Distributed not initialized, returning empty clusters")
-            return torch.tensor([], device='cuda')
-
-    def _distributed_bucket_indices(self):
-        """Load precomputed bucket indices with rank suffixes"""
-        bucket_files = sorted([
-            f for f in os.listdir(self.bucket_dir)
-            if f.endswith('.pt') and '_rank' in f
-        ])
-        
-        # Load and concatenate all bucket indices
-        indices = []
-        for fname in bucket_files:
-            indices.append(torch.load(os.path.join(self.bucket_dir, fname)))
-        
-        return torch.cat(indices)
-
-    def __len__(self):
-        return self.num_samples
-
-    def _init_memory_maps(self):
-        """Initialize memory maps for all data types"""
-        # Create unified memory map index
-        index_path = os.path.join(self.config.feature_cache_path, "mmap_index.bin")
-        self.mmap_handles = self._create_memory_map(index_path)
-        
-        # Preload first 10% of data for each type
-        self._warmup_cache()
-
-    def _create_memory_map(self, index_path):
-        """Create memory map index with validation"""
-        # Get file lists with consistent sorting - no truncation needed
-        self.latent_files = sorted([f.name for f in Path(self.latent_dir).glob("*.latent.pt")])
-        self.clip_files = sorted([f.name for f in Path(self.clip_dir).glob("*.clip_emb.pt")])
-        self.cluster_files = sorted([f.name for f in Path(self.cluster_dir).glob("*.cluster.pt")])
-        self.dim_files = sorted([f.name for f in Path(self.dim_dir).glob("*.pt")])
-
-        # All features guaranteed aligned by preprocessor
-        self.num_samples = len(self.latent_files)
-        
-        logger.info(f"Loaded aligned features: {self.num_samples} samples")
-
-        # Build index only if needed - use first feature type as reference
-        if not os.path.exists(index_path) and is_main_process():
-            with open(index_path, 'wb') as f:
-                for fname in self.latent_files:
-                    base = Path(fname).stem
-                    # Write placeholder values since sizes are known
-                    f.write(struct.pack('Q', 0)) 
-
-        # Load memory map with additional validation
-        mmap = np.memmap(index_path, mode='r', dtype=np.uint64)
-        return mmap
-
-    def _warmup_cache(self):
-        """Thread-safe cache warming with proper synchronization"""
-        # Synchronize processes before starting
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-        warmup_pbar = tqdm(
-            total=len(self)//10,
-            desc="Warming cache" + (f" (Rank {self.rank})" if self.rank != 0 else ""),
-            leave=False,
-            disable=not is_main_process(),
-            position=0  # Unified position for all ranks
-        )
-
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            futures = []
-            for idx in range(0, len(self), len(self)//10):
-                futures.append(executor.submit(self._load_item, idx))
-            
-            for future in as_completed(futures):
-                future.result()
-                warmup_pbar.update(1)
-
-        warmup_pbar.close()
-
-    def _load_item(self, idx):
-        """Load a single item for cache warming"""
-        try:
-            # Just access the item to load it into cache
-            latent_path = os.path.join(self.latent_dir, self.latent_files[idx])
-            if os.path.exists(latent_path):
-                # Load with mmap but don't keep in memory
-                _ = torch.load(latent_path, map_location='cpu', mmap=True)
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to warm cache for index {idx}: {str(e)}")
-            return False
-
-    def _load_manifest(self):
-        """Load manifest from rank-specific files"""
-        return [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
-
-    def _load_clusters(self):
-        """Load clusters from single combined file"""
+    def _lazy_load_clusters(self):
+        """Load precomputed cluster assignments"""
         cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
         try:
-            clusters = torch.load(cluster_path, weights_only=False)
-            if not isinstance(clusters, torch.Tensor):
-                clusters = torch.tensor(clusters)
-            clusters = clusters.cuda()
-            logger.info(f"[Rank {self.rank}] Loaded clusters tensor of shape {clusters.shape}")
-            return clusters
+            # Load the precomputed cluster assignments directly to GPU
+            # These were generated during preprocessing using the two-stage approach
+            cluster_assignments = torch.load(cluster_path)
+            
+            # Validate cluster assignments
+            num_clusters = cluster_assignments.max().item() + 1
+            logger.info(f"Loaded {num_clusters} clusters from {cluster_path}")
+            
+            # Log cluster distribution
+            unique_clusters, counts = torch.unique(cluster_assignments, return_counts=True)
+            for cluster, count in zip(unique_clusters.tolist(), counts.tolist()):
+                logger.info(f"Cluster {cluster}: {count} samples")
+            
+            return cluster_assignments.cuda()
+            
         except Exception as e:
-            logger.error(f"[Rank {self.rank}] Failed to load clusters: {str(e)}")
+            logger.error(f"Failed to load cluster assignments: {str(e)}")
             raise
 
     def _load_bucket_assignments(self):
-        """Load bucket assignments from rank-specific files"""
-        bucket_assignments = []
-        for base_name in self.manifest:
-            try:
-                # Find corresponding bucket file across all ranks
-                bucket_file = None
-                for r in range(self.world_size):
-                    potential_file = f"{base_name}_rank{r}.pt"
-                    if os.path.exists(os.path.join(self.bucket_dir, potential_file)):
-                        bucket_file = potential_file
-                        break
-                
-                if bucket_file is None:
-                    raise FileNotFoundError(f"No bucket file found for {base_name}")
-                    
-                bucket_idx = torch.load(os.path.join(self.bucket_dir, bucket_file))
-                bucket_assignments.append(bucket_idx)
-            except Exception as e:
-                logger.error(f"Error loading bucket for {base_name}: {str(e)}")
-                bucket_assignments.append(torch.tensor(0))  # Default to first bucket
-                
-        return torch.stack(bucket_assignments).cuda()
-
-    def __getitem__(self, idx):
-        """Load item from rank-specific files"""
-        base_name = self.manifest[idx]
-        
-        # Find the rank suffix for this sample
-        rank_suffix = self.latent_files[idx].split('_rank')[-1].split('.')[0]
-        
+        """Load bucket assignments from preprocessed files"""
         try:
-            return {
-                'latent': torch.load(os.path.join(self.latent_dir, f"{base_name}_rank{rank_suffix}.pt")),
-                'clip_embedding': torch.load(os.path.join(self.clip_dir, f"{base_name}_rank{rank_suffix}.pt")),
-                'expert': self.expert_assignments[idx],
-                'dims': torch.load(os.path.join(self.dim_dir, f"{base_name}_rank{rank_suffix}.pt"))
-            }
+            # Each rank loads its own bucket assignments
+            bucket_assignments = []
+            for latent_file in self.latent_files:
+                base_name = Path(latent_file).stem
+                bucket_file = os.path.join(self.bucket_dir, f"{base_name}.pt")
+                
+                if os.path.exists(bucket_file):
+                    bucket_idx = torch.load(bucket_file)
+                    bucket_assignments.append(bucket_idx)
+                else:
+                    logger.warning(f"Missing bucket file for {base_name}, using default bucket")
+                    bucket_assignments.append(torch.tensor(0))
+            
+            # Convert to tensor and move to GPU
+            bucket_tensor = torch.stack(bucket_assignments)
+            logger.info(f"[Rank {self.rank}] Loaded {len(bucket_assignments)} bucket assignments")
+            return bucket_tensor.cuda()
+            
         except Exception as e:
-            logger.error(f"Error loading item {idx} ({base_name}): {str(e)}")
+            logger.error(f"Error loading bucket assignments: {str(e)}")
             raise
 
-    def _load_latent(self, idx):
-        """Direct memory access with pointer arithmetic"""
-        ptr = self.mmap_handles[idx * 4]
-        mmap = np.memmap(ptr[0], mode='r', offset=ptr[1], shape=(ptr[2],))
-        return torch.from_numpy(np.frombuffer(mmap, dtype=np.float32))
-
-    def _load_clip(self, idx):
-        """CLIP embedding with async prefetch"""
-        ptr = self.mmap_handles[idx * 4 + 1]
-        mmap = np.memmap(ptr[0], mode='r', offset=ptr[1], shape=(ptr[2],))
-        return torch.from_numpy(np.frombuffer(mmap, dtype=np.float32))
-
-    def _prefetch_next_batch(self):
-        """Background prefetch of next anticipated batch"""
-        if not hasattr(self, '_prefetch_executor'):
-            self._prefetch_executor = ThreadPoolExecutor(max_workers=4)
-            
-        # Predict next access pattern
-        next_indices = range(self.last_idx, self.last_idx + self.config.batch_size)
-        self._prefetch_executor.submit(self._prefetch_indices, next_indices)
-
-    def _prefetch_indices(self, indices):
-        """Prefetch specific indices using POSIX_FADV_WILLNEED"""
-        for idx in indices:
-            if idx >= len(self):
-                continue
-            for ptr in self.mmap_handles[idx*4:(idx+1)*4]:
-                os.posix_fadvise(
-                    ptr[0].fileno(), 
-                    ptr[1], 
-                    ptr[2], 
-                    os.POSIX_FADV_WILLNEED
-                )
-
-    def validate_dataset(self):
-        for i in range(len(self)):
+    def _prefetch_worker(self):
+        """Background worker for prefetching data"""
+        while not self.stop_prefetch.is_set():
             try:
-                _ = self[i]
+                # Get next batch of indices to prefetch
+                indices = self.prefetch_queue.get(timeout=1.0)
+                if indices is None:
+                    break
+                
+                # Load data for each index
+                for idx in indices:
+                    if idx in self.cache:
+                        continue
+                        
+                    try:
+                        # Load data files
+                        base_name = Path(self.latent_files[idx]).stem
+                        
+                        data = {
+                            'latent': torch.load(os.path.join(self.latent_dir, f"{base_name}.pt")),
+                            'clip_embedding': torch.load(os.path.join(self.clip_dir, f"{base_name}.pt")),
+                            'dims': torch.load(os.path.join(self.dim_dir, f"{base_name}.pt")),
+                        }
+                        
+                        # Add to cache
+                        self.cache[idx] = data
+                        
+                        # Remove old items if cache is too large
+                        while len(self.cache) > self.prefetch_size:
+                            oldest_idx = min(self.cache.keys())
+                            del self.cache[oldest_idx]
+                            
+                    except Exception as e:
+                        logger.error(f"Failed to prefetch idx {idx}: {str(e)}")
+                        continue
+                        
             except Exception as e:
-                logger.error(f"Bad sample at index {i}: {str(e)}")
-                raise
+                if not self.stop_prefetch.is_set():
+                    logger.error(f"Prefetch worker error: {str(e)}")
+                continue
+
+    def __getitem__(self, idx):
+        """Get item with precomputed cluster assignment"""
+        try:
+            # Get data from cache or load if needed
+            if idx not in self.cache:
+                base_name = Path(self.latent_files[idx]).stem
+                self.cache[idx] = {
+                    'latent': torch.load(os.path.join(self.latent_dir, f"{base_name}.pt")),
+                    'clip_embedding': torch.load(os.path.join(self.clip_dir, f"{base_name}.pt")),
+                    'dims': torch.load(os.path.join(self.dim_dir, f"{base_name}.pt")),
+                }
+            
+            data = self.cache[idx].copy()
+            
+            # Use precomputed cluster assignment directly
+            data['expert'] = self.expert_assignments[idx]
+            data['bucket'] = self.bucket_assignments[idx]
+            
+            # Validate cluster assignment
+            if data['expert'] < 0 or data['expert'] >= self.config.num_experts:
+                raise ValueError(f"Invalid cluster assignment {data['expert']} for index {idx}")
+            
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error loading item {idx}: {str(e)}")
+            raise
+
+    def __len__(self):
+        return self.num_samples
+        
+    def __del__(self):
+        """Cleanup resources"""
+        self.stop_prefetch.set()
+        if hasattr(self, 'prefetch_thread'):
+            self.prefetch_thread.join(timeout=1.0)
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
@@ -416,57 +249,58 @@ class CombinedBatchSampler(Sampler):
 class BucketBatchSampler(torch.utils.data.Sampler):
     """Groups samples by bucket dimensions for efficient batching"""
     
-    def __init__(self, bucket_indices, batch_size, device, shuffle=True, drop_last=True):
-        # Add missing attribute assignments
-        self.shuffle = shuffle
-        self.device = device
-        self.drop_last = drop_last
+    def __init__(self, dataset, batch_size, shuffle=True, drop_last=True):
+        self.dataset = dataset
         self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
         
-        # Existing initialization
+        # Group indices by bucket
+        self.bucket_indices = defaultdict(list)
+        for idx in range(len(dataset)):
+            bucket = dataset.bucket_assignments[idx].item()
+            self.bucket_indices[bucket].append(idx)
+        
+        # Convert lists to tensors
         self.bucket_tensors = {
-            bucket: torch.tensor(indices, device=device, dtype=torch.long)
-            for bucket, indices in bucket_indices.items()
+            bucket: torch.tensor(indices, device='cuda')
+            for bucket, indices in self.bucket_indices.items()
         }
         
-        # Precomputes number of batches per bucket
-        self.batch_counts = torch.tensor([
+        # Calculate total batches
+        self.total_batches = sum(
             len(indices) // batch_size if drop_last 
-            else math.ceil(len(indices) / batch_size)
-            for indices in bucket_indices.values()
-        ], device=device)
+            else (len(indices) + batch_size - 1) // batch_size
+            for indices in self.bucket_indices.values()
+        )
+        
+        logger.info(f"Created BucketBatchSampler with {len(self.bucket_indices)} buckets")
+        for bucket, indices in self.bucket_indices.items():
+            logger.info(f"Bucket {bucket}: {len(indices)} samples")
 
     def __iter__(self):
-        print(f"[Rank {torch.distributed.get_rank()}] Initializing BucketBatchSampler with:")
-        print(f"Total buckets: {len(self.bucket_tensors)}")
-        print(f"Batch size: {self.batch_size}")
-        print(f"Shuffle: {self.shuffle}")
-        
-        # GPU-accelerated shuffling and batching
+        # Create batches for each bucket
         all_batches = []
-        for bucket_idx, indices in self.bucket_tensors.items():
-            print(f"Processing bucket {bucket_idx} with {len(indices)} samples")
+        
+        for bucket, indices in self.bucket_tensors.items():
+            if self.shuffle:
+                indices = indices[torch.randperm(len(indices), device=indices.device)]
             
-            # Shuffle on GPU using tensor operations
-            if self.shuffle:  # Now using properly initialized attribute
-                indices = indices[torch.randperm(len(indices), device=self.device)]
-            
-            # Split into batches using tensor slicing
+            # Split into batches
             batches = torch.split(indices, self.batch_size)
             
-            # Handle partial batch using initialized attribute
-            if self.drop_last and (len(indices) % self.batch_size != 0):
+            # Handle partial batches
+            if self.drop_last and len(batches[-1]) < self.batch_size:
                 batches = batches[:-1]
             
             all_batches.extend(batches)
         
-        # Final shuffle across buckets using initialized attribute
+        # Shuffle batches if requested
         if self.shuffle:
-            perm = torch.randperm(len(all_batches), device=self.device)
-            all_batches = [all_batches[i] for i in perm.cpu().numpy()]
-            
+            random.shuffle(all_batches)
+        
         return iter(all_batches)
-            
+
     def __len__(self):
         return self.total_batches
 
@@ -550,9 +384,8 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         sampler_start = time.time()
         try:
             sampler = BucketBatchSampler(
-                bucket_indices=bucket_indices,
+                dataset=dataset,
                 batch_size=config.expert_batch_size,
-                device=device,
                 shuffle=True,
                 drop_last=True
             )
