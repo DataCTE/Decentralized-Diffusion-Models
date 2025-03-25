@@ -59,27 +59,26 @@ class ExpertCacheManager:
                     self._add_to_cache(expert_idx, expert)
                     return expert
 
-                # Create new expert
+                # Create new expert trainer
                 expert = expert_factory_fn(expert_idx)
                 
-                # Only wrap with FSDP if not already wrapped
-                if not isinstance(expert, FSDP):
-                    expert = wrap_model_with_fsdp(
-                        expert.expert if hasattr(expert, 'expert') else expert,
+                # Only wrap the model part with FSDP if not already wrapped
+                if hasattr(expert, 'expert') and not isinstance(expert.expert, FSDP):
+                    expert.expert = wrap_model_with_fsdp(
+                        expert.expert,
                         self.config,
                         param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
                         rank=self.rank
                     )
                     
-                    # Reconfigure optimizer for FSDP if needed
-                    if hasattr(expert, 'optimizer'):
-                        expert.optimizer = configure_optimizer_for_fsdp(
-                            expert,
-                            AdamW8bit,
-                            lr=self.config.learning_rate,
-                            betas=self.config.adam_betas,
-                            weight_decay=self.config.weight_decay
-                        )
+                    # Reconfigure optimizer for FSDP
+                    expert.optimizer = configure_optimizer_for_fsdp(
+                        expert.expert,
+                        AdamW8bit,
+                        lr=self.config.learning_rate,
+                        betas=self.config.adam_betas,
+                        weight_decay=self.config.weight_decay
+                    )
                 
                 self._add_to_cache(expert_idx, expert)
                 return expert

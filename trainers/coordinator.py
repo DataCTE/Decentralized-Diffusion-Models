@@ -274,20 +274,32 @@ class DDMTrainingCoordinator:
 
     def _train_experts_sync(self, batch):
         """Expert training with quantized async updates"""
+        total_loss = torch.tensor(0.0, device=self.device)  # Initialize as tensor
+        num_experts = 0
+        
         for expert_idx in self.expert_indices:
-            expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
-            expert.train()
-        self.router.eval()
+            try:
+                expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
+                if hasattr(expert, 'train_step'):  # Check if it's an ExpertTrainer
+                    expert.train()
+                    loss = expert.train_step(batch)
+                    total_loss += loss
+                    num_experts += 1
+                else:
+                    logger.error(f"Error training expert {expert_idx} on rank {self.rank}: Object has no train_step method")
+            except Exception as e:
+                logger.error(f"Error training expert {expert_idx} on rank {self.rank}: {str(e)}")
+                continue
         
-        # Forward pass with quantized gradients
-        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
-            loss = self.train_experts(batch)
+        # Average loss across experts on this rank
+        if num_experts > 0:
+            total_loss = total_loss / num_experts
         
-        # Replace quant_comm logic with standard all_reduce
-        dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-        loss /= self.world_size
+        # Synchronize losses across all ranks
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        total_loss = total_loss / self.world_size
         
-        return loss.item()
+        return total_loss
 
     @contextlib.contextmanager
     def _async_context(self):
