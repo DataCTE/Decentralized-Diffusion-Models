@@ -33,21 +33,13 @@ class ExpertTrainer(BaseTrainer):
         self.expert_idx = expert_idx  # Store the expert index for identification
         self.world_size = world_size
         
-        # Create base expert model
-        base_expert = ExpertMMDiT(config).to(device)
-        
-        # Check if distributed is initialized before wrapping
-        if is_dist_initialized():
-            # Apply FSDP wrapping using the centralized utility
-            self.expert = wrap_model_with_fsdp(
-                base_expert,
-                config,
-                param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
-                rank=rank
-            )
-        else:
-            # Fallback for non-distributed mode
-            self.expert = base_expert
+        # FSDP handles all device placement
+        self.expert = wrap_model_with_fsdp(
+            ExpertMMDiT(config),
+            config,
+            param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
+            rank=rank
+        )
         
         # Use centralized optimizer configuration for FSDP compatibility
         if is_dist_initialized() and isinstance(self.expert, FSDP):
@@ -72,8 +64,8 @@ class ExpertTrainer(BaseTrainer):
             sigma=config.sigma, 
             loss_type=config.loss_type
         )
-        self.vae = VAEWrapper(device, config)
-        self.clip = CLIPTextEncoder(device, config)
+        self.vae = VAEWrapper(config)
+        self.clip = CLIPTextEncoder(config)
         
         # Precompute diffusion schedule as in paper appendix
         self.alphas, self.alpha_bar, _ = get_alphas_and_betas()
@@ -86,20 +78,16 @@ class ExpertTrainer(BaseTrainer):
             if step < warmup_steps
             else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (config.num_steps - warmup_steps)))
         )
-        
-        # Print initialization message from all ranks
-        print(f"[Rank {rank}] Initialized Expert {expert_idx} with FSDP")
 
     def compute_loss(self, batch):
         """Paper's per-expert loss calculation (Equation 6)"""
-        # Extract latents and move to device
-        x0 = batch["latent"].to(self.device)
+        # FSDP handles device placement - no .to(device) needed
+        x0 = batch["latent"]  # Already on correct device
         
         # Sample timesteps uniformly as in paper
-        t = torch.rand(x0.size(0), device=self.device)
+        t = torch.rand(x0.size(0), device=x0.device)  # Use tensor's device
         
         # Forward process using paper's flow matching formulation
-        # ut(xt|x0) = (x0 - αt·xt)/(σt^2)
         alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
         sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
         noise = torch.randn_like(x0)

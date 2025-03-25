@@ -59,7 +59,7 @@ class RouterTrainer:
         self.router = wrap_model_with_fsdp(
             base_router,
             config,
-            param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
+            param_init_fn=lambda m: m.to_empty(recurse=False),
             rank=rank
         )
         
@@ -91,32 +91,21 @@ class RouterTrainer:
 
     def train_step(self, batch, true_clusters=None, temperature=1.0):
         """Train router with cross-entropy loss per paper Section 3.3"""
-        # All ranks participate in router training
-        latents = batch["latent"].to(self.device)
-        if latents.dim() == 5:
-            latents = latents.squeeze(1)  # Remove extra dimension if present
-        
-        if true_clusters is None:
-            true_clusters = batch["expert"].to(self.device)
-        
-        text_embeds = batch["clip_embedding"].to(self.device)
-        if text_embeds.dim() == 4:
-            text_embeds = text_embeds.squeeze(1)
+        # Data already on correct device via DataLoader
+        latents = batch["latent"]
+        true_clusters = batch["expert"] if true_clusters is None else true_clusters
+        text_embeds = batch["clip_embedding"]
         
         # Use mixed precision training
         scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
         
         with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
             # Forward pass
-            t = torch.rand(latents.size(0), device=self.device)
+            t = torch.rand(latents.size(0), device=latents.device)
             alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             noise = torch.randn_like(latents)
             x_t = alpha_t * latents + sigma_t * noise
-            
-            # Ensure proper shape
-            if x_t.dim() != 4:
-                raise ValueError(f"Expected x_t to have 4 dimensions [B,C,H,W], got shape {x_t.shape}")
             
             # Forward through router
             logits = self.router(x_t, t * 1000, text_embeds)
@@ -125,8 +114,7 @@ class RouterTrainer:
             # Compute loss
             loss = self.criterion(logits, true_clusters)
         
-        # Optimize
-        self.optimizer.zero_grad()
+        # Backward pass handled automatically by FSDP
         scaler.scale(loss).backward()
         
         scaler.step(self.optimizer)

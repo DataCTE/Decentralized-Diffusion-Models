@@ -136,18 +136,20 @@ def load_models(config, device, checkpoint_dir, cache_manager=None):
         device=device
     )
     
-    # Load router model
-    logger.info("Loading router model")
+    # Load router model using FSDP-aware loading
     router_model = RouterModel(
         config=config,
         num_experts=config.num_experts
-    ).to(device)
+    )  # No .to(device) - FSDP handles placement
     
     router_checkpoint = os.path.join(checkpoint_dir, "router_model.pt")
     if os.path.exists(router_checkpoint):
-        state_dict = torch.load(router_checkpoint, map_location=device)
-        router_model.load_state_dict(state_dict)
-        logger.info(f"Loaded router model from {router_checkpoint}")
+        load_model_checkpoint(
+            router_model,
+            path=router_checkpoint,
+            is_fsdp=True,
+            device=device
+        )
     else:
         logger.warning(f"Router checkpoint {router_checkpoint} not found")
     

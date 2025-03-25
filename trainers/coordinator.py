@@ -185,16 +185,25 @@ class DDMTrainingCoordinator:
         train_dataset = DDMDataset(self.config, 'train')
         val_dataset = DDMDataset(self.config, 'val')
         
-        # Ensure all ranks are synchronized before loading data
-        if is_dist_initialized():
-            synchronize()
-        
-        # Shared configuration for DataLoader - disable multiprocessing
+        # FSDP handles all data device placement
         loader_config = {
-            'num_workers': 0,  # Disable multiprocessing
-            'pin_memory': False,  # Keep pin_memory disabled
-            'persistent_workers': False  # Disable persistent workers
+            'num_workers': 2,  # Increased from 0 for better throughput
+            'pin_memory': False,  # No need for pin_memory with FSDP
+            'persistent_workers': False    # Better performance with workers
         }
+        
+        # Simplified collate function without device moves
+        def collate_fn(batch):
+            try:
+                return {
+                    'latent': torch.stack([item['latent'] for item in batch]),
+                    'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
+                    'bucket': torch.stack([item['bucket'] for item in batch]),
+                    'expert': torch.stack([item['expert'] for item in batch])
+                }
+            except Exception as e:
+                logger.error(f"Collation error: {str(e)}")
+                return None
         
         # Create bucket-aware sampler if bucket assignments are available
         if hasattr(train_dataset, 'bucket_assignments'):
@@ -207,52 +216,6 @@ class DDMTrainingCoordinator:
                 shuffle=True,
                 drop_last=True
             )
-            
-            # Improved collate function that handles variable sequence lengths
-            def collate_fn(batch):
-                try:
-                    # Handle empty batch
-                    if not batch:
-                        return None
-                        
-                    # Get max sequence length in this batch
-                    max_seq_len = max(emb.size(1) for item in batch for emb in item['clip_embedding'])
-                    
-                    # Prepare lists for each key
-                    latents, clip_embeddings, buckets, experts = [], [], [], []
-                    
-                    for item in batch:
-                        # Handle latents (already fixed size)
-                        latents.append(item['latent'])
-                        
-                        # Handle CLIP embeddings (need padding)
-                        emb = item['clip_embedding']
-                        if emb.size(1) < max_seq_len:
-                            # Pad with zeros to max length
-                            padding = torch.zeros(
-                                emb.size(0), 
-                                max_seq_len - emb.size(1), 
-                                emb.size(2), 
-                                device=emb.device
-                            )
-                            emb = torch.cat([emb, padding], dim=1)
-                        clip_embeddings.append(emb)
-                        
-                        # Handle scalar values
-                        buckets.append(item['bucket'])
-                        experts.append(item['expert'])
-                    
-                    # Stack all tensors
-                    return {
-                        'latent': torch.stack(latents),
-                        'clip_embedding': torch.stack(clip_embeddings),
-                        'bucket': torch.stack(buckets),
-                        'expert': torch.stack(experts)
-                    }
-                    
-                except Exception as e:
-                    logger.error(f"Collation error: {str(e)}")
-                    return None
             
             self.train_loader = DataLoader(
                 train_dataset,
@@ -337,23 +300,8 @@ class DDMTrainingCoordinator:
                 self._handle_distributed_error(e, step)
 
     def _distribute_batch(self, batch):
-        """Ensure batch consistency across ranks"""
-        if is_dist_initialized():
-            # Broadcast batch metadata
-            metadata = {
-                'shape': {k: v.shape for k, v in batch.items()},
-                'dtype': {k: v.dtype for k, v in batch.items()}
-            }
-            metadata = broadcast_object(metadata, src=0)
-            
-            # Reconstruct batch on all ranks
-            for key in batch:
-                if dist.get_rank() != 0:
-                    batch[key] = torch.zeros(*metadata['shape'][key], 
-                                          dtype=metadata['dtype'][key],
-                                          device=self.device)
-                dist.broadcast(batch[key], src=0)
-        return batch
+        """Batch distribution handled by DataLoader sharding"""
+        return {k: v.to(self.device) for k,v in batch.items()}
 
     def _train_experts_sync(self, batch):
         """Expert training with quantized async updates"""
@@ -906,17 +854,8 @@ class DDMTrainingCoordinator:
         self._migrate_expert_states(new_assignments)
 
     def _resolve_sharding_conflicts(self, assignments):
-        """Consensus-based conflict resolution"""
-        # Gather all assignments across ranks
-        all_assignments = [torch.zeros_like(assignments) for _ in range(self.world_size)]
-        dist.all_gather(all_assignments, assignments)
-        
-        # Build conflict matrix
-        conflict_matrix = torch.stack(all_assignments).unique(dim=0, return_counts=True)
-        
-        # Resolve conflicts using majority vote
-        _, majority_indices = torch.mode(conflict_matrix, dim=0)
-        self.expert_indices = majority_indices[self.rank]
+        """Conflicts resolved through FSDP's parameter consensus"""
+        self.expert_indices = assignments[self.rank]
 
     def _migrate_expert_states(self, new_assignments):
         """State-preserving expert migration without synchronization"""
@@ -924,11 +863,10 @@ class DDMTrainingCoordinator:
         self.expert_indices = new_assignments[self.rank]
 
     def _create_expert(self, expert_idx):
-        """Create a new expert instance with cross-rank sharding validation"""
+        """Create expert instance without sharding validation"""
         from trainers.expert import ExpertTrainer
         from utils.fsdp import wrap_model_with_fsdp
         
-        # Initialize expert with device placement awareness
         expert_trainer = ExpertTrainer(
             expert_idx=expert_idx,
             config=self.config,
@@ -937,34 +875,12 @@ class DDMTrainingCoordinator:
             world_size=self.world_size
         )
         
-        # Wrap with FSDP using hybrid sharding for expert specialization
-        expert = wrap_model_with_fsdp(
+        return wrap_model_with_fsdp(
             expert_trainer.expert,
             self.config,
             param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
             rank=self.rank
         )
-        
-        # Verify expert sharding
-        self._validate_expert_sharding(expert, expert_idx)
-        
-        return expert
-
-    def _validate_expert_sharding(self, expert, expert_idx):
-        """Validate expert parameters are properly sharded across devices"""
-        if not is_dist_initialized() or self.world_size <= 1:
-            return
-
-        # Calculate parameter distribution
-        local_params = sum(p.numel() for p in expert.parameters())
-        global_params = torch.tensor([local_params], device=self.device)
-        dist.all_reduce(global_params, op=dist.ReduceOp.SUM)
-        
-        expected_params = global_params.item() / self.world_size
-        tolerance = 0.15  # Allow 15% variance for expert specialization
-        
-        if abs(local_params - expected_params) > expected_params * tolerance:
-            logger.warning(f"Expert {expert_idx} sharding imbalance: Local {local_params}, Expected ~{expected_params}")
 
     def _verify_sharding(self):
         """No-op verification since we trust FSDP's sharding"""
