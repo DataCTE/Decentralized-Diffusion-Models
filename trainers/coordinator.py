@@ -300,6 +300,7 @@ class DDMTrainingCoordinator:
             try:
                 step_start_time = time.time()
                 
+                # Get batch - ensure all ranks get same data
                 batch = next(iter(self.train_loader))
                 if batch is None:
                     continue
@@ -307,21 +308,8 @@ class DDMTrainingCoordinator:
                 # 1. Expert Training Phase - All ranks participate
                 expert_loss = self.train_experts(batch)
                 
-                # Synchronize expert losses across ranks
-                if self.world_size > 1:
-                    expert_losses = torch.tensor([expert_loss], device=self.device)
-                    dist.all_reduce(expert_losses, op=dist.ReduceOp.SUM)
-                    expert_loss = expert_losses.item() / self.world_size
-                
-                # 2. Router Update Phase (Section 3.3)
-                # All ranks participate in router training
+                # 2. Router Update Phase (Section 3.3) - All ranks participate
                 router_loss = self.train_router(batch)
-                
-                # Synchronize router losses
-                if self.world_size > 1:
-                    router_losses = torch.tensor([router_loss], device=self.device)
-                    dist.all_reduce(router_losses, op=dist.ReduceOp.SUM)
-                    router_loss = router_losses.item() / self.world_size
                 
                 # 3. Expert Redistribution Phase (Section 4.1)
                 if step % expert_update_interval == 0:
@@ -379,27 +367,38 @@ class DDMTrainingCoordinator:
         total_loss = 0.0
         num_experts = len(self.expert_indices)
         
-        # Define the expert builder function that will be used to create experts when needed
-        def expert_builder_fn(expert_idx):
-            from trainers.expert import ExpertTrainer
-            
-            # Create a new expert trainer with proper distributed initialization
-            expert = ExpertTrainer(
-                expert_idx=expert_idx,
-                config=self.config,
-                device=self.device,
-                rank=self.rank,
-                world_size=self.world_size
-            )
-            return expert
-        
         # Train each expert assigned to this process
         for expert_idx in self.expert_indices:
-            # Get expert from cache manager with the builder function
-            expert = self.cache_manager.get_expert(expert_idx, expert_builder_fn)
+            # Get expert from cache manager
+            expert = self.cache_manager.get_expert(expert_idx, self._create_expert)
             
-            # Perform training step and accumulate loss
+            # Perform training step
             loss = expert.train_step(batch)
+            total_loss += loss
+        
+        # Average loss across experts on this rank
+        avg_loss = total_loss / max(num_experts, 1)
+        
+        # Synchronize losses across all ranks
+        if self.world_size > 1:
+            loss_tensor = torch.tensor([avg_loss], device=self.device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg_loss = loss_tensor.item() / self.world_size
+        
+        return avg_loss
+    
+    def train_router(self, batch):
+        """Train router following paper's Section 3.3"""
+        try:
+            # Get cluster assignments from batch
+            true_clusters = batch['expert'].to(self.device)
+            
+            # Train router with cross-entropy loss as described in paper
+            loss = self.router.train_step(
+                batch,
+                true_clusters=true_clusters,
+                temperature=self.config.router_temperature
+            )
             
             # Synchronize loss across GPUs
             if self.world_size > 1:
@@ -407,32 +406,10 @@ class DDMTrainingCoordinator:
                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
                 loss = loss_tensor.item() / self.world_size
             
-            total_loss += loss
-        
-        # Return average loss across experts
-        return total_loss / max(num_experts, 1)
-    
-    def train_router(self, batch):
-        """
-        Train router following paper's Section 3.3 - router predicts cluster
-        probabilities p(k|x_t, t) using cross-entropy loss
-        """
-        if self.rank == 0:  # Router trains only on rank 0
-            try:
-                # Get cluster assignments from batch
-                true_clusters = batch['expert']
-                
-                # Train router with cross-entropy loss as described in paper
-                loss = self.router.train_step(
-                    batch,
-                    true_clusters=true_clusters,
-                    temperature=self.config.router_temperature
-                )
-                return loss
-            except Exception as e:
-                logger.error(f"Router training failed: {str(e)}")
-                return float('inf')
-        return 0.0
+            return loss
+        except Exception as e:
+            logger.error(f"Router training failed: {str(e)}")
+            return float('inf')
     
     def validate(self, step):
         """Run validation using DDM inference process"""
