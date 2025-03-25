@@ -33,6 +33,7 @@ class FeatureGenerator:
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         self.device = torch.device(f'cuda:{self.rank}')
+        self.enabled_features = enabled_features
         
         # Only initialize requested models
         if 'vae' in enabled_features:
@@ -50,7 +51,6 @@ class FeatureGenerator:
         self.batch_size = 32  # Images per batch
         self.image_buffer = []
         self.caption_buffer = []
-        self.enabled_features = enabled_features
 
     def _force_create_dirs(self):
         """Create only needed directories"""
