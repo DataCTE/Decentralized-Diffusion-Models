@@ -78,15 +78,18 @@ def main():
         torch.cuda.empty_cache()
         
         # Initialize logging on all processes for debugging
-        setup_logger(config.output_dir, log_to_console=(rank == 0))
+        # Modified logging setup with proper parameters
         if rank == 0:
-            log_training_start(logging.getLogger(), config, rank)
+            logger = setup_logger("DDMCoordinator", config.output_dir, log_to_console=True)
+            log_training_start(logger, config, rank)
             
             print("="*50)
             print(" Initializing dataset - this may take a few minutes")
             print(" Progress logs will be shown during the process")
             print("="*50)
-            
+        else:
+            setup_logger("DDMCoordinator", config.output_dir, log_to_console=False)
+        
         # Add memory sanity check
         if torch.cuda.memory_allocated(device) > 0:
             raise RuntimeError(f"Rank {rank} already has memory allocated before model creation")
@@ -131,4 +134,4 @@ def main():
             dist.destroy_process_group()
 
 if __name__ == "__main__":
-    main()
+    main() 
