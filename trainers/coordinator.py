@@ -242,7 +242,9 @@ class DDMTrainingCoordinator:
             
         # Add debug print to verify indices
         print(f"[Rank {self.rank}] Expert indices: {self.expert_indices}")
-        return f"Experts initialized: {self.expert_indices.tolist()}"
+        
+        # Fix here - don't call tolist() on a list
+        return f"Experts initialized: {self.expert_indices}"
 
     def _calculate_expert_shards(self):
         """Calculate expert assignments without cross-rank checks"""
@@ -263,8 +265,8 @@ class DDMTrainingCoordinator:
                 batch = next(iter(self.train_loader))
                 batch = self._distribute_batch(batch)
                 
-                # Expert training phase
-                expert_loss = self._train_experts_sync(batch)
+                # Expert training phase - now returns tuple of (avg_loss, individual_losses)
+                expert_loss, expert_individual_losses = self._train_experts_sync(batch)
                 
                 # Router update phase
                 router_loss = self._train_router_sync(batch)
@@ -273,9 +275,9 @@ class DDMTrainingCoordinator:
                 if step % self.config.expert_update_interval == 0:
                     self._redistribute_experts()
 
-                # Synchronized logging
+                # Synchronized logging - pass individual losses to logging function
                 if self.rank == 0:
-                    self._log_metrics(step, expert_loss, router_loss)
+                    self._log_metrics(step, expert_loss, router_loss, expert_individual_losses=expert_individual_losses)
                 
             except Exception as e:
                 self._handle_distributed_error(e, step)
@@ -288,6 +290,7 @@ class DDMTrainingCoordinator:
         """Train all experts synchronously"""
         total_loss = 0.0
         num_experts = 0
+        individual_losses = {}  # New dictionary to track per-expert losses
         
         # Ensure expert_indices is properly iterable
         if hasattr(self, 'expert_indices_tensor') and not hasattr(self, 'expert_indices'):
@@ -310,11 +313,13 @@ class DDMTrainingCoordinator:
                 loss = expert.train_step(batch)
                 total_loss += loss
                 num_experts += 1
+                individual_losses[f"expert_{expert_idx}_loss"] = loss  # Track individual loss
             except Exception as e:
                 print(f"Error training expert {expert_idx} on rank {self.rank}: {str(e)}")
         
         # Avoid division by zero
-        return total_loss / max(1, num_experts)
+        avg_loss = total_loss / max(1, num_experts)
+        return avg_loss, individual_losses  # Return both average and individual losses
 
     @contextlib.contextmanager
     def _async_context(self):
@@ -941,7 +946,7 @@ class DDMTrainingCoordinator:
             if imbalance > 1.5:
                 logger.warning(f"High memory imbalance detected at {stage}!")
 
-    def _log_metrics(self, step, expert_loss, router_loss, duration=None, learning_rates=None):
+    def _log_metrics(self, step, expert_loss, router_loss, duration=None, learning_rates=None, expert_individual_losses=None):
         """Log training metrics to wandb and console"""
         if self.rank != 0:
             return  # Only log from rank 0
@@ -959,17 +964,43 @@ class DDMTrainingCoordinator:
         
         # Log to wandb
         if hasattr(self, 'wandb') and self.config.wandb_enabled:
-            self._log_step_metrics_to_wandb(
-                step=step,
-                expert_loss=expert_loss,
-                router_loss=router_loss,
-                step_duration=duration,
-                learning_rates=learning_rates,
-                memory_stats=memory_stats
-            )
+            # Create log dictionary with all metrics
+            log_dict = {
+                "expert_loss_avg": expert_loss,
+                "router_loss": router_loss
+            }
+            
+            # Add individual expert losses if available
+            if expert_individual_losses:
+                log_dict.update(expert_individual_losses)
+                
+            # Add additional metrics if available
+            if duration is not None:
+                log_dict["step_duration_sec"] = duration
+                
+            if learning_rates:
+                for lr_name, lr_value in learning_rates.items():
+                    log_dict[f"lr_{lr_name}"] = lr_value
+                    
+            if memory_stats:
+                for mem_name, mem_value in memory_stats.items():
+                    log_dict[f"memory_{mem_name}"] = mem_value
+                    
+            # Log to wandb
+            import wandb
+            wandb.log(log_dict, step=step)
+            
+            # Handle commit frequency
+            if hasattr(self.config, 'wandb_commit_frequency') and step % self.config.wandb_commit_frequency == 0:
+                wandb.log({}, commit=True)
         
-        # Log to console periodically
+        # Log to console periodically (keep simple with just average loss)
         if step % self.config.log_every == 0:
-            lr_str = f", LR: {learning_rates['expert']:.6f}" if learning_rates else ""
+            lr_str = f", LR: {learning_rates['expert']:.6f}" if learning_rates and 'expert' in learning_rates else ""
             print(f"[Step {step}] Expert Loss: {expert_loss:.4f}, Router Loss: {router_loss:.4f}{lr_str}")
+            
+            # Optionally print individual expert losses in a more compact format
+            if expert_individual_losses and len(expert_individual_losses) > 0:
+                expert_str = ", ".join([f"E{k.split('_')[1]}: {v:.4f}" for k, v in expert_individual_losses.items()])
+                print(f"  Individual expert losses: {expert_str}")
 
