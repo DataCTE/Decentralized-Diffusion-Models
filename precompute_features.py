@@ -171,10 +171,7 @@ class FeatureGenerator:
                 torch.save(data, self.feature_dir/f"{feat}/{base_name}_rank{self.rank}.pt")
 
     def run_clustering(self):
-        """Distributed CPU clustering implementation"""
-        clustering_status = torch.tensor([0], device=self.device)
-        dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX)
-        
+        """Pure CPU clustering implementation"""
         try:
             if self.rank == 0:
                 feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
@@ -186,17 +183,20 @@ class FeatureGenerator:
                 feat_dim = sample_feat.shape[1]
                 
                 # Create memory-mapped array
-                mmap_array = np.memmap(mmap_path, dtype=np.float32, mode='w+', 
+                with open(mmap_path, 'wb') as f:
+                    f.seek(total_files * feat_dim * 4 - 1)
+                    f.write(b'\0')
+                
+                mmap_array = np.memmap(mmap_path, dtype=np.float32, mode='r+', 
                                      shape=(total_files, feat_dim))
                 
-                # Batched parallel loading with write locking
-                batch_size = 4096
+                # Batched loading with error handling
+                batch_size = 8192
                 with tqdm(total=total_files, desc="Loading features") as pbar:
-                    with ThreadPoolExecutor(max_workers=32) as executor:
-                        for batch_idx in range(0, total_files, batch_size):
-                            batch_files = feature_files[batch_idx:batch_idx+batch_size]
-                            
-                            # Process batch
+                    for batch_idx in range(0, total_files, batch_size):
+                        batch_files = feature_files[batch_idx:batch_idx+batch_size]
+                        
+                        with ThreadPoolExecutor(max_workers=32) as executor:
                             futures = {executor.submit(self._safe_load_feature, f): i 
                                      for i, f in enumerate(batch_files, batch_idx)}
                             for future in as_completed(futures):
@@ -209,10 +209,10 @@ class FeatureGenerator:
                                     print(f"Skipping corrupted file: {str(e)}")
                                 pbar.update(1)
                 
-                # Filter out invalid entries in-place
+                # Filter invalid entries
                 valid_mask = ~np.all(mmap_array == 0, axis=1)
                 full_features = mmap_array[valid_mask]
-                full_features.flush()
+                del mmap_array  # Release memory map
 
                 # CPU-only k-means
                 kmeans = faiss.Kmeans(
@@ -236,23 +236,23 @@ class FeatureGenerator:
                 )
                 agg.fit(kmeans.centroids)
                 
-                # Save from CPU
+                # Save final clusters
                 _, labels = kmeans.index.search(full_features, 1)
                 cluster_labels = agg.labels_[labels.flatten()]
                 torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
 
-                # Cleanup memory map
-                del mmap_array
+                # Cleanup
                 os.remove(mmap_path)
 
-            # Synchronize after CPU completion
-            clustering_status.fill_(2)
-            dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX, timeout=timedelta(minutes=10))
+            # Simple barrier since we're CPU-only
+            if dist.is_initialized():
+                dist.barrier()
             
         except Exception as e:
             print(f"Clustering failed: {str(e)}")
-            clustering_status.fill_(1)
-            dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX, timeout=timedelta(seconds=30))
+            if dist.is_initialized():
+                dist.barrier()
+            raise
 
     def _safe_load_feature(self, path):
         """Load features with validation and retries"""
@@ -315,7 +315,7 @@ class FeatureGenerator:
         test_tensor = torch.randn(1024, device=self.device)
         torch.cuda.synchronize()
         # If this hangs, it indicates GPU health issues
-        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM, timeout=timedelta(seconds=30))
+        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
 
     # Add this class attribute
     FEATURE_PROCESSORS = {
@@ -477,7 +477,7 @@ def main():
             clustering_status = torch.tensor([0], device=device)
             while True:
                 # Check status every 5 seconds with timeout
-                dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX, timeout=timedelta(seconds=30))
+                dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX)
                 
                 if clustering_status.item() == 2:
                     break  # Clustering completed
