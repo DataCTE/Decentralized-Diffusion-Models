@@ -89,10 +89,6 @@ class ExpertTrainer(BaseTrainer):
         
         # Print initialization message from all ranks
         print(f"[Rank {rank}] Initialized Expert {expert_idx} with FSDP")
-        
-        # Ensure synchronization after initialization
-        if is_dist_initialized():
-            synchronize()
 
     def compute_loss(self, batch):
         """Paper's per-expert loss calculation (Equation 6)"""
@@ -173,14 +169,6 @@ class ExpertTrainer(BaseTrainer):
         # Optimize with proper distributed handling
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
-        
-        # Note: With FSDP, we don't need explicit gradient synchronization
-        # as it's handled internally by FSDP
-        
-        # Gradient clipping and optimization
-        if self.config.max_grad_norm > 0:
-            scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.expert.parameters(), self.config.max_grad_norm)
         
         scaler.step(self.optimizer)
         scaler.update()

@@ -56,7 +56,12 @@ class RouterTrainer:
         
         # Apply FSDP wrapping - note we don't call .to(device) before FSDP wrapping
         # IMPORTANT: Let FSDP handle device placement to ensure proper sharding
-        self.router = base_router  # Remove FSDP wrapping here
+        self.router = wrap_model_with_fsdp(
+            base_router,
+            config,
+            param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
+            rank=rank
+        )
         
         # Print initialization message from all ranks
         self.logger.info(f"[Rank {rank}] Created base Router model")
@@ -83,10 +88,6 @@ class RouterTrainer:
             if step < self.warmup_steps 
             else 0.5*(1 + math.cos(math.pi*(step - self.warmup_steps)/self.total_steps))
         )
-
-        # Ensure all ranks are synchronized after initialization
-        if self.world_size > 1:
-            dist.barrier()
 
     def train_step(self, batch, true_clusters=None, temperature=1.0):
         """Train router with cross-entropy loss per paper Section 3.3"""
@@ -127,18 +128,6 @@ class RouterTrainer:
         # Optimize
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
-        
-        # Synchronize gradients across GPUs
-        if self.world_size > 1:
-            for param in self.router.parameters():
-                if param.grad is not None:
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                    param.grad.div_(self.world_size)
-        
-        # Gradient clipping and optimization
-        if self.config.max_grad_norm > 0:
-            scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.max_grad_norm)
         
         scaler.step(self.optimizer)
         scaler.update()

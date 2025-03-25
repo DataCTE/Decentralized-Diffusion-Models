@@ -50,10 +50,6 @@ def setup_distributed():
     return rank, world_size
 
 def main():
-    # Add early synchronization
-    if is_dist_initialized():
-        dist.barrier()
-    
     # Load configuration
     config = get_config("config.py")
     
@@ -66,12 +62,6 @@ def main():
         
         # Force proper device placement
         torch.cuda.set_device(rank)  # Explicitly set device
-        
-        # Ensure all processes wait for model size prints to complete
-        dist.barrier()
-        
-        # Clear GPU memory before proceeding
-        torch.cuda.empty_cache()
         
         # Initialize logging on all processes for debugging
         # Modified logging setup with proper parameters
@@ -107,18 +97,6 @@ def main():
             world_size=world_size,
             cache_manager=cache_manager
         )
-        
-        # Add verification after initialization
-        if rank == 0:
-            print("\nVerifying FSDP model distribution...")
-            print("="*50)
-            
-        # Verify FSDP for all ranks
-        if hasattr(coordinator, '_verify_sharding'):
-            coordinator._verify_sharding()
-            
-        # Wait for verification to complete
-        dist.barrier()
         
         # Train
         coordinator.train(config.num_steps)
