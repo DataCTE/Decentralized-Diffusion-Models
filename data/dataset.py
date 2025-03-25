@@ -77,6 +77,14 @@ class DDMDataset(Dataset):
         # Initialize memory maps
         self._init_memory_maps()
         
+        # Add validation for expert assignments
+        if self.expert_assignments is not None:
+            logger.info(f"[Rank {self.rank}] Loaded expert assignments with shape: {self.expert_assignments.shape}")
+            if torch.isnan(self.expert_assignments).any():
+                raise ValueError(f"[Rank {self.rank}] NaN values found in expert assignments")
+        else:
+            raise ValueError(f"[Rank {self.rank}] Failed to load expert assignments")
+
         # Add validation after initialization
         print(f"[Rank {self.rank}] Final dataset stats:")
         print(f"Total samples: {len(self)}")
@@ -145,16 +153,43 @@ class DDMDataset(Dataset):
         cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
         
         if self.rank == 0:
-            all_clusters = torch.load(cluster_path)
-            chunks = torch.chunk(all_clusters, self.world_size)
+            try:
+                # Explicitly set weights_only=False for numpy array loading
+                all_clusters = torch.load(cluster_path, weights_only=False)
+                if not isinstance(all_clusters, torch.Tensor):
+                    all_clusters = torch.tensor(all_clusters)
+                chunks = torch.chunk(all_clusters, self.world_size)
+                # Get size of first chunk to broadcast
+                chunk_size = chunks[0].size()
+            except Exception as e:
+                logger.error(f"Error loading clusters on rank 0: {str(e)}")
+                chunk_size = None
         else:
-            chunks = [None] * self.world_size
+            chunk_size = None
+            chunks = None
 
-        # Scatter chunks to all ranks
-        local_clusters = torch.empty_like(chunks[0]) if self.rank == 0 else None
-        dist.scatter(local_clusters, chunks, src=0)
-        
-        return local_clusters
+        # Broadcast chunk size from rank 0 to all ranks
+        if torch.distributed.is_initialized():
+            if self.rank == 0:
+                chunk_size = torch.tensor(list(chunk_size), dtype=torch.long, device='cuda')
+            else:
+                chunk_size = torch.zeros(2, dtype=torch.long, device='cuda')
+            torch.distributed.broadcast(chunk_size, src=0)
+            
+            # Initialize local_clusters with proper size on all ranks
+            local_clusters = torch.zeros(chunk_size.tolist(), device='cuda')
+            
+            # Scatter the chunks
+            try:
+                dist.scatter(local_clusters, chunks if self.rank == 0 else None, src=0)
+            except Exception as e:
+                logger.error(f"Error in scatter on rank {self.rank}: {str(e)}")
+                raise
+
+            return local_clusters
+        else:
+            logger.warning("Distributed not initialized, returning empty clusters")
+            return torch.tensor([])
 
     def _distributed_bucket_indices(self):
         """Load precomputed bucket indices with rank suffixes"""
