@@ -102,23 +102,33 @@ class DDMDataset(Dataset):
         """Load precomputed cluster assignments"""
         cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
         try:
-            # Load the precomputed cluster assignments directly to GPU
-            # These were generated during preprocessing using the two-stage approach
-            cluster_assignments = torch.load(cluster_path)
+            # Load the precomputed cluster assignments with weights_only=False
+            # since we're loading numpy arrays
+            cluster_assignments = torch.load(cluster_path, weights_only=False)
             
             # Validate cluster assignments
             num_clusters = cluster_assignments.max().item() + 1
-            logger.info(f"Loaded {num_clusters} clusters from {cluster_path}")
+            if num_clusters != self.config.num_experts:
+                logger.warning(
+                    f"Found {num_clusters} clusters but config specifies {self.config.num_experts} experts"
+                )
             
             # Log cluster distribution
             unique_clusters, counts = torch.unique(cluster_assignments, return_counts=True)
             for cluster, count in zip(unique_clusters.tolist(), counts.tolist()):
                 logger.info(f"Cluster {cluster}: {count} samples")
             
+            # Ensure cluster assignments are within valid range
+            if (cluster_assignments < 0).any() or (cluster_assignments >= self.config.num_experts).any():
+                raise ValueError(
+                    f"Invalid cluster assignments found. Min: {cluster_assignments.min()}, "
+                    f"Max: {cluster_assignments.max()}, Expected range: [0, {self.config.num_experts-1}]"
+                )
+            
             return cluster_assignments.cuda()
             
         except Exception as e:
-            logger.error(f"Failed to load cluster assignments: {str(e)}")
+            logger.error(f"Failed to load cluster assignments from {cluster_path}: {str(e)}")
             raise
 
     def _load_bucket_assignments(self):
