@@ -18,7 +18,7 @@ from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
 from data.dataset import BucketBatchSampler
 from torch.utils.data import DataLoader 
-from torch.distributed import dist
+import torch.distributed as dist
 
 
 
