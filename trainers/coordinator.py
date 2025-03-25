@@ -283,11 +283,8 @@ class DDMTrainingCoordinator:
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             loss = self.train_experts(batch)
         
-        # Async parameter update
-        if self.quant_comm:
-            loss = self.quant_comm.all_reduce(loss)
-        else:
-            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+        # Replace quant_comm logic with standard all_reduce
+        dist.all_reduce(loss, op=dist.ReduceOp.SUM)
         loss /= self.world_size
         
         return loss.item()
@@ -839,11 +836,9 @@ class DDMTrainingCoordinator:
         self.expert_indices = new_assignments[self.rank]
 
     def _create_expert(self, expert_idx):
-        """Create expert instance with proper FSDP validation"""
+        """Create expert trainer instance"""
         from trainers.expert import ExpertTrainer
-        from utils.fsdp import wrap_model_with_fsdp
         
-        # Create base expert
         expert_trainer = ExpertTrainer(
             expert_idx=expert_idx,
             config=self.config,
@@ -852,18 +847,7 @@ class DDMTrainingCoordinator:
             world_size=self.world_size
         )
         
-        # Get raw model before FSDP wrapping
-        base_expert = expert_trainer.expert
-        
-        # Apply FSDP wrapping if not already wrapped
-        if not isinstance(base_expert, FSDP):
-            return wrap_model_with_fsdp(
-                base_expert,
-                self.config,
-                param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
-                rank=self.rank
-            )
-        return base_expert
+        return expert_trainer
 
     def _verify_sharding(self):
         """No-op verification since we trust FSDP's sharding"""

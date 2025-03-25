@@ -118,56 +118,34 @@ class ExpertTrainer(BaseTrainer):
 
     def train_step(self, batch):
         """Train expert with flow matching loss per paper Section 3.2"""
-        # Get data
-        latents = batch["latent"].to(self.device)
-        if latents.dim() == 5:
-            latents = latents.squeeze(1)  # Remove extra dimension if present
+        # Get data - ensure proper device placement
+        latents = batch["latent"].to(self.device, non_blocking=True)
+        text_embeds = batch["clip_embedding"].to(self.device, non_blocking=True)
         
-        text_embeds = batch["clip_embedding"].to(self.device)
-        if text_embeds.dim() == 4:
-            text_embeds = text_embeds.squeeze(1)
-        
-        # Use mixed precision training
-        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
-        
-        # If using FSDP, this will respect sharding
-        with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
-            # Sample timestep uniformly
+        # Mixed precision context
+        with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+            # Random timesteps
             t = torch.rand(latents.size(0), device=self.device)
             
-            # Forward diffusion process
-            alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
-            sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
-            noise = torch.randn_like(latents)
-            x_t = alpha_t * latents + sigma_t * noise
-            
-            # Prepare position embeddings
-            h = latents.shape[2] // self.config.patch_size
-            w = latents.shape[3] // self.config.patch_size
-            img_ids = self._get_position_ids(latents)
-            txt_ids = self._get_text_position_ids(text_embeds)
-            
-            # Get expert predictions with proper position embeddings
+            # Forward pass through expert model
             pred_flow = self.expert(
-                img=x_t,
-                img_ids=img_ids,
+                img=latents,
+                img_ids=self._get_position_ids(latents),
                 txt=text_embeds,
-                txt_ids=txt_ids,
-                timesteps=t * 1000,  # Scale timesteps to match model expectation
+                txt_ids=self._get_text_position_ids(text_embeds),
+                timesteps=t * 1000,  # Scale timesteps
                 y=self._get_conditioning(latents.shape[0]),
                 cluster_ids=batch['expert'].to(self.device)
             )
             
-            # Compute flow matching loss
-            loss = self.flow_matcher.compute_flow_matching_loss(pred_flow, latents)
+            # Calculate loss
+            loss = self.flow_matcher.compute_loss(pred_flow, latents, t)
         
-        # Optimize with proper distributed handling
+        # Backpropagation
         self.optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        
-        scaler.step(self.optimizer)
-        scaler.update()
-        self.lr_scheduler.step()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         
         return loss.item()
     
