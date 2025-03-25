@@ -108,6 +108,11 @@ class RouterTrainer:
         if text_embeds.dim() == 3 and text_embeds.shape[1] == self.config.clip_embedding_dim:
             text_embeds = text_embeds.transpose(1, 2)
         
+        # If text_embeds have sequence dimension (B, seq_len, dim), mean-pool over sequence
+        if text_embeds.dim() == 3:
+            # Mean pooling over sequence dimension to get (B, dim)
+            text_embeds = text_embeds.mean(dim=1)
+        
         # Initialize scaler once in __init__ instead of every train step
         if not hasattr(self, 'scaler'):
             self.scaler = torch.amp.GradScaler(enabled=self.config.use_mixed_precision)
