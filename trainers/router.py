@@ -6,6 +6,7 @@ import math
 from bitsandbytes.optim import AdamW8bit
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
+from torch.distributed import dist
 
 
 
@@ -83,8 +84,8 @@ class RouterTrainer:
 
     def train_step(self, batch, true_clusters=None, temperature=1.0):
         """Train router with cross-entropy loss per paper Section 3.3"""
-        # Get inputs and ensure proper shapes
-        latents = batch["latent"].to(self.device)  # [B, C, H, W] or [B, 1, C, H, W]
+        # All ranks participate in router training
+        latents = batch["latent"].to(self.device)
         if latents.dim() == 5:
             latents = latents.squeeze(1)  # Remove extra dimension if present
         
@@ -92,49 +93,49 @@ class RouterTrainer:
             true_clusters = batch["expert"].to(self.device)
         
         text_embeds = batch["clip_embedding"].to(self.device)
-        if text_embeds.dim() == 4:  # [B, 1, seq_len, dim]
+        if text_embeds.dim() == 4:
             text_embeds = text_embeds.squeeze(1)
         
-        # Use mixed precision training with updated syntax
+        # Use mixed precision training
         scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
         
         with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
-            # Sample timestep uniformly as in paper
+            # Forward pass
             t = torch.rand(latents.size(0), device=self.device)
-            
-            # Forward diffusion process (Section 3.1)
             alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             noise = torch.randn_like(latents)
             x_t = alpha_t * latents + sigma_t * noise
             
-            # Ensure x_t has correct shape [B, C, H, W]
+            # Ensure proper shape
             if x_t.dim() != 4:
                 raise ValueError(f"Expected x_t to have 4 dimensions [B,C,H,W], got shape {x_t.shape}")
             
-            # Get router predictions with temperature annealing
+            # Forward through router
             logits = self.router(x_t, t * 1000, text_embeds)
-            logits = logits / temperature  # Apply temperature scaling
+            logits = logits / temperature
             
-            # Compute cross-entropy loss
+            # Compute loss
             loss = self.criterion(logits, true_clusters)
         
         # Optimize
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
         
-        # Gradient clipping
+        # Synchronize gradients across GPUs
+        if self.world_size > 1:
+            for param in self.router.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                    param.grad.div_(self.world_size)
+        
+        # Gradient clipping and optimization
         if self.config.max_grad_norm > 0:
             scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                self.router.parameters(), 
-                self.config.max_grad_norm
-            )
+            torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.max_grad_norm)
         
         scaler.step(self.optimizer)
         scaler.update()
-        
-        # Update learning rate
         self.lr_scheduler.step()
         
         return loss.item()

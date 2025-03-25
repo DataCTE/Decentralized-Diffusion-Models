@@ -18,6 +18,7 @@ from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
 from data.dataset import BucketBatchSampler
 from torch.utils.data import DataLoader 
+from torch.distributed import dist
 
 
 
@@ -251,24 +252,28 @@ class DDMTrainingCoordinator:
         Determine expert assignments based on paper's Section 3.2 - each expert 
         trains independently on its assigned data cluster
         """
-        # Current implementation: Simple round-robin assignment
-        self.expert_indices = [
-            idx for idx in range(self.config.num_experts)
-            if idx % self.world_size == self.rank
-        ]
-        
-        # Should be modified to:
-        cluster_sizes = self.train_loader.dataset.get_cluster_sizes()  # Get size of each cluster
-        min_size = self.config.min_cluster_samples  # From paper Section 4.1
-        
-        # Filter out clusters that are too small
+        # Get cluster sizes from dataset
+        cluster_sizes = self.train_loader.dataset.get_cluster_sizes()
+        min_size = self.config.min_cluster_samples
+
+        # Filter valid clusters (those with enough samples)
         valid_clusters = [
             idx for idx in range(self.config.num_experts)
-            if cluster_sizes[idx] >= min_size and idx % self.world_size == self.rank
+            if cluster_sizes[idx] >= min_size
         ]
-        
-        self.expert_indices = valid_clusters
-        logger.info(f"Rank {self.rank} managing {len(self.expert_indices)} experts with valid cluster sizes")
+
+        if len(valid_clusters) == 0:
+            logger.warning("No clusters meet minimum size requirement!")
+            valid_clusters = list(range(self.config.num_experts))
+
+        # Distribute experts across GPUs using interleaved assignment
+        # This ensures better load balancing than simple round-robin
+        self.expert_indices = [
+            idx for i, idx in enumerate(valid_clusters)
+            if i % self.world_size == self.rank
+        ]
+
+        logger.info(f"Rank {self.rank} managing experts: {self.expert_indices}")
     
     def _init_router(self):
         """Initialize router with async FSDP wrapping"""
@@ -299,27 +304,39 @@ class DDMTrainingCoordinator:
                 if batch is None:
                     continue
                 
-                # 1. Expert Training Phase
+                # 1. Expert Training Phase - All ranks participate
                 expert_loss = self.train_experts(batch)
                 
+                # Synchronize expert losses across ranks
+                if self.world_size > 1:
+                    expert_losses = torch.tensor([expert_loss], device=self.device)
+                    dist.all_reduce(expert_losses, op=dist.ReduceOp.SUM)
+                    expert_loss = expert_losses.item() / self.world_size
+                
                 # 2. Router Update Phase (Section 3.3)
-                # Router only trains on rank 0 and at specified intervals
-                router_loss = 0.0
-                if self.rank == 0 and step % router_update_interval == 0:
-                    router_loss = self.train_router(batch)
+                # All ranks participate in router training
+                router_loss = self.train_router(batch)
+                
+                # Synchronize router losses
+                if self.world_size > 1:
+                    router_losses = torch.tensor([router_loss], device=self.device)
+                    dist.all_reduce(router_losses, op=dist.ReduceOp.SUM)
+                    router_loss = router_losses.item() / self.world_size
                 
                 # 3. Expert Redistribution Phase (Section 4.1)
                 if step % expert_update_interval == 0:
                     self._redistribute_experts()
+                    # Synchronize after redistribution
+                    dist.barrier()
                 
                 # Calculate step duration
                 step_duration = time.time() - step_start_time
                 
-                # Log metrics
+                # Log metrics (only rank 0)
                 if self.rank == 0:
-                    global_step += 1  # Increment global step counter
+                    global_step += 1
                     self._log_step_metrics_to_wandb(
-                        step=global_step,  # Use global step for wandb
+                        step=global_step,
                         expert_loss=expert_loss,
                         router_loss=router_loss,
                         step_duration=step_duration,
@@ -327,12 +344,14 @@ class DDMTrainingCoordinator:
                         memory_stats=self._get_memory_stats()
                     )
                 
+                # Synchronize periodically
+                if step % 100 == 0:
+                    dist.barrier()
+                
             except Exception as e:
                 print(f"[Rank {self.rank}] Critical error in step {step}:")
                 print(f"Exception type: {type(e).__name__}")
                 print(f"Error message: {str(e)}")
-                print(f"Current latent files count: {len(self.train_loader.dataset.latent_files)}")
-                print(f"Attempted index: {e.args[1] if len(e.args) > 1 else 'N/A'}")
                 raise
         
         # Log final training stats
@@ -358,13 +377,13 @@ class DDMTrainingCoordinator:
     def train_experts(self, batch):
         """Train expert models using the DDM approach"""
         total_loss = 0.0
+        num_experts = len(self.expert_indices)
         
         # Define the expert builder function that will be used to create experts when needed
         def expert_builder_fn(expert_idx):
-            # Import the actual expert trainer class we have
             from trainers.expert import ExpertTrainer
             
-            # Create a new expert trainer with proper initialization 
+            # Create a new expert trainer with proper distributed initialization
             expert = ExpertTrainer(
                 expert_idx=expert_idx,
                 config=self.config,
@@ -381,10 +400,17 @@ class DDMTrainingCoordinator:
             
             # Perform training step and accumulate loss
             loss = expert.train_step(batch)
+            
+            # Synchronize loss across GPUs
+            if self.world_size > 1:
+                loss_tensor = torch.tensor([loss], device=self.device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                loss = loss_tensor.item() / self.world_size
+            
             total_loss += loss
         
         # Return average loss across experts
-        return total_loss / max(len(self.expert_indices), 1)
+        return total_loss / max(num_experts, 1)
     
     def train_router(self, batch):
         """
