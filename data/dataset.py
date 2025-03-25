@@ -58,57 +58,37 @@ class DDMDataset(Dataset):
         # Verify all required directories exist
         self._verify_cache_dirs()
         
-        # Initialize latent files first
-        self.latent_files = sorted([
-            f for f in os.listdir(self.latent_dir) 
-            if f.endswith('.latent.pt')
-        ])
+        # Initialize latent files first - match the rank-specific pattern
+        self.latent_files = []
+        for r in range(self.world_size):
+            rank_files = sorted([
+                f for f in os.listdir(self.latent_dir) 
+                if f.endswith(f'_rank{r}.pt')
+            ])
+            self.latent_files.extend(rank_files)
+            
         self.num_samples = len(self.latent_files)
+        logger.info(f"[Rank {self.rank}] Found {self.num_samples} total latent files")
         
         # Now load manifest since latent_files is initialized
         self.manifest = self._load_manifest()
         
-        # 2. Sharded cluster loading
-        self.expert_assignments = self._load_sharded_clusters()
+        # 2. Load clusters from the single combined file
+        self.expert_assignments = self._load_clusters()
         
-        # 3. Distributed bucket indices
-        self.bucket_assignments = self._distributed_bucket_indices()
+        # 3. Load bucket assignments
+        self.bucket_assignments = self._load_bucket_assignments()
         
         # Initialize memory maps
         self._init_memory_maps()
         
-        # Add validation for expert assignments
-        if self.expert_assignments is not None:
-            logger.info(f"[Rank {self.rank}] Loaded expert assignments with shape: {self.expert_assignments.shape}")
-            if torch.isnan(self.expert_assignments).any():
-                raise ValueError(f"[Rank {self.rank}] NaN values found in expert assignments")
-            if len(self.expert_assignments) == 0:
-                raise ValueError(f"[Rank {self.rank}] Empty expert assignments loaded")
-            if self.expert_assignments.device.type != 'cuda':
-                logger.warning(f"[Rank {self.rank}] Expert assignments not on CUDA device")
-                self.expert_assignments = self.expert_assignments.cuda()
-        else:
-            raise ValueError(f"[Rank {self.rank}] Failed to load expert assignments")
-
         # Add validation after initialization
         print(f"[Rank {self.rank}] Final dataset stats:")
         print(f"Total samples: {len(self)}")
         print(f"Latent files count: {len(self.latent_files)}")
-        print(f"First latent path: {os.path.join(self.latent_dir, self.latent_files[0])}")
-        print(f"Last latent path: {os.path.join(self.latent_dir, self.latent_files[-1])}")
-
-        # Validate indices
-        if len(self.latent_files) > 0:
-            try:
-                _ = self[0]
-                _ = self[len(self)-1]
-                print(f"[Rank {self.rank}] Initial samples loaded successfully")
-            except Exception as e:
-                print(f"[Rank {self.rank}] Initial sample loading failed: {str(e)}")
-                raise
-
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        if self.latent_files:
+            print(f"First latent path: {os.path.join(self.latent_dir, self.latent_files[0])}")
+            print(f"Last latent path: {os.path.join(self.latent_dir, self.latent_files[-1])}")
 
     def _verify_cache_dirs(self):
         """Validate cache directory structure"""
@@ -312,20 +292,64 @@ class DDMDataset(Dataset):
             return False
 
     def _load_manifest(self):
-        """Load manifest from precomputed features"""
-        # All features guaranteed aligned by preprocessor
-        return [Path(f).stem for f in self.latent_files]
+        """Load manifest from rank-specific files"""
+        return [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
+
+    def _load_clusters(self):
+        """Load clusters from single combined file"""
+        cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
+        try:
+            clusters = torch.load(cluster_path, weights_only=False)
+            if not isinstance(clusters, torch.Tensor):
+                clusters = torch.tensor(clusters)
+            clusters = clusters.cuda()
+            logger.info(f"[Rank {self.rank}] Loaded clusters tensor of shape {clusters.shape}")
+            return clusters
+        except Exception as e:
+            logger.error(f"[Rank {self.rank}] Failed to load clusters: {str(e)}")
+            raise
+
+    def _load_bucket_assignments(self):
+        """Load bucket assignments from rank-specific files"""
+        bucket_assignments = []
+        for base_name in self.manifest:
+            try:
+                # Find corresponding bucket file across all ranks
+                bucket_file = None
+                for r in range(self.world_size):
+                    potential_file = f"{base_name}_rank{r}.pt"
+                    if os.path.exists(os.path.join(self.bucket_dir, potential_file)):
+                        bucket_file = potential_file
+                        break
+                
+                if bucket_file is None:
+                    raise FileNotFoundError(f"No bucket file found for {base_name}")
+                    
+                bucket_idx = torch.load(os.path.join(self.bucket_dir, bucket_file))
+                bucket_assignments.append(bucket_idx)
+            except Exception as e:
+                logger.error(f"Error loading bucket for {base_name}: {str(e)}")
+                bucket_assignments.append(torch.tensor(0))  # Default to first bucket
+                
+        return torch.stack(bucket_assignments).cuda()
 
     def __getitem__(self, idx):
-        base = self.manifest[idx]
+        """Load item from rank-specific files"""
+        base_name = self.manifest[idx]
         
-        # Direct loading without existence checks
-        return {
-            'latent': torch.load(f"{self.latent_dir}/{base}.pt"),
-            'clip_embedding': torch.load(f"{self.clip_dir}/{base}.pt"),
-            'expert': torch.load(f"{self.cluster_dir}/final_clusters.pt")[idx],
-            'dims': torch.load(f"{self.dim_dir}/{base}.pt")
-        }
+        # Find the rank suffix for this sample
+        rank_suffix = self.latent_files[idx].split('_rank')[-1].split('.')[0]
+        
+        try:
+            return {
+                'latent': torch.load(os.path.join(self.latent_dir, f"{base_name}_rank{rank_suffix}.pt")),
+                'clip_embedding': torch.load(os.path.join(self.clip_dir, f"{base_name}_rank{rank_suffix}.pt")),
+                'expert': self.expert_assignments[idx],
+                'dims': torch.load(os.path.join(self.dim_dir, f"{base_name}_rank{rank_suffix}.pt"))
+            }
+        except Exception as e:
+            logger.error(f"Error loading item {idx} ({base_name}): {str(e)}")
+            raise
 
     def _load_latent(self, idx):
         """Direct memory access with pointer arithmetic"""
