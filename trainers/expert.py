@@ -101,6 +101,7 @@ class ExpertTrainer(BaseTrainer):
         # Get data - ensure proper device placement
         latents = batch["latent"].to(self.device, non_blocking=True)
         text_embeds = batch["clip_embedding"].to(self.device, non_blocking=True)
+        cluster_ids = batch["expert"].to(self.device, non_blocking=True)
         
         # Mixed precision context
         with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
@@ -115,7 +116,7 @@ class ExpertTrainer(BaseTrainer):
                 txt_ids=self._get_text_position_ids(text_embeds),
                 timesteps=t * 1000,  # Scale timesteps
                 y=self._get_conditioning(latents.shape[0]),
-                cluster_ids=batch['expert'].to(self.device)
+                cluster_ids=cluster_ids
             )
             
             # Calculate loss
@@ -250,3 +251,8 @@ class ExpertTrainer(BaseTrainer):
         B, L, _ = text_emb.shape
         pos_ids = torch.arange(L, device=self.device)[None].repeat(B, 1)
         return pos_ids[:, :, None].repeat(1, 1, 2)  # Add 2D position dim for consistency 
+
+    def _get_conditioning(self, batch_size):
+        """Get conditioning vector for expert"""
+        # Return zero conditioning vector of correct shape
+        return torch.zeros(batch_size, self.config.vec_in_dim, device=self.device) 

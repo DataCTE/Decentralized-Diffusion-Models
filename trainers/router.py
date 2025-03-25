@@ -89,6 +89,14 @@ class RouterTrainer:
             else 0.5*(1 + math.cos(math.pi*(step - self.warmup_steps)/self.total_steps))
         )
 
+    def train(self):
+        """Set router model to training mode"""
+        self.router.train()
+        
+    def eval(self):
+        """Set router model to evaluation mode"""
+        self.router.eval()
+
     def train_step(self, batch, true_clusters=None, temperature=1.0):
         """Train router with cross-entropy loss per paper Section 3.3"""
         # Data already on correct device via DataLoader
@@ -97,9 +105,9 @@ class RouterTrainer:
         text_embeds = batch["clip_embedding"]
         
         # Use mixed precision training
-        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
+        scaler = torch.amp.GradScaler(device_type='cuda', enabled=self.config.use_mixed_precision)
         
-        with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
+        with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             # Forward pass
             t = torch.rand(latents.size(0), device=latents.device)
             alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
@@ -115,8 +123,8 @@ class RouterTrainer:
             loss = self.criterion(logits, true_clusters)
         
         # Backward pass handled automatically by FSDP
+        self.optimizer.zero_grad()
         scaler.scale(loss).backward()
-        
         scaler.step(self.optimizer)
         scaler.update()
         self.lr_scheduler.step()
