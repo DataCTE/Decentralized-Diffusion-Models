@@ -25,18 +25,22 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from datetime import datetime, timedelta
 import time
+import argparse
 
 class FeatureGenerator:
-    def __init__(self, config):
+    def __init__(self, config, enabled_features):
         self.config = config
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         self.device = torch.device(f'cuda:{self.rank}')
         
-        # Initialize models directly without safety checks
-        self.vae = VAEWrapper(self.device, config)
-        self.clip = CLIPTextEncoder(self.device, config)
-        self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).eval()
+        # Only initialize requested models
+        if 'vae' in enabled_features:
+            self.vae = VAEWrapper(self.device, config)
+        if 'clip' in enabled_features:
+            self.clip = CLIPTextEncoder(self.device, config)
+        if 'dino' in enabled_features and not config.use_existing_dino:
+            self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).eval()
         
         # Create feature directories aggressively
         self.feature_dir = Path(config.feature_cache_path)
@@ -46,20 +50,24 @@ class FeatureGenerator:
         self.batch_size = 32  # Images per batch
         self.image_buffer = []
         self.caption_buffer = []
+        self.enabled_features = enabled_features
 
     def _force_create_dirs(self):
-        """Safer directory creation with existence checks"""
-        dirs = ['latents', 'clip', 'clusters', 'dims', 'dino_features', 'buckets']
+        """Create only needed directories"""
+        dir_map = {
+            'vae': 'latents',
+            'clip': 'clip',
+            'dino': 'dino_features',
+            'buckets': 'buckets',
+            'dims': 'dims',
+            'clustering': 'clusters'
+        }
         
-        # Only have rank 0 handle directory creation
         if self.rank == 0:
-            for d in dirs:
-                dir_path = self.feature_dir/d
-                if dir_path.exists():
-                    shutil.rmtree(dir_path, ignore_errors=True)
-                dir_path.mkdir(parents=True, exist_ok=True)
-        
-        # Wait for rank 0 to finish setup
+            for feat in self.enabled_features:
+                if feat in dir_map:
+                    dir_path = self.feature_dir/dir_map[feat]
+                    dir_path.mkdir(parents=True, exist_ok=True)
         dist.barrier()
 
     def process_image(self, img_path):
@@ -153,58 +161,79 @@ class FeatureGenerator:
 
     def _save_features(self, base_name, features):
         """Force-save features with rank ID"""
-        torch.save(features['latent'], self.feature_dir/f"latents/{base_name}_rank{self.rank}.pt")
-        torch.save(features['clip'], self.feature_dir/f"clip/{base_name}_rank{self.rank}.pt")
-        torch.save(features['dino'], self.feature_dir/f"dino_features/{base_name}_rank{self.rank}.pt")
-        torch.save(features['dims'], self.feature_dir/f"dims/{base_name}_rank{self.rank}.pt")
-        torch.save(features['bucket'], self.feature_dir/f"buckets/{base_name}_rank{self.rank}.pt")
+        for feat, data in features.items():
+            if feat in self.enabled_features:
+                torch.save(data, self.feature_dir/f"{feat}/{base_name}_rank{self.rank}.pt")
 
     def run_clustering(self):
-        """Global clustering after feature collection"""
+        """Distributed clustering implementation"""
         # Wait for all ranks to finish writing
         dist.barrier()
         
-        # Load all features across ranks with error handling
-        features = []
-        feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
-        
-        with tqdm(total=len(feature_files), desc="Loading features") as pbar:
-            with ThreadPoolExecutor(max_workers=16) as executor:
-                futures = {executor.submit(self._safe_load_feature, f): f for f in feature_files}
-                for future in as_completed(futures):
-                    try:
-                        feat = future.result()
-                        if feat is not None:
-                            features.append(feat)
-                        pbar.update(1)
-                    except Exception as e:
-                        print(f"Skipping corrupted file: {str(e)}")
+        if self.rank == 0:
+            print("Starting distributed clustering...")
+            try:
+                # Load features in parallel across all available GPUs
+                feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
+                features = []
+                
+                # Use memory mapping for large files
+                with tqdm(total=len(feature_files), desc="Loading features") as pbar:
+                    with ThreadPoolExecutor(max_workers=16) as executor:
+                        futures = {executor.submit(self._safe_load_feature, f): f 
+                                  for f in feature_files}
+                        for future in as_completed(futures):
+                            try:
+                                feat = future.result()
+                                if feat is not None:
+                                    features.append(feat)
+                                pbar.update(1)
+                            except Exception as e:
+                                print(f"Skipping corrupted file: {str(e)}")
 
-        if not features:
-            raise RuntimeError("No valid features found for clustering")
-        
-        full_features = torch.cat(features).numpy()
-        
-        # Paper's exact clustering parameters
-        kmeans = faiss.Kmeans(
-            full_features.shape[1], 1024,
-            niter=100, gpu=True, spherical=True,
-            min_points_per_centroid=100,
-            max_points_per_centroid=10000,
-            nredo=3
-        )
-        kmeans.train(full_features)
-        
-        agg = AgglomerativeClustering(
-            n_clusters=8, linkage='average',
-            metric='cosine', compute_full_tree=True
-        )
-        agg.fit(kmeans.centroids)
-        
-        # Save final clusters
-        _, labels = kmeans.index.search(full_features, 1)
-        cluster_labels = agg.labels_[labels.flatten()]
-        torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
+                full_features = torch.cat(features).numpy()
+                
+                # Distributed k-means with Faiss
+                kmeans = faiss.Kmeans(
+                    full_features.shape[1], 1024,
+                    niter=100, gpu=True, spherical=True,
+                    min_points_per_centroid=100,
+                    max_points_per_centroid=10000,
+                    nredo=3,
+                    verbose=True
+                )
+                kmeans.train(full_features)
+                
+                # Broadcast centroids to all ranks
+                centroids_tensor = torch.from_numpy(kmeans.centroids)
+                dist.broadcast(centroids_tensor, src=0)
+                
+                # Distributed hierarchical clustering
+                agg = AgglomerativeClustering(
+                    n_clusters=8, linkage='average',
+                    metric='cosine', compute_full_tree=True
+                )
+                agg.fit(kmeans.centroids)
+                
+                # Save final clusters
+                _, labels = kmeans.index.search(full_features, 1)
+                cluster_labels = agg.labels_[labels.flatten()]
+                torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
+                
+            except Exception as e:
+                print(f"Clustering failed: {str(e)}")
+                # Broadcast failure signal
+                failure_flag = torch.tensor([1], device=self.device)
+            else:
+                failure_flag = torch.tensor([0], device=self.device)
+            
+            dist.broadcast(failure_flag, src=0)
+        else:
+            failure_flag = torch.tensor([0], device=self.device)
+            dist.broadcast(failure_flag, src=0)
+
+        if failure_flag.item() == 1:
+            raise RuntimeError("Clustering failed on rank 0")
 
     def _safe_load_feature(self, path):
         """Load features with validation and retries"""
@@ -258,18 +287,81 @@ class FeatureGenerator:
         ]
         return min(distances)[1]
 
+    def _extract_dims(self, img):
+        """Extract original image dimensions"""
+        return torch.tensor(img.size, dtype=torch.int16)
+
+    # Add this class attribute
+    FEATURE_PROCESSORS = {
+        'vae': {
+            'handler': '_extract_vae_latent',
+            'save_prefix': 'latents'
+        },
+        'clip': {
+            'handler': '_extract_clip_embedding',
+            'save_prefix': 'clip'
+        },
+        'dino': {
+            'handler': '_extract_dino_features', 
+            'save_prefix': 'dino_features'
+        },
+        'buckets': {
+            'handler': '_get_bucket_index',
+            'save_prefix': 'buckets'
+        },
+        'dims': {
+            'handler': '_extract_dims',
+            'save_prefix': 'dims'
+        }
+    }
+
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
+    parser.add_argument('--buckets', action='store_true', help='Process image buckets')
+    parser.add_argument('--clustering', action='store_true', help='Run clustering')
+    parser.add_argument('--vae-latents', action='store_true', help='Extract VAE latents')
+    parser.add_argument('--clip-latents', action='store_true', help='Extract CLIP embeddings')
+    parser.add_argument('--dino-features', action='store_true', help='Extract DINO features')
+    parser.add_argument('--all', action='store_true', help='Run all processing stages')
+    parser.add_argument('--use-existing-dino', action='store_true',
+                        help='Use existing DINO features from disk')
+    args = parser.parse_args()
+
+    # Determine enabled features
+    enabled_features = []
+    if args.all:
+        enabled_features = ['vae', 'clip', 'dino', 'buckets', 'dims', 'clustering']
+    else:
+        feature_map = {
+            'vae-latents': 'vae',
+            'clip-latents': 'clip', 
+            'dino-features': 'dino',
+            'buckets': 'buckets',
+            'dims': 'dims',
+            'clustering': 'clustering'
+        }
+        enabled_features = [feature_map[f] for f in vars(args) if vars(args)[f] and f in feature_map]
+
+    # Add these NCCL settings before process group init
+    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"  # Disable async error handling
+    os.environ["NCCL_IGNORE_DISABLED_P2P"] = "1"   # Disable P2P check
+    os.environ["NCCL_SOCKET_IFNAME"] = "eth0"      # Specify network interface
+    os.environ["NCCL_DEBUG"] = "WARN"              # Reduce debug verbosity
+    
+    # Increase timeout to 2 hours (7200 seconds)
+    os.environ["NCCL_BLOCKING_WAIT"] = "1"
+    os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
+    os.environ["NCCL_SOCKET_NTHREADS"] = "4"
+    os.environ["NCCL_SOCKET_TIMEOUT"] = "7200000"
+    
     # Initialize distributed processing with explicit device settings
     rank = int(os.environ['LOCAL_RANK'])
     print(f"Rank {rank} starting initialization")
     
     # Critical NCCL environment variables
     os.environ["NCCL_ALGO"] = "RING"  # More reliable for small messages
-    os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
-    os.environ["NCCL_SOCKET_NTHREADS"] = "4"
     os.environ["NCCL_MIN_NCHANNELS"] = "12"
-    os.environ["NCCL_DEBUG"] = "INFO"
-    os.environ["NCCL_SOCKET_TIMEOUT"] = "300000"  # 5 minute timeout
     
     # Set device BEFORE initializing process group
     torch.cuda.set_device(rank)
@@ -305,13 +397,27 @@ def main():
     print(f"Rank {rank} received {len(local_images)} images to process")
     
     # Initialize feature generator
-    processor = FeatureGenerator(config)
+    processor = FeatureGenerator(config, enabled_features)
     
     try:
         # Main processing loop
         with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
             for img_path in local_images:
-                processor.process_image(img_path)
+                base_name = uuid.UUID(hashlib.md5(img_path.encode()).hexdigest()).hex
+                
+                # Only process enabled features
+                features = {}
+                for feat in enabled_features:
+                    if feat in FeatureGenerator.FEATURE_PROCESSORS:
+                        handler_info = FeatureGenerator.FEATURE_PROCESSORS[feat]
+                        handler = handler_info['handler']
+                        features[feat] = getattr(processor, handler)(img_path)
+                
+                # Save enabled features
+                for feat, data in features.items():
+                    prefix = FeatureGenerator.FEATURE_PROCESSORS[feat]['save_prefix']
+                    torch.save(data, processor.feature_dir/f"{prefix}/{base_name}_rank{rank}.pt")
+                
                 pbar.update(1)
 
         # Add final completion marker per rank
@@ -321,29 +427,14 @@ def main():
         if dist.get_world_size() > 1:
             dist.barrier()
 
-        # Cluster only after all ranks confirm completion
-        if rank == 0:
-            try:
-                # Remove timeout and use infinite retry
-                print("Waiting for all ranks to finish processing...")
-                while True:
-                    completed = sum(1 for r in range(dist.get_world_size()) 
-                                  if (processor.feature_dir/f"status_rank{r}.pt").exists())
-                    if completed == dist.get_world_size():
-                        break
-                    print(f"Waiting for {dist.get_world_size() - completed} ranks...")
-                    time.sleep(10)  # Check every 10 seconds
-                
-                print("All ranks completed, starting clustering...")
+        # Conditional clustering
+        if 'clustering' in enabled_features:
+            if rank == 0:
                 processor.run_clustering()
-                
-            except Exception as e:
-                print(f"Clustering failed: {str(e)}")
-        else:
-            # Non-zero ranks wait indefinitely for final signal
-            print(f"Rank {rank} waiting for clustering results...")
-            while not (processor.feature_dir/"clusters/final_clusters.pt").exists():
-                time.sleep(30)  # Check every 30 seconds
+            else:
+                # Wait for clustering results
+                while not (processor.feature_dir/"clusters/final_clusters.pt").exists():
+                    time.sleep(30)
 
     except Exception as e:
         print(f"Rank {rank} failed: {str(e)}")
