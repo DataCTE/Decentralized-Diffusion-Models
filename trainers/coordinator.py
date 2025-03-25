@@ -154,8 +154,8 @@ class DDMTrainingCoordinator:
         # Shared configuration for DataLoader - disable multiprocessing
         loader_config = {
             'num_workers': 0,  # Disable multiprocessing
-            'pin_memory': False,  # Keep pin_memory for faster GPU transfer
-            'persistent_workers': False  # Disable persistent workers since we're not using multiprocessing
+            'pin_memory': False,  # Keep pin_memory disabled
+            'persistent_workers': False  # Disable persistent workers
         }
         
         # Initialize training dataset
@@ -168,20 +168,53 @@ class DDMTrainingCoordinator:
             batch_sampler = BucketBatchSampler(
                 dataset=train_dataset,
                 batch_size=self.config.batch_size,
-                device=self.device,  # Use GPU for bucket assignments
+                device=self.device,
                 shuffle=True,
-                drop_last=True  # Drop incomplete batches
+                drop_last=True
             )
             
-            # Simplified collate function that handles tensor size mismatches
+            # Improved collate function that handles variable sequence lengths
             def collate_fn(batch):
                 try:
+                    # Handle empty batch
+                    if not batch:
+                        return None
+                        
+                    # Get max sequence length in this batch
+                    max_seq_len = max(emb.size(1) for item in batch for emb in item['clip_embedding'])
+                    
+                    # Prepare lists for each key
+                    latents, clip_embeddings, buckets, experts = [], [], [], []
+                    
+                    for item in batch:
+                        # Handle latents (already fixed size)
+                        latents.append(item['latent'])
+                        
+                        # Handle CLIP embeddings (need padding)
+                        emb = item['clip_embedding']
+                        if emb.size(1) < max_seq_len:
+                            # Pad with zeros to max length
+                            padding = torch.zeros(
+                                emb.size(0), 
+                                max_seq_len - emb.size(1), 
+                                emb.size(2), 
+                                device=emb.device
+                            )
+                            emb = torch.cat([emb, padding], dim=1)
+                        clip_embeddings.append(emb)
+                        
+                        # Handle scalar values
+                        buckets.append(item['bucket'])
+                        experts.append(item['expert'])
+                    
+                    # Stack all tensors
                     return {
-                        'latent': torch.stack([i['latent'] for i in batch]),
-                        'clip_embedding': torch.stack([i['clip_embedding'] for i in batch]),
-                        'bucket': torch.stack([i['bucket'] for i in batch]),
-                        'expert': torch.stack([i['expert'] for i in batch])
+                        'latent': torch.stack(latents),
+                        'clip_embedding': torch.stack(clip_embeddings),
+                        'bucket': torch.stack(buckets),
+                        'expert': torch.stack(experts)
                     }
+                    
                 except Exception as e:
                     logger.error(f"Collation error: {str(e)}")
                     return None
@@ -195,7 +228,7 @@ class DDMTrainingCoordinator:
             if self.rank == 0:
                 logger.info(f"Created bucket-aware DataLoader with batch size {self.config.batch_size}")
         else:
-            # Fallback to simple loader with batch_size=1
+            # Fallback to simple loader
             self.train_loader = DataLoader(
                 train_dataset,
                 batch_size=1,
@@ -203,12 +236,13 @@ class DDMTrainingCoordinator:
                 **loader_config
             )
         
-        # Validation dataset - always use batch_size=1 for safety
+        # Validation dataset with same collate function
         val_dataset = DDMDataset(self.config, 'val')
         self.val_loader = DataLoader(
             val_dataset,
             batch_size=1,
             shuffle=False,
+            collate_fn=collate_fn if 'collate_fn' in locals() else None,
             **loader_config
         )
     
@@ -238,8 +272,7 @@ class DDMTrainingCoordinator:
         # Initialize flow matcher on first use
         if self.flow_matcher is None:
             print(f"[Rank {self.rank}] Initializing flow matcher...")
-            
-        # Train loop implementing the DDM training approach
+        
         global_step = 0
         start_time = time.time()
         
@@ -247,11 +280,58 @@ class DDMTrainingCoordinator:
             try:
                 print(f"\n[Rank {self.rank}] Step {step}: Getting batch...")
                 batch = next(iter(self.train_loader))
+                
+                # Skip invalid batches
+                if batch is None:
+                    print(f"[Rank {self.rank}] Skipping invalid batch in step {step}")
+                    continue
+                    
                 print(f"[Rank {self.rank}] Batch keys: {batch.keys()}")
                 print(f"[Rank {self.rank}] Batch shapes:")
                 for k, v in batch.items():
                     print(f"{k}: {v.shape if hasattr(v, 'shape') else type(v)}")
+                
+                step_start_time = time.time()
+                
+                # Expert training phase
+                expert_loss = self.train_experts(batch)
+                
+                # Router update phase
+                router_loss = self.train_router(batch)
+                
+                step_duration = time.time() - step_start_time
+                global_step += 1
+                
+                # Log metrics to wandb on rank 0
+                if self.rank == 0 and self.wandb_enabled:
+                    self._log_step_metrics_to_wandb(
+                        step=global_step,
+                        expert_loss=expert_loss,
+                        router_loss=router_loss,
+                        step_duration=step_duration,
+                        learning_rates=self._get_learning_rates(),
+                        memory_stats=self._get_memory_stats() if getattr(self.config, 'wandb_log_memory', True) else None
+                    )
+                
+                # Log every N steps
+                if step % 100 == 0 or step == num_steps - 1:
+                    logger.info(f"Step {step}/{num_steps}: Expert loss = {expert_loss:.4f}, Router loss = {router_loss:.4f}")
                     
+                # Modified periodic validation with config check
+                if self.config.enable_validation and step % self.config.validate_every == 0:
+                    self.validate(step)
+                    
+                # Modified checkpoint saving with config check
+                if self.config.enable_checkpointing and step > 0 and step % self.config.save_every == 0:
+                    self.save_checkpoint(step)
+                
+                # Paper's dynamic expert scheduling
+                if step % self.config.expert_reshuffle_interval == 0:
+                    self._redistribute_experts()
+                
+                # Paper's gradient isolation
+                self._isolate_gradients()
+            
             except Exception as e:
                 print(f"[Rank {self.rank}] Critical error in step {step}:")
                 print(f"Exception type: {type(e).__name__}")
@@ -259,47 +339,6 @@ class DDMTrainingCoordinator:
                 print(f"Current latent files count: {len(self.train_loader.dataset.latent_files)}")
                 print(f"Attempted index: {e.args[1] if len(e.args) > 1 else 'N/A'}")
                 raise
-            
-            step_start_time = time.time()
-            
-            # Expert training phase
-            expert_loss = self.train_experts(batch)
-            
-            # Router update phase
-            router_loss = self.train_router(batch)
-            
-            step_duration = time.time() - step_start_time
-            global_step += 1
-            
-            # Log metrics to wandb on rank 0
-            if self.rank == 0 and self.wandb_enabled:
-                self._log_step_metrics_to_wandb(
-                    step=global_step,
-                    expert_loss=expert_loss,
-                    router_loss=router_loss,
-                    step_duration=step_duration,
-                    learning_rates=self._get_learning_rates(),
-                    memory_stats=self._get_memory_stats() if getattr(self.config, 'wandb_log_memory', True) else None
-                )
-            
-            # Log every N steps
-            if step % 100 == 0 or step == num_steps - 1:
-                logger.info(f"Step {step}/{num_steps}: Expert loss = {expert_loss:.4f}, Router loss = {router_loss:.4f}")
-                
-            # Modified periodic validation with config check
-            if self.config.enable_validation and step % self.config.validate_every == 0:
-                self.validate(step)
-                
-            # Modified checkpoint saving with config check
-            if self.config.enable_checkpointing and step > 0 and step % self.config.save_every == 0:
-                self.save_checkpoint(step)
-            
-            # Paper's dynamic expert scheduling
-            if step % self.config.expert_reshuffle_interval == 0:
-                self._redistribute_experts()
-            
-            # Paper's gradient isolation
-            self._isolate_gradients()
         
         # Log final training stats
         total_duration = time.time() - start_time
