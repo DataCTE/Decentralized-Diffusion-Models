@@ -62,7 +62,7 @@ class ExpertCacheManager:
                 # Create new expert trainer
                 expert = expert_factory_fn(expert_idx)
                 
-                # Only wrap the model part with FSDP if not already wrapped
+                # Only wrap the expert model with FSDP if not already wrapped
                 if hasattr(expert, 'expert') and not isinstance(expert.expert, FSDP):
                     expert.expert = wrap_model_with_fsdp(
                         expert.expert,
@@ -79,6 +79,9 @@ class ExpertCacheManager:
                         betas=self.config.adam_betas,
                         weight_decay=self.config.weight_decay
                     )
+                    
+                    # Initialize scaler for mixed precision training
+                    expert.scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
                 
                 self._add_to_cache(expert_idx, expert)
                 return expert

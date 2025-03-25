@@ -215,15 +215,12 @@ class DDMTrainingCoordinator:
     def _init_and_verify_router(self):
         """Initialize router with FSDP handling all device placement"""
         # Initialize router trainer with base model
-        router_trainer = RouterTrainer(
+        self.router = RouterTrainer(  # Store the RouterTrainer instance directly
             config=self.config,
             device=self.device,
             rank=self.rank,
             world_size=self.world_size
         )
-        
-        # Get the pre-wrapped FSDP model from the trainer
-        self.router = router_trainer.router
         
         return "Router initialized with FSDP"
 
@@ -312,21 +309,25 @@ class DDMTrainingCoordinator:
     def _train_router_sync(self, batch):
         """Router training with gradient synchronization"""
         # Set modes
-        self.router.train()
+        self.router.train()  # RouterTrainer has train() method
         for expert_idx in self.expert_indices:
             expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
             expert.eval()
         
         # Forward pass
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
-            loss = self.train_router(batch)
+            loss = self.router.train_step(batch)  # Use RouterTrainer's train_step
+        
+        # Convert loss to tensor if it's a float
+        if isinstance(loss, float):
+            loss = torch.tensor(loss, device=self.device)
         
         # Gradient synchronization
         if is_dist_initialized():
             dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-            loss /= self.world_size
+            loss = loss / self.world_size
         
-        return loss.item()
+        return loss
 
     def _handle_distributed_error(self, error, step):
         """Coordinated error handling across ranks"""
