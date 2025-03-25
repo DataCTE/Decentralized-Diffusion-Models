@@ -274,14 +274,24 @@ class DDMDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Modified collate that handles None entries"""
+        """Modified collate that handles variable-length sequences"""
         batch = [b for b in batch if b is not None]
         if len(batch) == 0:
             return None
-            
+        
+        # Pad CLIP embeddings to max length
+        clip_embeddings = [item['clip_embedding'] for item in batch]
+        max_len = max(e.size(1) for e in clip_embeddings)
+        
+        padded_embeddings = []
+        for emb in clip_embeddings:
+            pad_size = max_len - emb.size(1)
+            padded = torch.nn.functional.pad(emb, (0,0,0,pad_size), value=0)
+            padded_embeddings.append(padded)
+        
         return {
             'latent': torch.stack([item['latent'] for item in batch]),
-            'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
+            'clip_embedding': torch.stack(padded_embeddings),
             'bucket': torch.stack([item['bucket'] for item in batch]),
             'expert': torch.stack([item['expert'] for item in batch])
         }

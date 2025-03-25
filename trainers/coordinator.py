@@ -274,7 +274,9 @@ class DDMTrainingCoordinator:
 
     def _train_experts_sync(self, batch):
         """Expert training with quantized async updates"""
-        self._set_train_mode('expert')
+        for expert in self.expert_cache.values():
+            expert.train()
+        self.router.eval()
         
         # Forward pass with quantized gradients
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
@@ -299,7 +301,10 @@ class DDMTrainingCoordinator:
 
     def _train_router_sync(self, batch):
         """Router training with gradient synchronization"""
-        self._set_train_mode('router')
+        # Set modes
+        self.router.train()
+        for expert in self.expert_cache.values():
+            expert.eval()
         
         # Forward pass
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
