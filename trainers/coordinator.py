@@ -839,10 +839,11 @@ class DDMTrainingCoordinator:
         self.expert_indices = new_assignments[self.rank]
 
     def _create_expert(self, expert_idx):
-        """Create expert instance without sharding validation"""
+        """Create expert instance with proper FSDP validation"""
         from trainers.expert import ExpertTrainer
         from utils.fsdp import wrap_model_with_fsdp
         
+        # Create base expert
         expert_trainer = ExpertTrainer(
             expert_idx=expert_idx,
             config=self.config,
@@ -851,12 +852,18 @@ class DDMTrainingCoordinator:
             world_size=self.world_size
         )
         
-        return wrap_model_with_fsdp(
-            expert_trainer.expert,
-            self.config,
-            param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
-            rank=self.rank
-        )
+        # Get raw model before FSDP wrapping
+        base_expert = expert_trainer.expert
+        
+        # Apply FSDP wrapping if not already wrapped
+        if not isinstance(base_expert, FSDP):
+            return wrap_model_with_fsdp(
+                base_expert,
+                self.config,
+                param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
+                rank=self.rank
+            )
+        return base_expert
 
     def _verify_sharding(self):
         """No-op verification since we trust FSDP's sharding"""

@@ -5,7 +5,7 @@ import logging
 import threading
 from collections import OrderedDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
+from trainers.expert import wrap_model_with_fsdp
 logger = logging.getLogger(__name__)
 
 class ExpertCacheManager:
@@ -38,59 +38,42 @@ class ExpertCacheManager:
         
         logger.info(f"Initialized simplified ExpertCacheManager with max_experts={self.max_experts}, cpu_offload={self.cpu_offload}")
     
-    def get_expert(self, expert_idx, expert_factory_fn=None):
+    def get_expert(self, expert_idx, expert_factory_fn):
         """Get expert from cache, loading if necessary"""
-        with self.cache_lock:  # Always use the lock for thread safety
+        with self.cache_lock:
             try:
-                # Use expert_cache instead of active_experts
                 if expert_idx in self.expert_cache:
-                    # Reorder expert_cache to make this expert the most recently used
-                    expert = self.expert_cache.pop(expert_idx)
-                    self.expert_cache[expert_idx] = expert
+                    expert = self.expert_cache[expert_idx]
+                    self.expert_cache.move_to_end(expert_idx)
                     return expert
                 
-                # Use cpu_cache instead of offloaded_experts
                 if expert_idx in self.cpu_cache:
-                    # Load from CPU back to GPU
-                    expert = self.cpu_cache[expert_idx]
-                    # Move to device properly - FSDP-aware
+                    expert = self.cpu_cache.pop(expert_idx)
                     if isinstance(expert, FSDP):
-                        # For FSDP models, ensure proper device placement
-                        if expert.device != self.device:
-                            raise RuntimeError(f"FSDP expert {expert_idx} on wrong device {expert.device}")
+                        expert.to(self.device)
                     else:
-                        # Regular model
                         expert = expert.to(self.device)
-                    
-                    # Add to active cache
-                    self.expert_cache[expert_idx] = expert
-                    # Remove from CPU cache
-                    del self.cpu_cache[expert_idx]
+                    self._add_to_cache(expert_idx, expert)
                     return expert
+
+                # Create new expert with proper FSDP wrapping
+                expert = expert_factory_fn(expert_idx)
                 
-                # Not in any cache, create new expert
-                if expert_factory_fn:
-                    expert = expert_factory_fn(expert_idx)
-                    # Add to active cache
-                    self.expert_cache[expert_idx] = expert
-                    # Check if we need to evict experts
-                    self._enforce_cache_limits()
-                    return expert
+                # Verify FSDP wrapping
+                if not isinstance(expert, FSDP):
+                    expert = wrap_model_with_fsdp(
+                        expert,
+                        self.config,
+                        param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
+                        rank=self.rank
+                    )
                 
-                # No factory function and expert not found
-                return None
-            
+                self._add_to_cache(expert_idx, expert)
+                return expert
+
             except Exception as e:
-                logger.error(f"Error getting expert {expert_idx} from cache: {str(e)}")
-                # Attempt to recreate on error
-                if expert_factory_fn:
-                    try:
-                        expert = expert_factory_fn(expert_idx)
-                        self.expert_cache[expert_idx] = expert
-                        return expert
-                    except Exception as inner_e:
-                        logger.error(f"Failed to recreate expert {expert_idx}: {str(inner_e)}")
-                return None
+                logger.error(f"Critical error loading expert {expert_idx}: {str(e)}")
+                raise RuntimeError(f"Failed to load expert {expert_idx}") from e
     
     def _add_to_cache(self, expert_idx, expert):
         """Add expert to cache, evicting if necessary"""

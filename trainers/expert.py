@@ -33,9 +33,16 @@ class ExpertTrainer(BaseTrainer):
         self.expert_idx = expert_idx  # Store the expert index for identification
         self.world_size = world_size
         
-        # FSDP handles all device placement
+        # Initialize base model first
+        base_model = ExpertMMDiT(config)
+        
+        # Verify model is not already wrapped
+        if isinstance(base_model, FSDP):
+            raise ValueError("Expert model came pre-wrapped with FSDP")
+        
+        # Then apply FSDP wrapping
         self.expert = wrap_model_with_fsdp(
-            ExpertMMDiT(config),
+            base_model,
             config,
             param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
             rank=rank
