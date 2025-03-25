@@ -300,20 +300,30 @@ def estimate_model_size(config, model_type="expert"):
         h = config.image_size[1] // config.patch_size
         w = config.image_size[2] // config.patch_size
         
+        # Reshape image to sequence format (B, L, C)
+        img_seq_len = h * w
+        
         # Create dummy inputs with correct shapes
         dummy_input = [
-            torch.randn(batch_size, config.latent_channels, h, w, device=device),  # img
-            torch.randint(0, 2, (batch_size, h * w, 2), device=device),  # img_ids
+            # Reshape image from (B, C, H, W) to (B, L, C)
+            torch.randn(batch_size, img_seq_len, config.latent_channels, device=device),  # img
+            # Position IDs for image patches
+            torch.randint(0, h, (batch_size, img_seq_len, 2), device=device),  # img_ids
+            # Text embeddings (B, L, D)
             torch.randn(batch_size, config.max_token_length, config.clip_embedding_dim, device=device),  # txt
-            torch.randint(0, 2, (batch_size, config.max_token_length, 2), device=device),  # txt_ids
+            # Position IDs for text tokens
+            torch.randint(0, config.max_token_length, (batch_size, config.max_token_length, 2), device=device),  # txt_ids
+            # Timesteps
             torch.randn(batch_size, device=device),  # timesteps
+            # Conditioning vector
             torch.randn(batch_size, config.vec_in_dim, device=device),  # y
+            # Cluster IDs
             torch.randint(0, config.num_experts, (batch_size,), device=device),  # cluster_ids
-            torch.randn(batch_size, device=device) if config.guidance_embed else None,  # guidance (optional)
         ]
         
-        # Remove None values if guidance_embed is False
-        dummy_input = [x for x in dummy_input if x is not None]
+        # Add guidance if enabled
+        if config.guidance_embed:
+            dummy_input.append(torch.randn(batch_size, device=device))  # guidance
 
     elif model_type == "router":
         from models.router import RouterModel
@@ -339,40 +349,47 @@ def estimate_model_size(config, model_type="expert"):
         raise ValueError(f"Invalid model_type: {model_type}. Must be 'expert' or 'router'.")
 
     if TORCHINFO_AVAILABLE:
-        model_summary = summary(
-            dummy_model,
-            dtypes=[torch.float32],
-            device=device,
-            verbose=0,
-            input_data=dummy_input,  # Now properly defined for both cases
-        )
-        total_params = model_summary.total_params
-        trainable_params = model_summary.trainable_params
-        # Conditional check for non_trainable_params
-        if hasattr(model_summary, 'non_trainable_params'):
-            non_trainable_params = model_summary.non_trainable_params
-        else:
-            non_trainable_params = total_params - trainable_params # Calculate manually if not available
-        param_size_mb = model_summary.total_param_bytes / (1024**2) # Use total_param_bytes
+        try:
+            model_summary = summary(
+                dummy_model,
+                dtypes=[torch.float32] * len(dummy_input),  # Specify dtype for each input
+                device=device,
+                verbose=0,
+                input_data=dummy_input,
+            )
+            total_params = model_summary.total_params
+            trainable_params = model_summary.trainable_params
+            non_trainable_params = (
+                model_summary.non_trainable_params 
+                if hasattr(model_summary, 'non_trainable_params')
+                else total_params - trainable_params
+            )
+            param_size_mb = model_summary.total_param_bytes / (1024**2)
 
-        print(f"===================== {model_name} Size Summary =====================") # Model name in summary
-        print(f"Total params:        {total_params:,}")
-        print(f"Trainable params:    {trainable_params:,}")
-        print(f"Non-trainable params:{non_trainable_params:,}")
-        print(f"Model size (MB):     {param_size_mb:.2f}")
-        print("===============================================================")
+            print(f"\n===================== {model_name} Size Summary =====================")
+            print(f"Total params:         {total_params:,}")
+            print(f"Trainable params:     {trainable_params:,}")
+            print(f"Non-trainable params: {non_trainable_params:,}")
+            print(f"Model size (MB):      {param_size_mb:.2f}")
+            print("===============================================================\n")
+
+        except Exception as e:
+            print(f"Failed to generate detailed summary: {str(e)}")
+            total_params = sum(p.numel() for p in dummy_model.parameters())
+            print(f"\nFallback to basic parameter count for {model_name}:")
+            print(f"Total parameters: {total_params:,}\n")
 
     else:
         total_params = sum(p.numel() for p in dummy_model.parameters())
-        print(f"torchinfo not available. Estimating parameter count manually for {model_name}.") # Model name in message
-        print(f"Total parameters (approximate): {total_params:,}")
-        print("Please install torchinfo for a detailed model summary.")
+        print(f"\ntorchinfo not available. Basic parameter count for {model_name}:")
+        print(f"Total parameters: {total_params:,}")
+        print("Install torchinfo for detailed model summary.\n")
 
-    # Cleanup: Move model to CPU and delete to free memory
-    dummy_model.to('cpu') # Move model to CPU
-    del dummy_model # Delete model object
+    # Cleanup
+    dummy_model.to('cpu')
+    del dummy_model
     if device == 'cuda':
-        torch.cuda.empty_cache() # Clear CUDA cache
+        torch.cuda.empty_cache()
 
-    print("Model unloaded and memory cleared.") # Inform user about cleanup
+    print("Model unloaded and memory cleared.")
 
