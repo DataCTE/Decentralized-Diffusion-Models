@@ -16,6 +16,11 @@ class VAEWrapper:
         self._vae = None  # Lazy loading
         self.precision = torch.float16 if config.use_mixed_precision else torch.float32
         
+        # Add config flag to disable loading
+        if getattr(config, 'use_precomputed_latents', False):
+            logger.info("VAE loading skipped - using precomputed latents")
+            return
+        
         # Handle model loading paths
         vae_model_path = config.vae_model
         if not os.path.exists(vae_model_path) and "/" not in vae_model_path:

@@ -200,6 +200,9 @@ DEFAULT_CONFIG = {
         'overlap_communication': True,
         'consensus_timeout': 5.0  # Seconds for conflict resolution
     },
+
+    # Add to DEFAULT_CONFIG
+    'use_precomputed_latents': True,  # Set to True to disable VAE loading
 }
 
 def get_config(config_path=None):

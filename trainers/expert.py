@@ -64,8 +64,8 @@ class ExpertTrainer(BaseTrainer):
             sigma=config.sigma, 
             loss_type=config.loss_type
         )
-        self.vae = VAEWrapper(self.device, config)
-        self.clip = CLIPTextEncoder(self.device, config)
+        self.vae = None
+        self.clip = None
         
         # Precompute diffusion schedule as in paper appendix
         self.alphas, self.alpha_bar, _ = get_alphas_and_betas()
