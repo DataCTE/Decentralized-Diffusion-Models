@@ -19,6 +19,7 @@ from config import get_config, estimate_model_size
 from utils.logging import setup_logger, log_training_start
 from utils.checkpoint import load_coordinator_checkpoint
 from utils.expert_cache import ExpertCacheManager
+from utils.distributed import is_dist_initialized
 
 def setup_distributed():
     """Initialize distributed training environment using our centralized utilities"""
@@ -46,6 +47,10 @@ def setup_distributed():
     return rank, world_size
 
 def main():
+    # Add early synchronization
+    if is_dist_initialized():
+        dist.barrier()
+    
     # Load configuration
     config = get_config("config.py")
     
@@ -82,6 +87,10 @@ def main():
             print(" Progress logs will be shown during the process")
             print("="*50)
             
+        # Add memory sanity check
+        if torch.cuda.memory_allocated(device) > 0:
+            raise RuntimeError(f"Rank {rank} already has memory allocated before model creation")
+        
         # Create expert cache manager with proper memory constraints
         max_experts_per_rank = max(1, config.max_experts_in_memory // world_size)
         cache_manager = ExpertCacheManager(

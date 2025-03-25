@@ -1073,6 +1073,11 @@ class DDMTrainingCoordinator:
                 if self.rank == 0:
                     logger.info(f"Expert {expert_idx} parameters per rank: {[t.item() for t in all_params]}")
 
+        if hasattr(self.router, 'router'):
+            for name, param in self.router.router.named_parameters():
+                if param.device != self.device:
+                    logger.error(f"Router param {name} on wrong device {param.device}")
+
     def _log_gpu_memory_usage(self, stage=""):
         """Log GPU memory usage from all ranks"""
         if not is_dist_initialized():

@@ -55,8 +55,9 @@ class ExpertCacheManager:
                     expert = self.cpu_cache[expert_idx]
                     # Move to device properly - FSDP-aware
                     if isinstance(expert, FSDP):
-                        # For FSDP models, ensure they're properly moved to the right device
-                        expert.to(self.device)
+                        # For FSDP models, ensure proper device placement
+                        if expert.device != self.device:
+                            raise RuntimeError(f"FSDP expert {expert_idx} on wrong device {expert.device}")
                     else:
                         # Regular model
                         expert = expert.to(self.device)
@@ -101,7 +102,14 @@ class ExpertCacheManager:
             # Move to CPU if offloading is enabled
             if self.cpu_offload:
                 logger.debug(f"Moving expert {lru_idx} from GPU to CPU")
-                self.cpu_cache[lru_idx] = lru_expert.to('cpu')
+                if isinstance(lru_expert, FSDP):
+                    # Properly handle FSDP model movement
+                    with torch.no_grad():
+                        lru_expert.to('cpu')
+                    self.cpu_cache[lru_idx] = lru_expert
+                else:
+                    # For non-FSDP models, simple CPU transfer
+                    self.cpu_cache[lru_idx] = lru_expert.to('cpu')
             
             # Remove from GPU cache
             self.expert_cache.pop(lru_idx)
@@ -171,8 +179,10 @@ class ExpertCacheManager:
                 logger.debug(f"Offloading expert {lru_idx} to CPU due to cache limit")
                 # For FSDP models, handle differently
                 if isinstance(lru_expert, FSDP):
-                    # Just store the CPU version - FSDP will handle proper sharding when reloaded
-                    self.cpu_cache[lru_idx] = lru_expert.cpu()
+                    # Properly handle FSDP model movement
+                    with torch.no_grad():
+                        lru_expert.to('cpu')
+                    self.cpu_cache[lru_idx] = lru_expert
                 else:
                     # For non-FSDP models, simple CPU transfer
                     self.cpu_cache[lru_idx] = lru_expert.to('cpu')
