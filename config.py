@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
     'vec_in_dim': 768,          # Input dimension for conditioning vector
     'context_in_dim': 768,      # Input dimension for text context
     'guidance_embed': False,     # Enable guidance embedding layer
+    'expert_update_interval': 1,  # How often to update experts (every step by default)
+    'router_update_interval': 5,  # How often to update router (every 5 steps)
 
     # ===== Expert Configuration =====
     'num_experts': 8,           # Number of data clusters
@@ -159,6 +161,7 @@ DEFAULT_CONFIG = {
 
     'fast_validation': True,    # Use fewer steps for validation
     'sampling_steps': 20,       # Default number of sampling steps for validation
+    'validation_interval': 1000,  # How often to run validation
     
     # ===== Training controls =====
     'enable_validation': False,
