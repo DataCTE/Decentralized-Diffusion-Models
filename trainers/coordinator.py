@@ -329,12 +329,19 @@ class DDMTrainingCoordinator:
         """Initialize experts with distributed sharding validation"""
         self.expert_indices = self._calculate_expert_shards()
         
-        # Verify no overlapping experts across ranks
-        all_indices = [torch.zeros(self.config.num_experts, dtype=torch.int) for _ in range(self.world_size)]
+        # Create GPU tensors for verification
+        all_indices = [torch.zeros(self.config.num_experts, dtype=torch.int, device=self.device) 
+                      for _ in range(self.world_size)]
         all_indices[self.rank][self.expert_indices] = 1
-        gathered = [torch.zeros_like(all_indices[0]) for _ in range(self.world_size)]
+        
+        # Ensure proper device placement for gathered tensors
+        gathered = [torch.zeros_like(all_indices[0], device=self.device) 
+                   for _ in range(self.world_size)]
+        
+        # Perform all_gather on GPU tensors
         dist.all_gather(gathered, all_indices[self.rank])
         
+        # Conflict check should use device tensors
         conflict_matrix = sum(gathered)
         if (conflict_matrix > 1).any():
             logger.error("Expert sharding conflict detected!")

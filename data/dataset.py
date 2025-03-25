@@ -4,17 +4,14 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler, SubsetRandomSampler
-from PIL import Image
 import random
 from collections import defaultdict, OrderedDict
 import logging
 import time  
 import glob
-import bisect
-import struct
 
-import io
-import torchvision.transforms as transforms
+
+
 from tqdm.auto import tqdm
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,18 +20,10 @@ from pathlib import Path
 # Import centralized utilities
 from utils.distributed import is_main_process, broadcast_object, get_rank, get_local_rank, get_world_size
 from utils.logging import setup_distributed_logger
-from data.transforms import resize_image, normalize
-import threading
-import signal
 
 # Setup logging
 logger = logging.getLogger(__name__)
 
-import math  # For BucketBatchSampler
-import torch.distributed as dist
-
-from queue import Queue, Empty
-from threading import Thread, Event
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from list"""
@@ -113,16 +102,15 @@ class DDMDataset(Dataset):
                 raise FileNotFoundError(f"Missing required cache directory: {name} ({path})")
 
     def _lazy_load_clusters(self):
-        """Load precomputed cluster assignments"""
+        """Load precomputed cluster assignments with proper device placement"""
         cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
         try:
-            # Load the precomputed cluster assignments with weights_only=False
-            # since we're loading numpy arrays
-            cluster_assignments = torch.load(cluster_path, weights_only=False)
+            cluster_assignments = torch.load(cluster_path, map_location=self.device)
             
-            # Convert numpy array to tensor if needed
             if isinstance(cluster_assignments, np.ndarray):
-                cluster_assignments = torch.from_numpy(cluster_assignments)
+                cluster_assignments = torch.from_numpy(cluster_assignments).to(self.device)
+            else:
+                cluster_assignments = cluster_assignments.to(self.device)
             
             # Validate cluster assignments
             num_clusters = cluster_assignments.max().item() + 1
@@ -143,10 +131,10 @@ class DDMDataset(Dataset):
                     f"Max: {cluster_assignments.max()}, Expected range: [0, {self.config.num_experts-1}]"
                 )
             
-            return cluster_assignments.cuda()
+            return cluster_assignments
             
         except Exception as e:
-            logger.error(f"Failed to load cluster assignments from {cluster_path}: {str(e)}")
+            logger.error(f"Failed to load cluster assignments: {str(e)}")
             raise
 
     def _load_sample(self, idx):
