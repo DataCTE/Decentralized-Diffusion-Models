@@ -104,8 +104,9 @@ class RouterTrainer:
         true_clusters = batch["expert"] if true_clusters is None else true_clusters
         text_embeds = batch["clip_embedding"]
         
-        # Use mixed precision training
-        scaler = torch.amp.GradScaler(device_type='cuda', enabled=self.config.use_mixed_precision)
+        # Initialize scaler once in __init__ instead of every train step
+        if not hasattr(self, 'scaler'):
+            self.scaler = torch.amp.GradScaler(enabled=self.config.use_mixed_precision)
         
         with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             # Forward pass
@@ -124,9 +125,9 @@ class RouterTrainer:
         
         # Backward pass handled automatically by FSDP
         self.optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.step(self.optimizer)
-        scaler.update()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         self.lr_scheduler.step()
         
         return loss.item()

@@ -66,6 +66,9 @@ class ExpertTrainer(BaseTrainer):
             else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (config.num_steps - warmup_steps)))
         )
 
+        # Initialize scaler once in __init__
+        self.scaler = torch.amp.GradScaler(enabled=config.use_mixed_precision)
+
     def compute_loss(self, batch):
         """Paper's per-expert loss calculation (Equation 6)"""
         # FSDP handles device placement - no .to(device) needed

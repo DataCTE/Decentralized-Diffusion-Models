@@ -315,7 +315,7 @@ class DDMTrainingCoordinator:
             expert.eval()
         
         # Forward pass
-        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+        with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             loss = self.router.train_step(batch)  # Use RouterTrainer's train_step
         
         # Convert loss to tensor if it's a float
