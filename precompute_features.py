@@ -315,6 +315,23 @@ class FeatureGenerator:
         }
     }
 
+def get_active_network_interface():
+    """Dynamically detect active network interface using iproute2"""
+    try:
+        import netifaces
+        # Get default gateway interface
+        gateways = netifaces.gateways()
+        default_iface = gateways['default'][netifaces.AF_INET][1]
+        return default_iface
+    except ImportError:
+        # Fallback to parsing /proc/net/route
+        with open('/proc/net/route') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 3 and parts[1] == '00000000' and not parts[0] == 'Iface':
+                    return parts[0]
+    return 'eth0'  # Ultimate fallback
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
@@ -346,10 +363,6 @@ def main():
     # Add these NCCL settings before process group init
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"  # Disable async error handling
     os.environ["NCCL_IGNORE_DISABLED_P2P"] = "1"   # Disable P2P check
-    os.environ["NCCL_SOCKET_IFNAME"] = "eth0"      # Specify network interface
-    os.environ["NCCL_DEBUG"] = "WARN"              # Reduce debug verbosity
-    
-    # Increase timeout to 2 hours (7200 seconds)
     os.environ["NCCL_BLOCKING_WAIT"] = "1"
     os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
     os.environ["NCCL_SOCKET_NTHREADS"] = "4"
@@ -447,4 +460,28 @@ def main():
         dist.destroy_process_group()
 
 if __name__ == "__main__":
+    # Replace the hardcoded NCCL_SOCKET_IFNAME line with:
+
+    def get_active_network_interface():
+        """Dynamically detect active network interface using iproute2"""
+        try:
+            import netifaces
+            # Get default gateway interface
+            gateways = netifaces.gateways()
+            default_iface = gateways['default'][netifaces.AF_INET][1]
+            return default_iface
+        except ImportError:
+            # Fallback to parsing /proc/net/route
+            with open('/proc/net/route') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 3 and parts[1] == '00000000' and not parts[0] == 'Iface':
+                        return parts[0]
+        return 'eth0'  # Ultimate fallback
+
+    # Then modify the network interface setting:
+    iface = get_active_network_interface()
+    os.environ["NCCL_SOCKET_IFNAME"] = iface
+    print(f"Using network interface: {iface}")
+
     main() 
