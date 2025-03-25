@@ -34,6 +34,7 @@ DEFAULT_CONFIG = {
 
     # ===== Flux MMDiT Architecture =====
     'hidden_dim': 768,          # Transformer hidden size
+    'in_channels': 3,
     'num_heads': 12,            # Attention heads per layer
     'num_layers': 24,           # Total transformer blocks
     'patch_size': 2,            # Input patch dimension 
@@ -117,6 +118,7 @@ DEFAULT_CONFIG = {
     # ===== Expert Cache parameters =====
    
     'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
+
     
     # Add to DEFAULT_CONFIG
     'use_gradient_checkpointing': True,
