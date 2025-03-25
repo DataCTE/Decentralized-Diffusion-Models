@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 import math  # For BucketBatchSampler
 import torch.distributed as dist
 
-from queue import Queue, Full
+from queue import Queue, Empty
 from threading import Thread, Event
 
 def chunks(lst, n):
@@ -154,7 +154,7 @@ class DDMDataset(Dataset):
                     indices = self.prefetch_queue.get(timeout=1.0)
                     if indices is None:
                         break
-                except Queue.Empty:
+                except Empty:
                     continue  # No indices to process, try again
                 
                 # Load data for each index
