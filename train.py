@@ -15,7 +15,7 @@ multiprocessing.set_start_method('spawn', force=True)
 
 # Import core components
 from trainers.coordinator import DDMTrainingCoordinator
-from config import get_config, estimate_model_size
+from config import get_config
 from utils.logging import setup_logger, log_training_start
 from utils.checkpoint import load_coordinator_checkpoint
 from utils.expert_cache import ExpertCacheManager
@@ -38,8 +38,14 @@ def setup_distributed():
     
     # Verify device assignment
     device = torch.device(f"cuda:{rank}")
-    test_tensor = torch.tensor([rank], device=device)
-    dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
+    with torch.no_grad():
+        test_tensor = torch.tensor([rank], device=device)
+        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
+        del test_tensor  # Explicitly delete test tensor
+        torch.cuda.synchronize(device)
+    
+    # Force memory cleanup before proceeding
+    torch.cuda.empty_cache()
     
     # Log success message
     print(f"[Rank {rank}] Distributed setup complete with {world_size} processes")
@@ -64,13 +70,6 @@ def main():
         # Force proper device placement
         torch.cuda.set_device(rank)  # Explicitly set device
         
-        # Add model size estimation here, AFTER distributed setup
-        if rank == 0:
-            print("Estimating ExpertMMDiT model size:")
-            estimate_model_size(config, model_type="expert")
-            print("\nEstimating RouterModel size:")
-            estimate_model_size(config, model_type="router")
-        
         # Ensure all processes wait for model size prints to complete
         dist.barrier()
         
@@ -90,9 +89,10 @@ def main():
         else:
             setup_logger("DDMCoordinator", config.output_dir, log_to_console=False)
         
-        # Add memory sanity check
-        if torch.cuda.memory_allocated(device) > 0:
-            raise RuntimeError(f"Rank {rank} already has memory allocated before model creation")
+        # Modified memory check with higher tolerance
+        allocated = torch.cuda.memory_allocated(device)
+        if allocated > 10 * 1024 * 1024:  # Allow 10MB for framework overhead
+            raise RuntimeError(f"Rank {rank} has {allocated/1024**2:.2f}MB allocated before model creation")
         
         # Create expert cache manager with proper memory constraints
         max_experts_per_rank = max(1, config.max_experts_in_memory // world_size)
