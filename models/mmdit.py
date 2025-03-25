@@ -978,7 +978,7 @@ class ExpertMMDiT(Flux):
         
         # Projection for combining cluster emb + original vector
         self.vec_proj = nn.Linear(
-            params.vec_in_dim + params.cluster_embed_dim,  # Cluster + original vector
+            params.vec_in_dim + params.cluster_embed_dim,  # Changed: Correct input dimension
             params.vec_in_dim
         )
         

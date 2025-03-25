@@ -285,40 +285,36 @@ def save_config(config, path):
 def estimate_model_size(config, model_type="expert"):
     """
     Estimates and prints the size of the specified model type, then clears memory.
-
-    Args:
-        config: Configuration object.
-        model_type: "expert" or "router" to specify which model size to estimate.
     """
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dummy_model = None
-    dummy_input = None  # Initialize dummy_input here
+    dummy_input = None
+    batch_size = config.batch_size
 
     if model_type == "expert":
         from models.mmdit import ExpertMMDiT
         dummy_model = ExpertMMDiT(config).to(device)
         model_name = "ExpertMMDiT"
-        # Add expert-specific dummy input
+        
+        # Calculate image dimensions
+        h = config.image_size[1] // config.patch_size
+        w = config.image_size[2] // config.patch_size
+        
+        # Create dummy inputs with correct shapes
         dummy_input = [
-            torch.randn(
-                config.batch_size,
-                config.latent_channels,
-                config.image_size[1] // config.patch_size,
-                config.image_size[2] // config.patch_size,
-                device=device
-            ),  # img - latent image
-            torch.randint(0, 1000, (config.batch_size,), device=device), # img_ids - dummy ids
-            torch.randn(
-                config.batch_size,
-                config.max_token_length,
-                config.clip_embedding_dim,
-                device=device
-            ), # txt - text embeddings
-            torch.randint(0, 1000, (config.batch_size, config.max_token_length), device=device), # txt_ids - dummy token ids
-            torch.randint(0, 1000, (config.batch_size,), device=device), # timesteps - dummy timesteps
-            torch.randn(config.batch_size, config.vec_in_dim, device=device), # y - conditioning vector
-            torch.randint(0, config.num_experts, (config.batch_size,), device=device)  # cluster_ids - dummy cluster ids
+            torch.randn(batch_size, config.latent_channels, h, w, device=device),  # img
+            torch.randint(0, 2, (batch_size, h * w, 2), device=device),  # img_ids
+            torch.randn(batch_size, config.max_token_length, config.clip_embedding_dim, device=device),  # txt
+            torch.randint(0, 2, (batch_size, config.max_token_length, 2), device=device),  # txt_ids
+            torch.randn(batch_size, device=device),  # timesteps
+            torch.randn(batch_size, config.vec_in_dim, device=device),  # y
+            torch.randint(0, config.num_experts, (batch_size,), device=device),  # cluster_ids
+            torch.randn(batch_size, device=device) if config.guidance_embed else None,  # guidance (optional)
         ]
+        
+        # Remove None values if guidance_embed is False
+        dummy_input = [x for x in dummy_input if x is not None]
+
     elif model_type == "router":
         from models.router import RouterModel
         dummy_model = RouterModel(config).to(device)
