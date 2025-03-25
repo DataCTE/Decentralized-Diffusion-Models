@@ -123,7 +123,6 @@ DEFAULT_CONFIG = {
     'expert_batch_size': 1,
     
     # ===== Expert Cache parameters =====
-   
     'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
     
     # Add to DEFAULT_CONFIG
@@ -143,6 +142,7 @@ DEFAULT_CONFIG = {
     # ===== Distributed Training ===== (simplified)
     'batch_size_per_gpu': 1,  # Batch size per GPU
     'gradient_accumulation_steps': 1,  # Accumulate gradients
+    'num_clusters': 8, # or your desired number of clusters 
     
     # ===== W&B Logging Parameters =====
     'wandb_enabled': True,                    # Whether to use wandb for logging
