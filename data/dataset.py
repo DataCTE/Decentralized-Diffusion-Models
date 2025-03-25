@@ -44,10 +44,6 @@ class DDMDataset(Dataset):
     def __init__(self, config, split='train'):
         self.config = config
         self.feature_dir = config.feature_cache_path
-        
-        # Load unified manifest
-        self.manifest = self._load_manifest()
-        
         self.device = torch.device('cpu')
         self.rank = get_rank()
         self.world_size = get_world_size()
@@ -62,12 +58,15 @@ class DDMDataset(Dataset):
         # Verify all required directories exist
         self._verify_cache_dirs()
         
-        # Get latent files with proper extension
+        # Initialize latent files first
         self.latent_files = sorted([
             f for f in os.listdir(self.latent_dir) 
             if f.endswith('.latent.pt')
         ])
         self.num_samples = len(self.latent_files)
+        
+        # Now load manifest since latent_files is initialized
+        self.manifest = self._load_manifest()
         
         # 2. Sharded cluster loading
         self.expert_assignments = self._load_sharded_clusters()
