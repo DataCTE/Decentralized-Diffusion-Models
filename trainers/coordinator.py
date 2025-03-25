@@ -154,7 +154,7 @@ class DDMTrainingCoordinator:
         # Shared configuration for DataLoader - disable multiprocessing
         loader_config = {
             'num_workers': 0,  # Disable multiprocessing
-            'pin_memory': True,  # Keep pin_memory for faster GPU transfer
+            'pin_memory': False,  # Keep pin_memory for faster GPU transfer
             'persistent_workers': False  # Disable persistent workers since we're not using multiprocessing
         }
         
