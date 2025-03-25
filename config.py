@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
     'max_token_length': 77,     # CLIP standard
 
     # ===== Flux MMDiT Architecture =====
-    'hidden_dim': 768,          # Transformer hidden size
+    'hidden_size': 768,          # Transformer hidden size
     'in_channels': 3,
     'out_channels': 16,
     'num_heads': 12,            # Attention heads per layer
