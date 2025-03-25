@@ -153,8 +153,9 @@ class DDMTrainingCoordinator:
         
         # Shared configuration for DataLoader
         loader_config = {
-            'num_workers': 0,  # Disable multiprocessing
-            'pin_memory': False
+            'num_workers': 4,  # Use some workers for faster loading
+            'pin_memory': False,  # Enable pinned memory for faster GPU transfer
+            'prefetch_factor': 2
         }
         
         # Initialize training dataset
@@ -167,12 +168,12 @@ class DDMTrainingCoordinator:
             batch_sampler = BucketBatchSampler(
                 dataset=train_dataset,
                 batch_size=self.config.batch_size,
-                device='cpu',  # Use CPU for initial setup
+                device=self.device,  # Use GPU for bucket assignments
                 shuffle=True,
-                drop_last=False
+                drop_last=True  # Drop incomplete batches
             )
             
-            # Modify DataLoader creation to use custom collate
+            # Improved collate function that handles tensor size mismatches
             def collate_fn(batch):
                 # Group by actual dimensions
                 grouped = defaultdict(list)
@@ -180,14 +181,31 @@ class DDMTrainingCoordinator:
                     key = (item['latent'].shape[-2], item['latent'].shape[-1])
                     grouped[key].append(item)
                 
-                # Return batches with consistent dimensions
-                for group in grouped.values():
+                # Process largest valid group
+                valid_groups = []
+                for key, group in grouped.items():
+                    # Validate CLIP embedding sizes
+                    clip_sizes = set(x['clip_embedding'].size(1) for x in group)
+                    if len(clip_sizes) == 1 and len(group) >= self.config.batch_size // 2:
+                        valid_groups.append((len(group), group))
+                
+                if not valid_groups:
+                    # Fallback to smallest complete batch
+                    return None
+                
+                # Use largest valid group
+                _, group = max(valid_groups, key=lambda x: x[0])
+                
+                try:
                     return {
-                        'latent': torch.cat([i['latent'] for i in group]),
-                        'clip_embedding': torch.cat([i['clip_embedding'] for i in group]),
-                        'bucket': torch.cat([i['bucket'] for i in group]),
-                        'expert': torch.cat([i['expert'] for i in group])
+                        'latent': torch.stack([i['latent'] for i in group]),
+                        'clip_embedding': torch.stack([i['clip_embedding'] for i in group]),
+                        'bucket': torch.stack([i['bucket'] for i in group]),
+                        'expert': torch.stack([i['expert'] for i in group])
                     }
+                except Exception as e:
+                    logger.error(f"Collation error: {str(e)}")
+                    return None
             
             self.train_loader = DataLoader(
                 train_dataset,

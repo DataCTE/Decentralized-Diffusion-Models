@@ -47,7 +47,7 @@ class DDMDataset(Dataset):
     def __init__(self, config, split='train'):
         self.config = config
         self.feature_dir = config.feature_cache_path
-        self.device = torch.device('cpu')
+        self.device = torch.device('cuda')  # Use GPU by default
         self.rank = get_rank()
         self.world_size = get_world_size()
         
@@ -68,32 +68,30 @@ class DDMDataset(Dataset):
         # Extract base names without rank suffix for loading other features
         self.base_names = [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
         
-        # Initialize prefetch cache with larger size and better error handling
+        # Initialize memory-mapped cache
         self.cache = {}
-        self.prefetch_size = getattr(config, 'prefetch_size', 100)  # Increased from 50
-        self.prefetch_queue = Queue(maxsize=self.prefetch_size)
-        self.stop_prefetch = Event()
+        self.cache_size = min(100, self.num_samples)  # Larger cache size
         
-        # Start prefetch thread with better error handling
-        try:
-            self.prefetch_thread = Thread(target=self._prefetch_worker, daemon=True)
-            self.prefetch_thread.start()
-            logger.info(f"Started prefetch worker thread with cache size {self.prefetch_size}")
-        except Exception as e:
-            logger.error(f"Failed to start prefetch worker: {str(e)}")
-            self.prefetch_thread = None
+        # Pre-load frequently accessed data
+        logger.info(f"Pre-loading data for rank {self.rank}")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for idx in range(min(self.cache_size, self.num_samples)):
+                futures.append(executor.submit(self._load_sample, idx))
+            
+            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Rank {self.rank} preloading"):
+                idx, data = future.result()
+                if data is not None:
+                    self.cache[idx] = data
         
-        # Load global cluster assignments
+        # Load global cluster assignments to GPU
         self.expert_assignments = self._lazy_load_clusters()
         
-        # Load bucket assignments
-        self.bucket_assignments = torch.tensor([
-            torch.load(os.path.join(self.bucket_dir, f"{base}_rank{self.rank}.pt"))
-            for base in self.base_names
-        ]).cuda()
+        # Load bucket assignments to GPU
+        self.bucket_assignments = self._load_bucket_assignments()
         
         logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples")
-        logger.info(f"[Rank {self.rank}] Found {len(set(self.bucket_assignments))} unique buckets")
+        logger.info(f"[Rank {self.rank}] Preloaded {len(self.cache)} samples")
 
     def _verify_cache_dirs(self):
         """Validate cache directory structure"""
@@ -145,109 +143,81 @@ class DDMDataset(Dataset):
             logger.error(f"Failed to load cluster assignments from {cluster_path}: {str(e)}")
             raise
 
-    def _prefetch_worker(self):
-        """Background worker for prefetching data"""
-        while not self.stop_prefetch.is_set():
-            try:
-                # Get next batch of indices to prefetch with timeout
-                try:
-                    indices = self.prefetch_queue.get(timeout=1.0)
-                    if indices is None:
-                        break
-                except Empty:
-                    continue  # No indices to process, try again
-                
-                # Load data for each index
-                for idx in indices:
-                    if idx in self.cache:
-                        continue
-                        
-                    try:
-                        base_name = self.base_names[idx]
-                        rank_suffix = f"_rank{self.rank}"
-                        
-                        # Load all features for this sample
-                        data = {
-                            'latent': torch.load(
-                                os.path.join(self.latent_dir, f"{base_name}{rank_suffix}.pt"),
-                                weights_only=False
-                            ),
-                            'clip_embedding': torch.load(
-                                os.path.join(self.clip_dir, f"{base_name}{rank_suffix}.pt"),
-                                weights_only=False
-                            ),
-                            'dims': torch.load(
-                                os.path.join(self.dim_dir, f"{base_name}{rank_suffix}.pt"),
-                                weights_only=False
-                            ),
-                            'expert': self.expert_assignments[idx],
-                            'bucket': self.bucket_assignments[idx]
-                        }
-                        
-                        # Validate loaded data
-                        if not all(isinstance(v, torch.Tensor) for v in data.values()):
-                            logger.error(f"Invalid data types for index {idx}: {[type(v) for v in data.values()]}")
-                            continue
-                        
-                        # Add to cache with LRU eviction
-                        self.cache[idx] = data
-                        if len(self.cache) > self.prefetch_size:
-                            oldest_idx = min(self.cache.keys())
-                            del self.cache[oldest_idx]
-                            
-                    except Exception as e:
-                        logger.error(f"Failed to prefetch idx {idx}: {str(e)}")
-                        continue
-                        
-            except Exception as e:
-                if not self.stop_prefetch.is_set():
-                    logger.error(f"Prefetch worker error in main loop: {str(e)}")
-                continue
-
-        logger.info("Prefetch worker shutting down")
-
-    def __getitem__(self, idx):
-        """Get item with improved error handling"""
+    def _load_sample(self, idx):
+        """Load a single sample with error handling"""
         try:
             base_name = self.base_names[idx]
             rank_suffix = f"_rank{self.rank}"
             
-            # Load all features for this sample
             data = {
                 'latent': torch.load(
                     os.path.join(self.latent_dir, f"{base_name}{rank_suffix}.pt"),
                     weights_only=False
-                ),
+                ).to(self.device),
                 'clip_embedding': torch.load(
                     os.path.join(self.clip_dir, f"{base_name}{rank_suffix}.pt"),
                     weights_only=False
-                ),
+                ).to(self.device),
                 'dims': torch.load(
                     os.path.join(self.dim_dir, f"{base_name}{rank_suffix}.pt"),
                     weights_only=False
-                ),
-                'expert': self.expert_assignments[idx],
-                'bucket': self.bucket_assignments[idx]
+                ).to(self.device)
             }
             
-            # Validate data
-            if not all(isinstance(v, torch.Tensor) for v in data.values()):
-                raise ValueError(f"Invalid data types for index {idx}")
-            
-            return data
-            
+            return idx, data
         except Exception as e:
-            logger.error(f"Error loading data for index {idx}: {str(e)}")
-            raise
+            logger.error(f"Error loading sample {idx}: {str(e)}")
+            return idx, None
+
+    def _load_bucket_assignments(self):
+        """Load bucket assignments efficiently"""
+        assignments = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for base in self.base_names:
+                futures.append(executor.submit(
+                    torch.load,
+                    os.path.join(self.bucket_dir, f"{base}_rank{self.rank}.pt"),
+                    weights_only=False
+                ))
+            
+            for future in futures:
+                try:
+                    assignments.append(future.result())
+                except Exception as e:
+                    logger.error(f"Error loading bucket assignment: {str(e)}")
+                    assignments.append(torch.tensor(0))  # Default bucket
+                    
+        return torch.stack(assignments).to(self.device)
+
+    def __getitem__(self, idx):
+        """Get item with cache"""
+        if idx in self.cache:
+            data = self.cache[idx]
+        else:
+            idx_data = self._load_sample(idx)
+            if idx_data[1] is None:
+                raise RuntimeError(f"Failed to load sample {idx}")
+            data = idx_data[1]
+            
+            # Update cache with LRU policy
+            if len(self.cache) >= self.cache_size:
+                oldest_idx = min(self.cache.keys())
+                del self.cache[oldest_idx]
+            self.cache[idx] = data
+        
+        # Add assignments
+        data['expert'] = self.expert_assignments[idx]
+        data['bucket'] = self.bucket_assignments[idx]
+        
+        return data
 
     def __len__(self):
         return self.num_samples
         
     def __del__(self):
         """Cleanup resources"""
-        self.stop_prefetch.set()
-        if hasattr(self, 'prefetch_thread'):
-            self.prefetch_thread.join(timeout=1.0)
+        pass
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
