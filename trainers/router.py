@@ -7,6 +7,7 @@ from bitsandbytes.optim import AdamW8bit
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
 import torch.distributed as dist
+import logging
 
 # Import centralized utilities for consistent implementation
 
@@ -14,6 +15,9 @@ from utils.fsdp import wrap_model_with_fsdp
 from models.router import RouterModel
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 from utils.fsdp import get_auto_wrap_policy as get_fsdp_policy
+
+# Initialize module-level logger
+logger = logging.getLogger(__name__)
 
 def get_sharding_strategy(name: str) -> ShardingStrategy:
     """Convert sharding strategy name to enum"""
@@ -44,6 +48,9 @@ class RouterTrainer:
         self.rank = rank
         self.world_size = world_size or 1
         
+        # Initialize logger for this class
+        self.logger = logging.getLogger(__name__)
+        
         # Create base router model with safe config access
         base_router = RouterModel(config)
         
@@ -57,7 +64,7 @@ class RouterTrainer:
         )
         
         # Print initialization message from all ranks
-        logger.info(f"[Rank {rank}] Initialized Router with FSDP")
+        self.logger.info(f"[Rank {rank}] Initialized Router with FSDP")
         
         # Add VAE for latent encoding - load VAE on demand to save memory
         self._vae = None
