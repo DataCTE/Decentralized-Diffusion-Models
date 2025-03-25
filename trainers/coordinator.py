@@ -252,28 +252,57 @@ class DDMTrainingCoordinator:
         Determine expert assignments based on paper's Section 3.2 - each expert 
         trains independently on its assigned data cluster
         """
-        # Get cluster sizes from dataset
-        cluster_sizes = self.train_loader.dataset.get_cluster_sizes()
-        min_size = self.config.min_cluster_samples
+        try:
+            # Get cluster sizes from dataset
+            cluster_sizes = self.train_loader.dataset.get_cluster_sizes()
+            min_size = self.config.min_cluster_samples
 
-        # Filter valid clusters (those with enough samples)
-        valid_clusters = [
-            idx for idx in range(self.config.num_experts)
-            if cluster_sizes[idx] >= min_size
-        ]
+            # Filter valid clusters (those with enough samples)
+            valid_clusters = [
+                idx for idx in range(self.config.num_experts)
+                if cluster_sizes[idx] >= min_size
+            ]
 
-        if len(valid_clusters) == 0:
-            logger.warning("No clusters meet minimum size requirement!")
-            valid_clusters = list(range(self.config.num_experts))
+            if len(valid_clusters) == 0:
+                logger.warning("No clusters meet minimum size requirement!")
+                valid_clusters = list(range(self.config.num_experts))
 
-        # Distribute experts across GPUs using interleaved assignment
-        # This ensures better load balancing than simple round-robin
-        self.expert_indices = [
-            idx for i, idx in enumerate(valid_clusters)
-            if i % self.world_size == self.rank
-        ]
+            # Ensure all ranks have the same valid_clusters
+            if self.world_size > 1:
+                # Convert to tensor for synchronization
+                valid_clusters_tensor = torch.tensor(valid_clusters, device=self.device)
+                # Broadcast from rank 0 to ensure consistency
+                dist.broadcast(valid_clusters_tensor, src=0)
+                valid_clusters = valid_clusters_tensor.tolist()
 
-        logger.info(f"Rank {self.rank} managing experts: {self.expert_indices}")
+            # Distribute experts evenly across GPUs
+            num_experts = len(valid_clusters)
+            experts_per_rank = (num_experts + self.world_size - 1) // self.world_size
+            
+            # Calculate start and end indices for this rank
+            start_idx = self.rank * experts_per_rank
+            end_idx = min(start_idx + experts_per_rank, num_experts)
+            
+            # Assign experts to this rank
+            self.expert_indices = valid_clusters[start_idx:end_idx]
+
+            # Log assignments
+            logger.info(f"Rank {self.rank} managing experts: {self.expert_indices}")
+            
+            # Synchronize to ensure all ranks have their assignments
+            dist.barrier()
+            
+            # Verify distribution
+            if self.verbose:
+                total_experts = torch.tensor([len(self.expert_indices)], device=self.device)
+                if self.world_size > 1:
+                    dist.all_reduce(total_experts, op=dist.ReduceOp.SUM)
+                if self.rank == 0:
+                    logger.info(f"Total experts distributed: {total_experts.item()}")
+
+        except Exception as e:
+            logger.error(f"Error in expert distribution on rank {self.rank}: {str(e)}")
+            raise
     
     def _init_router(self):
         """Initialize router with async FSDP wrapping"""

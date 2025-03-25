@@ -69,9 +69,12 @@ class ExpertTrainer(BaseTrainer):
             else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (config.num_steps - warmup_steps)))
         )
         
-        # Update log message to match router style
-        if rank == 0:
-            print(f"Initialized SHARDED Expert {expert_idx} across {world_size} GPUs")
+        # Print initialization message from all ranks
+        print(f"[Rank {rank}] Initialized Expert {expert_idx} with FSDP")
+        
+        # Ensure all ranks are synchronized after initialization
+        if self.world_size > 1:
+            dist.barrier()
 
     def compute_loss(self, batch):
         """Paper's per-expert loss calculation (Equation 6)"""

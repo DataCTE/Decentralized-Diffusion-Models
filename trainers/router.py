@@ -55,8 +55,8 @@ class RouterTrainer:
             rank=rank
         )
         
-        if rank == 0:
-            print(f"Initialized SHARDED Router across {self.world_size} GPUs")
+        # Print initialization message from all ranks
+        print(f"[Rank {rank}] Initialized Router with FSDP")
         
         # Add VAE for latent encoding
         from data.vae import VAEWrapper
@@ -81,6 +81,10 @@ class RouterTrainer:
             if step < self.warmup_steps 
             else 0.5*(1 + math.cos(math.pi*(step - self.warmup_steps)/self.total_steps))
         )
+
+        # Ensure all ranks are synchronized after initialization
+        if self.world_size > 1:
+            dist.barrier()
 
     def train_step(self, batch, true_clusters=None, temperature=1.0):
         """Train router with cross-entropy loss per paper Section 3.3"""
