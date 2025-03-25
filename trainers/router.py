@@ -104,23 +104,27 @@ class RouterTrainer:
         true_clusters = batch["expert"] if true_clusters is None else true_clusters
         text_embeds = batch["clip_embedding"]
         
+        # Ensure text_embeds are in the shape [B, L, clip_embedding_dim]
+        if text_embeds.dim() == 3 and text_embeds.shape[1] == self.config.clip_embedding_dim:
+            text_embeds = text_embeds.transpose(1, 2)
+        
         # Initialize scaler once in __init__ instead of every train step
         if not hasattr(self, 'scaler'):
             self.scaler = torch.amp.GradScaler(enabled=self.config.use_mixed_precision)
         
         with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            # Forward pass
+            # Sample a random timestep per sample.
             t = torch.rand(latents.size(0), device=latents.device)
-            alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
-            sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+            alpha_t = torch.cos(t * math.pi/2)[:, None, None, None]
+            sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
             noise = torch.randn_like(latents)
             x_t = alpha_t * latents + sigma_t * noise
             
-            # Forward through router
+            # Forward pass through the router model; note that t is scaled (t*1000) for compatibility.
             logits = self.router(x_t, t * 1000, text_embeds)
             logits = logits / temperature
             
-            # Compute loss
+            # Cross-entropy loss computed against the true cluster labels
             loss = self.criterion(logits, true_clusters)
         
         # Backward pass handled automatically by FSDP
