@@ -5,7 +5,7 @@ import sys
 import importlib.util
 from types import SimpleNamespace
 import logging
-import torch
+
 
 logger = logging.getLogger(__name__)
 

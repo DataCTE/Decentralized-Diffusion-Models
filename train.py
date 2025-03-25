@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Main training script for Decentralized Diffusion Models (DDM)"""
 
-import os
+
 import torch
 import logging
 import multiprocessing

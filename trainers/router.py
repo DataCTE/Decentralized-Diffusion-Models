@@ -9,9 +9,9 @@ from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
 import torch.distributed as dist
 
 # Import centralized utilities for consistent implementation
-from utils.distributed import is_dist_initialized, synchronize, broadcast_object
-from utils.fsdp import wrap_model_with_fsdp, get_sharding_strategy, configure_optimizer_for_fsdp
-from models.router import RouterModel, SelfAttentionBlock
+
+from utils.fsdp import wrap_model_with_fsdp
+from models.router import RouterModel
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 from utils.fsdp import get_auto_wrap_policy as get_fsdp_policy
 

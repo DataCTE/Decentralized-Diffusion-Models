@@ -5,9 +5,8 @@ from bitsandbytes.optim import AdamW8bit
 import math
 import os
 import torch.nn.functional as F
-import torch.distributed as dist
-from utils.distributed import is_dist_initialized, synchronize, broadcast_object
-from utils.fsdp import wrap_model_with_fsdp, save_fsdp_model, configure_optimizer_for_fsdp
+from utils.distributed import is_dist_initialized, synchronize
+from utils.fsdp import wrap_model_with_fsdp, configure_optimizer_for_fsdp
 
 from models.mmdit import ExpertMMDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
