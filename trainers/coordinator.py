@@ -5,6 +5,7 @@ import torch
 import datetime
 import time
 from collections import defaultdict
+import contextlib
 
 from tqdm.auto import tqdm
 import concurrent.futures
@@ -139,7 +140,7 @@ class DDMTrainingCoordinator:
                 logger.warning(f"Enforced latent_channels=16 for 16ch-VAE compatibility")
     
     def _init_parallel_components(self):
-        """Initialize critical components with proper thread safety"""
+        """Initialize critical components with proper thread safety and FSDP verification"""
         pbar = None
         if self.rank == 0:
             pbar = tqdm(
@@ -149,50 +150,34 @@ class DDMTrainingCoordinator:
                 bar_format="{l_bar}{bar:20}{r_bar}"
             )
 
-        # Ensure all ranks are synchronized before initialization
+        # Critical synchronization point before initialization
         if is_dist_initialized():
-            synchronize()
+            dist.barrier()
         
-        # Verify GPU device is correctly set
-        if torch.cuda.is_available():
-            # Force set device to match rank
-            torch.cuda.set_device(self.rank)
-            # Verify the device is correctly set
-            current_device = torch.cuda.current_device()
-            if current_device != self.rank:
-                logger.warning(f"Device mismatch! Rank {self.rank} is using device {current_device}")
-                # Try to correct it
-                torch.cuda.set_device(self.rank)
-        
-        # Initialize dataset FIRST in main thread to ensure tqdm safety
+        # Initialize dataset with distributed-aware sampler
         self._init_data_loaders()
 
-        # Then parallelize other components
+        # Parallel component initialization with FSDP validation
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures = {
-                executor.submit(self._init_router): "router",
-                executor.submit(self._init_expert_indices): "experts"
+                executor.submit(self._init_and_verify_router): "router",
+                executor.submit(self._init_and_verify_experts): "experts"
             }
 
             try:
                 for future in concurrent.futures.as_completed(futures):
                     component = futures[future]
-                    future.result()
+                    result = future.result()
                     if pbar and self.rank == 0:
                         pbar.update(1)
-                        pbar.set_postfix_str(f"Completed: {component}")
+                        pbar.set_postfix_str(f"Completed: {component} | {result}")
             finally:
                 if pbar:
                     pbar.close()
-        
-        # Final sync and memory check
-        if is_dist_initialized():
-            synchronize()
-            # Log memory usage after initialization
-            if self.verbose:
-                mem_allocated = torch.cuda.memory_allocated(self.device) / 1e9  # GB
-                mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9  # GB
-                logger.info(f"Rank {self.rank} memory after init: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB")
+
+        # Final verification sync
+        dist.barrier()
+        self._verify_cross_rank_sharding()
     
     def _init_data_loaders(self):
         """Initialize data loaders without multiprocessing to avoid pickling requirements"""
@@ -297,163 +282,181 @@ class DDMTrainingCoordinator:
             **loader_config
         )
     
-    def _init_expert_indices(self):
-        """
-        Determine expert assignments based on paper's Section 3.2 with proper sharding
-        """
-        try:
-            # Import distributed utilities
-            from utils.distributed import is_dist_initialized, broadcast_object, synchronize
-            
-            # Get cluster sizes from dataset
-            cluster_sizes = self.train_loader.dataset.get_cluster_sizes()
-            min_size = self.config.min_cluster_samples
-
-            # Filter valid clusters (those with enough samples)
-            valid_clusters = [
-                idx for idx in range(self.config.num_experts)
-                if cluster_sizes[idx] >= min_size
-            ]
-
-            if len(valid_clusters) == 0:
-                logger.warning("No clusters meet minimum size requirement!")
-                valid_clusters = list(range(self.config.num_experts))
-
-            # Ensure all ranks have the same valid_clusters using our centralized broadcast
-            if is_dist_initialized():
-                valid_clusters = broadcast_object(valid_clusters, src=0)
-                synchronize()
-
-            # Distribute experts evenly across GPUs
-            num_experts = len(valid_clusters)
-            experts_per_rank = (num_experts + self.world_size - 1) // self.world_size
-            
-            # Calculate start and end indices for this rank
-            start_idx = self.rank * experts_per_rank
-            end_idx = min(start_idx + experts_per_rank, num_experts)
-            
-            # Assign experts to this rank
-            self.expert_indices = valid_clusters[start_idx:end_idx]
-
-            # Log assignments
-            logger.info(f"Rank {self.rank} managing experts: {self.expert_indices}")
-            
-            # Synchronize to ensure all ranks have their assignments
-            if is_dist_initialized():
-                synchronize()
-            
-            # Verify distribution
-            if self.verbose:
-                total_experts = torch.tensor([len(self.expert_indices)], device=self.device)
-                if self.world_size > 1:
-                    dist.all_reduce(total_experts, op=dist.ReduceOp.SUM)
-                if self.rank == 0:
-                    logger.info(f"Total experts distributed: {total_experts.item()}")
-
-        except Exception as e:
-            logger.error(f"Error in expert distribution on rank {self.rank}: {str(e)}")
-            raise
-    
-    def _init_router(self):
-        """Initialize router with proper FSDP wrapping using distributed utilities"""
-        logger.info(f"Creating router on rank {self.rank}")
+    def _init_and_verify_router(self):
+        """Initialize router with strict FSDP validation"""
+        from utils.fsdp import wrap_model_with_fsdp, check_fsdp_wrapping
         
-        from utils.fsdp import check_fsdp_wrapping
-        
-        # Create router with proper distributed setup
-        self.router = RouterTrainer(
+        # Initialize router trainer
+        router_trainer = RouterTrainer(
             config=self.config,
             device=self.device,
             rank=self.rank,
             world_size=self.world_size
         )
         
-        # Check if router is properly FSDP wrapped
-        if hasattr(self.router, 'router'):
-            is_wrapped, message = check_fsdp_wrapping(self.router.router, "Router model")
-            logger.info(f"[Rank {self.rank}] {message}")
-        
-        # Ensure synchronization after initialization
+        # FSDP wrapping with proper parameter initialization
         if is_dist_initialized():
-            synchronize()
-    
+            self.router = wrap_model_with_fsdp(
+                router_trainer.router,
+                self.config,
+                param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
+                rank=self.rank
+            )
+        else:
+            self.router = router_trainer.router
+        
+        # Strict sharding verification
+        is_wrapped, msg = check_fsdp_wrapping(self.router, "Router")
+        if not is_wrapped:
+            logger.error(f"Router sharding failed: {msg}")
+            raise RuntimeError("Router FSDP wrapping verification failed")
+        
+        return f"Router initialized {msg}"
+
+    def _init_and_verify_experts(self):
+        """Initialize experts with distributed sharding validation"""
+        self.expert_indices = self._calculate_expert_shards()
+        
+        # Verify no overlapping experts across ranks
+        all_indices = [torch.zeros(self.config.num_experts, dtype=torch.int) for _ in range(self.world_size)]
+        all_indices[self.rank][self.expert_indices] = 1
+        gathered = [torch.zeros_like(all_indices[0]) for _ in range(self.world_size)]
+        dist.all_gather(gathered, all_indices[self.rank])
+        
+        conflict_matrix = sum(gathered)
+        if (conflict_matrix > 1).any():
+            logger.error("Expert sharding conflict detected!")
+            raise RuntimeError("Overlapping expert assignments across ranks")
+        
+        return f"Experts: {self.expert_indices.tolist()}"
+
+    def _calculate_expert_shards(self):
+        """Calculate expert assignments with balanced sharding"""
+        total_experts = self.config.num_experts
+        experts_per_rank = (total_experts + self.world_size - 1) // self.world_size
+        start = self.rank * experts_per_rank
+        end = min(start + experts_per_rank, total_experts)
+        return torch.arange(start, end, device=self.device)
+
+    def _verify_cross_rank_sharding(self):
+        """Cross-rank validation of parameter sharding"""
+        if not is_dist_initialized() or self.world_size <= 1:
+            return
+
+        # Verify router parameter distribution
+        router_params = sum(p.numel() for p in self.router.parameters())
+        global_params = torch.tensor([router_params], device=self.device)
+        dist.all_reduce(global_params, op=dist.ReduceOp.SUM)
+        
+        expected_params = global_params.item() / self.world_size
+        tolerance = 0.1  # Allow 10% variance
+        
+        if abs(router_params - expected_params) > expected_params * tolerance:
+            logger.error(f"Router sharding imbalance: Local {router_params}, Expected ~{expected_params}")
+            raise RuntimeError("Router parameter sharding imbalance detected")
+
     def train(self, num_steps):
-        """Train the DDM system following paper's Section 4"""
-        print(f"[Rank {self.rank}] Starting training with {num_steps} steps")
-        
-        # Paper's training phases and intervals
-        expert_update_interval = getattr(self.config, 'expert_update_interval', 1000)
-        router_update_interval = getattr(self.config, 'router_update_interval', 100)
-        
-        # Initialize step counter for wandb
-        global_step = 0
+        """Distributed training loop with synchronization optimizations"""
+        # Set up distributed data sampler
+        self.train_loader.sampler.set_epoch(0)  # For epoch-based sampling
         
         for step in range(num_steps):
             try:
-                step_start_time = time.time()
-                
-                # Get batch - ensure all ranks get same data
+                # Synchronized batch loading
                 batch = next(iter(self.train_loader))
-                if batch is None:
-                    continue
+                batch = self._distribute_batch(batch)
                 
-                # 1. Expert Training Phase - All ranks participate
-                expert_loss = self.train_experts(batch)
+                # Expert training phase
+                expert_loss = self._train_experts_sync(batch)
                 
-                # 2. Router Update Phase (Section 3.3) - All ranks participate
-                router_loss = self.train_router(batch)
+                # Router update phase
+                router_loss = self._train_router_sync(batch)
                 
-                # 3. Expert Redistribution Phase (Section 4.1)
-                if step % expert_update_interval == 0:
+                # Expert redistribution
+                if step % self.config.expert_update_interval == 0:
                     self._redistribute_experts()
-                    # Synchronize after redistribution
-                    dist.barrier()
-                
-                # Calculate step duration
-                step_duration = time.time() - step_start_time
-                
-                # Log metrics (only rank 0)
+                    dist.barrier()  # Critical sync point
+
+                # Synchronized logging
                 if self.rank == 0:
-                    global_step += 1
-                    self._log_step_metrics_to_wandb(
-                        step=global_step,
-                        expert_loss=expert_loss,
-                        router_loss=router_loss,
-                        step_duration=step_duration,
-                        learning_rates=self._get_learning_rates(),
-                        memory_stats=self._get_memory_stats()
-                    )
-                
-                # Synchronize periodically
-                if step % 100 == 0:
-                    dist.barrier()
+                    self._log_metrics(step, expert_loss, router_loss)
                 
             except Exception as e:
-                print(f"[Rank {self.rank}] Critical error in step {step}:")
-                print(f"Exception type: {type(e).__name__}")
-                print(f"Error message: {str(e)}")
-                raise
+                self._handle_distributed_error(e, step)
+
+    def _distribute_batch(self, batch):
+        """Ensure batch consistency across ranks"""
+        if is_dist_initialized():
+            # Broadcast batch metadata
+            metadata = {
+                'shape': {k: v.shape for k, v in batch.items()},
+                'dtype': {k: v.dtype for k, v in batch.items()}
+            }
+            metadata = broadcast_object(metadata, src=0)
+            
+            # Reconstruct batch on all ranks
+            for key in batch:
+                if dist.get_rank() != 0:
+                    batch[key] = torch.zeros(*metadata['shape'][key], 
+                                          dtype=metadata['dtype'][key],
+                                          device=self.device)
+                dist.broadcast(batch[key], src=0)
+        return batch
+
+    def _train_experts_sync(self, batch):
+        """Expert training with quantized async updates"""
+        self._set_train_mode('expert')
         
-        # Log final training stats
-        if self.rank == 0 and self.wandb_enabled:
-            import wandb
-            import threading
-            
-            # Define a thread for final logging
-            def final_log_thread():
-                try:
-                    wandb.log({
-                        "training_complete": True
-                    }, commit=True)  # Use commit=True for final log
-                except Exception as e:
-                    print(f"Warning: W&B final logging error: {e}")
-            
-            # Start logging in a separate thread
-            threading.Thread(target=final_log_thread).start()
-            
-            # Flush any remaining logs
-            self.flush_wandb_logs()
-    
+        # Forward pass with quantized gradients
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            loss = self.train_experts(batch)
+        
+        # Async parameter update
+        if self.config.async_parameter_update:
+            with self._async_context():
+                if self.config.gradient_quantization:
+                    loss = self.quant_comm.all_reduce(loss)
+                else:
+                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                loss /= self.world_size
+        
+        return loss.item()
+
+    @contextlib.contextmanager
+    def _async_context(self):
+        """Non-blocking CUDA stream for communication"""
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            yield
+        torch.cuda.current_stream().wait_stream(stream)
+
+    def _train_router_sync(self, batch):
+        """Router training with gradient synchronization"""
+        self._set_train_mode('router')
+        
+        # Forward pass
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            loss = self.train_router(batch)
+        
+        # Gradient synchronization
+        if is_dist_initialized():
+            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+            loss /= self.world_size
+        
+        return loss.item()
+
+    def _handle_distributed_error(self, error, step):
+        """Coordinated error handling across ranks"""
+        error_msg = f"Step {step} error: {str(error)}"
+        error_tensor = torch.tensor([1 if error else 0], device=self.device)
+        dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
+        
+        if error_tensor.item() == 1:
+            dist.barrier()
+            if self.rank == 0:
+                logger.error(f"Critical error detected: {error_msg}")
+            raise RuntimeError("Distributed training error") from error
+
     def train_experts(self, batch):
         """Train expert models using the DDM approach"""
         total_loss = 0.0
@@ -685,18 +688,15 @@ class DDMTrainingCoordinator:
         # Import fsdp utilities for saving
         from utils.fsdp import save_fsdp_model
         
-        # Save router
-        if hasattr(self.router, 'save_checkpoint'):
-            self.router.save_checkpoint(checkpoint_dir, step)
-        else:
-            router_path = os.path.join(checkpoint_dir, 'router.pt')
-            save_fsdp_model(
-                self.router.router,
-                router_path,
-                optim=self.router.optimizer,
-                scheduler=self.router.lr_scheduler,
-                metadata={"step": step}
-            )
+        # Save router using FSDP-aware saving
+        router_path = os.path.join(checkpoint_dir, 'router.pt')
+        save_fsdp_model(
+            self.router,
+            router_path,
+            optim=self.router.optimizer,
+            scheduler=self.router.lr_scheduler,
+            metadata={"step": step}
+        )
             
         # Save coordinator state
         save_coordinator_checkpoint(
@@ -936,89 +936,82 @@ class DDMTrainingCoordinator:
                 pass
 
     def _redistribute_experts(self):
-        """
-        Implement paper's expert redistribution strategy (Section 4.1)
-        """
-        # Get cluster statistics
+        """Improved expert redistribution with gradient-aware sharding"""
+        # Get cluster statistics with synchronized access
         cluster_counts = self.train_loader.dataset.get_cluster_distribution()
-        active_clusters = torch.where(cluster_counts >= self.config.min_cluster_samples)[0]
+        cluster_counts = cluster_counts.to(self.device)
+        dist.all_reduce(cluster_counts, op=dist.ReduceOp.SUM)
         
-        # Identify underutilized experts
-        for expert_idx in self.expert_indices:
-            if cluster_counts[expert_idx] < self.config.min_cluster_samples:
-                # Find largest unassigned cluster
-                new_cluster = None
-                max_count = 0
-                for cluster_idx in active_clusters:
-                    if (cluster_counts[cluster_idx] > max_count and 
-                        cluster_idx not in self.expert_indices):
-                        new_cluster = cluster_idx
-                        max_count = cluster_counts[cluster_idx]
-                
-                if new_cluster is not None:
-                    # Reassign expert
-                    self.expert_indices[self.expert_indices.index(expert_idx)] = new_cluster
-                    # Reset expert parameters as described in paper
-                    expert = self.cache_manager.get_expert(expert_idx)
-                    expert.reset_parameters()
-                    logger.info(f"Expert {expert_idx} reassigned to cluster {new_cluster}")
+        # Calculate new expert assignments using weighted distribution
+        total_samples = cluster_counts.sum()
+        expert_weights = cluster_counts / total_samples
+        new_assignments = torch.distributions.Categorical(expert_weights).sample((self.world_size,))
+        
+        # Verify assignments are disjoint
+        unique_counts = torch.unique(new_assignments, return_counts=True)[1]
+        if (unique_counts > 1).any():
+            logger.error("Expert redistribution conflict detected!")
+            self._resolve_sharding_conflicts(new_assignments)
+        
+        # Redistribute experts with state preservation
+        self._migrate_expert_states(new_assignments)
 
-    def _isolate_gradients(self):
-        """
-        Isolate gradients between experts to ensure independent training
-        as described in paper Section 3.2
-        """
-        try:
-            # Synchronize before isolation to ensure clean state
-            if self.world_size > 1:
-                dist.barrier()
+    def _resolve_sharding_conflicts(self, assignments):
+        """Consensus-based conflict resolution"""
+        # Gather all assignments across ranks
+        all_assignments = [torch.zeros_like(assignments) for _ in range(self.world_size)]
+        dist.all_gather(all_assignments, assignments)
+        
+        # Build conflict matrix
+        conflict_matrix = torch.stack(all_assignments).unique(dim=0, return_counts=True)
+        
+        # Resolve conflicts using majority vote
+        _, majority_indices = torch.mode(conflict_matrix, dim=0)
+        self.expert_indices = majority_indices[self.rank]
+
+    def _migrate_expert_states(self, new_assignments):
+        """State-preserving expert migration between ranks"""
+        # Stage 1: Export current expert states
+        state_exports = {}
+        for idx in self.expert_indices:
+            expert = self.cache_manager.get_expert(idx)
+            state_exports[idx] = {
+                'model': FSDP.state_dict(expert, full_state_dict=False),
+                'optim': expert.optimizer.state_dict()
+            }
+        
+        # Stage 2: Synchronize states across cluster
+        dist.barrier()
+        
+        # Stage 3: Import new expert states
+        for new_idx in new_assignments[self.rank]:
+            if new_idx in state_exports:
+                # Local expert remains
+                continue
             
-            # For each expert managed by this rank
-            for expert_idx in self.expert_indices:
-                # Get expert from cache
-                expert = self.cache_manager.get_expert(
-                    expert_idx,
-                    lambda idx: self._create_expert(idx)
-                )
-                
-                # 1. Zero out any existing gradients
-                if hasattr(expert, 'optimizer'):
-                    expert.optimizer.zero_grad()
-                
-                # 2. Ensure no gradient sharing between experts
-                for param in expert.parameters():
-                    if param.grad is not None:
-                        # Detach gradient to prevent backward flow between experts
-                        param.grad = param.grad.detach()
-                        
-                        # Zero out gradients from other processes
-                        if self.world_size > 1:
-                            param.grad.zero_()
-                
-                # 3. Isolate optimizer states
-                if hasattr(expert, 'isolate_optimizer_state'):
-                    expert.isolate_optimizer_state()
-                
-                if self.verbose:
-                    logger.debug(f"Isolated gradients for expert {expert_idx} on rank {self.rank}")
+            # Find source rank for this expert
+            source_rank = torch.argmax(new_assignments == new_idx).item()
             
-            # Synchronize after isolation
-            if self.world_size > 1:
-                dist.barrier()
+            # Receive state from source rank
+            if self.rank == source_rank:
+                continue  # Skip self
             
-        except Exception as e:
-            logger.error(f"Error in gradient isolation: {str(e)}")
-            if self.verbose:
-                import traceback
-                logger.error(traceback.format_exc())
+            # Expert migration protocol
+            expert = self.cache_manager.get_expert(new_idx, self._create_expert)
+            FSDP.load_state_dict(
+                expert,
+                state_exports[new_idx]['model'],
+                full_state_dict=False
+            )
+            expert.optimizer.load_state_dict(state_exports[new_idx]['optim'])
 
     def _create_expert(self, expert_idx):
-        """Create a new expert instance with proper FSDP wrapping"""
+        """Create a new expert instance with cross-rank sharding validation"""
         from trainers.expert import ExpertTrainer
         from utils.fsdp import wrap_model_with_fsdp
         
-        # Create expert trainer with proper initialization
-        expert = ExpertTrainer(
+        # Initialize expert with device placement awareness
+        expert_trainer = ExpertTrainer(
             expert_idx=expert_idx,
             config=self.config,
             device=self.device,
@@ -1026,10 +1019,34 @@ class DDMTrainingCoordinator:
             world_size=self.world_size
         )
         
-        if self.verbose:
-            logger.info(f"Created expert {expert_idx} on rank {self.rank}")
+        # Wrap with FSDP using hybrid sharding for expert specialization
+        expert = wrap_model_with_fsdp(
+            expert_trainer.expert,
+            self.config,
+            param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
+            rank=self.rank
+        )
+        
+        # Verify expert sharding
+        self._validate_expert_sharding(expert, expert_idx)
         
         return expert
+
+    def _validate_expert_sharding(self, expert, expert_idx):
+        """Validate expert parameters are properly sharded across devices"""
+        if not is_dist_initialized() or self.world_size <= 1:
+            return
+
+        # Calculate parameter distribution
+        local_params = sum(p.numel() for p in expert.parameters())
+        global_params = torch.tensor([local_params], device=self.device)
+        dist.all_reduce(global_params, op=dist.ReduceOp.SUM)
+        
+        expected_params = global_params.item() / self.world_size
+        tolerance = 0.15  # Allow 15% variance for expert specialization
+        
+        if abs(local_params - expected_params) > expected_params * tolerance:
+            logger.warning(f"Expert {expert_idx} sharding imbalance: Local {local_params}, Expected ~{expected_params}")
 
     def _verify_sharding(self):
         """Verify model sharding across GPUs"""

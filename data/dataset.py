@@ -479,3 +479,20 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     print(f"[Rank {rank}] Total initialization time: {time.time() - loader_start:.2f}s")
 
     return expert_loaders 
+
+def _init_data_loaders(self):
+    # Replace with distributed sampler
+    sampler = DistributedSampler(
+        self.train_dataset,
+        num_replicas=self.world_size,
+        rank=self.rank,
+        shuffle=True
+    )
+    
+    self.train_loader = DataLoader(
+        self.train_dataset,
+        batch_size=self.config.batch_size,
+        sampler=sampler,
+        pin_memory=True,
+        persistent_workers=True
+    ) 

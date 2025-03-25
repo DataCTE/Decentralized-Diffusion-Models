@@ -197,6 +197,16 @@ DEFAULT_CONFIG = {
     'router_temperature': 2.0,  # Initial temperature for router softmax
     'router_min_temperature': 0.5,  # Minimum temperature after annealing
     'router_temperature_decay': 0.99995,  # Temperature decay rate
+
+    # Add to DEFAULT_CONFIG
+    'distributed': {
+        'expert_sync_interval': 100,  # Steps between expert sync
+        'gradient_quantization': True,
+        'quantization_bits': 8,
+        'async_parameter_update': True,
+        'overlap_communication': True,
+        'consensus_timeout': 5.0  # Seconds for conflict resolution
+    },
 }
 
 def get_config(config_path=None):

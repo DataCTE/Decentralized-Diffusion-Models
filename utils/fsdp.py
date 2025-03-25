@@ -298,20 +298,18 @@ def configure_optimizer_for_fsdp(model, optimizer_class, **kwargs):
         return optimizer_class(model.parameters(), **kwargs)
 
 def get_fsdp_defaults():
-    """Paper-specified isolation defaults"""
-    process_group = None
-    if torch.distributed.is_initialized():
-        process_group = torch.distributed.new_group(backend="nccl")
-        logger.info("FSDP: Distributed mode detected, creating process group.")
-    else:
-        logger.info("FSDP: Distributed mode NOT initialized, process group will be None.")
-
     return {
-        "process_group": process_group,
-        "sync_module_states": False,  # Don't sync initial weights
+        "sharding_strategy": ShardingStrategy.FULL_SHARD,
+        "cpu_offload": CPUOffload(offload_params=False),
+        "backward_prefetch": BackwardPrefetch.BACKWARD_PRE,
+        "mixed_precision": MixedPrecision(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.float16
+        ),
         "device_id": torch.cuda.current_device(),
         "limit_all_gathers": True,
-        "use_orig_params": True
+        "use_orig_params": False
     }
 
 def create_fsdp_config(config, sharding_strategy="FULL_SHARD", rank=0):
