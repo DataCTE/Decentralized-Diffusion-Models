@@ -315,23 +315,6 @@ class FeatureGenerator:
         }
     }
 
-def get_active_network_interface():
-    """Dynamically detect active network interface using iproute2"""
-    try:
-        import netifaces
-        # Get default gateway interface
-        gateways = netifaces.gateways()
-        default_iface = gateways['default'][netifaces.AF_INET][1]
-        return default_iface
-    except ImportError:
-        # Fallback to parsing /proc/net/route
-        with open('/proc/net/route') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 3 and parts[1] == '00000000' and not parts[0] == 'Iface':
-                    return parts[0]
-    return 'eth0'  # Ultimate fallback
-
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
@@ -360,34 +343,24 @@ def main():
         }
         enabled_features = [feature_map[f] for f in vars(args) if vars(args)[f] and f in feature_map]
 
-    # Add these NCCL settings before process group init
-    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "0"  # Disable async error handling
-    os.environ["NCCL_IGNORE_DISABLED_P2P"] = "1"   # Disable P2P check
-    os.environ["NCCL_BLOCKING_WAIT"] = "1"
-    os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
-    os.environ["NCCL_SOCKET_NTHREADS"] = "4"
-    os.environ["NCCL_SOCKET_TIMEOUT"] = "7200000"
-    
-    # Initialize distributed processing with explicit device settings
+    # Add these after setting the device but before init_process_group
+    torch.cuda.synchronize()
+    time.sleep(1)  # Allow device warmup
+
+    # Initialize distributed processing
     rank = int(os.environ['LOCAL_RANK'])
     print(f"Rank {rank} starting initialization")
-    
-    # Critical NCCL environment variables
-    os.environ["NCCL_ALGO"] = "RING"  # More reliable for small messages
-    os.environ["NCCL_MIN_NCHANNELS"] = "12"
     
     # Set device BEFORE initializing process group
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
     
-    # Initialize process group with TCP store
-    print(f"Rank {rank} initializing process group")
+    # Initialize process group with default settings
     dist.init_process_group(
         backend='nccl',
-        init_method='tcp://127.0.0.1:29500',  # Explicit TCP initialization
+        init_method='env://',  # Use automatic environment initialization
         world_size=int(os.environ['WORLD_SIZE']),
-        rank=rank,
-        timeout=timedelta(minutes=10)  # Increased timeout
+        rank=rank
     )
     
     # Load config after distributed init
@@ -460,28 +433,4 @@ def main():
         dist.destroy_process_group()
 
 if __name__ == "__main__":
-    # Replace the hardcoded NCCL_SOCKET_IFNAME line with:
-
-    def get_active_network_interface():
-        """Dynamically detect active network interface using iproute2"""
-        try:
-            import netifaces
-            # Get default gateway interface
-            gateways = netifaces.gateways()
-            default_iface = gateways['default'][netifaces.AF_INET][1]
-            return default_iface
-        except ImportError:
-            # Fallback to parsing /proc/net/route
-            with open('/proc/net/route') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 3 and parts[1] == '00000000' and not parts[0] == 'Iface':
-                        return parts[0]
-        return 'eth0'  # Ultimate fallback
-
-    # Then modify the network interface setting:
-    iface = get_active_network_interface()
-    os.environ["NCCL_SOCKET_IFNAME"] = iface
-    print(f"Using network interface: {iface}")
-
     main() 
