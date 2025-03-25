@@ -54,8 +54,10 @@ def main():
         device = torch.device(f"cuda:{rank}")
         
         # Force FSDP configuration to FULL_SHARD for maximum parameter distribution
-        # This ensures models are fully sharded across all GPUs
         config.fsdp_sharding_strategy = "FULL_SHARD"
+        
+        # Force proper device placement
+        torch.cuda.set_device(rank)  # Explicitly set device
         
         # Add model size estimation here, AFTER distributed setup
         if rank == 0:
@@ -66,23 +68,26 @@ def main():
         
         # Ensure all processes wait for model size prints to complete
         dist.barrier()
+        
+        # Clear GPU memory before proceeding
         torch.cuda.empty_cache()
         
-        # Initialize logging only on main process
+        # Initialize logging on all processes for debugging
+        setup_logger(config.output_dir, log_to_console=(rank == 0))
         if rank == 0:
-            setup_logger(config.output_dir)
             log_training_start(logging.getLogger(), config, rank)
             
             print("="*50)
             print(" Initializing dataset - this may take a few minutes")
             print(" Progress logs will be shown during the process")
             print("="*50)
-        
-        # Create expert cache manager
+            
+        # Create expert cache manager with proper memory constraints
+        max_experts_per_rank = max(1, config.max_experts_in_memory // world_size)
         cache_manager = ExpertCacheManager(
             config=config,
             device=device,
-            max_experts=config.max_experts_in_memory,
+            max_experts=max_experts_per_rank,  # Per-rank expert limit
             cpu_offload=config.expert_offload_to_cpu
         )
         

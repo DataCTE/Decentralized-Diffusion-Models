@@ -78,11 +78,25 @@ class DDMTrainingCoordinator:
         # Initialize wandb - only on rank 0
         self._init_wandb()
         
+        # Verify GPU device is correctly set
+        if torch.cuda.is_available():
+            # Force set device to match rank
+            torch.cuda.set_device(self.rank)
+        
+        # Log initial memory usage
+        self._log_gpu_memory_usage("initialization_start")
+        
         # Parallel initialization components
         self._init_parallel_components()
         
+        # Log memory after component init
+        self._log_gpu_memory_usage("after_component_init")
+        
         # Verify proper sharding across GPUs
         self._verify_sharding()
+        
+        # Log memory after verification
+        self._log_gpu_memory_usage("after_verification")
         
         # Defer non-critical initialization
         self.flow_matcher = None  # Will be created on first training step
@@ -184,6 +198,10 @@ class DDMTrainingCoordinator:
         """Initialize data loaders without multiprocessing to avoid pickling requirements"""
         debug_print(f"Initializing data loaders on rank {self.rank}", self.rank)
         
+        # Ensure all ranks are synchronized before loading data
+        if is_dist_initialized():
+            synchronize()
+        
         # Shared configuration for DataLoader - disable multiprocessing
         loader_config = {
             'num_workers': 0,  # Disable multiprocessing
@@ -191,8 +209,8 @@ class DDMTrainingCoordinator:
             'persistent_workers': False  # Disable persistent workers
         }
         
-        # Initialize training dataset
-        train_dataset = DDMDataset(self.config, 'train')
+        # Initialize training dataset - directly pass device to ensure proper placement
+        train_dataset = DDMDataset(self.config, 'train', device=self.device)
         
         # Create bucket-aware sampler if bucket assignments are available
         if hasattr(train_dataset, 'bucket_assignments'):
@@ -1054,4 +1072,47 @@ class DDMTrainingCoordinator:
                 
                 if self.rank == 0:
                     logger.info(f"Expert {expert_idx} parameters per rank: {[t.item() for t in all_params]}")
+
+    def _log_gpu_memory_usage(self, stage=""):
+        """Log GPU memory usage from all ranks"""
+        if not is_dist_initialized():
+            return
+        
+        # Collect memory stats from this rank
+        mem_allocated = torch.cuda.memory_allocated(self.device) / 1e9  # GB
+        mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9  # GB
+        
+        # Create tensors to gather from all ranks
+        mem_allocated_tensor = torch.tensor([mem_allocated], device=self.device)
+        mem_reserved_tensor = torch.tensor([mem_reserved], device=self.device)
+        
+        # Create lists to hold values from all ranks
+        all_mem_allocated = [torch.zeros_like(mem_allocated_tensor) for _ in range(self.world_size)]
+        all_mem_reserved = [torch.zeros_like(mem_reserved_tensor) for _ in range(self.world_size)]
+        
+        # Gather memory stats from all ranks
+        dist.all_gather(all_mem_allocated, mem_allocated_tensor)
+        dist.all_gather(all_mem_reserved, mem_reserved_tensor)
+        
+        # Log the results
+        if self.rank == 0:
+            all_allocated = [t.item() for t in all_mem_allocated]
+            all_reserved = [t.item() for t in all_mem_reserved]
+            
+            # Calculate stats
+            min_allocated = min(all_allocated)
+            max_allocated = max(all_allocated)
+            avg_allocated = sum(all_allocated) / len(all_allocated)
+            
+            # Check imbalance
+            imbalance = max_allocated / (min_allocated + 1e-6)
+            
+            logger.info(f"==== GPU Memory Usage ({stage}) ====")
+            for i, (alloc, resv) in enumerate(zip(all_allocated, all_reserved)):
+                logger.info(f"Rank {i}: Allocated: {alloc:.2f} GB, Reserved: {resv:.2f} GB")
+            
+            logger.info(f"Memory imbalance factor: {imbalance:.2f}x")
+            
+            if imbalance > 1.5:
+                logger.warning(f"High memory imbalance detected at {stage}!")
 

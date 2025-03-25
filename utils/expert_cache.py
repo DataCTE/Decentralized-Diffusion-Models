@@ -40,56 +40,56 @@ class ExpertCacheManager:
     
     def get_expert(self, expert_idx, expert_factory_fn=None):
         """Get expert from cache, loading if necessary"""
-        try:
-            # Try to get from active cache
-            if expert_idx in self.active_experts:
-                return self.active_experts[expert_idx]
-            
-            # Not in active cache, check if it's offloaded
-            if expert_idx in self.offloaded_experts:
-                # Load from CPU back to GPU
-                expert = self.offloaded_experts[expert_idx]
-                # Move to correct device - FSDP-aware
-                if isinstance(expert, FSDP):
-                    # For FSDP models, we need special handling
-                    with FSDP.summon_full_params(expert):
-                        # Just activate the parameters, FSDP handles the device placement
-                        pass
-                else:
-                    # Regular model, just move to device
-                    expert = expert.to(self.device)
-                
-                # Add to active cache
-                self.active_experts[expert_idx] = expert
-                # Remove from offloaded cache
-                del self.offloaded_experts[expert_idx]
-                return expert
-            
-            # Not in any cache, create new expert
-            if expert_factory_fn:
-                expert = expert_factory_fn(expert_idx)
-                # Add directly to active cache
-                self.active_experts[expert_idx] = expert
-                
-                # Ensure we don't exceed max active experts
-                self._enforce_cache_limits()
-                
-                return expert
-            
-            # No factory function and expert not found
-            return None
-        
-        except Exception as e:
-            logger.error(f"Error getting expert {expert_idx} from cache: {str(e)}")
-            # Attempt to recreate on error
-            if expert_factory_fn:
-                try:
-                    expert = expert_factory_fn(expert_idx)
-                    self.active_experts[expert_idx] = expert
+        with self.cache_lock:  # Always use the lock for thread safety
+            try:
+                # Use expert_cache instead of active_experts
+                if expert_idx in self.expert_cache:
+                    # Reorder expert_cache to make this expert the most recently used
+                    expert = self.expert_cache.pop(expert_idx)
+                    self.expert_cache[expert_idx] = expert
                     return expert
-                except Exception as inner_e:
-                    logger.error(f"Failed to recreate expert {expert_idx}: {str(inner_e)}")
-            return None
+                
+                # Use cpu_cache instead of offloaded_experts
+                if expert_idx in self.cpu_cache:
+                    # Load from CPU back to GPU
+                    expert = self.cpu_cache[expert_idx]
+                    # Move to device properly - FSDP-aware
+                    if isinstance(expert, FSDP):
+                        # For FSDP models, ensure they're properly moved to the right device
+                        expert.to(self.device)
+                    else:
+                        # Regular model
+                        expert = expert.to(self.device)
+                    
+                    # Add to active cache
+                    self.expert_cache[expert_idx] = expert
+                    # Remove from CPU cache
+                    del self.cpu_cache[expert_idx]
+                    return expert
+                
+                # Not in any cache, create new expert
+                if expert_factory_fn:
+                    expert = expert_factory_fn(expert_idx)
+                    # Add to active cache
+                    self.expert_cache[expert_idx] = expert
+                    # Check if we need to evict experts
+                    self._enforce_cache_limits()
+                    return expert
+                
+                # No factory function and expert not found
+                return None
+            
+            except Exception as e:
+                logger.error(f"Error getting expert {expert_idx} from cache: {str(e)}")
+                # Attempt to recreate on error
+                if expert_factory_fn:
+                    try:
+                        expert = expert_factory_fn(expert_idx)
+                        self.expert_cache[expert_idx] = expert
+                        return expert
+                    except Exception as inner_e:
+                        logger.error(f"Failed to recreate expert {expert_idx}: {str(inner_e)}")
+                return None
     
     def _add_to_cache(self, expert_idx, expert):
         """Add expert to cache, evicting if necessary"""
@@ -159,3 +159,23 @@ class ExpertCacheManager:
             logger.error(f"Error during expert cache manager shutdown: {str(e)}")
             return False
         return True 
+
+    def _enforce_cache_limits(self):
+        """Enforce cache size limits, offloading experts if necessary"""
+        if len(self.expert_cache) > self.max_experts:
+            # Get the first expert (least recently used)
+            lru_idx, lru_expert = next(iter(self.expert_cache.items()))
+            
+            # Move to CPU if offloading is enabled
+            if self.cpu_offload:
+                logger.debug(f"Offloading expert {lru_idx} to CPU due to cache limit")
+                # For FSDP models, handle differently
+                if isinstance(lru_expert, FSDP):
+                    # Just store the CPU version - FSDP will handle proper sharding when reloaded
+                    self.cpu_cache[lru_idx] = lru_expert.cpu()
+                else:
+                    # For non-FSDP models, simple CPU transfer
+                    self.cpu_cache[lru_idx] = lru_expert.to('cpu')
+            
+            # Remove from GPU cache
+            del self.expert_cache[lru_idx] 

@@ -4,6 +4,7 @@ import torch
 from diffusers import AutoencoderKL
 import logging
 import os
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,7 @@ class VAEWrapper:
     def __init__(self, device, config):
         self.device = device
         self.config = config
+        self._vae = None  # Lazy loading
         self.precision = torch.float16 if config.use_mixed_precision else torch.float32
         
         # Handle model loading paths
@@ -24,12 +26,7 @@ class VAEWrapper:
         
         try:
             # Load VAE from specified repository
-            self.model = AutoencoderKL.from_pretrained(vae_model_path).to(device)
-            self.model.eval()
-            
-            # Explicitly convert model weights to match precision
-            if config.use_mixed_precision:
-                self.model.half()
+            self.vae
             
             # VAE scaling factor (commonly used with Stable Diffusion VAEs)
             self.scaling_factor = getattr(config, 'vae_scaling_factor', 0.18215)
@@ -40,10 +37,33 @@ class VAEWrapper:
             logger.error(f"Error loading VAE: {str(e)}")
             raise RuntimeError(f"Failed to load VAE: {str(e)}")
             
+    @property
+    def vae(self):
+        """Lazy-load VAE only when needed"""
+        if self._vae is None:
+            # Import when needed
+            from diffusers import AutoencoderKL
+            
+            # Log this loading
+            print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] Loading VAE model")
+            
+            # Load VAE
+            self._vae = AutoencoderKL.from_pretrained(
+                self.config.vae_model, 
+                torch_dtype=torch.float16 if self.config.use_half_precision else torch.float32
+            ).to(self.device)
+            
+            # Put in eval mode and disable grads
+            self._vae.eval()
+            for param in self._vae.parameters():
+                param.requires_grad = False
+        
+        return self._vae
+    
     def encode(self, x):
         with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             x = x.to(self.device, dtype=self.precision)
-            return self.model.encode(x).latent_dist.sample().to(torch.float32)
+            return self.vae.encode(x).latent_dist.sample().to(torch.float32)
     
     def decode(self, latents):
         """
@@ -71,13 +91,13 @@ class VAEWrapper:
                 
                 for i in range(0, latents.shape[0], batch_size):
                     batch_latents = latents[i:i+batch_size]
-                    batch_images = self.model.decode(batch_latents).sample
+                    batch_images = self.vae.decode(batch_latents).sample
                     images.append(batch_images)
                     
                 images = torch.cat(images, dim=0)
             else:
                 # Process all latents at once
-                images = self.model.decode(latents).sample
+                images = self.vae.decode(latents).sample
                 
             return images
             

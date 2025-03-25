@@ -45,9 +45,10 @@ class RouterTrainer:
         self.world_size = world_size or 1
         
         # Create base router model with safe config access
-        base_router = RouterModel(config).to(device)
+        base_router = RouterModel(config)
         
-        # Apply FSDP wrapping
+        # Apply FSDP wrapping - note we don't call .to(device) before FSDP wrapping
+        # IMPORTANT: Let FSDP handle device placement to ensure proper sharding
         self.router = wrap_model_with_fsdp(
             base_router,
             config,
@@ -56,11 +57,10 @@ class RouterTrainer:
         )
         
         # Print initialization message from all ranks
-        print(f"[Rank {rank}] Initialized Router with FSDP")
+        logger.info(f"[Rank {rank}] Initialized Router with FSDP")
         
-        # Add VAE for latent encoding
-        from data.vae import VAEWrapper
-        self.vae = VAEWrapper(device, config)
+        # Add VAE for latent encoding - load VAE on demand to save memory
+        self._vae = None
         
         # Paper-recommended optimizer settings
         self.optimizer = AdamW8bit(
