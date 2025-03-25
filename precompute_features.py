@@ -42,6 +42,8 @@ class FeatureGenerator:
             self.clip = CLIPTextEncoder(self.device, config)
         if 'dino' in enabled_features and not config.use_existing_dino:
             self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).eval()
+        else:
+            self.dino = None  # Explicitly set to None if not loading
         
         # Create feature directories aggressively
         self.feature_dir = Path(config.feature_cache_path)
@@ -111,7 +113,7 @@ class FeatureGenerator:
                 features = {
                     'latent': self._extract_vae_latent(img),
                     'clip': self._extract_clip_embedding(caption_path.read_text()),
-                    'dino': self._extract_dino_features(img),
+                    'dino': self._extract_dino_features(img) if self.dino is not None else None,
                     'dims': torch.tensor(img.size, dtype=torch.int16),
                     'bucket': torch.tensor(bucket_idx, dtype=torch.int16)
                 }
@@ -137,7 +139,10 @@ class FeatureGenerator:
             return self.clip.encode([caption]).cpu()
 
     def _extract_dino_features(self, img):
-        """Robust DINO feature extraction with channel validation"""
+        """Robust DINO feature extraction with model check"""
+        if self.dino is None:
+            return torch.zeros(1, 1024)  # Return empty features if model not loaded
+            
         try:
             # Convert to RGB tensor with 3 channels
             img_rgb = img.convert('RGB')
@@ -389,22 +394,26 @@ def main():
         # Main processing loop
         with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
             for img_path in local_images:
-                base_name = uuid.UUID(hashlib.md5(img_path.encode()).hexdigest()).hex
-                
-                # Only process enabled features
-                features = {}
-                for feat in enabled_features:
-                    if feat in FeatureGenerator.FEATURE_PROCESSORS:
-                        handler_info = FeatureGenerator.FEATURE_PROCESSORS[feat]
-                        handler = handler_info['handler']
-                        features[feat] = getattr(processor, handler)(img_path)
-                
-                # Save enabled features
-                for feat, data in features.items():
-                    prefix = FeatureGenerator.FEATURE_PROCESSORS[feat]['save_prefix']
-                    torch.save(data, processor.feature_dir/f"{prefix}/{base_name}_rank{rank}.pt")
-                
-                pbar.update(1)
+                try:
+                    base_name = uuid.UUID(hashlib.md5(img_path.encode()).hexdigest()).hex
+                    
+                    # Only process enabled features
+                    features = {}
+                    for feat in enabled_features:
+                        if feat in FeatureGenerator.FEATURE_PROCESSORS:
+                            handler_info = FeatureGenerator.FEATURE_PROCESSORS[feat]
+                            handler = handler_info['handler']
+                            features[feat] = getattr(processor, handler)(img_path)
+                    
+                    # Save enabled features
+                    for feat, data in features.items():
+                        prefix = FeatureGenerator.FEATURE_PROCESSORS[feat]['save_prefix']
+                        torch.save(data, processor.feature_dir/f"{prefix}/{base_name}_rank{rank}.pt")
+                    
+                    pbar.update(1)
+                except Exception as e:
+                    print(f"Rank {rank} failed to process {img_path}: {str(e)}")
+                    continue  # Skip to next image
 
         # Add final completion marker per rank
         torch.save({'status': 'done'}, processor.feature_dir/f"status_rank{rank}.pt")
