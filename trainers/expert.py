@@ -87,100 +87,60 @@ class ExpertTrainer(BaseTrainer):
         return F.mse_loss(pred, target)
 
     def train_step(self, batch):
-        """
-        Implements Algorithm 1 from paper with proper gradient isolation
-        
-        This trains an expert model using the flow matching objective
-        as described in Section 3.2 of the paper.
-        """
-        # Get scaler based on config
-        scaler = torch.amp.GradScaler("cuda", enabled=self.config.use_mixed_precision)
-        
-        # Get images from batch (already in latent space)
-        latents = batch["latent"].to(self.device)  # Directly use precomputed latents
-        text_embeds = batch["clip_embedding"].to(self.device)  # Directly use dataset's CLIP embeddings
-        
-        with torch.autocast(device_type="cuda", enabled=self.config.use_mixed_precision):
-            # Sample random timesteps t ∈ [0, 1] (Section 3.2)
-            t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
-            t = t_indices.float() / 1000.0  # Normalize to [0, 1]
-            
-            # Sample random noise (Section 3.2)
-            noise = torch.randn_like(latents)
-            
-            # Forward process using cosine schedule (Section 3.2)
-            alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)[:,None,None,None]
-            sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
-            latent_t = alpha_t * latents + sigma_t * noise
-            
-            # Add cluster IDs from dataset
-            cluster_ids = batch["expert"].to(self.device)  # Assuming dataset returns expert/cluster IDs
-            
-            # Modified expert call with cluster IDs
-            pred_flow = self.expert(
-                latent_t, 
-                t_indices, 
-                text_embeds,
-                cluster_ids=cluster_ids  # Add cluster IDs parameter
-            )
-            
-            # The target flow field v_t(x_t) (Equation 4)
-            target_flow = self.flow_matcher.compute_flow_matching_target(
-                latents, latent_t, t
-            )
-            
-            # Flow matching loss (Equation 7)
-            loss = self.flow_matcher.compute_flow_matching_loss(
-                pred_flow, target_flow
-            )
-        
-        # Optimize with gradient isolation
+        """Execute a single training step"""
+        self.expert.train()
         self.optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.unscale_(self.optimizer)
         
-        # Use isolated gradient norm calculation for proper clipping
-        with torch.no_grad():
-            # Get this expert's parameters only
-            expert_params = list(self.expert.parameters())
+        # Extract and reshape inputs from batch
+        latents = batch['latent']  # [B, 1, C, H, W]
+        B, _, C, H, W = latents.shape
+        latents = latents.squeeze(1)  # Remove sequence dim for latents
+        
+        # Get CLIP embeddings and reshape
+        clip_emb = batch['clip_embedding']  # [B, 1, seq_len, dim]
+        clip_emb = clip_emb.squeeze(1)  # [B, seq_len, dim]
+        
+        # Create position IDs for text and image
+        txt_ids = torch.arange(clip_emb.size(1), device=self.device)[None].repeat(B, 1)
+        txt_ids = torch.stack([txt_ids // self.config.max_token_length, txt_ids % self.config.max_token_length], dim=-1)
+        
+        img_size = H // self.config.patch_size
+        img_ids = torch.arange(img_size * img_size, device=self.device)[None].repeat(B, 1)
+        img_ids = torch.stack([img_ids // img_size, img_ids % img_size], dim=-1)
+        
+        # Sample random timesteps
+        timesteps = torch.rand(B, device=self.device)
+        
+        # Generate random noise for conditioning
+        y = torch.randn(B, self.config.vec_in_dim, device=self.device)
+        
+        # Reshape latents to sequence format
+        img_seq = latents.view(B, C, -1).permute(0, 2, 1)  # [B, L, C]
+        
+        # Forward pass through expert
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            pred_flow = self.expert(
+                img=img_seq,
+                img_ids=img_ids,
+                txt=clip_emb,
+                txt_ids=txt_ids,
+                timesteps=timesteps,
+                y=y,
+                cluster_ids=batch['expert']
+            )
             
-            # Filter out parameters with None gradients
-            grads = [p.grad.detach() for p in expert_params if p.grad is not None]
-
-            if grads:  # Check if grads list is not empty
-                # Calculate norm for only this expert's gradients
-                grad_norm = torch.norm(
-                    torch.stack([
-                        torch.norm(grad.flatten(), 2) # Flatten each grad to scalar
-                        for grad in grads
-                    ]), 
-                    2
-                )
-                
-                # Apply clipping if norm exceeds threshold
-                clip_coef = self.config.max_grad_norm / (grad_norm + 1e-6)
-                if clip_coef < 1:
-                    for p in expert_params:
-                        if p.grad is not None:
-                            p.grad.detach().mul_(clip_coef)
-            else:
-                # No gradients to clip, skip clipping step
-                grad_norm = torch.tensor(0.0) # Set grad_norm to 0 if no gradients
-
-            if self.rank == 0 and torch.rand(1).item() < 0.01:  # Log occasionally
-                logger.debug(f"Expert {self.expert_idx} grad norm: {grad_norm:.4f}, clip: {clip_coef < 1}")
+            # Compute target flow
+            target_flow = self.flow_matcher.compute_target_flow(latents, timesteps)
+            
+            # Compute loss
+            loss = self.flow_matcher.compute_flow_matching_loss(pred_flow, target_flow)
         
-        # Finish optimization
-        scaler.step(self.optimizer)
-        scaler.update()
-        
-        # Update learning rate
+        # Backward pass and optimization
+        loss.backward()
+        if self.config.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.expert.parameters(), self.config.max_grad_norm)
+        self.optimizer.step()
         self.lr_scheduler.step()
-        
-        # Add in train_step method
-        #print(f"Latent shape: {latents.shape}")
-        #print(f"Predicted flow shape: {pred_flow.shape}")
-        #print(f"Target flow shape: {target_flow.shape}")
         
         return loss.item()
     
