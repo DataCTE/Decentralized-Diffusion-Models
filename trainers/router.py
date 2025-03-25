@@ -83,16 +83,22 @@ class RouterTrainer:
 
     def train_step(self, batch, true_clusters=None, temperature=1.0):
         """Train router with cross-entropy loss per paper Section 3.3"""
-        # Get inputs
-        latents = batch["latent"].to(self.device)
+        # Get inputs and ensure proper shapes
+        latents = batch["latent"].to(self.device)  # [B, C, H, W] or [B, 1, C, H, W]
+        if latents.dim() == 5:
+            latents = latents.squeeze(1)  # Remove extra dimension if present
+        
         if true_clusters is None:
             true_clusters = batch["expert"].to(self.device)
+        
         text_embeds = batch["clip_embedding"].to(self.device)
+        if text_embeds.dim() == 4:  # [B, 1, seq_len, dim]
+            text_embeds = text_embeds.squeeze(1)
         
-        # Use mixed precision training
-        scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
+        # Use mixed precision training with updated syntax
+        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
         
-        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+        with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
             # Sample timestep uniformly as in paper
             t = torch.rand(latents.size(0), device=self.device)
             
@@ -101,6 +107,10 @@ class RouterTrainer:
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
             noise = torch.randn_like(latents)
             x_t = alpha_t * latents + sigma_t * noise
+            
+            # Ensure x_t has correct shape [B, C, H, W]
+            if x_t.dim() != 4:
+                raise ValueError(f"Expected x_t to have 4 dimensions [B,C,H,W], got shape {x_t.shape}")
             
             # Get router predictions with temperature annealing
             logits = self.router(x_t, t * 1000, text_embeds)
