@@ -290,6 +290,8 @@ class DDMTrainingCoordinator:
         
         for step in range(num_steps):
             try:
+                step_start_time = time.time()
+                
                 batch = next(iter(self.train_loader))
                 if batch is None:
                     continue
@@ -307,13 +309,20 @@ class DDMTrainingCoordinator:
                 if step % expert_update_interval == 0:
                     self._redistribute_experts()
                 
+                # Calculate step duration
+                step_duration = time.time() - step_start_time
+                
                 # Log metrics
                 if self.rank == 0:
                     self._log_step_metrics_to_wandb(
                         step=step,
                         expert_loss=expert_loss,
-                        router_loss=router_loss
+                        router_loss=router_loss,
+                        step_duration=step_duration,
+                        learning_rates=self._get_learning_rates(),
+                        memory_stats=self._get_memory_stats()
                     )
+                
             except Exception as e:
                 print(f"[Rank {self.rank}] Critical error in step {step}:")
                 print(f"Exception type: {type(e).__name__}")

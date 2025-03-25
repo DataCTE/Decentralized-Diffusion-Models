@@ -192,6 +192,11 @@ DEFAULT_CONFIG = {
         'portrait': (0.4, 0.9), 
         'landscape': (1.1, 2.5)
     },
+
+    # ===== Router Configuration =====
+    'router_temperature': 2.0,  # Initial temperature for router softmax
+    'router_min_temperature': 0.5,  # Minimum temperature after annealing
+    'router_temperature_decay': 0.99995,  # Temperature decay rate
 }
 
 def get_config(config_path=None):
