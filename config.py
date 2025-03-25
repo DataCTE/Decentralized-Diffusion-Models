@@ -306,7 +306,7 @@ def estimate_model_size(config, model_type="expert"):
                 config.image_size[1] // config.patch_size,
                 config.image_size[2] // config.patch_size,
                 device=device
-            ),
+            ),  # img - latent image
             torch.randint(0, 1000, (config.batch_size,), device=device), # img_ids - dummy ids
             torch.randn(
                 config.batch_size,

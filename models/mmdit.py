@@ -1005,6 +1005,11 @@ class ExpertMMDiT(Flux):
         combined_vec = torch.cat([y, cluster_emb], dim=-1)
         y = self.vec_proj(combined_vec)
         
+        # Debug print shapes
+        print(f"y shape: {y.shape}")  # Should be (batch_size, vec_in_dim)
+        print(f"cluster_emb shape: {cluster_emb.shape}")  # Should be (batch_size, cluster_embed_dim)
+        print(f"combined_vec shape: {combined_vec.shape}")  # Should be (batch_size, vec_in_dim * 2)
+        
         # Remainder of forward pass as original Flux
         return super().forward(
             img=img,
