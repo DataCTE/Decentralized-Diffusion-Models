@@ -6,7 +6,7 @@ import math
 from bitsandbytes.optim import AdamW8bit
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
-from torch.distributed import dist
+import torch.distributed as dist
 
 
 
