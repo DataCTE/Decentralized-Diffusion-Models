@@ -171,37 +171,34 @@ class FeatureGenerator:
                 torch.save(data, self.feature_dir/f"{feat}/{base_name}_rank{self.rank}.pt")
 
     def run_clustering(self):
-        """Distributed clustering implementation"""
-        # Wait for all ranks to finish writing
-        dist.barrier()
+        """Distributed CPU clustering implementation"""
+        clustering_status = torch.tensor([0], device=self.device)
+        dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX)
         
-        if self.rank == 0:
-            print("Starting distributed clustering...")
-            try:
-                # Load features in parallel across all available GPUs
+        try:
+            if self.rank == 0:
+                # Move feature loading to CPU
                 feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
                 features = []
                 
-                # Use memory mapping for large files
                 with tqdm(total=len(feature_files), desc="Loading features") as pbar:
-                    with ThreadPoolExecutor(max_workers=16) as executor:
-                        futures = {executor.submit(self._safe_load_feature, f): f 
-                                  for f in feature_files}
-                        for future in as_completed(futures):
-                            try:
-                                feat = future.result()
-                                if feat is not None:
-                                    features.append(feat)
-                                pbar.update(1)
-                            except Exception as e:
-                                print(f"Skipping corrupted file: {str(e)}")
+                    for f in feature_files:
+                        try:
+                            feat = torch.load(f, map_location='cpu')
+                            if feat.shape == (1, 1024):
+                                features.append(feat.numpy())
+                            pbar.update(1)
+                        except Exception as e:
+                            print(f"Skipping corrupted file: {str(e)}")
 
-                full_features = torch.cat(features).numpy()
+                full_features = np.concatenate(features)
                 
-                # Distributed k-means with Faiss
+                # CPU-only k-means
                 kmeans = faiss.Kmeans(
                     full_features.shape[1], 1024,
-                    niter=100, gpu=True, spherical=True,
+                    niter=100, 
+                    gpu=False,  # Force CPU
+                    spherical=True,
                     min_points_per_centroid=100,
                     max_points_per_centroid=10000,
                     nredo=3,
@@ -209,48 +206,28 @@ class FeatureGenerator:
                 )
                 kmeans.train(full_features)
                 
-                # Broadcast centroids to all ranks
-                centroids_tensor = torch.from_numpy(kmeans.centroids)
-                dist.broadcast(centroids_tensor, src=0)
-                
-                # Distributed hierarchical clustering
+                # CPU-based hierarchical clustering
                 agg = AgglomerativeClustering(
-                    n_clusters=8, linkage='average',
-                    metric='cosine', compute_full_tree=True
+                    n_clusters=8, 
+                    linkage='average',
+                    metric='cosine', 
+                    compute_full_tree=True
                 )
                 agg.fit(kmeans.centroids)
                 
-                # Save final clusters
+                # Save from CPU
                 _, labels = kmeans.index.search(full_features, 1)
                 cluster_labels = agg.labels_[labels.flatten()]
                 torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
-                
-                # Write initialization marker
-                (self.feature_dir/"clusters/started.pt").touch()
-                
-            except Exception as e:
-                print(f"Clustering failed: {str(e)}")
-                # Broadcast failure signal
-                failure_flag = torch.tensor([1], device=self.device)
-            else:
-                failure_flag = torch.tensor([0], device=self.device)
+
+            # Synchronize after CPU completion
+            clustering_status.fill_(2)
+            dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX, timeout=timedelta(minutes=10))
             
-            dist.broadcast(failure_flag, src=0)
-        else:
-            failure_flag = torch.tensor([0], device=self.device)
-            dist.broadcast(failure_flag, src=0)
-
-        if failure_flag.item() == 1:
-            raise RuntimeError("Clustering failed on rank 0")
-
-        # For non-zero ranks in clustering wait:
-        start_time = time.time()
-        while True:
-            if (self.feature_dir/"clusters/started.pt").exists():
-                break
-            if time.time() - start_time > 1800:  # 30 minute timeout
-                raise RuntimeError("Clustering never started on rank 0")
-            time.sleep(10)
+        except Exception as e:
+            print(f"Clustering failed: {str(e)}")
+            clustering_status.fill_(1)
+            dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX, timeout=timedelta(seconds=30))
 
     def _safe_load_feature(self, path):
         """Load features with validation and retries"""
@@ -307,6 +284,13 @@ class FeatureGenerator:
     def _extract_dims(self, img):
         """Extract original image dimensions"""
         return torch.tensor(img.size, dtype=torch.int16)
+
+    def _gpu_health_check(self):
+        """Verify GPU is responsive"""
+        test_tensor = torch.randn(1024, device=self.device)
+        torch.cuda.synchronize()
+        # If this hangs, it indicates GPU health issues
+        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM, timeout=timedelta(seconds=30))
 
     # Add this class attribute
     FEATURE_PROCESSORS = {
@@ -464,17 +448,28 @@ def main():
             if cluster_error.item() == 1:
                 raise RuntimeError("Clustering failed on rank 0")
             
-            # Unified waiting logic for all ranks
-            while not (processor.feature_dir/"clusters/final_clusters.pt").exists():
-                # Check timeout
-                if time.time() - cluster_start_time > 10800:  # 3 hours
-                    raise RuntimeError("Clustering timed out")
+            # Unified waiting logic using distributed status
+            clustering_status = torch.tensor([0], device=device)
+            while True:
+                # Check status every 5 seconds with timeout
+                dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX, timeout=timedelta(seconds=30))
                 
-                # Check for error file
-                if (processor.feature_dir/"clusters/error.pt").exists():
+                if clustering_status.item() == 2:
+                    break  # Clustering completed
+                elif clustering_status.item() == 1:
                     raise RuntimeError("Clustering failed on rank 0")
                 
-                time.sleep(30)
+                if time.time() - cluster_start_time > 7200:  # 2 hour timeout
+                    raise RuntimeError("Clustering timed out")
+                
+                # Progress reporting
+                if rank == 0:
+                    print(f"Clustering progress: {time.time() - cluster_start_time:.1f}s elapsed")
+                
+                time.sleep(5)
+
+        # Add GPU health check
+        processor._gpu_health_check()
 
     except Exception as e:
         print(f"Rank {rank} failed: {str(e)}")
