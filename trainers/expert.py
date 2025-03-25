@@ -101,7 +101,6 @@ class ExpertTrainer(BaseTrainer):
 
     def train_step(self, batch):
         """Train expert with flow matching loss per paper Section 3.2"""
-        # Add detailed shape debugging
         print(f"[DEBUG Expert {self.expert_idx}] Starting train_step")
         print(f"[DEBUG Expert {self.expert_idx}] Batch keys: {batch.keys()}")
         
@@ -115,16 +114,34 @@ class ExpertTrainer(BaseTrainer):
         print(f"[DEBUG Expert {self.expert_idx}] text_embeds shape: {text_embeds.shape}")
         print(f"[DEBUG Expert {self.expert_idx}] cluster_ids shape: {cluster_ids.shape}")
         
+        # Reshape latents if needed - handle 5D format [B, S, C, H, W] → [B, C, H, W]
+        original_shape = latents.shape
+        if latents.dim() == 5:
+            B, S, C, H, W = latents.shape
+            if S == 1:
+                latents = latents.squeeze(1)  # Remove sequence dimension if S=1
+                print(f"[DEBUG Expert {self.expert_idx}] Reshaped latents to: {latents.shape}")
+            else:
+                print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch, using first sequence")
+                latents = latents[:, 0]  # Take only first sequence if multiple
+                print(f"[DEBUG Expert {self.expert_idx}] Using first sequence, shape: {latents.shape}")
+        
+        # Same for text embeddings if needed
+        if text_embeds.dim() == 4:
+            B, S, L, D = text_embeds.shape
+            if S == 1:
+                text_embeds = text_embeds.squeeze(1)
+                print(f"[DEBUG Expert {self.expert_idx}] Reshaped text_embeds to: {text_embeds.shape}")
+        
         # Mixed precision context
         with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             # Random timesteps
             t = torch.rand(latents.size(0), device=self.device)
             print(f"[DEBUG Expert {self.expert_idx}] timesteps shape: {t.shape}")
             
-            # *** THIS IS LIKELY WHERE THE ERROR IS HAPPENING ***
-            print(f"[DEBUG Expert {self.expert_idx}] Calling expert forward pass")
             try:
                 # Forward pass through expert model
+                print(f"[DEBUG Expert {self.expert_idx}] Calling expert forward pass")
                 pred_flow = self.expert(
                     img=latents,
                     img_ids=self._get_position_ids(latents),
@@ -136,17 +153,15 @@ class ExpertTrainer(BaseTrainer):
                 )
                 print(f"[DEBUG Expert {self.expert_idx}] pred_flow shape: {pred_flow.shape}")
                 
-                # *** THE ISSUE MIGHT BE IN THE FLOW MATCHER ***
+                # Calculate loss - need to reshape latents back if it was modified
                 print(f"[DEBUG Expert {self.expert_idx}] Computing loss with flow_matcher")
                 loss = self.flow_matcher.compute_loss(pred_flow, latents, t)
                 print(f"[DEBUG Expert {self.expert_idx}] Loss value: {loss.item()}")
                 
             except Exception as e:
                 print(f"[CRITICAL ERROR Expert {self.expert_idx}] Forward pass failed: {str(e)}")
-                # Print a detailed traceback
                 import traceback
                 traceback.print_exc()
-                # IMPORTANT: Raise the error instead of silently continuing
                 raise
         
         # Backpropagation
@@ -261,8 +276,27 @@ class ExpertTrainer(BaseTrainer):
                 logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 
 
     def _get_position_ids(self, x):
-        """Simple patch-based position IDs as described in paper"""
-        B, C, H, W = x.shape
+        """Simple patch-based position IDs as described in paper with improved shape handling"""
+        # Handle 5D inputs (B, S, C, H, W) common in latent diffusion models
+        print(f"[DEBUG Expert {self.expert_idx}] Position ID input shape: {x.shape}")
+        
+        if x.dim() == 5:
+            # Extract dimensions from 5D tensor (B, S, C, H, W)
+            B, S, C, H, W = x.shape
+            # Reshape to 4D by combining batch and sequence dimensions if S=1
+            if S == 1:
+                # Just use the existing batch size and reshape while keeping original H/W
+                print(f"[DEBUG Expert {self.expert_idx}] Reshaping 5D->4D tensor for position IDs")
+            else:
+                # If sequence length > 1, maintain batch size but note for debugging
+                print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch, using first sequence")
+        elif x.dim() == 4:
+            # Standard 4D tensor (B, C, H, W)
+            B, C, H, W = x.shape
+        else:
+            raise ValueError(f"Unexpected tensor dimensions: {x.dim()}, shape: {x.shape}")
+        
+        # Calculate grid dimensions based on patch size
         h = H // self.config.patch_size
         w = W // self.config.patch_size
         
@@ -272,13 +306,31 @@ class ExpertTrainer(BaseTrainer):
         pos_grid = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), dim=-1)
         pos_grid = pos_grid.reshape(-1, 2)[None].repeat(B, 1, 1)
         
+        print(f"[DEBUG Expert {self.expert_idx}] Position ID output shape: {pos_grid.shape}")
         return pos_grid
 
     def _get_text_position_ids(self, text_emb):
-        """Simple sequence position IDs for text"""
+        """Simple sequence position IDs for text with improved shape handling"""
+        print(f"[DEBUG Expert {self.expert_idx}] Text embedding shape for position IDs: {text_emb.shape}")
+        
+        if text_emb.dim() == 4:
+            # Handle [B, S, L, D] → [B, L, D]
+            B, S, L, D = text_emb.shape
+            if S == 1:
+                # If sequence dimension is 1, we can simply remove it
+                print(f"[DEBUG Expert {self.expert_idx}] Reshaping 4D text embedding for position IDs")
+                text_emb = text_emb.squeeze(1)
+            else:
+                print(f"[WARNING Expert {self.expert_idx}] Multiple text sequences ({S}), using first")
+                text_emb = text_emb[:, 0]
+        
+        # Now process the standard 3D case
         B, L, _ = text_emb.shape
         pos_ids = torch.arange(L, device=self.device)[None].repeat(B, 1)
-        return pos_ids[:, :, None].repeat(1, 1, 2)  # Add 2D position dim for consistency 
+        pos_ids = pos_ids[:, :, None].repeat(1, 1, 2)  # Add 2D position dim for consistency
+        
+        print(f"[DEBUG Expert {self.expert_idx}] Text position ID shape: {pos_ids.shape}")
+        return pos_ids
 
     def _get_conditioning(self, batch_size):
         """Get conditioning vector for expert"""

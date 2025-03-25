@@ -81,7 +81,7 @@ class ExpertCacheManager:
                     )
                     
                     # Initialize scaler for mixed precision training
-                    expert.scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
+                    expert.scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
                 
                 self._add_to_cache(expert_idx, expert)
                 return expert

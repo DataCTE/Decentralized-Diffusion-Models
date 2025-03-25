@@ -263,8 +263,7 @@ class DecentralizedFlowMatcher:
 
     def compute_loss(self, predictions, x0, t):
         """
-        Compute flow matching loss with better error handling and debugging.
-        Was probably returning a tuple with 4 values when a single value was expected.
+        Compute flow matching loss with better error handling and shape compatibility
         """
         print(f"[DEBUG FlowMatcher] compute_loss called")
         print(f"[DEBUG FlowMatcher] predictions shape: {predictions.shape}")
@@ -272,29 +271,34 @@ class DecentralizedFlowMatcher:
         print(f"[DEBUG FlowMatcher] t shape: {t.shape}")
         
         try:
+            # Ensure x0 and predictions have compatible shapes
+            if x0.dim() == 5 and predictions.dim() == 4:
+                # Reshape x0 from [B, S, C, H, W] to [B, C, H, W]
+                print(f"[DEBUG FlowMatcher] Reshaping x0 from 5D to 4D")
+                if x0.shape[1] == 1:  # If sequence length is 1
+                    x0 = x0.squeeze(1)
+                else:
+                    x0 = x0[:, 0]  # Use first sequence
+            
             # Calculate target flow
             target = self.compute_flow_matching_target(x0, predictions, t)
             print(f"[DEBUG FlowMatcher] target shape: {target.shape}")
             
-            # Compute loss - THIS MAY RETURN MULTIPLE VALUES
-            # Let's explicitly return only one value
+            # Compute loss
             raw_loss = self.compute_flow_matching_loss(predictions, target)
             print(f"[DEBUG FlowMatcher] raw_loss type: {type(raw_loss)}")
             
-            # Check if raw_loss is a tuple and extract first element
+            # Ensure we return only one value
             if isinstance(raw_loss, tuple):
                 print(f"[DEBUG FlowMatcher] raw_loss is a tuple with {len(raw_loss)} elements")
                 for i, item in enumerate(raw_loss):
                     print(f"[DEBUG FlowMatcher] raw_loss[{i}] type: {type(item)}, value: {item}")
-                # IMPORTANT: Only return the loss value, not other metrics
                 return raw_loss[0]
             else:
                 return raw_loss
             
         except Exception as e:
             print(f"[CRITICAL ERROR FlowMatcher] Loss computation failed: {str(e)}")
-            # Print detailed traceback
             import traceback
             traceback.print_exc()
-            # IMPORTANT: Raise the error instead of silently continuing
             raise 
