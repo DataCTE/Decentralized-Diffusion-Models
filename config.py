@@ -119,7 +119,7 @@ DEFAULT_CONFIG = {
     # ===== Expert Cache parameters =====
    
     'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
-
+    'axes_dim': [32, 32],  # Add this line for axes_dim
     
     # Add to DEFAULT_CONFIG
     'use_gradient_checkpointing': True,
