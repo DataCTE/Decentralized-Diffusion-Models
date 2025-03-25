@@ -20,7 +20,12 @@ from data.dataset import BucketBatchSampler
 from torch.utils.data import DataLoader 
 import torch.distributed as dist
 
+# Import centralized utilities
+from utils.distributed import is_dist_initialized, synchronize, broadcast_object
+from utils.fsdp import wrap_model_with_fsdp, save_fsdp_model, check_fsdp_wrapping
 
+# Import FSDP directly to fix the "FSDP is not defined" error
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 # Setup logger
 logger = setup_logger("DDMCoordinator")
@@ -75,6 +80,9 @@ class DDMTrainingCoordinator:
         
         # Parallel initialization components
         self._init_parallel_components()
+        
+        # Verify proper sharding across GPUs
+        self._verify_sharding()
         
         # Defer non-critical initialization
         self.flow_matcher = None  # Will be created on first training step
@@ -249,10 +257,12 @@ class DDMTrainingCoordinator:
     
     def _init_expert_indices(self):
         """
-        Determine expert assignments based on paper's Section 3.2 - each expert 
-        trains independently on its assigned data cluster
+        Determine expert assignments based on paper's Section 3.2 with proper sharding
         """
         try:
+            # Import distributed utilities
+            from utils.distributed import is_dist_initialized, broadcast_object, synchronize
+            
             # Get cluster sizes from dataset
             cluster_sizes = self.train_loader.dataset.get_cluster_sizes()
             min_size = self.config.min_cluster_samples
@@ -267,13 +277,10 @@ class DDMTrainingCoordinator:
                 logger.warning("No clusters meet minimum size requirement!")
                 valid_clusters = list(range(self.config.num_experts))
 
-            # Ensure all ranks have the same valid_clusters
-            if self.world_size > 1:
-                # Convert to tensor for synchronization
-                valid_clusters_tensor = torch.tensor(valid_clusters, device=self.device)
-                # Broadcast from rank 0 to ensure consistency
-                dist.broadcast(valid_clusters_tensor, src=0)
-                valid_clusters = valid_clusters_tensor.tolist()
+            # Ensure all ranks have the same valid_clusters using our centralized broadcast
+            if is_dist_initialized():
+                valid_clusters = broadcast_object(valid_clusters, src=0)
+                synchronize()
 
             # Distribute experts evenly across GPUs
             num_experts = len(valid_clusters)
@@ -290,7 +297,8 @@ class DDMTrainingCoordinator:
             logger.info(f"Rank {self.rank} managing experts: {self.expert_indices}")
             
             # Synchronize to ensure all ranks have their assignments
-            dist.barrier()
+            if is_dist_initialized():
+                synchronize()
             
             # Verify distribution
             if self.verbose:
@@ -305,14 +313,27 @@ class DDMTrainingCoordinator:
             raise
     
     def _init_router(self):
-        """Initialize router with async FSDP wrapping"""
+        """Initialize router with proper FSDP wrapping using distributed utilities"""
         logger.info(f"Creating router on rank {self.rank}")
+        
+        from utils.fsdp import check_fsdp_wrapping
+        
+        # Create router with proper distributed setup
         self.router = RouterTrainer(
             config=self.config,
             device=self.device,
             rank=self.rank,
             world_size=self.world_size
         )
+        
+        # Check if router is properly FSDP wrapped
+        if hasattr(self.router, 'router'):
+            is_wrapped, message = check_fsdp_wrapping(self.router.router, "Router model")
+            logger.info(f"[Rank {self.rank}] {message}")
+        
+        # Ensure synchronization after initialization
+        if is_dist_initialized():
+            synchronize()
     
     def train(self, num_steps):
         """Train the DDM system following paper's Section 4"""
@@ -608,7 +629,7 @@ class DDMTrainingCoordinator:
             return None
     
     def save_checkpoint(self, step):
-        """Save checkpoint of all components"""
+        """Save checkpoint of all components with FSDP support"""
         if not self.config.enable_checkpointing:
             logger.debug("Skipping checkpoint save (disabled in config)")
             return
@@ -619,8 +640,21 @@ class DDMTrainingCoordinator:
         checkpoint_dir = os.path.join(self.config.output_dir, 'checkpoints', f'step_{step}')
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # Save router using its save_checkpoint method
-        self.router.save_checkpoint(checkpoint_dir, step)
+        # Import fsdp utilities for saving
+        from utils.fsdp import save_fsdp_model
+        
+        # Save router
+        if hasattr(self.router, 'save_checkpoint'):
+            self.router.save_checkpoint(checkpoint_dir, step)
+        else:
+            router_path = os.path.join(checkpoint_dir, 'router.pt')
+            save_fsdp_model(
+                self.router.router,
+                router_path,
+                optim=self.router.optimizer,
+                scheduler=self.router.lr_scheduler,
+                metadata={"step": step}
+            )
             
         # Save coordinator state
         save_coordinator_checkpoint(
@@ -937,8 +971,9 @@ class DDMTrainingCoordinator:
                 logger.error(traceback.format_exc())
 
     def _create_expert(self, expert_idx):
-        """Create a new expert instance"""
+        """Create a new expert instance with proper FSDP wrapping"""
         from trainers.expert import ExpertTrainer
+        from utils.fsdp import wrap_model_with_fsdp
         
         # Create expert trainer with proper initialization
         expert = ExpertTrainer(
@@ -953,4 +988,46 @@ class DDMTrainingCoordinator:
             logger.info(f"Created expert {expert_idx} on rank {self.rank}")
         
         return expert
+
+    def _verify_sharding(self):
+        """Verify model sharding across GPUs"""
+        if not is_dist_initialized() or self.world_size <= 1:
+            logger.info("Skipping sharding verification (single process/no distributed)")
+            return
+        
+        # Verify router sharding
+        if hasattr(self.router, 'router') and isinstance(self.router.router, FSDP):
+            # Count parameters on this rank
+            local_params = sum(p.numel() for p in self.router.router.parameters())
+            
+            # Gather from all ranks
+            local_params_tensor = torch.tensor([local_params], device=self.device)
+            all_params = [torch.zeros_like(local_params_tensor) for _ in range(self.world_size)]
+            dist.all_gather(all_params, local_params_tensor)
+            
+            # Check distribution
+            all_params = [t.item() for t in all_params]
+            if self.rank == 0:
+                logger.info(f"Router parameters per rank: {all_params}")
+                
+                # Check variance - should be small for good sharding
+                mean_params = sum(all_params) / len(all_params)
+                variance = sum((p - mean_params)**2 for p in all_params) / len(all_params)
+                
+                logger.info(f"Router parameter distribution variance: {variance}")
+                if variance > 0.1 * mean_params:
+                    logger.warning("High variance in parameter distribution detected - sharding may be uneven")
+        
+        # Verify expert sharding (sample one expert)
+        for expert_idx in self.expert_indices[:1]:  # Check first expert
+            expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
+            if hasattr(expert, 'expert') and isinstance(expert.expert, FSDP):
+                # Perform similar check for expert
+                local_params = sum(p.numel() for p in expert.expert.parameters())
+                local_params_tensor = torch.tensor([local_params], device=self.device)
+                all_params = [torch.zeros_like(local_params_tensor) for _ in range(self.world_size)]
+                dist.all_gather(all_params, local_params_tensor)
+                
+                if self.rank == 0:
+                    logger.info(f"Expert {expert_idx} parameters per rank: {[t.item() for t in all_params]}")
 

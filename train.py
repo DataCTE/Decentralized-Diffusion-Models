@@ -21,25 +21,29 @@ from utils.checkpoint import load_coordinator_checkpoint
 from utils.expert_cache import ExpertCacheManager
 
 def setup_distributed():
-    """Initialize distributed training environment"""
-    # Initialize process group with explicit device specification
-    rank = int(os.environ['LOCAL_RANK'])
-    torch.cuda.set_device(rank)
-    device = torch.device(f"cuda:{rank}")
+    """Initialize distributed training environment using our centralized utilities"""
+    # Use our centralized distributed setup
+    from utils.distributed import setup_distributed as dist_setup, is_dist_initialized
     
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=int(os.environ['WORLD_SIZE']),
-        rank=rank,
-        device_id=device
-    )
+    # Only set up if not already initialized
+    if not is_dist_initialized():
+        # Get rank and world size
+        rank, world_size = dist_setup()
+    else:
+        # Get rank and world size if already initialized
+        from utils.distributed import get_rank, get_world_size
+        rank = get_rank()
+        world_size = get_world_size()
     
     # Verify device assignment
+    device = torch.device(f"cuda:{rank}")
     test_tensor = torch.tensor([rank], device=device)
     dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
     
-    return rank, int(os.environ['WORLD_SIZE'])
+    # Log success message
+    print(f"[Rank {rank}] Distributed setup complete with {world_size} processes")
+    
+    return rank, world_size
 
 def main():
     # Load configuration

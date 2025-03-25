@@ -6,6 +6,8 @@ import math
 import os
 import torch.nn.functional as F
 import torch.distributed as dist
+from utils.distributed import is_dist_initialized, synchronize, broadcast_object
+from utils.fsdp import wrap_model_with_fsdp, save_fsdp_model, configure_optimizer_for_fsdp
 
 from models.mmdit import ExpertMMDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
@@ -14,7 +16,6 @@ from data.clip import CLIPTextEncoder
 from trainers.base import BaseTrainer
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 from utils.logging import logger
-from utils.fsdp import wrap_model_with_fsdp
 
 
 
@@ -33,21 +34,36 @@ class ExpertTrainer(BaseTrainer):
         # Create base expert model
         base_expert = ExpertMMDiT(config).to(device)
         
-        # Apply FSDP wrapping using the same method as router
-        self.expert = wrap_model_with_fsdp(
-            base_expert,
-            config,
-            param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
-            rank=rank
-        )
+        # Check if distributed is initialized before wrapping
+        if is_dist_initialized():
+            # Apply FSDP wrapping using the centralized utility
+            self.expert = wrap_model_with_fsdp(
+                base_expert,
+                config,
+                param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
+                rank=rank
+            )
+        else:
+            # Fallback for non-distributed mode
+            self.expert = base_expert
         
-        # Paper-specified optimizer settings - use Adam with FSDP
-        self.optimizer = AdamW8bit(
-            self.expert.parameters(),
-            lr=config.learning_rate,
-            betas=config.adam_betas,
-            weight_decay=config.weight_decay
-        )
+        # Use centralized optimizer configuration for FSDP compatibility
+        if is_dist_initialized() and isinstance(self.expert, dist.fsdp.FullyShardedDataParallel):
+            self.optimizer = configure_optimizer_for_fsdp(
+                self.expert,
+                AdamW8bit,
+                lr=config.learning_rate,
+                betas=config.adam_betas,
+                weight_decay=config.weight_decay
+            )
+        else:
+            # Fallback for non-FSDP mode
+            self.optimizer = AdamW8bit(
+                self.expert.parameters(),
+                lr=config.learning_rate,
+                betas=config.adam_betas,
+                weight_decay=config.weight_decay
+            )
         
         # Paper-defined components
         self.flow_matcher = DecentralizedFlowMatcher(
@@ -72,9 +88,9 @@ class ExpertTrainer(BaseTrainer):
         # Print initialization message from all ranks
         print(f"[Rank {rank}] Initialized Expert {expert_idx} with FSDP")
         
-        # Ensure all ranks are synchronized after initialization
-        if self.world_size > 1:
-            dist.barrier()
+        # Ensure synchronization after initialization
+        if is_dist_initialized():
+            synchronize()
 
     def compute_loss(self, batch):
         """Paper's per-expert loss calculation (Equation 6)"""
@@ -109,18 +125,19 @@ class ExpertTrainer(BaseTrainer):
 
     def train_step(self, batch):
         """Train expert with flow matching loss per paper Section 3.2"""
-        # Get inputs and ensure proper shapes
+        # Get data
         latents = batch["latent"].to(self.device)
         if latents.dim() == 5:
             latents = latents.squeeze(1)  # Remove extra dimension if present
         
-        clip_emb = batch["clip_embedding"].to(self.device)
-        if clip_emb.dim() == 4:
-            clip_emb = clip_emb.squeeze(1)
+        text_embeds = batch["clip_embedding"].to(self.device)
+        if text_embeds.dim() == 4:
+            text_embeds = text_embeds.squeeze(1)
         
-        # Use mixed precision training with updated syntax
+        # Use mixed precision training
         scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
         
+        # If using FSDP, this will respect sharding
         with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
             # Sample timestep uniformly
             t = torch.rand(latents.size(0), device=self.device)
@@ -135,13 +152,13 @@ class ExpertTrainer(BaseTrainer):
             h = latents.shape[2] // self.config.patch_size
             w = latents.shape[3] // self.config.patch_size
             img_ids = self._get_position_ids(latents)
-            txt_ids = self._get_text_position_ids(clip_emb)
+            txt_ids = self._get_text_position_ids(text_embeds)
             
             # Get expert predictions with proper position embeddings
             pred_flow = self.expert(
                 img=x_t,
                 img_ids=img_ids,
-                txt=clip_emb,
+                txt=text_embeds,
                 txt_ids=txt_ids,
                 timesteps=t * 1000,  # Scale timesteps to match model expectation
                 y=self._get_conditioning(latents.shape[0]),
@@ -155,12 +172,8 @@ class ExpertTrainer(BaseTrainer):
         self.optimizer.zero_grad()
         scaler.scale(loss).backward()
         
-        # Synchronize gradients across GPUs
-        if self.world_size > 1:
-            for param in self.expert.parameters():
-                if param.grad is not None:
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                    param.grad.div_(self.world_size)
+        # Note: With FSDP, we don't need explicit gradient synchronization
+        # as it's handled internally by FSDP
         
         # Gradient clipping and optimization
         if self.config.max_grad_norm > 0:

@@ -460,3 +460,26 @@ def load_fsdp_model(model, load_path, optim=None, scheduler=None, device=None):
         is_fsdp=True,
         device=device
     )
+
+def check_fsdp_wrapping(model, name="model"):
+    """Check if model is properly wrapped with FSDP"""
+    if not dist.is_initialized():
+        return False, f"{name} not using FSDP (distributed not initialized)"
+    
+    # Check if model is FSDP wrapped
+    is_fsdp_wrapped = isinstance(model, FSDP)
+    message = f"{name} {'is' if is_fsdp_wrapped else 'is NOT'} FSDP wrapped"
+    
+    # If wrapped, check sharding strategy
+    if is_fsdp_wrapped:
+        strategy = model.sharding_strategy
+        strategy_name = {
+            ShardingStrategy.FULL_SHARD: "FULL_SHARD",
+            ShardingStrategy.SHARD_GRAD_OP: "SHARD_GRAD_OP",
+            ShardingStrategy.NO_SHARD: "NO_SHARD",
+            ShardingStrategy.HYBRID_SHARD: "HYBRID_SHARD",
+        }.get(strategy, "Unknown")
+        
+        message += f" with {strategy_name} strategy"
+    
+    return is_fsdp_wrapped, message
