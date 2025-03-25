@@ -131,26 +131,22 @@ class RouterModel(nn.Module):
         x = x + t_emb
         print(f"[Router] After adding timestep shape: {x.shape}")
 
-        # Text embedding integration - Project text and reduce sequence dimension first
+        # Text embedding integration
         print(f"[Router] Input text shape: {txt.shape}")
-        text_emb = self.text_embed_proj(txt)  # Either [B, L, D] or [B, D]
+        if txt.dim() == 4:
+            txt = txt.squeeze(1)  # Handle [B, 1, L, D] format
+            print(f"[Router] After squeezing dim 1: {txt.shape}")
+
+        text_emb = self.text_embed_proj(txt)
         print(f"[Router] Projected text shape: {text_emb.shape}")
 
-        # If the projected text embeddings are 3D, average over the token dimension
-        # Handle both possible dimension arrangements
+        # Mean-pool if there's a sequence dimension
+        print(f"[Router] Text embedding shape: {text_emb.shape}")
         if text_emb.dim() == 3:
-            if text_emb.shape[1] == self.config.clip_embedding_dim:
-                # Handle [B, D, L] format
-                print(f"[Router] Text in [B, D, L] format")
-                text_emb = text_emb.mean(dim=2)
-            else:
-                # Handle [B, L, D] format
-                print(f"[Router] Text in [B, L, D] format")
-                text_emb = text_emb.mean(dim=1)
-            print(f"[Router] Text after pooling shape: {text_emb.shape}")
+            text_emb = text_emb.mean(dim=1)
+            print(f"[Router] After mean pooling shape: {text_emb.shape}")
 
-        # Verify dimensions match before addition
-        assert x.shape == text_emb.shape, f"Shape mismatch: x={x.shape}, text_emb={text_emb.shape}"
+        assert x.shape == text_emb.shape, f"Shape mismatch: x={x.shape}, text_emb={text_emb.shape}" 
         x = x + text_emb
         print(f"[Router] After adding text shape: {x.shape}")
 
