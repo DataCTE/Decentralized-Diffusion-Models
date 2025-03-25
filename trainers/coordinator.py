@@ -28,6 +28,9 @@ from utils.fsdp import wrap_model_with_fsdp, save_fsdp_model, check_fsdp_wrappin
 # Import FSDP directly to fix the "FSDP is not defined" error
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+# Import QuantizedCommunicator
+from utils.comm import QuantizedCommunicator
+
 # Setup logger
 logger = setup_logger("DDMCoordinator")
 
@@ -108,6 +111,15 @@ class DDMTrainingCoordinator:
             os.makedirs(sample_dir, exist_ok=True)
         else:
             logger.info("Sampling disabled in config")
+        
+        # Initialize quantized communicator
+        if config.distributed.gradient_quantization:
+            self.quant_comm = QuantizedCommunicator(
+                bits=config.distributed.quantization_bits,
+                use_symmetric=True
+            )
+        else:
+            self.quant_comm = None
         
         # Final initialization sync
         total_init_time = time.time() - init_start_time
@@ -412,13 +424,11 @@ class DDMTrainingCoordinator:
             loss = self.train_experts(batch)
         
         # Async parameter update
-        if self.config.async_parameter_update:
-            with self._async_context():
-                if self.config.gradient_quantization:
-                    loss = self.quant_comm.all_reduce(loss)
-                else:
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                loss /= self.world_size
+        if self.quant_comm:
+            loss = self.quant_comm.all_reduce(loss)
+        else:
+            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+        loss /= self.world_size
         
         return loss.item()
 
