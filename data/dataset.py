@@ -90,6 +90,10 @@ class DDMDataset(Dataset):
         # Load bucket assignments to GPU
         self.bucket_assignments = self._load_bucket_assignments()
         
+        # Load cluster assignments and compute statistics
+        self.cluster_assignments = self._lazy_load_clusters()
+        self._compute_cluster_statistics()
+        
         logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples")
         logger.info(f"[Rank {self.rank}] Preloaded {len(self.cache)} samples")
 
@@ -218,6 +222,38 @@ class DDMDataset(Dataset):
     def __del__(self):
         """Cleanup resources"""
         pass
+
+    def _compute_cluster_statistics(self):
+        """Compute and cache cluster statistics"""
+        if self.cluster_assignments is None:
+            logger.warning("No cluster assignments found - using uniform distribution")
+            self.cluster_counts = torch.ones(self.config.num_experts, device=self.device)
+            return
+
+        # Count samples per cluster
+        unique_clusters, counts = torch.unique(self.cluster_assignments, return_counts=True)
+        
+        # Initialize counts tensor
+        self.cluster_counts = torch.zeros(self.config.num_experts, device=self.device)
+        
+        # Fill in actual counts
+        self.cluster_counts[unique_clusters] = counts
+        
+        # Log distribution
+        total = self.cluster_counts.sum().item()
+        for cluster, count in enumerate(self.cluster_counts.tolist()):
+            logger.info(f"Cluster {cluster}: {count} samples ({100 * count/total:.2f}%)")
+
+    def get_cluster_sizes(self):
+        """Return number of samples per cluster"""
+        if not hasattr(self, 'cluster_counts'):
+            self._compute_cluster_statistics()
+        return self.cluster_counts
+
+    def get_cluster_distribution(self):
+        """Return normalized cluster distribution"""
+        counts = self.get_cluster_sizes()
+        return counts / counts.sum()
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
