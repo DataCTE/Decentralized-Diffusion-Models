@@ -369,12 +369,20 @@ class DDMTrainingCoordinator:
         
         # Train each expert assigned to this process
         for expert_idx in self.expert_indices:
-            # Get expert from cache manager
-            expert = self.cache_manager.get_expert(expert_idx, self._create_expert)
-            
-            # Perform training step
-            loss = expert.train_step(batch)
-            total_loss += loss
+            try:
+                # Get expert from cache manager
+                expert = self.cache_manager.get_expert(
+                    expert_idx, 
+                    lambda idx: self._create_expert(idx)  # Use lambda to pass expert_idx
+                )
+                
+                # Perform training step
+                loss = expert.train_step(batch)
+                total_loss += loss
+                
+            except Exception as e:
+                logger.error(f"Error training expert {expert_idx} on rank {self.rank}: {str(e)}")
+                continue
         
         # Average loss across experts on this rank
         avg_loss = total_loss / max(num_experts, 1)
@@ -851,6 +859,69 @@ class DDMTrainingCoordinator:
                     logger.info(f"Expert {expert_idx} reassigned to cluster {new_cluster}")
 
     def _isolate_gradients(self):
-        # Implementation of _isolate_gradients method
-        pass
+        """
+        Isolate gradients between experts to ensure independent training
+        as described in paper Section 3.2
+        """
+        try:
+            # Synchronize before isolation to ensure clean state
+            if self.world_size > 1:
+                dist.barrier()
+            
+            # For each expert managed by this rank
+            for expert_idx in self.expert_indices:
+                # Get expert from cache
+                expert = self.cache_manager.get_expert(
+                    expert_idx,
+                    lambda idx: self._create_expert(idx)
+                )
+                
+                # 1. Zero out any existing gradients
+                if hasattr(expert, 'optimizer'):
+                    expert.optimizer.zero_grad()
+                
+                # 2. Ensure no gradient sharing between experts
+                for param in expert.parameters():
+                    if param.grad is not None:
+                        # Detach gradient to prevent backward flow between experts
+                        param.grad = param.grad.detach()
+                        
+                        # Zero out gradients from other processes
+                        if self.world_size > 1:
+                            param.grad.zero_()
+                
+                # 3. Isolate optimizer states
+                if hasattr(expert, 'isolate_optimizer_state'):
+                    expert.isolate_optimizer_state()
+                
+                if self.verbose:
+                    logger.debug(f"Isolated gradients for expert {expert_idx} on rank {self.rank}")
+            
+            # Synchronize after isolation
+            if self.world_size > 1:
+                dist.barrier()
+            
+        except Exception as e:
+            logger.error(f"Error in gradient isolation: {str(e)}")
+            if self.verbose:
+                import traceback
+                logger.error(traceback.format_exc())
+
+    def _create_expert(self, expert_idx):
+        """Create a new expert instance"""
+        from trainers.expert import ExpertTrainer
+        
+        # Create expert trainer with proper initialization
+        expert = ExpertTrainer(
+            expert_idx=expert_idx,
+            config=self.config,
+            device=self.device,
+            rank=self.rank,
+            world_size=self.world_size
+        )
+        
+        if self.verbose:
+            logger.info(f"Created expert {expert_idx} on rank {self.rank}")
+        
+        return expert
 
