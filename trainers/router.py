@@ -81,11 +81,16 @@ class RouterTrainer:
             else 0.5*(1 + math.cos(math.pi*(step - self.warmup_steps)/self.total_steps))
         )
 
-    def train_step(self, batch):
+    def train_step(self, batch, true_clusters=None, temperature=1.0):
         """Train router with cross-entropy loss per paper Section 3.3"""
+        # Get inputs
         latents = batch["latent"].to(self.device)
-        targets = batch["expert"].to(self.device)
+        if true_clusters is None:
+            true_clusters = batch["expert"].to(self.device)
         text_embeds = batch["clip_embedding"].to(self.device)
+        
+        # Use mixed precision training
+        scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
         
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
             # Sample timestep uniformly as in paper
@@ -99,22 +104,27 @@ class RouterTrainer:
             
             # Get router predictions with temperature annealing
             logits = self.router(x_t, t * 1000, text_embeds)
+            logits = logits / temperature  # Apply temperature scaling
             
-            # Paper's cross-entropy loss
-            loss = self.criterion(logits, targets)
+            # Compute cross-entropy loss
+            loss = self.criterion(logits, true_clusters)
         
         # Optimize
         self.optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
         
-        # Paper's gradient clipping
+        # Gradient clipping
         if self.config.max_grad_norm > 0:
+            scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
                 self.router.parameters(), 
                 self.config.max_grad_norm
             )
         
-        self.optimizer.step()
+        scaler.step(self.optimizer)
+        scaler.update()
+        
+        # Update learning rate
         self.lr_scheduler.step()
         
         return loss.item()

@@ -288,6 +288,9 @@ class DDMTrainingCoordinator:
         expert_update_interval = getattr(self.config, 'expert_update_interval', 1000)
         router_update_interval = getattr(self.config, 'router_update_interval', 100)
         
+        # Initialize step counter for wandb
+        global_step = 0
+        
         for step in range(num_steps):
             try:
                 step_start_time = time.time()
@@ -314,8 +317,9 @@ class DDMTrainingCoordinator:
                 
                 # Log metrics
                 if self.rank == 0:
+                    global_step += 1  # Increment global step counter
                     self._log_step_metrics_to_wandb(
-                        step=step,
+                        step=global_step,  # Use global step for wandb
                         expert_loss=expert_loss,
                         router_loss=router_loss,
                         step_duration=step_duration,
