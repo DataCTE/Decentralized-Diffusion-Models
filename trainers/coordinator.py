@@ -295,7 +295,7 @@ class DDMTrainingCoordinator:
         """Initialize router with strict FSDP validation"""
         from utils.fsdp import wrap_model_with_fsdp, check_fsdp_wrapping
         
-        # Initialize router trainer
+        # Initialize router trainer with base model
         router_trainer = RouterTrainer(
             config=self.config,
             device=self.device,
@@ -303,16 +303,19 @@ class DDMTrainingCoordinator:
             world_size=self.world_size
         )
         
+        # Get the base model from the trainer
+        base_router = router_trainer.router
+        
         # FSDP wrapping with proper parameter initialization
         if is_dist_initialized():
             self.router = wrap_model_with_fsdp(
-                router_trainer.router,
+                base_router,
                 self.config,
                 param_init_fn=lambda m: m.to_empty(device=self.device, recurse=False),
                 rank=self.rank
             )
         else:
-            self.router = router_trainer.router
+            self.router = base_router
         
         # Strict sharding verification
         is_wrapped, msg = check_fsdp_wrapping(self.router, "Router")

@@ -56,15 +56,10 @@ class RouterTrainer:
         
         # Apply FSDP wrapping - note we don't call .to(device) before FSDP wrapping
         # IMPORTANT: Let FSDP handle device placement to ensure proper sharding
-        self.router = wrap_model_with_fsdp(
-            base_router,
-            config,
-            param_init_fn=lambda m: m.to_empty(device=device, recurse=False),
-            rank=rank
-        )
+        self.router = base_router  # Remove FSDP wrapping here
         
         # Print initialization message from all ranks
-        self.logger.info(f"[Rank {rank}] Initialized Router with FSDP")
+        self.logger.info(f"[Rank {rank}] Created base Router model")
         
         # Add VAE for latent encoding - load VAE on demand to save memory
         self._vae = None
