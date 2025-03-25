@@ -382,9 +382,15 @@ def main():
     all_images = [str(p) for p in Path(config.dataset_path).rglob('*') 
                  if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
     
-    # Distribute images
-    chunk_size = len(all_images) // dist.get_world_size()
-    local_images = all_images[rank*chunk_size : (rank+1)*chunk_size]
+    # Distribute images with remainder handling
+    world_size = dist.get_world_size()
+    chunk_size = len(all_images) // world_size
+    remainder = len(all_images) % world_size
+    
+    start = rank * chunk_size + min(rank, remainder)
+    end = (rank + 1) * chunk_size + min(rank + 1, remainder)
+    local_images = all_images[start:end]
+    
     print(f"Rank {rank} received {len(local_images)} images to process")
     
     # Initialize feature generator
@@ -415,24 +421,47 @@ def main():
                     print(f"Rank {rank} failed to process {img_path}: {str(e)}")
                     continue  # Skip to next image
 
-        # Add final completion marker per rank
-        torch.save({'status': 'done'}, processor.feature_dir/f"status_rank{rank}.pt")
+        # Add final completion marker with verification
+        status_path = processor.feature_dir/f"status_rank{rank}.pt"
+        torch.save({'status': 'done', 'count': len(local_images)}, status_path)
         
-        # Wait for all ranks to finish processing
-        if dist.get_world_size() > 1:
-            dist.barrier()
+        # Verify all ranks completed
+        start_time = time.time()
+        while True:
+            done = sum(1 for f in processor.feature_dir.glob("status_rank*.pt") 
+                      if torch.load(f)['status'] == 'done')
+            if done == dist.get_world_size():
+                break
+            if time.time() - start_time > 3600:  # 1 hour timeout
+                raise RuntimeError(f"Rank {rank} timed out waiting for others")
+            time.sleep(10)
+        
+        dist.barrier()  # Synchronize after verification
 
         # Conditional clustering
         if 'clustering' in enabled_features:
             if rank == 0:
-                processor.run_clustering()
+                try:
+                    processor.run_clustering()
+                except Exception as e:
+                    print(f"Clustering failed: {str(e)}")
+                    # Create error marker
+                    (processor.feature_dir/"clusters/error.pt").touch()
             else:
-                # Wait for clustering results
+                # Wait for clustering results with timeout
+                start_time = time.time()
                 while not (processor.feature_dir/"clusters/final_clusters.pt").exists():
+                    if (processor.feature_dir/"clusters/error.pt").exists():
+                        raise RuntimeError("Clustering failed on rank 0")
+                    if time.time() - start_time > 10800:  # 3 hour timeout
+                        raise RuntimeError("Timed out waiting for clustering results")
                     time.sleep(30)
 
     except Exception as e:
         print(f"Rank {rank} failed: {str(e)}")
+        # Emergency barrier with timeout
+        dist.barrier(timeout=timedelta(seconds=60))
+        raise
     finally:
         # Cleanup status files
         if rank == 0:
