@@ -29,6 +29,19 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
+def simple_collate(batch):
+    """Standalone collate function that doesn't capture class instances"""
+    try:
+        return {
+            'latent': torch.stack([item['latent'] for item in batch]),
+            'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
+            'bucket': torch.stack([item['bucket'] for item in batch]),
+            'expert': torch.stack([item['expert'] for item in batch])
+        }
+    except Exception as e:
+        print(f"Collation error: {str(e)}")
+        return None
+
 class DDMDataset(Dataset):
     """Distributed-optimized dataset pipeline with lazy loading and prefetching"""
     

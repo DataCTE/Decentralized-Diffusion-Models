@@ -11,7 +11,7 @@ import concurrent.futures
 # Import needed components
 from trainers.router import RouterTrainer
 from trainers.sampling import ddm_sample
-from data.dataset import DDMDataset
+from data.dataset import DDMDataset, simple_collate
 from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
 from data.dataset import BucketBatchSampler
@@ -176,7 +176,7 @@ class DDMTrainingCoordinator:
         # Convert config to dict before passing to dataset
         config_dict = vars(self.config)
         
-        # Remove device parameter from dataset initialization
+        # Create datasets
         train_dataset = DDMDataset(config_dict, 'train')
         val_dataset = DDMDataset(config_dict, 'val')
         
@@ -188,31 +188,19 @@ class DDMTrainingCoordinator:
             shuffle=True
         )
         
+        # Use the standalone collate function
         loader_config = {
             'num_workers': 2,
             'pin_memory': False,
             'persistent_workers': False,
-            'sampler': train_sampler  # Use distributed sampler
+            'sampler': train_sampler,
+            'collate_fn': simple_collate  # Use the standalone function
         }
         
-        # Simplified collate function
-        def collate_fn(batch):
-            try:
-                return {
-                    'latent': torch.stack([item['latent'] for item in batch]),
-                    'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
-                    'bucket': torch.stack([item['bucket'] for item in batch]),
-                    'expert': torch.stack([item['expert'] for item in batch])
-                }
-            except Exception as e:
-                logger.error(f"Collation error: {str(e)}")
-                return None
-        
-        # Create DataLoader with distributed sampler
+        # Create DataLoader
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
-            collate_fn=collate_fn,
             **loader_config
         )
         
@@ -221,7 +209,6 @@ class DDMTrainingCoordinator:
             val_dataset,
             batch_size=1,
             shuffle=False,
-            collate_fn=collate_fn,
             **loader_config
         )
     
