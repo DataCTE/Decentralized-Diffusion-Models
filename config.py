@@ -195,8 +195,6 @@ DEFAULT_CONFIG = {
     # Add to DEFAULT_CONFIG
     'distributed': {
         'expert_sync_interval': 100,  # Steps between expert sync
-        'gradient_quantization': True,
-        'quantization_bits': 8,
         'async_parameter_update': True,
         'overlap_communication': True,
         'consensus_timeout': 5.0  # Seconds for conflict resolution

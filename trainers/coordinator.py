@@ -109,15 +109,6 @@ class DDMTrainingCoordinator:
         else:
             logger.info("Sampling disabled in config")
         
-        # Initialize quantized communicator
-        if config.distributed.gradient_quantization:
-            self.quant_comm = QuantizedCommunicator(
-                bits=config.distributed.quantization_bits,
-                use_symmetric=True
-            )
-        else:
-            self.quant_comm = None
-        
         # Final initialization sync
         total_init_time = time.time() - init_start_time
         debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
