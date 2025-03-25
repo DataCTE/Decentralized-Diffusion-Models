@@ -192,8 +192,12 @@ class DDMTrainingCoordinator:
         self._verify_cross_rank_sharding()
     
     def _init_data_loaders(self):
-        """Initialize data loaders without multiprocessing to avoid pickling requirements"""
-        debug_print(f"Initializing data loaders on rank {self.rank}", self.rank)
+        """Initialize distributed-aware data loaders"""
+        debug_print("Initializing data loaders", self.rank)
+        
+        # Remove device parameter from dataset initialization
+        train_dataset = DDMDataset(self.config, 'train')
+        val_dataset = DDMDataset(self.config, 'val')
         
         # Ensure all ranks are synchronized before loading data
         if is_dist_initialized():
@@ -205,9 +209,6 @@ class DDMTrainingCoordinator:
             'pin_memory': False,  # Keep pin_memory disabled
             'persistent_workers': False  # Disable persistent workers
         }
-        
-        # Initialize training dataset - directly pass device to ensure proper placement
-        train_dataset = DDMDataset(self.config, 'train', device=self.device)
         
         # Create bucket-aware sampler if bucket assignments are available
         if hasattr(train_dataset, 'bucket_assignments'):
@@ -285,7 +286,6 @@ class DDMTrainingCoordinator:
             )
         
         # Validation dataset with same collate function
-        val_dataset = DDMDataset(self.config, 'val')
         self.val_loader = DataLoader(
             val_dataset,
             batch_size=1,

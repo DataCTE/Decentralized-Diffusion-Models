@@ -47,9 +47,11 @@ class DDMDataset(Dataset):
     def __init__(self, config, split='train'):
         self.config = config
         self.feature_dir = config.feature_cache_path
-        self.device = torch.device('cuda')  # Use GPU by default
         self.rank = get_rank()
         self.world_size = get_world_size()
+        
+        # Set device based on availability and rank
+        self.device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
         
         # Cache directories
         self.latent_dir = os.path.join(config.feature_cache_path, "latents")
