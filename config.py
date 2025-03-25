@@ -121,6 +121,7 @@ DEFAULT_CONFIG = {
     'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
     'axes_dim': [32, 32],  # Add this line for axes_dim
     'theta': 10000,  # Add this line for theta
+    'vec_in_dim': 768,  # Add this line for vec_in_dim
     
     # Add to DEFAULT_CONFIG
     'use_gradient_checkpointing': True,
