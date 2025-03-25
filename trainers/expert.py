@@ -101,29 +101,53 @@ class ExpertTrainer(BaseTrainer):
 
     def train_step(self, batch):
         """Train expert with flow matching loss per paper Section 3.2"""
+        # Add detailed shape debugging
+        print(f"[DEBUG Expert {self.expert_idx}] Starting train_step")
+        print(f"[DEBUG Expert {self.expert_idx}] Batch keys: {batch.keys()}")
+        
         # Get data - ensure proper device placement
         latents = batch["latent"].to(self.device, non_blocking=True)
         text_embeds = batch["clip_embedding"].to(self.device, non_blocking=True)
         cluster_ids = batch["expert"].to(self.device, non_blocking=True)
         
+        # Print shapes for debugging
+        print(f"[DEBUG Expert {self.expert_idx}] latents shape: {latents.shape}")
+        print(f"[DEBUG Expert {self.expert_idx}] text_embeds shape: {text_embeds.shape}")
+        print(f"[DEBUG Expert {self.expert_idx}] cluster_ids shape: {cluster_ids.shape}")
+        
         # Mixed precision context
         with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             # Random timesteps
             t = torch.rand(latents.size(0), device=self.device)
+            print(f"[DEBUG Expert {self.expert_idx}] timesteps shape: {t.shape}")
             
-            # Forward pass through expert model
-            pred_flow = self.expert(
-                img=latents,
-                img_ids=self._get_position_ids(latents),
-                txt=text_embeds,
-                txt_ids=self._get_text_position_ids(text_embeds),
-                timesteps=t * 1000,  # Scale timesteps
-                y=self._get_conditioning(latents.shape[0]),
-                cluster_ids=cluster_ids
-            )
-            
-            # Calculate loss
-            loss = self.flow_matcher.compute_loss(pred_flow, latents, t)
+            # *** THIS IS LIKELY WHERE THE ERROR IS HAPPENING ***
+            print(f"[DEBUG Expert {self.expert_idx}] Calling expert forward pass")
+            try:
+                # Forward pass through expert model
+                pred_flow = self.expert(
+                    img=latents,
+                    img_ids=self._get_position_ids(latents),
+                    txt=text_embeds,
+                    txt_ids=self._get_text_position_ids(text_embeds),
+                    timesteps=t * 1000,  # Scale timesteps
+                    y=self._get_conditioning(latents.shape[0]),
+                    cluster_ids=cluster_ids
+                )
+                print(f"[DEBUG Expert {self.expert_idx}] pred_flow shape: {pred_flow.shape}")
+                
+                # *** THE ISSUE MIGHT BE IN THE FLOW MATCHER ***
+                print(f"[DEBUG Expert {self.expert_idx}] Computing loss with flow_matcher")
+                loss = self.flow_matcher.compute_loss(pred_flow, latents, t)
+                print(f"[DEBUG Expert {self.expert_idx}] Loss value: {loss.item()}")
+                
+            except Exception as e:
+                print(f"[CRITICAL ERROR Expert {self.expert_idx}] Forward pass failed: {str(e)}")
+                # Print a detailed traceback
+                import traceback
+                traceback.print_exc()
+                # IMPORTANT: Raise the error instead of silently continuing
+                raise
         
         # Backpropagation
         self.optimizer.zero_grad()
@@ -131,6 +155,7 @@ class ExpertTrainer(BaseTrainer):
         self.scaler.step(self.optimizer)
         self.scaler.update()
         
+        print(f"[DEBUG Expert {self.expert_idx}] Successfully completed train_step")
         return loss.item()
     
     def save_checkpoint(self, save_dir, step):

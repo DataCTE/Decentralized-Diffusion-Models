@@ -288,6 +288,7 @@ class DDMTrainingCoordinator:
 
     def _train_experts_sync(self, batch):
         """Train all experts synchronously with improved error handling"""
+        print(f"[DEBUG Coordinator] train_experts_sync called on rank {self.rank}")
         total_loss = 0.0
         num_experts = 0
         individual_losses = {}
@@ -305,38 +306,42 @@ class DDMTrainingCoordinator:
         else:
             expert_indices = self.expert_indices
         
+        print(f"[DEBUG Coordinator] Expert indices for this rank: {expert_indices}")
+        
         for expert_idx in expert_indices:
             # Get expert from cache
             try:
+                print(f"[DEBUG Coordinator] Getting expert {expert_idx} from cache")
                 expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
                 
-                # DEFENSIVE: Train the expert with better error handling
-                try:
-                    # If train_step returns multiple values, only take the first one as loss
-                    result = expert.train_step(batch)
-                    if isinstance(result, tuple):
-                        loss = result[0]  # Take first element if it's a tuple
-                    else:
-                        loss = result
-                        
-                    total_loss += loss
-                    num_experts += 1
-                    individual_losses[f"expert_{expert_idx}_loss"] = loss
-                except ValueError as ve:
-                    if "too many values to unpack" in str(ve):
-                        print(f"ValueError in expert {expert_idx}: {ve}. Fixing tuple unpacking.")
-                        # Try a different approach if there's an unpacking error
-                        expert.train()  # Ensure training mode
-                        loss = 0.0
-                        individual_losses[f"expert_{expert_idx}_loss"] = loss
-                    else:
-                        raise  # Re-raise if it's a different ValueError
+                # DEFENSIVE: Instead of silently continuing, we'll raise errors
+                print(f"[DEBUG Coordinator] Calling train_step on expert {expert_idx}")
+                result = expert.train_step(batch)
+                
+                # Check what's returned
+                print(f"[DEBUG Coordinator] Expert {expert_idx} train_step result: {result}, type: {type(result)}")
+                
+                if isinstance(result, tuple):
+                    print(f"[DEBUG Coordinator] Expert {expert_idx} returned a tuple of length {len(result)}")
+                    # Take first element as loss
+                    loss = result[0]
+                else:
+                    loss = result
                     
+                total_loss += loss
+                num_experts += 1
+                individual_losses[f"expert_{expert_idx}_loss"] = loss
+                
             except Exception as e:
-                print(f"Error training expert {expert_idx} on rank {self.rank}: {str(e)}")
+                print(f"[CRITICAL ERROR] Training expert {expert_idx} on rank {self.rank} failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                # STOP EXECUTION - don't silently continue with 0 loss
+                raise
         
         # Avoid division by zero
         avg_loss = total_loss / max(1, num_experts)
+        print(f"[DEBUG Coordinator] Finished train_experts_sync with avg_loss: {avg_loss}")
         return avg_loss, individual_losses
 
     @contextlib.contextmanager

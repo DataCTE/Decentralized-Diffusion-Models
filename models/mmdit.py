@@ -906,34 +906,41 @@ class Flux(nn.Module):
         txt_ids: Tensor,
         timesteps: Tensor,
         y: Tensor,
+        cluster_ids: Tensor,  # [B] cluster indices per sample
         guidance: Tensor | None = None,
     ) -> Tensor:
-        if img.ndim != 3 or txt.ndim != 3:
-            raise ValueError("Input img and txt tensors must have 3 dimensions.")
-
-        # running on sequences img
-        img = self.img_in(img)
-        vec = self.time_in(timestep_embedding(timesteps, 256))
-        if self.params.guidance_embed:
-            if guidance is None:
-                raise ValueError("Didn't get guidance strength for guidance distilled model.")
-            vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
-        vec = vec + self.vector_in(y)
-        txt = self.txt_in(txt)
-
-        ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe = self.pe_embedder(ids)
-
-        for block in self.double_blocks:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
-
-        img = torch.cat((txt, img), 1)
-        for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe)
-        img = img[:, txt.shape[1] :, ...]
-
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
-        return img
+        print(f"[DEBUG MMDiT] forward called")
+        print(f"[DEBUG MMDiT] img shape: {img.shape}")
+        print(f"[DEBUG MMDiT] img_ids shape: {img_ids.shape}")
+        print(f"[DEBUG MMDiT] txt shape: {txt.shape}")
+        print(f"[DEBUG MMDiT] txt_ids shape: {txt_ids.shape}")
+        print(f"[DEBUG MMDiT] timesteps shape: {timesteps.shape}")
+        print(f"[DEBUG MMDiT] y shape: {y.shape}")
+        print(f"[DEBUG MMDiT] cluster_ids shape: {cluster_ids.shape}")
+        
+        try:
+            # Get cluster embeddings [B, D]
+            cluster_embeddings = self.pe_embedder(cluster_ids)
+            print(f"[DEBUG MMDiT] cluster_embeddings shape: {cluster_embeddings.shape}")
+            
+            # Merge with conditioning
+            combined_cond = y + cluster_embeddings
+            print(f"[DEBUG MMDiT] combined_cond shape: {combined_cond.shape}")
+            
+            # Continue with regular forward logic
+            result = super().forward(img, img_ids, txt, txt_ids, timesteps, combined_cond, guidance)
+            print(f"[DEBUG MMDiT] forward result shape: {result.shape}")
+            
+            # Explicitly ensure we only return one tensor
+            return result
+            
+        except Exception as e:
+            print(f"[CRITICAL ERROR MMDiT] Forward pass failed: {str(e)}")
+            # Print detailed traceback
+            import traceback
+            traceback.print_exc()
+            # IMPORTANT: Raise the error instead of silently continuing
+            raise
 
 
 class FluxLoraWrapper(Flux):
@@ -998,25 +1005,44 @@ class ExpertMMDiT(Flux):
         cluster_ids: Tensor,  # [B] cluster indices per sample
         guidance: Tensor | None = None,
     ) -> Tensor:
-        # Get cluster embeddings [B, D]
-        cluster_emb = self.cluster_embed(cluster_ids)
+        print(f"[DEBUG MMDiT] forward called")
+        print(f"[DEBUG MMDiT] img shape: {img.shape}")
+        print(f"[DEBUG MMDiT] img_ids shape: {img_ids.shape}")
+        print(f"[DEBUG MMDiT] txt shape: {txt.shape}")
+        print(f"[DEBUG MMDiT] txt_ids shape: {txt_ids.shape}")
+        print(f"[DEBUG MMDiT] timesteps shape: {timesteps.shape}")
+        print(f"[DEBUG MMDiT] y shape: {y.shape}")
+        print(f"[DEBUG MMDiT] cluster_ids shape: {cluster_ids.shape}")
         
-        # Combine with original conditioning vector
-        combined_vec = torch.cat([y, cluster_emb], dim=-1)
-        y = self.vec_proj(combined_vec)
-        
-        # Debug print shapes
-        #print(f"y shape: {y.shape}")  # Should be (batch_size, vec_in_dim)
-        #print(f"cluster_emb shape: {cluster_emb.shape}")  # Should be (batch_size, cluster_embed_dim)
-        #print(f"combined_vec shape: {combined_vec.shape}")  # Should be (batch_size, vec_in_dim * 2)
-        
-        # Remainder of forward pass as original Flux
-        return super().forward(
-            img=img,
-            img_ids=img_ids,
-            txt=txt,
-            txt_ids=txt_ids,
-            timesteps=timesteps,
-            y=y,
-            guidance=guidance
-        )
+        try:
+            # Get cluster embeddings [B, D]
+            cluster_embeddings = self.cluster_embed(cluster_ids)
+            print(f"[DEBUG MMDiT] cluster_embeddings shape: {cluster_embeddings.shape}")
+            
+            # Merge with conditioning
+            combined_cond = y + cluster_embeddings
+            print(f"[DEBUG MMDiT] combined_cond shape: {combined_cond.shape}")
+            
+            # Continue with regular forward logic
+            result = super().forward(
+                img=img,
+                img_ids=img_ids,
+                txt=txt,
+                txt_ids=txt_ids,
+                timesteps=timesteps,
+                y=combined_cond,
+                cluster_ids=cluster_ids,
+                guidance=guidance
+            )
+            print(f"[DEBUG MMDiT] forward result shape: {result.shape}")
+            
+            # Explicitly ensure we only return one tensor
+            return result
+            
+        except Exception as e:
+            print(f"[CRITICAL ERROR MMDiT] Forward pass failed: {str(e)}")
+            # Print detailed traceback
+            import traceback
+            traceback.print_exc()
+            # IMPORTANT: Raise the error instead of silently continuing
+            raise

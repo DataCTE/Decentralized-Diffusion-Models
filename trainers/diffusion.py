@@ -262,53 +262,39 @@ class DecentralizedFlowMatcher:
         return loss.mean()
 
     def compute_loss(self, predictions, x0, t):
-        """Paper Eq.6 with uniform expert weighting"""
-        # Sample random noise
-        eps = torch.randn_like(x0)
-        
-        # Create noisy input
-        alpha_t = torch.cos(t * math.pi/2)
-        sigma_t = torch.sin(t * math.pi/2)
-        xt = alpha_t * x0 + sigma_t * eps
-        
-        # Get target flow
-        target = self.compute_flow_matching_target(x0, xt, t)
-        
-        # Calculate loss
-        if self.loss_type == 'mse':
-            loss = F.mse_loss(predictions, target, reduction='mean')
-        elif self.loss_type == 'huber':
-            loss = F.huber_loss(predictions, target, delta=0.1, reduction='mean')
-        elif self.loss_type == 'l1':
-            loss = F.l1_loss(predictions, target, reduction='mean')
-            
-        return loss
-
-    def compute_loss(self, predictions, x0, t):
         """
-        Compute full flow matching loss according to paper Section 3.2 and 3.4
-        
-        Args:
-            predictions: Model predictions [B, C, H, W]
-            x0: Original data [B, C, H, W]
-            t: Timestep tensor [B]
-            
-        Returns:
-            Loss value
+        Compute flow matching loss with better error handling and debugging.
+        Was probably returning a tuple with 4 values when a single value was expected.
         """
-        # Forward process to get x_t
-        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
-        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
-        noise = torch.randn_like(x0)
-        xt = alpha_t * x0 + sigma_t * noise
+        print(f"[DEBUG FlowMatcher] compute_loss called")
+        print(f"[DEBUG FlowMatcher] predictions shape: {predictions.shape}")
+        print(f"[DEBUG FlowMatcher] x0 shape: {x0.shape}")
+        print(f"[DEBUG FlowMatcher] t shape: {t.shape}")
         
-        # Compute target flow field
-        target = self.compute_flow_matching_target(x0, xt, t)
-        
-        # Compute loss
-        loss = self.compute_flow_matching_loss(predictions, target)
-        
-        # Anneal temperature for router
-        self.temperature = max(0.5, self.temperature * self.temp_decay)
-        
-        return loss 
+        try:
+            # Calculate target flow
+            target = self.compute_flow_matching_target(x0, predictions, t)
+            print(f"[DEBUG FlowMatcher] target shape: {target.shape}")
+            
+            # Compute loss - THIS MAY RETURN MULTIPLE VALUES
+            # Let's explicitly return only one value
+            raw_loss = self.compute_flow_matching_loss(predictions, target)
+            print(f"[DEBUG FlowMatcher] raw_loss type: {type(raw_loss)}")
+            
+            # Check if raw_loss is a tuple and extract first element
+            if isinstance(raw_loss, tuple):
+                print(f"[DEBUG FlowMatcher] raw_loss is a tuple with {len(raw_loss)} elements")
+                for i, item in enumerate(raw_loss):
+                    print(f"[DEBUG FlowMatcher] raw_loss[{i}] type: {type(item)}, value: {item}")
+                # IMPORTANT: Only return the loss value, not other metrics
+                return raw_loss[0]
+            else:
+                return raw_loss
+            
+        except Exception as e:
+            print(f"[CRITICAL ERROR FlowMatcher] Loss computation failed: {str(e)}")
+            # Print detailed traceback
+            import traceback
+            traceback.print_exc()
+            # IMPORTANT: Raise the error instead of silently continuing
+            raise 
