@@ -122,16 +122,16 @@ class RouterModel(nn.Module):
         t_emb = self.time_embedder(timesteps.float())  # [B, D]
         x = x + t_emb
 
-        # Text embedding integration - Changed: Project text before mean reduction
+        # Text embedding integration - Project text and reduce sequence dimension first
         text_emb = self.text_embed_proj(txt)  # [B, L, D]
         text_emb = text_emb.mean(dim=1)  # [B, D]
-        x = x + text_emb
+        x = x + text_emb  # Now both x and text_emb are [B, D]
 
-        # Prepare for transformer
+        # Prepare for transformer - ensure correct dimensions
         x = x.unsqueeze(1)  # [B, 1, D]
         
-        # Add CLS token with proper dimension check
-        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)  # [B, 1, D]
+        # Add CLS token
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [B, 1, D]
         x = torch.cat([cls_tokens, x], dim=1)  # [B, 2, D]
 
         # Apply transformer blocks
