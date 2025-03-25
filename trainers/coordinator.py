@@ -25,8 +25,6 @@ from utils.distributed import is_dist_initialized, synchronize, broadcast_object
 # Import FSDP directly to fix the "FSDP is not defined" error
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-# Import QuantizedCommunicator
-from utils.comm import QuantizedCommunicator
 
 # Setup logger
 logger = setup_logger("DDMCoordinator")
@@ -179,14 +177,22 @@ class DDMTrainingCoordinator:
         train_dataset = DDMDataset(self.config, 'train')
         val_dataset = DDMDataset(self.config, 'val')
         
-        # FSDP handles all data device placement
+        # Create distributed sampler
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True
+        )
+        
         loader_config = {
-            'num_workers': 2,  # Increased from 0 for better throughput
-            'pin_memory': False,  # No need for pin_memory with FSDP
-            'persistent_workers': False    # Better performance with workers
+            'num_workers': 2,
+            'pin_memory': False,
+            'persistent_workers': False,
+            'sampler': train_sampler  # Use distributed sampler
         }
         
-        # Simplified collate function without device moves
+        # Simplified collate function
         def collate_fn(batch):
             try:
                 return {
@@ -199,41 +205,20 @@ class DDMTrainingCoordinator:
                 logger.error(f"Collation error: {str(e)}")
                 return None
         
-        # Create bucket-aware sampler if bucket assignments are available
-        if hasattr(train_dataset, 'bucket_assignments'):
-            debug_print(f"Creating BucketBatchSampler with batch size {self.config.batch_size}", self.rank)
-            
-            batch_sampler = BucketBatchSampler(
-                dataset=train_dataset,
-                batch_size=self.config.batch_size,
-                device=self.device,
-                shuffle=True,
-                drop_last=True
-            )
-            
-            self.train_loader = DataLoader(
-                train_dataset,
-                batch_sampler=batch_sampler,
-                collate_fn=collate_fn,
-                **loader_config
-            )
-            if self.rank == 0:
-                logger.info(f"Created bucket-aware DataLoader with batch size {self.config.batch_size}")
-        else:
-            # Fallback to simple loader
-            self.train_loader = DataLoader(
-                train_dataset,
-                batch_size=1,
-                shuffle=True,
-                **loader_config
-            )
+        # Create DataLoader with distributed sampler
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            collate_fn=collate_fn,
+            **loader_config
+        )
         
-        # Validation dataset with same collate function
+        # Validation loader
         self.val_loader = DataLoader(
             val_dataset,
             batch_size=1,
             shuffle=False,
-            collate_fn=collate_fn if 'collate_fn' in locals() else None,
+            collate_fn=collate_fn,
             **loader_config
         )
     
