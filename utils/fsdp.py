@@ -9,14 +9,15 @@ from torch.distributed.fsdp import (
     MixedPrecision,
     BackwardPrefetch,
     ShardingStrategy,
-    CPUOffload
+    CPUOffload,
+    StateDictType,
+    StateDictConfig
 )
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
     size_based_auto_wrap_policy,
     lambda_auto_wrap_policy
 )
-from torch.distributed.fsdp import StateDictType
 
 
 logger = logging.getLogger(__name__)
@@ -298,23 +299,28 @@ def configure_optimizer_for_fsdp(model, optimizer_class, **kwargs):
         return optimizer_class(model.parameters(), **kwargs)
 
 def get_fsdp_defaults():
+    """Get paper-recommended FSDP defaults with process group"""
     return {
-        "sharding_strategy": ShardingStrategy.FULL_SHARD,
-        "cpu_offload": CPUOffload(offload_params=False),
-        "backward_prefetch": BackwardPrefetch.BACKWARD_PRE,
         "mixed_precision": MixedPrecision(
             param_dtype=torch.float16,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.float16
+            reduce_dtype=torch.float16,
+            buffer_dtype=torch.float16,
         ),
-        "device_id": torch.cuda.current_device(),
-        "limit_all_gathers": True,
-        "use_orig_params": False
+        "backward_prefetch": BackwardPrefetch.BACKWARD_PRE,
+        "process_group": dist.group.WORLD if dist.is_initialized() else None,
+        "use_orig_params": True,
+        "limit_all_gathers": True
     }
 
 def create_fsdp_config(config, sharding_strategy="FULL_SHARD", rank=0):
     """Paper's sharding strategies with config overrides"""
     defaults = get_fsdp_defaults()
+    
+    # Get process group if available
+    process_group = defaults.get("process_group", None)
+    if process_group is None and dist.is_initialized():
+        process_group = dist.group.WORLD
+
     fsdp_config = {
         **defaults,
         "sharding_strategy": {
@@ -323,7 +329,8 @@ def create_fsdp_config(config, sharding_strategy="FULL_SHARD", rank=0):
             "HYBRID_SHARD": ShardingStrategy.HYBRID_SHARD,
             "NO_SHARD": ShardingStrategy.NO_SHARD
         }[sharding_strategy],
-        "device_id": torch.device(f"cuda:{rank}")
+        "device_id": torch.device(f"cuda:{rank}"),
+        "process_group": process_group  # Add explicit process group
     }
     if defaults["process_group"] is not None:
         fsdp_config["process_group"] = defaults["process_group"]
@@ -364,61 +371,16 @@ def get_backward_prefetch(config):
     return BackwardPrefetch.BACKWARD_PRE
 
 def wrap_model_with_fsdp(model, config, param_init_fn=None, rank=0):
-    """
-    Wrap model with FSDP using configuration from config object
-    
-    Args:
-        model: Base model to wrap
-        config: Configuration object with FSDP settings
-        param_init_fn: Optional function to initialize parameters (for expert isolation)
-        rank: Process rank for device placement
-        
-    Returns:
-        FSDP-wrapped model
-    """
-    # Check for distributed initialization first
-    if not dist.is_initialized():
-        logger.warning("Distributed is not initialized, returning unwrapped model")
-        return model
-    
-    # Get FSDP configuration settings from config
-    sharding_strategy = getattr(config, 'fsdp_sharding_strategy', "FULL_SHARD")
-    
-    # Verify FSDP policy is "FULL_SHARD" for maximum distribution
-    if sharding_strategy != "FULL_SHARD":
-        logger.warning(f"Using sharding strategy {sharding_strategy}, but FULL_SHARD is recommended for best distribution")
-    
-    # Create FSDP configuration with explicit rank
+    """Wrap model with FSDP using paper's recommended settings"""
+    sharding_strategy = getattr(config, 'fsdp_sharding_strategy', 'FULL_SHARD')
     fsdp_config = create_fsdp_config(config, sharding_strategy, rank=rank)
     
-    # Add backward prefetch
-    fsdp_config["backward_prefetch"] = get_backward_prefetch(config)
-    
-    # Add auto wrap policy for more effective sharding
-    fsdp_config["auto_wrap_policy"] = get_auto_wrap_policy(config)
-    
-    # Add parameter initialization function if provided
-    if param_init_fn is not None:
-        fsdp_config["param_init_fn"] = param_init_fn
-    
-    # Force world_size to match dist.get_world_size()
-    world_size = dist.get_world_size()
-    
-    # Log FSDP configuration
-    logger.info(f"Rank {rank}: Wrapping model with FSDP using strategy {sharding_strategy}, world_size={world_size}")
-    
-    # Wrap model with FSDP
-    wrapped_model = FSDP(model, **fsdp_config)
-    
-    # Report sharding stats if verbose
-    logger.info(f"Rank {rank}: Model successfully wrapped with FSDP")
-    
-    # Use activation checkpointing if configured
-    if getattr(config, 'use_gradient_checkpointing', False):
-        from utils.fsdp import apply_activation_checkpointing
-        wrapped_model = apply_activation_checkpointing(wrapped_model, config)
-    
-    return wrapped_model
+    return FSDP(
+        model,
+        **fsdp_config,
+        auto_wrap_policy=get_auto_wrap_policy(config),
+        param_init_fn=param_init_fn
+    )
 
 def save_fsdp_model(model, save_path, optim=None, scheduler=None, metadata=None):
     """
