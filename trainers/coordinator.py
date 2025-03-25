@@ -274,7 +274,8 @@ class DDMTrainingCoordinator:
 
     def _train_experts_sync(self, batch):
         """Expert training with quantized async updates"""
-        for expert in self.expert_cache.values():
+        for expert_idx in self.expert_indices:
+            expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
             expert.train()
         self.router.eval()
         
@@ -303,7 +304,8 @@ class DDMTrainingCoordinator:
         """Router training with gradient synchronization"""
         # Set modes
         self.router.train()
-        for expert in self.expert_cache.values():
+        for expert_idx in self.expert_indices:
+            expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
             expert.eval()
         
         # Forward pass
