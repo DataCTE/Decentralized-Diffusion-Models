@@ -109,56 +109,78 @@ class RouterModel(nn.Module):
         # Reshape 5D latents to 4D for conv2d
         if img.dim() == 5:
             B, C, D, H, W = img.shape
+            print(f"[Router] Input img shape: {img.shape}")
             img = img.reshape(B, C * D, H, W)
+            print(f"[Router] Reshaped img shape: {img.shape}")
+        else:
+            print(f"[Router] Input img shape: {img.shape}")
         
         # Patch embedding
         x = self.embedder(img)  # [B, D, H', W']
+        print(f"[Router] After embedder shape: {x.shape}")
         
         # Spatial attention processing
         attn_features = self.spatial_attention(x)
+        print(f"[Router] After spatial_attention shape: {attn_features.shape}")
         x = attn_features.mean(dim=(2, 3))  # [B, D]
+        print(f"[Router] After spatial pooling shape: {x.shape}")
         
         # Timestep embedding
         t_emb = self.time_embedder(timesteps.float())  # [B, D]
+        print(f"[Router] Timestep embedding shape: {t_emb.shape}")
         x = x + t_emb
+        print(f"[Router] After adding timestep shape: {x.shape}")
 
         # Text embedding integration - Project text and reduce sequence dimension first
+        print(f"[Router] Input text shape: {txt.shape}")
         text_emb = self.text_embed_proj(txt)  # Either [B, L, D] or [B, D]
+        print(f"[Router] Projected text shape: {text_emb.shape}")
 
         # If the projected text embeddings are 3D, average over the token dimension
         # Handle both possible dimension arrangements
         if text_emb.dim() == 3:
             if text_emb.shape[1] == self.config.clip_embedding_dim:
                 # Handle [B, D, L] format
+                print(f"[Router] Text in [B, D, L] format")
                 text_emb = text_emb.mean(dim=2)
             else:
                 # Handle [B, L, D] format
+                print(f"[Router] Text in [B, L, D] format")
                 text_emb = text_emb.mean(dim=1)
+            print(f"[Router] Text after pooling shape: {text_emb.shape}")
 
         # Verify dimensions match before addition
         assert x.shape == text_emb.shape, f"Shape mismatch: x={x.shape}, text_emb={text_emb.shape}"
         x = x + text_emb
+        print(f"[Router] After adding text shape: {x.shape}")
 
         # Prepare for transformer - ensure correct dimensions
         x = x.unsqueeze(1)  # [B, 1, D]
+        print(f"[Router] After unsqueeze shape: {x.shape}")
         
         # Add CLS token
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [B, 1, D]
+        print(f"[Router] CLS token shape: {cls_tokens.shape}")
         x = torch.cat([cls_tokens, x], dim=1)  # [B, 2, D]
+        print(f"[Router] After adding CLS token shape: {x.shape}")
 
         # Apply transformer blocks
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x)
+            print(f"[Router] After block {i} shape: {x.shape}")
             
         # Final processing
         cls_output = x[:, 0]
+        print(f"[Router] CLS output shape: {cls_output.shape}")
         logits = self.classifier(cls_output)
+        print(f"[Router] Logits shape: {logits.shape}")
         
         # Apply temperature scaling with decay
         temperature = max(
             self.min_temp,
             self.initial_temp * (self.temp_decay ** self.current_step)
         )
+        print(f"[Router] Temperature value: {temperature}")
         self.current_step += 1
         
         return logits / temperature 
