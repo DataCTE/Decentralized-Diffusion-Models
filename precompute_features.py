@@ -95,7 +95,7 @@ class FeatureGenerator:
             if not caption_path.exists():
                 return False
             
-            # Generate deterministic UUID
+            # Use file contents instead of path for UUID
             with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
                 img_hash = hashlib.md5(f.read()).hexdigest()
                 text_hash = hashlib.md5(cf.read()).hexdigest()
@@ -225,6 +225,9 @@ class FeatureGenerator:
                 cluster_labels = agg.labels_[labels.flatten()]
                 torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
                 
+                # Write initialization marker
+                (self.feature_dir/"clusters/started.pt").touch()
+                
             except Exception as e:
                 print(f"Clustering failed: {str(e)}")
                 # Broadcast failure signal
@@ -239,6 +242,15 @@ class FeatureGenerator:
 
         if failure_flag.item() == 1:
             raise RuntimeError("Clustering failed on rank 0")
+
+        # For non-zero ranks in clustering wait:
+        start_time = time.time()
+        while True:
+            if (self.feature_dir/"clusters/started.pt").exists():
+                break
+            if time.time() - start_time > 1800:  # 30 minute timeout
+                raise RuntimeError("Clustering never started on rank 0")
+            time.sleep(10)
 
     def _safe_load_feature(self, path):
         """Load features with validation and retries"""
@@ -348,10 +360,6 @@ def main():
         }
         enabled_features = [feature_map[f] for f in vars(args) if vars(args)[f] and f in feature_map]
 
-    # Add these after setting the device but before init_process_group
-    torch.cuda.synchronize()
-    time.sleep(1)  # Allow device warmup
-
     # Initialize distributed processing
     rank = int(os.environ['LOCAL_RANK'])
     print(f"Rank {rank} starting initialization")
@@ -376,7 +384,7 @@ def main():
         if not Path(config.dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {config.dataset_path} not found")
     
-    # Get all images - add progress bar
+    # Get all images
     if rank == 0:
         print("Scanning dataset directory...")
     all_images = [str(p) for p in Path(config.dataset_path).rglob('*') 
@@ -421,46 +429,57 @@ def main():
                     print(f"Rank {rank} failed to process {img_path}: {str(e)}")
                     continue  # Skip to next image
 
-        # Add final completion marker with verification
+        # Add final completion marker
         status_path = processor.feature_dir/f"status_rank{rank}.pt"
         torch.save({'status': 'done', 'count': len(local_images)}, status_path)
         
-        # Verify all ranks completed
-        start_time = time.time()
-        while True:
-            done = sum(1 for f in processor.feature_dir.glob("status_rank*.pt") 
-                      if torch.load(f)['status'] == 'done')
-            if done == dist.get_world_size():
-                break
-            if time.time() - start_time > 3600:  # 1 hour timeout
-                raise RuntimeError(f"Rank {rank} timed out waiting for others")
-            time.sleep(10)
-        
-        dist.barrier()  # Synchronize after verification
+        # Final synchronization before clustering
+        dist.barrier()
 
-        # Conditional clustering
+        # Clustering phase with coordinated error handling
         if 'clustering' in enabled_features:
+            # All ranks participate in clustering workflow
+            cluster_start_time = time.time()
+            cluster_error = torch.tensor([0], device=device)
+            
             if rank == 0:
                 try:
+                    # Clear previous cluster markers
+                    (processor.feature_dir/"clusters/started.pt").unlink(missing_ok=True)
+                    (processor.feature_dir/"clusters/error.pt").unlink(missing_ok=True)
+                    
+                    # Signal clustering start
+                    (processor.feature_dir/"clusters/started.pt").touch()
+                    
+                    # Actual clustering execution
                     processor.run_clustering()
                 except Exception as e:
                     print(f"Clustering failed: {str(e)}")
-                    # Create error marker
+                    cluster_error.fill_(1)
                     (processor.feature_dir/"clusters/error.pt").touch()
-            else:
-                # Wait for clustering results with timeout
-                start_time = time.time()
-                while not (processor.feature_dir/"clusters/final_clusters.pt").exists():
-                    if (processor.feature_dir/"clusters/error.pt").exists():
-                        raise RuntimeError("Clustering failed on rank 0")
-                    if time.time() - start_time > 10800:  # 3 hour timeout
-                        raise RuntimeError("Timed out waiting for clustering results")
-                    time.sleep(30)
+            
+            # Broadcast error status to all ranks
+            dist.broadcast(cluster_error, src=0)
+            
+            if cluster_error.item() == 1:
+                raise RuntimeError("Clustering failed on rank 0")
+            
+            # Unified waiting logic for all ranks
+            while not (processor.feature_dir/"clusters/final_clusters.pt").exists():
+                # Check timeout
+                if time.time() - cluster_start_time > 10800:  # 3 hours
+                    raise RuntimeError("Clustering timed out")
+                
+                # Check for error file
+                if (processor.feature_dir/"clusters/error.pt").exists():
+                    raise RuntimeError("Clustering failed on rank 0")
+                
+                time.sleep(30)
 
     except Exception as e:
         print(f"Rank {rank} failed: {str(e)}")
         # Emergency barrier with timeout
-        dist.barrier(timeout=timedelta(seconds=60))
+        dist.barrier(timeout=60)
         raise
     finally:
         # Cleanup status files
