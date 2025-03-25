@@ -36,9 +36,9 @@ class RouterModel(nn.Module):
         self.temp_decay = 0.99995  # Decay rate
         self.current_step = 0
         
-        # Embedding layer
+        # Embedding layer - Changed input channels to match latent dimension
         self.embedder = nn.Conv2d(
-            config.latent_channels, 
+            config.latent_channels * 16,  # Changed: Account for the 16x channel dimension 
             config.router_hidden_size,
             kernel_size=config.patch_size,
             stride=config.patch_size
