@@ -4,16 +4,13 @@ import os
 import torch
 import datetime
 import time
-from collections import defaultdict
 import contextlib
-
 from tqdm.auto import tqdm
 import concurrent.futures
 
 # Import needed components
 from trainers.router import RouterTrainer
 from trainers.sampling import ddm_sample
-from trainers.diffusion import DecentralizedFlowMatcher
 from data.dataset import DDMDataset
 from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint

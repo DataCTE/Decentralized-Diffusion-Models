@@ -3,22 +3,20 @@
 import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler, SubsetRandomSampler
+from torch.utils.data import Dataset, DataLoader, Sampler
 import random
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 import logging
 import time  
 import glob
-
-
-
 from tqdm.auto import tqdm
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from torch.serialization import safe_globals
+from numpy._core.multiarray import _reconstruct
 
 # Import centralized utilities
-from utils.distributed import is_main_process, broadcast_object, get_rank, get_local_rank, get_world_size
+from utils.distributed import is_main_process, get_rank, get_world_size
 from utils.logging import setup_distributed_logger
 
 # Setup logging
@@ -105,7 +103,13 @@ class DDMDataset(Dataset):
         """Load precomputed cluster assignments with proper device placement"""
         cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
         try:
-            cluster_assignments = torch.load(cluster_path, map_location=self.device)
+            # Add safe_globals context for numpy compatibility
+            with torch.serialization.safe_globals([_reconstruct]):
+                cluster_assignments = torch.load(
+                    cluster_path,
+                    map_location=self.device,
+                    weights_only=False  # Required for numpy compatibility
+                )
             
             if isinstance(cluster_assignments, np.ndarray):
                 cluster_assignments = torch.from_numpy(cluster_assignments).to(self.device)
@@ -143,6 +147,7 @@ class DDMDataset(Dataset):
             base_name = self.base_names[idx]
             rank_suffix = f"_rank{self.rank}"
             
+            # Load with weights_only=False for feature tensors
             data = {
                 'latent': torch.load(
                     os.path.join(self.latent_dir, f"{base_name}{rank_suffix}.pt"),
