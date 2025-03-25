@@ -272,6 +272,20 @@ class DDMDataset(Dataset):
         counts = self.get_cluster_sizes()
         return counts / counts.sum()
 
+    @staticmethod
+    def collate_fn(batch):
+        """Modified collate that handles None entries"""
+        batch = [b for b in batch if b is not None]
+        if len(batch) == 0:
+            return None
+            
+        return {
+            'latent': torch.stack([item['latent'] for item in batch]),
+            'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
+            'bucket': torch.stack([item['bucket'] for item in batch]),
+            'expert': torch.stack([item['expert'] for item in batch])
+        }
+
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
     def __init__(self, batch_samplers):

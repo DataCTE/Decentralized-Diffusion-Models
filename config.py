@@ -5,6 +5,7 @@ import sys
 import importlib.util
 from types import SimpleNamespace
 import logging
+import types  # Add this import
 
 
 logger = logging.getLogger(__name__)
@@ -218,10 +219,11 @@ def get_config(config_path=None):
         # Create a namespace for the config
         config = SimpleNamespace()
         
-        # Add all non-hidden attributes from the config module
+        # Add this filter when loading config attributes
         for key in dir(config_module):
-            if not key.startswith('_'):
-                setattr(config, key, getattr(config_module, key))
+            val = getattr(config_module, key)
+            if not key.startswith('_') and not isinstance(val, types.ModuleType):
+                setattr(config, key, val)
         
         # Add default values for any missing required fields
         defaults = DEFAULT_CONFIG

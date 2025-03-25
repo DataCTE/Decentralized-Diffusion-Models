@@ -11,7 +11,7 @@ import concurrent.futures
 # Import needed components
 from trainers.router import RouterTrainer
 from trainers.sampling import ddm_sample
-from data.dataset import DDMDataset, simple_collate
+from data.dataset import DDMDataset
 from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
 from data.dataset import BucketBatchSampler
@@ -194,7 +194,7 @@ class DDMTrainingCoordinator:
             'pin_memory': False,
             'persistent_workers': False,
             'sampler': train_sampler,
-            'collate_fn': simple_collate  # Use the standalone function
+            'collate_fn': DDMDataset.collate_fn  # Use class reference
         }
         
         # Create DataLoader
