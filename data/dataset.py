@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from torch.serialization import safe_globals
 from numpy._core.multiarray import _reconstruct
+from types import SimpleNamespace
 
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, get_world_size
@@ -31,9 +32,10 @@ def chunks(lst, n):
 class DDMDataset(Dataset):
     """Distributed-optimized dataset pipeline with lazy loading and prefetching"""
     
-    def __init__(self, config, split='train'):
-        self.config = config
-        self.feature_dir = config.feature_cache_path
+    def __init__(self, config_dict, split='train'):
+        # Convert config dict to SimpleNamespace
+        self.config = SimpleNamespace(**config_dict)
+        self.feature_dir = self.config.feature_cache_path
         self.rank = get_rank()
         self.world_size = get_world_size()
         
@@ -41,11 +43,11 @@ class DDMDataset(Dataset):
         self.device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
         
         # Cache directories
-        self.latent_dir = os.path.join(config.feature_cache_path, "latents")
-        self.clip_dir = os.path.join(config.feature_cache_path, "clip")
-        self.cluster_dir = os.path.join(config.feature_cache_path, "clusters")
-        self.dim_dir = os.path.join(config.feature_cache_path, "dims")
-        self.bucket_dir = os.path.join(config.feature_cache_path, "buckets")
+        self.latent_dir = os.path.join(self.config.feature_cache_path, "latents")
+        self.clip_dir = os.path.join(self.config.feature_cache_path, "clip")
+        self.cluster_dir = os.path.join(self.config.feature_cache_path, "clusters")
+        self.dim_dir = os.path.join(self.config.feature_cache_path, "dims")
+        self.bucket_dir = os.path.join(self.config.feature_cache_path, "buckets")
         
         # Verify directories exist
         self._verify_cache_dirs()

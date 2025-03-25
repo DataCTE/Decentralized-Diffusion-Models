@@ -173,9 +173,12 @@ class DDMTrainingCoordinator:
         """Initialize distributed-aware data loaders"""
         debug_print("Initializing data loaders", self.rank)
         
+        # Convert config to dict before passing to dataset
+        config_dict = vars(self.config)
+        
         # Remove device parameter from dataset initialization
-        train_dataset = DDMDataset(self.config, 'train')
-        val_dataset = DDMDataset(self.config, 'val')
+        train_dataset = DDMDataset(config_dict, 'train')
+        val_dataset = DDMDataset(config_dict, 'val')
         
         # Create distributed sampler
         train_sampler = torch.utils.data.distributed.DistributedSampler(
