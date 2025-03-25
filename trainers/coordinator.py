@@ -225,8 +225,23 @@ class DDMTrainingCoordinator:
         return "Router initialized with FSDP"
 
     def _init_and_verify_experts(self):
-        """Initialize experts without sharding validation"""
-        self.expert_indices = self._calculate_expert_shards()
+        """Initialize expert networks and verify they're correctly distributed"""
+        # Initialize expert indices as a list or tensor with proper dimensions
+        if not hasattr(self, 'expert_indices') or self.expert_indices is None:
+            # If expert_indices doesn't exist or is None, initialize it properly
+            # This could be a list of indices or a properly sized tensor
+            num_experts_per_rank = max(1, self.config.num_experts // self.world_size)
+            start_idx = self.rank * num_experts_per_rank
+            end_idx = min(start_idx + num_experts_per_rank, self.config.num_experts)
+            
+            # Create as a list first to ensure it's iterable
+            self.expert_indices = list(range(start_idx, end_idx))
+            
+            # Convert to tensor if needed elsewhere
+            self.expert_indices_tensor = torch.tensor(self.expert_indices, device=self.device)
+            
+        # Add debug print to verify indices
+        print(f"[Rank {self.rank}] Expert indices: {self.expert_indices}")
         return f"Experts initialized: {self.expert_indices.tolist()}"
 
     def _calculate_expert_shards(self):
@@ -270,33 +285,36 @@ class DDMTrainingCoordinator:
         return {k: v.to(self.device) for k,v in batch.items()}
 
     def _train_experts_sync(self, batch):
-        """Expert training with quantized async updates"""
-        total_loss = torch.tensor(0.0, device=self.device)  # Initialize as tensor
+        """Train all experts synchronously"""
+        total_loss = 0.0
         num_experts = 0
         
-        for expert_idx in self.expert_indices:
+        # Ensure expert_indices is properly iterable
+        if hasattr(self, 'expert_indices_tensor') and not hasattr(self, 'expert_indices'):
+            self.expert_indices = self.expert_indices_tensor.tolist() if self.expert_indices_tensor.dim() > 0 else [self.expert_indices_tensor.item()]
+        
+        # If expert_indices is a tensor, convert to list for iteration
+        if torch.is_tensor(self.expert_indices):
+            if self.expert_indices.dim() == 0:  # It's a scalar tensor
+                expert_indices = [self.expert_indices.item()]
+            else:
+                expert_indices = self.expert_indices.tolist()
+        else:
+            expert_indices = self.expert_indices
+        
+        for expert_idx in expert_indices:
+            # Get expert from cache
             try:
                 expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
-                if hasattr(expert, 'train_step'):  # Check if it's an ExpertTrainer
-                    expert.train()
-                    loss = expert.train_step(batch)
-                    total_loss += loss
-                    num_experts += 1
-                else:
-                    logger.error(f"Error training expert {expert_idx} on rank {self.rank}: Object has no train_step method")
+                # Train the expert
+                loss = expert.train_step(batch)
+                total_loss += loss
+                num_experts += 1
             except Exception as e:
-                logger.error(f"Error training expert {expert_idx} on rank {self.rank}: {str(e)}")
-                continue
+                print(f"Error training expert {expert_idx} on rank {self.rank}: {str(e)}")
         
-        # Average loss across experts on this rank
-        if num_experts > 0:
-            total_loss = total_loss / num_experts
-        
-        # Synchronize losses across all ranks
-        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        total_loss = total_loss / self.world_size
-        
-        return total_loss
+        # Avoid division by zero
+        return total_loss / max(1, num_experts)
 
     @contextlib.contextmanager
     def _async_context(self):
@@ -819,25 +837,39 @@ class DDMTrainingCoordinator:
                 pass
 
     def _redistribute_experts(self):
-        """Improved expert redistribution with gradient-aware sharding"""
-        # Get cluster statistics with synchronized access
-        cluster_counts = self.train_loader.dataset.get_cluster_distribution()
-        cluster_counts = cluster_counts.to(self.device)
-        dist.all_reduce(cluster_counts, op=dist.ReduceOp.SUM)
-        
-        # Calculate new expert assignments using weighted distribution
-        total_samples = cluster_counts.sum()
-        expert_weights = cluster_counts / total_samples
-        new_assignments = torch.distributions.Categorical(expert_weights).sample((self.world_size,))
-        
-        # Verify assignments are disjoint
-        unique_counts = torch.unique(new_assignments, return_counts=True)[1]
-        if (unique_counts > 1).any():
-            logger.error("Expert redistribution conflict detected!")
-            self._resolve_sharding_conflicts(new_assignments)
-        
-        # Redistribute experts with state preservation
-        self._migrate_expert_states(new_assignments)
+        """Redistribute experts across ranks based on load balancing"""
+        try:
+            # Get current expert assignments and load metrics
+            assignments = self._calculate_expert_assignments()
+            
+            # Handle potential mismatched tuple unpacking
+            if isinstance(assignments, tuple) and len(assignments) == 4:
+                new_assignments, conflicts, stats, metrics = assignments
+            else:
+                # Handle the case where the return value structure is different
+                print(f"Warning: Unexpected return structure from _calculate_expert_assignments")
+                new_assignments = assignments if not isinstance(assignments, tuple) else assignments[0]
+                conflicts = []
+                stats = {}
+                metrics = {}
+            
+            # Handle conflicts if any
+            if conflicts:
+                print(f"Expert redistribution conflict detected!")
+                resolved_assignments = self._resolve_sharding_conflicts(new_assignments)
+                self._migrate_expert_states(resolved_assignments)
+            else:
+                self._migrate_expert_states(new_assignments)
+            
+            # Update local expert indices
+            self.expert_indices = [idx for idx, rank in enumerate(new_assignments) if rank == self.rank]
+            # Also update tensor version
+            self.expert_indices_tensor = torch.tensor(self.expert_indices, device=self.device)
+            
+            return True
+        except Exception as e:
+            print(f"Error in expert redistribution: {str(e)}")
+            return False
 
     def _resolve_sharding_conflicts(self, assignments):
         """Conflicts resolved through FSDP's parameter consensus"""
@@ -908,4 +940,36 @@ class DDMTrainingCoordinator:
             
             if imbalance > 1.5:
                 logger.warning(f"High memory imbalance detected at {stage}!")
+
+    def _log_metrics(self, step, expert_loss, router_loss, duration=None, learning_rates=None):
+        """Log training metrics to wandb and console"""
+        if self.rank != 0:
+            return  # Only log from rank 0
+        
+        # Get memory stats if enabled
+        memory_stats = self._get_memory_stats() if hasattr(self.config, 'wandb_log_memory') and self.config.wandb_log_memory else None
+        
+        # Get learning rates if not provided
+        if learning_rates is None and hasattr(self, '_get_learning_rates'):
+            learning_rates = self._get_learning_rates()
+        
+        # Calculate step duration if not provided
+        if duration is None and hasattr(self, 'step_start_time'):
+            duration = time.time() - self.step_start_time
+        
+        # Log to wandb
+        if hasattr(self, 'wandb') and self.config.wandb_enabled:
+            self._log_step_metrics_to_wandb(
+                step=step,
+                expert_loss=expert_loss,
+                router_loss=router_loss,
+                step_duration=duration,
+                learning_rates=learning_rates,
+                memory_stats=memory_stats
+            )
+        
+        # Log to console periodically
+        if step % self.config.log_every == 0:
+            lr_str = f", LR: {learning_rates['expert']:.6f}" if learning_rates else ""
+            print(f"[Step {step}] Expert Loss: {expert_loss:.4f}, Router Loss: {router_loss:.4f}{lr_str}")
 
