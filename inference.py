@@ -144,7 +144,7 @@ def load_models(config, device, checkpoint_dir, cache_manager=None):
     
     router_checkpoint = os.path.join(checkpoint_dir, "router_model.pt")
     if os.path.exists(router_checkpoint):
-        load_model_checkpoint(
+        load_models(
             router_model,
             path=router_checkpoint,
             is_fsdp=True,

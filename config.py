@@ -245,9 +245,44 @@ def get_config(config_path=None):
             config.image_size = (3, h, w)
             logger.info(f"Derived image_size {config.image_size} from first bucket")
         
+        # Add this function to convert nested dicts to SimpleNamespace
+        def dict_to_namespace(d):
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    d[k] = dict_to_namespace(v)
+                return SimpleNamespace(**d)
+            return d
+        
+        # Convert all nested dictionaries to SimpleNamespace
+        for key in dir(config_module):
+            if not key.startswith('_'):
+                val = getattr(config_module, key)
+                if isinstance(val, dict):
+                    setattr(config, key, dict_to_namespace(val))
+        
         return config
     else:
-        return create_default_config()
+        # For default config, convert the distributed dict
+        defaults = DEFAULT_CONFIG
+        defaults['distributed'] = dict_to_namespace(defaults['distributed'])
+        
+        # Add all default values
+        config = SimpleNamespace()
+        for key, value in defaults.items():
+            setattr(config, key, dict_to_namespace(value) if isinstance(value, dict) else value)
+        
+        # Derive image_size from the first bucket
+        if hasattr(config, 'buckets') and config.buckets:
+            w, h = config.buckets[0]
+            config.image_size = (3, h, w)
+        
+        # Create required directories
+        os.makedirs(config.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(config.output_dir, 'checkpoints'), exist_ok=True)
+        os.makedirs(os.path.join(config.output_dir, 'samples'), exist_ok=True)
+        os.makedirs(os.path.join(config.output_dir, 'logs'), exist_ok=True)
+        
+        return config
 
 def create_default_config():
     """Create a default configuration."""
