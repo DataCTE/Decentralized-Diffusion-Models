@@ -307,13 +307,17 @@ def estimate_model_size(config, model_type="expert"):
                 config.image_size[2] // config.patch_size,
                 device=device
             ),
-            torch.randint(0, 1000, (config.batch_size,), device=device),
+            torch.randint(0, 1000, (config.batch_size,), device=device), # img_ids - dummy ids
             torch.randn(
-                config.batch_size, 
+                config.batch_size,
                 config.max_token_length,
                 config.clip_embedding_dim,
                 device=device
-            )
+            ), # txt - text embeddings
+            torch.randint(0, 1000, (config.batch_size, config.max_token_length), device=device), # txt_ids - dummy token ids
+            torch.randint(0, 1000, (config.batch_size,), device=device), # timesteps - dummy timesteps
+            torch.randn(config.batch_size, config.vec_in_dim, device=device), # y - conditioning vector
+            torch.randint(0, config.num_experts, (config.batch_size,), device=device)  # cluster_ids - dummy cluster ids
         ]
     elif model_type == "router":
         from models.router import RouterModel
