@@ -95,25 +95,35 @@ class RouterModel(nn.Module):
             nn.init.normal_(self.classifier[-1].weight, std=0.02)
             nn.init.zeros_(self.classifier[-1].bias)
 
-    def forward(self, x, t, text_embeddings):
+    def forward(self, img, timesteps, txt):
         """
         Forward pass with temperature annealing (Section 3.3)
+        
+        Args:
+            img: Input image tensor [B, C, H, W] or [B, C, D, H, W] for latents
+            timesteps: Timestep values [B]
+            txt: Text embeddings [B, L, D]
         """
-        batch_size = x.shape[0]
+        batch_size = img.shape[0]
+        
+        # Reshape 5D latents to 4D for conv2d
+        if img.dim() == 5:
+            B, C, D, H, W = img.shape
+            img = img.reshape(B, C * D, H, W)
         
         # Patch embedding
-        x = self.embedder(x)  # [B, D, H', W']
+        x = self.embedder(img)  # [B, D, H', W']
         
         # Spatial attention processing
         attn_features = self.spatial_attention(x)
         x = attn_features.mean(dim=(2, 3))  # [B, D]
         
         # Timestep embedding
-        t_emb = self.time_embedder(t.float())  # [B, D]
+        t_emb = self.time_embedder(timesteps.float())  # [B, D]
         x = x + t_emb
 
         # Text embedding integration with sequence reduction
-        text_emb = self.text_embed_proj(text_embeddings.mean(dim=1))  # [B, D]
+        text_emb = self.text_embed_proj(txt.mean(dim=1))  # [B, D]
         x = x + text_emb
 
         # Prepare for transformer
