@@ -40,6 +40,9 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     assert dim % 2 == 0
+    # Ensure pos has at least one dimension (this prevents a 0-D tensor error)
+    if pos.dim() == 0:
+        pos = pos.unsqueeze(0)
     scale = torch.arange(0, dim, 2, dtype=pos.dtype, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
     out = torch.einsum("...n,d->...nd", pos, omega)
@@ -928,7 +931,16 @@ class Flux(nn.Module):
             print(f"[DEBUG MMDiT] combined_cond shape: {combined_cond.shape}")
             
             # Continue with regular forward logic
-            result = super().forward(img, img_ids, txt, txt_ids, timesteps, combined_cond, guidance)
+            result = super().forward(
+                img=img,
+                img_ids=img_ids,
+                txt=txt,
+                txt_ids=txt_ids,
+                timesteps=timesteps,
+                y=combined_cond,
+                cluster_ids=cluster_ids,
+                guidance=guidance
+            )
             print(f"[DEBUG MMDiT] forward result shape: {result.shape}")
             
             # Explicitly ensure we only return one tensor
@@ -1024,14 +1036,14 @@ class ExpertMMDiT(Flux):
             
             # Call parent class forward implementation with the combined conditioning
             # Important: Don't pass cluster_ids to the parent as it would try to use pe_embedder again
-            result = Flux.forward(
-                self,
+            result = super().forward(
                 img=img,
                 img_ids=img_ids,
                 txt=txt,
                 txt_ids=txt_ids,
                 timesteps=timesteps,
                 y=combined_cond,
+                cluster_ids=cluster_ids,
                 guidance=guidance
             )
             print(f"[DEBUG MMDiT] forward result shape: {result.shape}")
