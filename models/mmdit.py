@@ -1009,7 +1009,8 @@ class ExpertMMDiT(Flux):
         print(f"[DEBUG MMDiT] cluster_ids shape: {cluster_ids.shape}")
         
         try:
-            # Get cluster embeddings [B, cluster_embed_dim]
+            # Don't use pe_embedder, use the cluster_embed layer directly
+            # This fixes the dimensionality issue
             cluster_embeddings = self.cluster_embed(cluster_ids)
             print(f"[DEBUG MMDiT] cluster_embeddings shape: {cluster_embeddings.shape}")
             
@@ -1021,15 +1022,16 @@ class ExpertMMDiT(Flux):
             combined_cond = y + projected_embeddings
             print(f"[DEBUG MMDiT] combined_cond shape: {combined_cond.shape}")
             
-            # Continue with regular forward logic
-            result = super().forward(
+            # Call parent class forward implementation with the combined conditioning
+            # Important: Don't pass cluster_ids to the parent as it would try to use pe_embedder again
+            result = Flux.forward(
+                self,
                 img=img,
                 img_ids=img_ids,
                 txt=txt,
                 txt_ids=txt_ids,
                 timesteps=timesteps,
                 y=combined_cond,
-                cluster_ids=cluster_ids,
                 guidance=guidance
             )
             print(f"[DEBUG MMDiT] forward result shape: {result.shape}")
@@ -1039,8 +1041,6 @@ class ExpertMMDiT(Flux):
             
         except Exception as e:
             print(f"[CRITICAL ERROR MMDiT] Forward pass failed: {str(e)}")
-            # Print detailed traceback
             import traceback
             traceback.print_exc()
-            # IMPORTANT: Raise the error instead of silently continuing
             raise
