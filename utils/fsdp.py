@@ -378,41 +378,47 @@ def wrap_model_with_fsdp(model, config, param_init_fn=None, rank=0):
     Returns:
         FSDP-wrapped model
     """
+    # Check for distributed initialization first
+    if not dist.is_initialized():
+        logger.warning("Distributed is not initialized, returning unwrapped model")
+        return model
+    
     # Get FSDP configuration settings from config
     sharding_strategy = getattr(config, 'fsdp_sharding_strategy', "FULL_SHARD")
-    cpu_offload = getattr(config, 'fsdp_cpu_offload', False)
-    mixed_precision = getattr(config, 'use_mixed_precision', False)
+    
+    # Verify FSDP policy is "FULL_SHARD" for maximum distribution
+    if sharding_strategy != "FULL_SHARD":
+        logger.warning(f"Using sharding strategy {sharding_strategy}, but FULL_SHARD is recommended for best distribution")
     
     # Create FSDP configuration with explicit rank
     fsdp_config = create_fsdp_config(config, sharding_strategy, rank=rank)
-
-    # Override process_group to None if distributed is not initialized
-    if not torch.distributed.is_initialized():
-        fsdp_config["process_group"] = None
-        logger.info("FSDP: Distributed mode NOT initialized, overriding process_group to None for FSDP wrap.")
-
-    # Add CPU offload if enabled
-    if cpu_offload:
-        fsdp_config["cpu_offload"] = CPUOffload(offload_params=True)
-    
-    # Add mixed precision if enabled
-    if mixed_precision:
-        fsdp_config["mixed_precision"] = create_mixed_precision_config(config)
     
     # Add backward prefetch
     fsdp_config["backward_prefetch"] = get_backward_prefetch(config)
     
-    # Add auto wrap policy
+    # Add auto wrap policy for more effective sharding
     fsdp_config["auto_wrap_policy"] = get_auto_wrap_policy(config)
     
     # Add parameter initialization function if provided
     if param_init_fn is not None:
         fsdp_config["param_init_fn"] = param_init_fn
     
+    # Force world_size to match dist.get_world_size()
+    world_size = dist.get_world_size()
+    
+    # Log FSDP configuration
+    logger.info(f"Rank {rank}: Wrapping model with FSDP using strategy {sharding_strategy}, world_size={world_size}")
+    
     # Wrap model with FSDP
     wrapped_model = FSDP(model, **fsdp_config)
     
-    logger.info(f"Model wrapped with FSDP using {sharding_strategy} strategy")
+    # Report sharding stats if verbose
+    logger.info(f"Rank {rank}: Model successfully wrapped with FSDP")
+    
+    # Use activation checkpointing if configured
+    if getattr(config, 'use_gradient_checkpointing', False):
+        from utils.fsdp import apply_activation_checkpointing
+        wrapped_model = apply_activation_checkpointing(wrapped_model, config)
     
     return wrapped_model
 

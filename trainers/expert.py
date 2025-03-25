@@ -17,6 +17,9 @@ from trainers.base import BaseTrainer
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
 from utils.logging import logger
 
+# Import FSDP explicitly for type checking
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
 
 
 class ExpertTrainer(BaseTrainer):
@@ -48,7 +51,7 @@ class ExpertTrainer(BaseTrainer):
             self.expert = base_expert
         
         # Use centralized optimizer configuration for FSDP compatibility
-        if is_dist_initialized() and isinstance(self.expert, dist.fsdp.FullyShardedDataParallel):
+        if is_dist_initialized() and isinstance(self.expert, FSDP):
             self.optimizer = configure_optimizer_for_fsdp(
                 self.expert,
                 AdamW8bit,

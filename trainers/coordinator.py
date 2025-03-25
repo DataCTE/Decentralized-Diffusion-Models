@@ -135,6 +135,21 @@ class DDMTrainingCoordinator:
                 bar_format="{l_bar}{bar:20}{r_bar}"
             )
 
+        # Ensure all ranks are synchronized before initialization
+        if is_dist_initialized():
+            synchronize()
+        
+        # Verify GPU device is correctly set
+        if torch.cuda.is_available():
+            # Force set device to match rank
+            torch.cuda.set_device(self.rank)
+            # Verify the device is correctly set
+            current_device = torch.cuda.current_device()
+            if current_device != self.rank:
+                logger.warning(f"Device mismatch! Rank {self.rank} is using device {current_device}")
+                # Try to correct it
+                torch.cuda.set_device(self.rank)
+        
         # Initialize dataset FIRST in main thread to ensure tqdm safety
         self._init_data_loaders()
 
@@ -155,6 +170,15 @@ class DDMTrainingCoordinator:
             finally:
                 if pbar:
                     pbar.close()
+        
+        # Final sync and memory check
+        if is_dist_initialized():
+            synchronize()
+            # Log memory usage after initialization
+            if self.verbose:
+                mem_allocated = torch.cuda.memory_allocated(self.device) / 1e9  # GB
+                mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9  # GB
+                logger.info(f"Rank {self.rank} memory after init: Allocated={mem_allocated:.2f}GB, Reserved={mem_reserved:.2f}GB")
     
     def _init_data_loaders(self):
         """Initialize data loaders without multiprocessing to avoid pickling requirements"""

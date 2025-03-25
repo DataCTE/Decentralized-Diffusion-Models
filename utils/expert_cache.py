@@ -4,6 +4,7 @@ import torch
 import logging
 import threading
 from collections import OrderedDict
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 logger = logging.getLogger(__name__)
 
@@ -37,44 +38,58 @@ class ExpertCacheManager:
         
         logger.info(f"Initialized simplified ExpertCacheManager with max_experts={self.max_experts}, cpu_offload={self.cpu_offload}")
     
-    def get_expert(self, expert_idx, expert_builder_fn):
-        """
-        Get an expert model, loading it if necessary
+    def get_expert(self, expert_idx, expert_factory_fn=None):
+        """Get expert from cache, loading if necessary"""
+        try:
+            # Try to get from active cache
+            if expert_idx in self.active_experts:
+                return self.active_experts[expert_idx]
+            
+            # Not in active cache, check if it's offloaded
+            if expert_idx in self.offloaded_experts:
+                # Load from CPU back to GPU
+                expert = self.offloaded_experts[expert_idx]
+                # Move to correct device - FSDP-aware
+                if isinstance(expert, FSDP):
+                    # For FSDP models, we need special handling
+                    with FSDP.summon_full_params(expert):
+                        # Just activate the parameters, FSDP handles the device placement
+                        pass
+                else:
+                    # Regular model, just move to device
+                    expert = expert.to(self.device)
+                
+                # Add to active cache
+                self.active_experts[expert_idx] = expert
+                # Remove from offloaded cache
+                del self.offloaded_experts[expert_idx]
+                return expert
+            
+            # Not in any cache, create new expert
+            if expert_factory_fn:
+                expert = expert_factory_fn(expert_idx)
+                # Add directly to active cache
+                self.active_experts[expert_idx] = expert
+                
+                # Ensure we don't exceed max active experts
+                self._enforce_cache_limits()
+                
+                return expert
+            
+            # No factory function and expert not found
+            return None
         
-        Args:
-            expert_idx: Expert index
-            expert_builder_fn: Function to build expert if not cached
-            
-        Returns:
-            Expert model on target device
-        """
-        with self.cache_lock:
-            # Check if expert is already in GPU cache
-            if expert_idx in self.expert_cache:
-                # Move expert to end of LRU order
-                expert = self.expert_cache.pop(expert_idx)
-                self.expert_cache[expert_idx] = expert
-                return expert
-                
-            # Check if expert is in CPU cache
-            if self.cpu_offload and expert_idx in self.cpu_cache:
-                # Load from CPU to GPU
-                logger.debug(f"Moving expert {expert_idx} from CPU to GPU")
-                expert = self.cpu_cache.pop(expert_idx)
-                expert = expert.to(self.device)
-                
-                # Add to GPU cache and manage cache size
-                self._add_to_cache(expert_idx, expert)
-                return expert
-            
-            # Expert not in cache, create it
-            logger.debug(f"Creating new expert {expert_idx}")
-            expert = expert_builder_fn(expert_idx)
-            expert = expert.to(self.device)
-            
-            # Add to cache and manage cache size
-            self._add_to_cache(expert_idx, expert)
-            return expert
+        except Exception as e:
+            logger.error(f"Error getting expert {expert_idx} from cache: {str(e)}")
+            # Attempt to recreate on error
+            if expert_factory_fn:
+                try:
+                    expert = expert_factory_fn(expert_idx)
+                    self.active_experts[expert_idx] = expert
+                    return expert
+                except Exception as inner_e:
+                    logger.error(f"Failed to recreate expert {expert_idx}: {str(inner_e)}")
+            return None
     
     def _add_to_cache(self, expert_idx, expert):
         """Add expert to cache, evicting if necessary"""

@@ -53,6 +53,10 @@ def main():
         rank, world_size = setup_distributed()
         device = torch.device(f"cuda:{rank}")
         
+        # Force FSDP configuration to FULL_SHARD for maximum parameter distribution
+        # This ensures models are fully sharded across all GPUs
+        config.fsdp_sharding_strategy = "FULL_SHARD"
+        
         # Add model size estimation here, AFTER distributed setup
         if rank == 0:
             print("Estimating ExpertMMDiT model size:")
@@ -89,6 +93,18 @@ def main():
             world_size=world_size,
             cache_manager=cache_manager
         )
+        
+        # Add verification after initialization
+        if rank == 0:
+            print("\nVerifying FSDP model distribution...")
+            print("="*50)
+            
+        # Verify FSDP for all ranks
+        if hasattr(coordinator, '_verify_sharding'):
+            coordinator._verify_sharding()
+            
+        # Wait for verification to complete
+        dist.barrier()
         
         # Train
         coordinator.train(config.num_steps)
