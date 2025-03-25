@@ -247,12 +247,28 @@ class DDMTrainingCoordinator:
         )
     
     def _init_expert_indices(self):
-        """Determine expert assignments without model creation"""
+        """
+        Determine expert assignments based on paper's Section 3.2 - each expert 
+        trains independently on its assigned data cluster
+        """
+        # Current implementation: Simple round-robin assignment
         self.expert_indices = [
             idx for idx in range(self.config.num_experts)
             if idx % self.world_size == self.rank
         ]
-        logger.info(f"Rank {self.rank} will manage {len(self.expert_indices)} experts")
+        
+        # Should be modified to:
+        cluster_sizes = self.train_loader.dataset.get_cluster_sizes()  # Get size of each cluster
+        min_size = self.config.min_cluster_samples  # From paper Section 4.1
+        
+        # Filter out clusters that are too small
+        valid_clusters = [
+            idx for idx in range(self.config.num_experts)
+            if cluster_sizes[idx] >= min_size and idx % self.world_size == self.rank
+        ]
+        
+        self.expert_indices = valid_clusters
+        logger.info(f"Rank {self.rank} managing {len(self.expert_indices)} experts with valid cluster sizes")
     
     def _init_router(self):
         """Initialize router with async FSDP wrapping"""
@@ -265,73 +281,39 @@ class DDMTrainingCoordinator:
         )
     
     def train(self, num_steps):
-        """Train the DDM system for the specified number of steps"""
+        """Train the DDM system following paper's Section 4"""
         print(f"[Rank {self.rank}] Starting training with {num_steps} steps")
-        print(f"[Rank {self.rank}] First 5 latent files: {self.train_loader.dataset.latent_files[:5]}")
         
-        # Initialize flow matcher on first use
-        if self.flow_matcher is None:
-            print(f"[Rank {self.rank}] Initializing flow matcher...")
-        
-        global_step = 0
-        start_time = time.time()
+        # Paper's training phases and intervals
+        expert_update_interval = getattr(self.config, 'expert_update_interval', 1000)
+        router_update_interval = getattr(self.config, 'router_update_interval', 100)
         
         for step in range(num_steps):
             try:
-                print(f"\n[Rank {self.rank}] Step {step}: Getting batch...")
                 batch = next(iter(self.train_loader))
-                
-                # Skip invalid batches
                 if batch is None:
-                    print(f"[Rank {self.rank}] Skipping invalid batch in step {step}")
                     continue
-                    
-                print(f"[Rank {self.rank}] Batch keys: {batch.keys()}")
-                print(f"[Rank {self.rank}] Batch shapes:")
-                for k, v in batch.items():
-                    print(f"{k}: {v.shape if hasattr(v, 'shape') else type(v)}")
                 
-                step_start_time = time.time()
-                
-                # Expert training phase
+                # 1. Expert Training Phase
                 expert_loss = self.train_experts(batch)
                 
-                # Router update phase
-                router_loss = self.train_router(batch)
+                # 2. Router Update Phase (Section 3.3)
+                # Router only trains on rank 0 and at specified intervals
+                router_loss = 0.0
+                if self.rank == 0 and step % router_update_interval == 0:
+                    router_loss = self.train_router(batch)
                 
-                step_duration = time.time() - step_start_time
-                global_step += 1
-                
-                # Log metrics to wandb on rank 0
-                if self.rank == 0 and self.wandb_enabled:
-                    self._log_step_metrics_to_wandb(
-                        step=global_step,
-                        expert_loss=expert_loss,
-                        router_loss=router_loss,
-                        step_duration=step_duration,
-                        learning_rates=self._get_learning_rates(),
-                        memory_stats=self._get_memory_stats() if getattr(self.config, 'wandb_log_memory', True) else None
-                    )
-                
-                # Log every N steps
-                if step % 100 == 0 or step == num_steps - 1:
-                    logger.info(f"Step {step}/{num_steps}: Expert loss = {expert_loss:.4f}, Router loss = {router_loss:.4f}")
-                    
-                # Modified periodic validation with config check
-                if self.config.enable_validation and step % self.config.validate_every == 0:
-                    self.validate(step)
-                    
-                # Modified checkpoint saving with config check
-                if self.config.enable_checkpointing and step > 0 and step % self.config.save_every == 0:
-                    self.save_checkpoint(step)
-                
-                # Paper's dynamic expert scheduling
-                if step % self.config.expert_reshuffle_interval == 0:
+                # 3. Expert Redistribution Phase (Section 4.1)
+                if step % expert_update_interval == 0:
                     self._redistribute_experts()
                 
-                # Paper's gradient isolation
-                self._isolate_gradients()
-            
+                # Log metrics
+                if self.rank == 0:
+                    self._log_step_metrics_to_wandb(
+                        step=step,
+                        expert_loss=expert_loss,
+                        router_loss=router_loss
+                    )
             except Exception as e:
                 print(f"[Rank {self.rank}] Critical error in step {step}:")
                 print(f"Exception type: {type(e).__name__}")
@@ -341,7 +323,6 @@ class DDMTrainingCoordinator:
                 raise
         
         # Log final training stats
-        total_duration = time.time() - start_time
         if self.rank == 0 and self.wandb_enabled:
             import wandb
             import threading
@@ -350,9 +331,7 @@ class DDMTrainingCoordinator:
             def final_log_thread():
                 try:
                     wandb.log({
-                        "training_complete": True,
-                        "total_training_duration": total_duration,
-                        "steps_per_second": num_steps / total_duration
+                        "training_complete": True
                     }, commit=True)  # Use commit=True for final log
                 except Exception as e:
                     print(f"Warning: W&B final logging error: {e}")
@@ -395,23 +374,26 @@ class DDMTrainingCoordinator:
         return total_loss / max(len(self.expert_indices), 1)
     
     def train_router(self, batch):
-        """Train the router with the provided batch"""
-        # Remove reference to non-existent self.verbose attribute
-        # Replace with a config-based check or default to False
-        verbose = getattr(self.config, 'verbose_router_training', False)
-        
-        if self.rank == 0 and verbose:
-            logger.debug("Training router...")
-        
-        try:
-            # Train step now doesn't require cluster_idx
-            loss = self.router.train_step(batch)
-            return loss
-        except Exception as e:
-            logger.error(f"Router training failed: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return float('inf')  # Return a placeholder value to continue training
+        """
+        Train router following paper's Section 3.3 - router predicts cluster
+        probabilities p(k|x_t, t) using cross-entropy loss
+        """
+        if self.rank == 0:  # Router trains only on rank 0
+            try:
+                # Get cluster assignments from batch
+                true_clusters = batch['expert']
+                
+                # Train router with cross-entropy loss as described in paper
+                loss = self.router.train_step(
+                    batch,
+                    true_clusters=true_clusters,
+                    temperature=self.config.router_temperature
+                )
+                return loss
+            except Exception as e:
+                logger.error(f"Router training failed: {str(e)}")
+                return float('inf')
+        return 0.0
     
     def validate(self, step):
         """Run validation using DDM inference process"""
@@ -825,18 +807,32 @@ class DDMTrainingCoordinator:
                 pass
 
     def _redistribute_experts(self):
-        """Paper's expert redistribution strategy (Section 4.1)"""
-        # 1. Analyze cluster distributions
-        cluster_counts = self.dataset.get_cluster_distribution()
+        """
+        Implement paper's expert redistribution strategy (Section 4.1)
+        """
+        # Get cluster statistics
+        cluster_counts = self.train_loader.dataset.get_cluster_distribution()
+        active_clusters = torch.where(cluster_counts >= self.config.min_cluster_samples)[0]
         
-        # 2. Reassign underutilized experts
+        # Identify underutilized experts
         for expert_idx in self.expert_indices:
             if cluster_counts[expert_idx] < self.config.min_cluster_samples:
-                new_cluster = torch.argmax(cluster_counts).item()
-                self.expert_cache.reassign_expert(expert_idx, new_cluster)
-            
-        # 3. Reset optimizer states
-        self.router.optimizer.zero_grad()
+                # Find largest unassigned cluster
+                new_cluster = None
+                max_count = 0
+                for cluster_idx in active_clusters:
+                    if (cluster_counts[cluster_idx] > max_count and 
+                        cluster_idx not in self.expert_indices):
+                        new_cluster = cluster_idx
+                        max_count = cluster_counts[cluster_idx]
+                
+                if new_cluster is not None:
+                    # Reassign expert
+                    self.expert_indices[self.expert_indices.index(expert_idx)] = new_cluster
+                    # Reset expert parameters as described in paper
+                    expert = self.cache_manager.get_expert(expert_idx)
+                    expert.reset_parameters()
+                    logger.info(f"Expert {expert_idx} reassigned to cluster {new_cluster}")
 
     def _isolate_gradients(self):
         # Implementation of _isolate_gradients method

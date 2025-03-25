@@ -82,43 +82,39 @@ class RouterTrainer:
         )
 
     def train_step(self, batch):
-        """Train router with actual text embeddings per paper section 3.3"""
-        # Use precomputed latents from dataset instead of re-encoding
-        latents = batch["latent"].to(self.device)  # Direct latent access
+        """Train router with cross-entropy loss per paper Section 3.3"""
+        latents = batch["latent"].to(self.device)
         targets = batch["expert"].to(self.device)
         text_embeds = batch["clip_embedding"].to(self.device)
         
-        scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
-        with torch.amp.autocast('cuda', enabled=self.config.use_mixed_precision):
-            # Remove VAE encoding - use precomputed latents directly
-            t_indices = torch.randint(0, 1000, (latents.size(0),), device=self.device)
-            t = t_indices.float() / 1000.0
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            # Sample timestep uniformly as in paper
+            t = torch.rand(latents.size(0), device=self.device)
             
-            # Forward process using precomputed latents as x0
-            alpha_t = torch.cos((t + 0.008)/1.008 * math.pi/2).pow(2)[:,None,None,None]
+            # Forward diffusion process (Section 3.1)
+            alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
             sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
-            latent_t = alpha_t * latents + sigma_t * torch.randn_like(latents)
+            noise = torch.randn_like(latents)
+            x_t = alpha_t * latents + sigma_t * noise
             
-            logits = self.router(latent_t, t_indices, text_embeds)
+            # Get router predictions with temperature annealing
+            logits = self.router(x_t, t * 1000, text_embeds)
             
+            # Paper's cross-entropy loss
             loss = self.criterion(logits, targets)
         
-        # Optimize with gradient isolation
+        # Optimize
         self.optimizer.zero_grad()
-        scaler.scale(loss).backward()
+        loss.backward()
         
-        # Apply gradient clipping if configured
-        if hasattr(self.config, 'max_grad_norm') and self.config.max_grad_norm > 0:
+        # Paper's gradient clipping
+        if self.config.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(
                 self.router.parameters(), 
                 self.config.max_grad_norm
             )
         
-        # Finish optimization
-        scaler.step(self.optimizer)
-        scaler.update()
-        
-        # Update learning rate
+        self.optimizer.step()
         self.lr_scheduler.step()
         
         return loss.item()
@@ -193,4 +189,79 @@ class RouterTrainer:
         """
         # Forward pass through the router
         return self.router(x_t, timesteps, text_embeddings)
+
+    def validate_router(self, val_loader):
+        """Validate router accuracy on validation set"""
+        self.router.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                latents = batch["latent"].to(self.device)
+                targets = batch["expert"].to(self.device)
+                text_embeds = batch["clip_embedding"].to(self.device)
+                
+                # Sample random timestep
+                t = torch.rand(latents.size(0), device=self.device)
+                
+                # Forward diffusion
+                alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
+                sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+                noise = torch.randn_like(latents)
+                x_t = alpha_t * latents + sigma_t * noise
+                
+                # Get predictions
+                logits = self.router(x_t, t * 1000, text_embeds)
+                predictions = torch.argmax(logits, dim=1)
+                
+                correct += (predictions == targets).sum().item()
+                total += targets.size(0)
+        
+        accuracy = correct / total
+        return accuracy
+
+    def get_expert_weights(self, x_t, t, text_embeddings=None, strategy='top_k', k=1):
+        """
+        Get expert combination weights for inference (Section 3.4)
+        
+        Args:
+            x_t: Noisy input at timestep t
+            t: Timestep values
+            text_embeddings: Optional text conditioning
+            strategy: Sampling strategy ('top_k', 'nucleus', etc.)
+            k: Number of experts to select for top-k
+        """
+        self.router.eval()
+        with torch.no_grad():
+            # Get logits
+            logits = self.router(x_t, t, text_embeddings)
+            probs = torch.softmax(logits, dim=-1)
+            
+            if strategy == 'top_k':
+                # Zero out all but top-k probabilities
+                topk_probs, indices = torch.topk(probs, k=k, dim=-1)
+                zeros = torch.zeros_like(probs)
+                zeros.scatter_(-1, indices, topk_probs)
+                weights = zeros / zeros.sum(dim=-1, keepdim=True)
+                
+            elif strategy == 'nucleus':
+                # Nucleus (top-p) sampling
+                sorted_probs, indices = torch.sort(probs, descending=True)
+                cumsum = torch.cumsum(sorted_probs, dim=-1)
+                mask = cumsum <= self.config.top_p
+                mask[..., 0] = True  # Always keep top probability
+                
+                # Zero out filtered probabilities
+                filtered_probs = sorted_probs * mask
+                weights = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
+                
+                # Restore original ordering
+                reverse_indices = torch.argsort(indices)
+                weights = torch.gather(weights, -1, reverse_indices)
+                
+            else:
+                weights = probs  # Use raw probabilities
+                
+            return weights
             

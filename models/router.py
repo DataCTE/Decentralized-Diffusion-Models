@@ -27,9 +27,15 @@ class SelfAttentionBlock(nn.Module):
         return x
 
 class RouterModel(nn.Module):
-    """Implements lightweight router from Paper Appendix A.3"""
+    """Implements lightweight router from Paper Section 3.3"""
     def __init__(self, config):
         super().__init__()
+        # Paper's temperature schedule
+        self.initial_temp = 2.0  # Initial temperature
+        self.min_temp = 0.5     # Minimum temperature
+        self.temp_decay = 0.99995  # Decay rate
+        self.current_step = 0
+        
         # Embedding layer
         self.embedder = nn.Conv2d(
             config.latent_channels, 
@@ -73,10 +79,6 @@ class RouterModel(nn.Module):
             nn.Linear(config.router_hidden_size, config.num_experts)
         )
         
-        # Add temperature decay
-        self.temperature = 2.0  # Initial temperature (paper default)
-        self.temp_decay = 0.99995  # Paper's annealing rate
-        
         # Initialize weights with smaller values for stability
         self._init_weights()
         
@@ -95,12 +97,7 @@ class RouterModel(nn.Module):
 
     def forward(self, x, t, text_embeddings):
         """
-        Args:
-            x: Input tensor [B, C, H, W]
-            t: Timestep tensor [B,]
-            text_embeddings: Text embeddings for conditioning
-        Returns:
-            logits: Expert logits [B, num_experts]
+        Forward pass with temperature annealing (Section 3.3)
         """
         batch_size = x.shape[0]
         
@@ -134,12 +131,11 @@ class RouterModel(nn.Module):
         cls_output = x[:, 0]
         logits = self.classifier(cls_output)
         
-        return logits / self.temperature
-    
-    def update_temperature(self):
-        """Exponential temperature decay"""
-        self.temperature = max(0.5, self.temperature * self.temp_decay)
-    
-    def get_temperature(self):
-        """Get the current temperature value"""
-        return self.temperature 
+        # Apply temperature scaling with decay
+        temperature = max(
+            self.min_temp,
+            self.initial_temp * (self.temp_decay ** self.current_step)
+        )
+        self.current_step += 1
+        
+        return logits / temperature 

@@ -104,71 +104,56 @@ class ExpertTrainer(BaseTrainer):
         return F.mse_loss(pred_flow, target_flow)
 
     def train_step(self, batch):
-        """Execute a single training step"""
+        """Execute single training step per paper Section 3.2"""
         self.expert.train()
         self.optimizer.zero_grad()
         
-        # Extract and reshape inputs from batch
-        latents = batch['latent']  # [B, 1, C, H, W]
-        B, _, C, H, W = latents.shape
-        latents = latents.squeeze(1)  # [B, C, H, W]
+        # Get inputs
+        latents = batch['latent'].to(self.device)  # [B, C, H, W]
+        clip_emb = batch['clip_embedding'].to(self.device)  # [B, seq_len, dim]
+        cluster_ids = batch['expert'].to(self.device)  # [B]
         
-        # Get CLIP embeddings
-        clip_emb = batch['clip_embedding']  # [B, 1, seq_len, dim]
-        clip_emb = clip_emb.squeeze(1)  # [B, seq_len, dim]
+        # Sample timestep uniformly
+        t = torch.rand(latents.size(0), device=self.device)
         
-        # Calculate patch dimensions
-        h = H // self.config.patch_size
-        w = W // self.config.patch_size
+        # Forward diffusion process
+        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
+        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+        noise = torch.randn_like(latents)
+        x_t = alpha_t * latents + sigma_t * noise
         
-        # Reshape image to sequence format as expected by Flux
-        img_seq = latents.view(B, C, h * w).permute(0, 2, 1)  # [B, L, C]
+        # Prepare position embeddings
+        h = latents.shape[2] // self.config.patch_size
+        w = latents.shape[3] // self.config.patch_size
+        img_ids = self._get_position_ids(latents)
+        txt_ids = self._get_text_position_ids(clip_emb)
         
-        # Create position IDs for patches
-        pos_h = torch.arange(h, device=self.device)
-        pos_w = torch.arange(w, device=self.device)
-        img_ids = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), dim=-1)
-        img_ids = img_ids.reshape(-1, 2)  # [h*w, 2]
-        img_ids = img_ids[None].expand(B, -1, -1)  # [B, h*w, 2]
-        
-        # Create position IDs for text
-        txt_ids = torch.arange(clip_emb.size(1), device=self.device)
-        txt_ids = torch.stack([
-            txt_ids // self.config.max_token_length,
-            txt_ids % self.config.max_token_length
-        ], dim=-1)
-        txt_ids = txt_ids[None].expand(B, -1, -1)  # [B, seq_len, 2]
-        
-        # Sample timesteps uniformly as in paper
-        timesteps = torch.rand(B, device=self.device)
-        
-        # Generate conditioning vector
-        y = torch.randn(B, self.config.vec_in_dim, device=self.device)
-        
-        # Forward pass through expert with mixed precision
+        # Forward pass through expert
         with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            # Predict flow
             pred_flow = self.expert(
-                img=img_seq,           # [B, h*w, C]
-                img_ids=img_ids,       # [B, h*w, 2]
-                txt=clip_emb,          # [B, seq_len, dim]
-                txt_ids=txt_ids,       # [B, seq_len, 2]
-                timesteps=timesteps,   # [B]
-                y=y,                   # [B, vec_dim]
-                cluster_ids=batch['expert']  # [B]
+                img=x_t,
+                img_ids=img_ids,
+                txt=clip_emb,
+                txt_ids=txt_ids,
+                timesteps=t,
+                y=self._get_conditioning(latents.shape[0]),
+                cluster_ids=cluster_ids
             )
             
-            # Reshape predicted flow back to image format
-            pred_flow = pred_flow.view(B, h * w, -1)
-            pred_flow = pred_flow.permute(0, 2, 1).view(B, -1, h, w)
+            # Compute flow matching target
+            target_flow = (latents - alpha_t * x_t) / (sigma_t**2 + 1e-7)
             
-            # Compute flow matching loss
-            target_flow = self.flow_matcher.compute_target_flow(latents, timesteps)
-            loss = self.flow_matcher.compute_flow_matching_loss(pred_flow, target_flow)
+            # Paper's flow matching loss
+            loss = F.mse_loss(pred_flow, target_flow)
         
-        # Optimization step
+        # Optimize
         loss.backward()
         if self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.expert.parameters(), self.config.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(
+                self.expert.parameters(),
+                self.config.max_grad_norm
+            )
         self.optimizer.step()
         self.lr_scheduler.step()
         
