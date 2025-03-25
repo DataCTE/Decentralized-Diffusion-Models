@@ -37,11 +37,17 @@ DEFAULT_CONFIG = {
     'in_channels': 3,
     'out_channels': 16,
     'num_heads': 12,            # Attention heads per layer
-    'num_layers': 24,           # Total transformer blocks
-    'patch_size': 2,            # Input patch dimension 
+    'depth': 24,                # Transformer blocks with double stream
+    'depth_single_blocks': 2,   # Transformer blocks with single stream
+    'patch_size': 2,            # Input patch dimension
     'mlp_ratio': 4.0,           # FFN expansion factor
     'qkv_bias': True,           # Enable QKV projection biases
     'qk_rmsnorm': True,         # Use RMSNorm for Q/K projections
+    'axes_dim': [32, 32],       # Positional embedding axes dimension
+    'theta': 10000,             # RoPE base frequency
+    'vec_in_dim': 768,          # Input dimension for conditioning vector
+    'context_in_dim': 768,      # Input dimension for text context
+    'guidance_embed': False,     # Enable guidance embedding layer
 
     # ===== Expert Configuration =====
     'num_experts': 8,           # Number of data clusters
@@ -119,13 +125,6 @@ DEFAULT_CONFIG = {
     # ===== Expert Cache parameters =====
    
     'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
-    'axes_dim': [32, 32],  # Add this line for axes_dim
-    'theta': 10000,  # Add this line for theta
-    'vec_in_dim': 768,  # Add this line for vec_in_dim
-    'guidance_embed': False,  # Add this line for guidance_embed
-    'context_in_dim': 768,  # Add this line for context_in_dim
-    'depth': 24,             # Add this line for depth
-    'depth_single_blocks': 2, # Add this line for depth_single_blocks
     
     # Add to DEFAULT_CONFIG
     'use_gradient_checkpointing': True,
