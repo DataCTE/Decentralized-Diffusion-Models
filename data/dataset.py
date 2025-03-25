@@ -35,8 +35,6 @@ import torch.distributed as dist
 
 from queue import Queue, Full
 from threading import Thread, Event
-import lmdb
-import pickle
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from list"""
