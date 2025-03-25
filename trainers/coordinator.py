@@ -151,11 +151,11 @@ class DDMTrainingCoordinator:
         """Initialize data loaders without multiprocessing to avoid pickling requirements"""
         debug_print(f"Initializing data loaders on rank {self.rank}", self.rank)
         
-        # Shared configuration for DataLoader
+        # Shared configuration for DataLoader - disable multiprocessing
         loader_config = {
-            'num_workers': 4,  # Use some workers for faster loading
-            'pin_memory': False,  # Enable pinned memory for faster GPU transfer
-            'prefetch_factor': 2
+            'num_workers': 0,  # Disable multiprocessing
+            'pin_memory': True,  # Keep pin_memory for faster GPU transfer
+            'persistent_workers': False  # Disable persistent workers since we're not using multiprocessing
         }
         
         # Initialize training dataset
@@ -173,35 +173,14 @@ class DDMTrainingCoordinator:
                 drop_last=True  # Drop incomplete batches
             )
             
-            # Improved collate function that handles tensor size mismatches
+            # Simplified collate function that handles tensor size mismatches
             def collate_fn(batch):
-                # Group by actual dimensions
-                grouped = defaultdict(list)
-                for item in batch:
-                    key = (item['latent'].shape[-2], item['latent'].shape[-1])
-                    grouped[key].append(item)
-                
-                # Process largest valid group
-                valid_groups = []
-                for key, group in grouped.items():
-                    # Validate CLIP embedding sizes
-                    clip_sizes = set(x['clip_embedding'].size(1) for x in group)
-                    if len(clip_sizes) == 1 and len(group) >= self.config.batch_size // 2:
-                        valid_groups.append((len(group), group))
-                
-                if not valid_groups:
-                    # Fallback to smallest complete batch
-                    return None
-                
-                # Use largest valid group
-                _, group = max(valid_groups, key=lambda x: x[0])
-                
                 try:
                     return {
-                        'latent': torch.stack([i['latent'] for i in group]),
-                        'clip_embedding': torch.stack([i['clip_embedding'] for i in group]),
-                        'bucket': torch.stack([i['bucket'] for i in group]),
-                        'expert': torch.stack([i['expert'] for i in group])
+                        'latent': torch.stack([i['latent'] for i in batch]),
+                        'clip_embedding': torch.stack([i['clip_embedding'] for i in batch]),
+                        'bucket': torch.stack([i['bucket'] for i in batch]),
+                        'expert': torch.stack([i['expert'] for i in batch])
                     }
                 except Exception as e:
                     logger.error(f"Collation error: {str(e)}")
