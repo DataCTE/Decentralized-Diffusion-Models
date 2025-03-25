@@ -124,11 +124,20 @@ class RouterModel(nn.Module):
 
         # Text embedding integration - Project text and reduce sequence dimension first
         text_emb = self.text_embed_proj(txt)  # Either [B, L, D] or [B, D]
+
         # If the projected text embeddings are 3D, average over the token dimension
+        # Handle both possible dimension arrangements
         if text_emb.dim() == 3:
-            text_emb = text_emb.mean(dim=1)  # [B, D]
-        # If they are already 2D, assume they are already reduced
-        x = x + text_emb  # Now both x and text_emb are [B, D]
+            if text_emb.shape[1] == self.config.clip_embedding_dim:
+                # Handle [B, D, L] format
+                text_emb = text_emb.mean(dim=2)
+            else:
+                # Handle [B, L, D] format
+                text_emb = text_emb.mean(dim=1)
+
+        # Verify dimensions match before addition
+        assert x.shape == text_emb.shape, f"Shape mismatch: x={x.shape}, text_emb={text_emb.shape}"
+        x = x + text_emb
 
         # Prepare for transformer - ensure correct dimensions
         x = x.unsqueeze(1)  # [B, 1, D]
