@@ -177,27 +177,48 @@ class FeatureGenerator:
         
         try:
             if self.rank == 0:
-                # Move feature loading to CPU
                 feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
-                features = []
+                total_files = len(feature_files)
                 
-                with tqdm(total=len(feature_files), desc="Loading features") as pbar:
-                    for f in feature_files:
-                        try:
-                            feat = torch.load(f, map_location='cpu')
-                            if feat.shape == (1, 1024):
-                                features.append(feat.numpy())
-                            pbar.update(1)
-                        except Exception as e:
-                            print(f"Skipping corrupted file: {str(e)}")
+                # Memory map setup
+                mmap_path = self.feature_dir/"clusters/features.mmap"
+                sample_feat = torch.load(feature_files[0], map_location='cpu')
+                feat_dim = sample_feat.shape[1]
+                
+                # Create memory-mapped array
+                mmap_array = np.memmap(mmap_path, dtype=np.float32, mode='w+', 
+                                     shape=(total_files, feat_dim))
+                
+                # Batched parallel loading with write locking
+                batch_size = 4096
+                with tqdm(total=total_files, desc="Loading features") as pbar:
+                    with ThreadPoolExecutor(max_workers=32) as executor:
+                        for batch_idx in range(0, total_files, batch_size):
+                            batch_files = feature_files[batch_idx:batch_idx+batch_size]
+                            
+                            # Process batch
+                            futures = {executor.submit(self._safe_load_feature, f): i 
+                                     for i, f in enumerate(batch_files, batch_idx)}
+                            for future in as_completed(futures):
+                                idx = futures[future]
+                                try:
+                                    feat = future.result()
+                                    if feat is not None:
+                                        mmap_array[idx] = feat.numpy().squeeze()
+                                except Exception as e:
+                                    print(f"Skipping corrupted file: {str(e)}")
+                                pbar.update(1)
+                
+                # Filter out invalid entries in-place
+                valid_mask = ~np.all(mmap_array == 0, axis=1)
+                full_features = mmap_array[valid_mask]
+                full_features.flush()
 
-                full_features = np.concatenate(features)
-                
                 # CPU-only k-means
                 kmeans = faiss.Kmeans(
                     full_features.shape[1], 1024,
                     niter=100, 
-                    gpu=False,  # Force CPU
+                    gpu=False,
                     spherical=True,
                     min_points_per_centroid=100,
                     max_points_per_centroid=10000,
@@ -219,6 +240,10 @@ class FeatureGenerator:
                 _, labels = kmeans.index.search(full_features, 1)
                 cluster_labels = agg.labels_[labels.flatten()]
                 torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
+
+                # Cleanup memory map
+                del mmap_array
+                os.remove(mmap_path)
 
             # Synchronize after CPU completion
             clustering_status.fill_(2)

@@ -31,6 +31,7 @@ import signal
 logger = logging.getLogger(__name__)
 
 import math  # For BucketBatchSampler
+import torch.distributed as dist
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from list"""
@@ -53,9 +54,9 @@ class DDMDataset(Dataset):
         
         # 1. Distributed file discovery
         self.latent_dir = os.path.join(config.feature_cache_path, "latents")
-        self.clip_dir = os.path.join(config.feature_cache_path, "clip_embeddings")
+        self.clip_dir = os.path.join(config.feature_cache_path, "clip")
         self.cluster_dir = os.path.join(config.feature_cache_path, "clusters")
-        self.dim_dir = os.path.join(config.feature_cache_path, "dimensions")
+        self.dim_dir = os.path.join(config.feature_cache_path, "dims")
         self.bucket_dir = os.path.join(config.feature_cache_path, "buckets")
         
         # Verify all required directories exist
@@ -141,87 +142,34 @@ class DDMDataset(Dataset):
         return [f"{i:08d}.latent.pt" for i in range(count_tensor.item())]
 
     def _load_sharded_clusters(self):
-        """Distributed cluster loading with size alignment"""
-        total_samples = len(self.latent_files)
+        """Load clusters from single file with distributed sharding"""
+        cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
         
-        # Calculate equal shard sizes using ceiling division
-        shard_size = (total_samples + self.world_size - 1) // self.world_size
-        start = self.rank * shard_size
-        end = min(start + shard_size, total_samples)
+        if self.rank == 0:
+            all_clusters = torch.load(cluster_path)
+            chunks = torch.chunk(all_clusters, self.world_size)
+        else:
+            chunks = [None] * self.world_size
 
-        # Synchronize before starting progress bars
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-        pbar = tqdm(
-            total=end-start,
-            desc="Loading clusters" + (f" (Rank {self.rank})" if self.rank != 0 else ""),
-            leave=False,
-            bar_format="{l_bar}{bar:20}{r_bar}",
-            disable=not is_main_process(),
-            position=0
-        )
-
-        assignments = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(self._load_cluster_or_default, 
-                os.path.join(self.cluster_dir, fname.replace('.latent.pt', '.cluster.pt'))): fname 
-                for fname in self.latent_files[start:end]}
-            
-            for future in as_completed(futures):
-                tensor = future.result()
-                assignments.append(tensor)
-                pbar.update(1)
-
-        pbar.close()
-
-        # Pad with zeros if necessary to maintain equal shard sizes
-        current_count = len(assignments)
-        if current_count < shard_size:
-            padding = [torch.tensor([0], dtype=torch.long) for _ in range(shard_size - current_count)]
-            assignments.extend(padding)
-
-        assignments = torch.cat(assignments).cuda()
+        # Scatter chunks to all ranks
+        local_clusters = torch.empty_like(chunks[0]) if self.rank == 0 else None
+        dist.scatter(local_clusters, chunks, src=0)
         
-        # Distributed sync with padding
-        gathered = [torch.empty_like(assignments) for _ in range(self.world_size)]
-        torch.distributed.all_gather(gathered, assignments)
-        
-        # Concatenate and trim to actual total_samples
-        full_assignments = torch.cat(gathered).cpu()
-        return full_assignments[:total_samples]
-
-    def _load_cluster_or_default(self, path):
-        """Load cluster with dimension enforcement"""
-        try:
-            cluster = torch.load(path, map_location='cpu', mmap=True)
-            return cluster.view(-1)  # Ensure 1D tensor
-        except (FileNotFoundError, IOError, RuntimeError):
-            return torch.tensor([0], dtype=torch.long)  # 1D tensor
+        return local_clusters
 
     def _distributed_bucket_indices(self):
-        """Load precomputed bucket indices"""
+        """Load precomputed bucket indices with rank suffixes"""
         bucket_files = sorted([
             f for f in os.listdir(self.bucket_dir)
-            if f.endswith('.pt')
+            if f.endswith('.pt') and '_rank' in f
         ])
         
-        # Direct loading without filename parsing
-        bucket_indices = torch.zeros(len(bucket_files), dtype=torch.long, device=self.device)
+        # Load and concatenate all bucket indices
+        indices = []
+        for fname in bucket_files:
+            indices.append(torch.load(os.path.join(self.bucket_dir, fname)))
         
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(torch.load, os.path.join(self.bucket_dir, fname)): i
-                for i, fname in enumerate(bucket_files)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                bucket_indices[idx] = future.result().item()
-        
-        # Distributed sync
-        gathered = [torch.empty_like(bucket_indices) for _ in range(self.world_size)]
-        torch.distributed.all_gather(gathered, bucket_indices)
-        return torch.cat(gathered).cpu()
+        return torch.cat(indices)
 
     def __len__(self):
         return self.num_samples
@@ -308,9 +256,9 @@ class DDMDataset(Dataset):
         
         # Direct loading without existence checks
         return {
-            'latent': torch.load(f"{self.latent_dir}/{base}.latent.pt"),
-            'clip_embedding': torch.load(f"{self.clip_dir}/{base}.clip_emb.pt"),
-            'expert': torch.load(f"{self.cluster_dir}/{base}.cluster.pt"),
+            'latent': torch.load(f"{self.latent_dir}/{base}.pt"),
+            'clip_embedding': torch.load(f"{self.clip_dir}/{base}.pt"),
+            'expert': torch.load(f"{self.cluster_dir}/final_clusters.pt")[idx],
             'dims': torch.load(f"{self.dim_dir}/{base}.pt")
         }
 
