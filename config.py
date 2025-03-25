@@ -123,6 +123,9 @@ DEFAULT_CONFIG = {
     'theta': 10000,  # Add this line for theta
     'vec_in_dim': 768,  # Add this line for vec_in_dim
     'guidance_embed': False,  # Add this line for guidance_embed
+    'context_in_dim': 768,  # Add this line for context_in_dim
+    'depth': 24,             # Add this line for depth
+    'depth_single_blocks': 2, # Add this line for depth_single_blocks
     
     # Add to DEFAULT_CONFIG
     'use_gradient_checkpointing': True,
