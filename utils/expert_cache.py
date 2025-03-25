@@ -6,6 +6,7 @@ import threading
 from collections import OrderedDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from trainers.expert import wrap_model_with_fsdp
+import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 class ExpertCacheManager:
@@ -28,6 +29,7 @@ class ExpertCacheManager:
         self.device = device
         self.max_experts = max_experts or getattr(config, 'max_experts_in_memory', 3)
         self.cpu_offload = cpu_offload if cpu_offload is not None else getattr(config, 'expert_offload_to_cpu', True)
+        self.rank = dist.get_rank()  # Add rank attribute
         
         # Simple LRU cache using OrderedDict
         self.expert_cache = OrderedDict()  # Maps expert_idx -> expert model
