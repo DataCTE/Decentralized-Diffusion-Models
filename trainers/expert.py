@@ -166,9 +166,16 @@ class ExpertTrainer(BaseTrainer):
         latents = batch["latent"].to(self.device, non_blocking=True)
         text_embeds = batch["clip_embedding"].to(self.device, non_blocking=True)
         
-        # Get router-predicted clusters instead of using ground truth
+        # Get router-predicted clusters with proper timestep scaling
         with torch.no_grad():
-            cluster_ids = self.router.router(text_embeds).argmax(dim=-1)
+            # Generate proper timesteps scaled to [0, 1000)
+            router_t = torch.rand(text_embeds.size(0), device=text_embeds.device) * 1000
+            
+            # Pass scaled timesteps to router
+            cluster_ids = self.router.router(
+                txt=text_embeds,
+                timesteps=router_t
+            ).argmax(dim=-1)
         
         # Print shapes for debugging (using filtered tensors)
         print(f"[DEBUG Expert {self.expert_idx}] Processing {latents.shape[0]} samples for this expert.")

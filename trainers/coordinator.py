@@ -351,7 +351,7 @@ class DDMTrainingCoordinator:
         return {k: v.to(self.device) for k,v in batch.items()}
 
     def _train_experts_sync(self, batch):
-        """Train all experts synchronously with improved error handling"""
+        """Train all experts synchronously with real timesteps"""
         print(f"[DEBUG Coordinator] train_experts_sync called on rank {self.rank}")
         total_loss = 0.0
         num_experts = 0
@@ -378,11 +378,11 @@ class DDMTrainingCoordinator:
                 print(f"[DEBUG Coordinator] Getting expert {expert_idx} from cache")
                 expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
                 
-                # Generate dummy timesteps (assuming the router expects them but doesn't use them)
-                dummy_timesteps = torch.zeros(batch['latent'].shape[0], device=self.device)
+                # Generate real timesteps scaled to [0, 1000)
+                real_timesteps = torch.rand(batch['latent'].shape[0], device=self.device) * 1000
                 batch['cluster_pred'] = self.router.router(
                     img=batch['latent'],
-                    timesteps=dummy_timesteps,
+                    timesteps=real_timesteps,
                     txt=batch['clip_embedding']
                 ).argmax(dim=-1)
                 
@@ -425,16 +425,23 @@ class DDMTrainingCoordinator:
         torch.cuda.current_stream().wait_stream(stream)
 
     def _train_router_sync(self, batch):
-        """Router training with gradient synchronization"""
+        """Router training with real timesteps"""
         # Set modes
-        self.router.train()  # RouterTrainer has train() method
+        self.router.train()
         for expert_idx in self.expert_indices:
             expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
             expert.eval()
         
-        # Forward pass
+        # Generate proper timesteps scaled to [0, 1000) as in paper
+        timesteps = torch.rand(batch['latent'].shape[0], device=self.device) * 1000
+        
+        # Forward pass with real timesteps
         with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            loss = self.router.train_step(batch)  # Use RouterTrainer's train_step
+            loss = self.router.train_step(
+                batch,
+                timesteps=timesteps,
+                true_clusters=batch['expert']
+            )
         
         # Convert loss to tensor if it's a float
         if isinstance(loss, float):
