@@ -147,11 +147,27 @@ class ExpertTrainer(BaseTrainer):
         print(f"[DEBUG Expert {self.expert_idx}] Batch keys: {batch.keys()}")
         
         # Get data - ensure proper device placement
-        latents = batch["latent"].to(self.device, non_blocking=True)
-        text_embeds = batch["clip_embedding"].to(self.device, non_blocking=True)
-        cluster_ids = batch["expert"].to(self.device, non_blocking=True)
+        latents_full = batch["latent"].to(self.device, non_blocking=True)
+        text_embeds_full = batch["clip_embedding"].to(self.device, non_blocking=True)
+        cluster_ids_full = batch["expert"].to(self.device, non_blocking=True)
         
-        # Print shapes for debugging
+        # --- FIX: Filter batch for the current expert ---
+        expert_mask = (cluster_ids_full == self.expert_idx)
+        num_expert_samples = expert_mask.sum().item()
+        
+        if num_expert_samples == 0:
+            print(f"[DEBUG Expert {self.expert_idx}] No samples for this expert in the current batch. Skipping step.")
+            # Return 0 loss and indicate no samples were processed, or handle as appropriate
+            # Returning 0.0 is simple, but check if coordinator needs more info
+            return 0.0 
+            
+        latents = latents_full[expert_mask]
+        text_embeds = text_embeds_full[expert_mask]
+        cluster_ids = cluster_ids_full[expert_mask] # Pass only relevant cluster IDs
+        # --- END FIX ---
+
+        # Print shapes for debugging (using filtered tensors)
+        print(f"[DEBUG Expert {self.expert_idx}] Processing {num_expert_samples} samples for this expert.")
         print(f"[DEBUG Expert {self.expert_idx}] latents shape: {latents.shape}")
         print(f"[DEBUG Expert {self.expert_idx}] text_embeds shape: {text_embeds.shape}")
         print(f"[DEBUG Expert {self.expert_idx}] cluster_ids shape: {cluster_ids.shape}")
@@ -168,46 +184,46 @@ class ExpertTrainer(BaseTrainer):
                 latents = latents[:, 0]  # Take only first sequence if multiple
                 print(f"[DEBUG Expert {self.expert_idx}] Using first sequence, shape: {latents.shape}")
         # --- FIX: Reshape latents to [B, SeqLen, Channels] ---
-        B, C, H, W = latents.shape
-        img_seq = latents.reshape(B, C, H * W).permute(0, 2, 1) # Shape: [B, H*W, C]
+        B, C, H, W = latents.shape # B is now the number of samples for this expert
+        img_seq = latents.reshape(B, C, H * W).permute(0, 2, 1) # Shape: [B_expert, H*W, C]
         print(f"[DEBUG Expert {self.expert_idx}] Reshaped img_seq for model: {img_seq.shape}")
         # --- END FIX ---
         
         # Same for text embeddings if needed
         if text_embeds.dim() == 4:
-            B, S, L, D = text_embeds.shape
-            if S == 1:
+            B_txt, S_txt, L_txt, D_txt = text_embeds.shape # B_txt is B_expert
+            if S_txt == 1:
                 text_embeds = text_embeds.squeeze(1)
                 print(f"[DEBUG Expert {self.expert_idx}] Reshaped text_embeds to: {text_embeds.shape}")
         
         # Mixed precision context
         with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             # Random timesteps
-            t = torch.rand(latents.size(0), device=self.device)
+            t = torch.rand(latents.size(0), device=self.device) # Use B_expert size
             print(f"[DEBUG Expert {self.expert_idx}] timesteps shape: {t.shape}")
             
             try:
                 # --- FIX: Use reshaped img_seq and corrected position IDs ---
-                img_pos_ids = self._get_position_ids(latents) # Pass original 4D latents to get H, W
+                img_pos_ids = self._get_position_ids(latents) # Pass filtered 4D latents
                 print(f"[DEBUG Expert {self.expert_idx}] img_pos_ids shape: {img_pos_ids.shape}")
 
                 # Forward pass through expert model
                 print(f"[DEBUG Expert {self.expert_idx}] Calling expert forward pass")
                 pred_flow = self.expert(
-                    img=img_seq,                      # Use reshaped image sequence
-                    img_ids=img_pos_ids,              # Use generated position IDs
-                    txt=text_embeds,
-                    txt_ids=self._get_text_position_ids(text_embeds),
+                    img=img_seq,                      # Use filtered & reshaped image sequence
+                    img_ids=img_pos_ids,              # Use generated position IDs for filtered batch
+                    txt=text_embeds,                  # Use filtered text embeds
+                    txt_ids=self._get_text_position_ids(text_embeds), # Use filtered text embeds
                     timesteps=t * 1000,               # Scale timesteps
-                    y=self._get_conditioning(latents.shape[0]),
-                    cluster_ids=cluster_ids
+                    y=self._get_conditioning(latents.shape[0]), # Use B_expert size
+                    cluster_ids=cluster_ids           # Use filtered cluster IDs
                 )
                 # --- END FIX ---
                 print(f"[DEBUG Expert {self.expert_idx}] pred_flow shape: {pred_flow.shape}")
                 
                 # Calculate loss - need to reshape latents back if it was modified
                 print(f"[DEBUG Expert {self.expert_idx}] Computing loss with flow_matcher")
-                # Pass the reshaped prediction and original latents to the loss function
+                # Pass the reshaped prediction and original filtered latents to the loss function
                 loss = self.flow_matcher.compute_loss(pred_flow, latents, t)
                 print(f"[DEBUG Expert {self.expert_idx}] Loss value: {loss.item()}")
                 
