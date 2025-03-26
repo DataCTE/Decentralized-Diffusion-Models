@@ -428,18 +428,19 @@ class DDMTrainingCoordinator:
         """Router training with real timesteps"""
         # Set modes
         self.router.train()
-        for expert_idx in self.expert_indices:
-            expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
-            expert.eval()
+        
+        # Get latent input from batch
+        latents = batch['latent'].to(self.device)
         
         # Generate proper timesteps scaled to [0, 1000) as in paper
-        timesteps = torch.rand(batch['latent'].shape[0], device=self.device) * 1000
+        timesteps = torch.rand(latents.shape[0], device=self.device) * 1000
         
-        # Forward pass with real timesteps
+        # Forward pass with real timesteps AND latent input
         with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             loss = self.router.train_step(
                 batch,
                 timesteps=timesteps,
+                img=latents,  # Add latent input
                 true_clusters=batch['expert']
             )
         

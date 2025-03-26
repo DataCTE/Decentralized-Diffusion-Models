@@ -173,6 +173,7 @@ class ExpertTrainer(BaseTrainer):
             
             # Pass scaled timesteps to router
             cluster_ids = self.router.router(
+                img=latents,
                 txt=text_embeds,
                 timesteps=router_t
             ).argmax(dim=-1)
