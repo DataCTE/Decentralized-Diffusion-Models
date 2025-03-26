@@ -923,6 +923,10 @@ def main():
                         help='Manual override for T5 batch size')
     parser.add_argument('--debug', action='store_true',
                         help='Enable debug output for troubleshooting')
+    parser.add_argument('--regen-t5', action='store_true',
+                        help='Regenerate T5 embeddings from existing CLIP files')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Show verbose output including processed files')
     args = parser.parse_args()
 
     # Configure logging
@@ -979,6 +983,63 @@ def main():
     
     # Create feature cache directory if it doesn't exist
     os.makedirs(config.feature_cache_path, exist_ok=True)
+    
+    # Special handling for T5 regeneration from CLIP
+    if args.regen_t5 and 't5' in enabled_features:
+        if rank == 0:
+            logger.info("Setting up for T5 regeneration from CLIP embeddings")
+            clip_dir = Path(config.feature_cache_path) / "clip"
+            t5_dir = Path(config.feature_cache_path) / "t5"
+            
+            # Create T5 directory if it doesn't exist
+            t5_dir.mkdir(exist_ok=True)
+            
+            if not clip_dir.exists():
+                logger.error("CLIP directory not found. Cannot generate T5 embeddings.")
+                raise FileNotFoundError(f"CLIP directory {clip_dir} not found")
+            
+            # Get all CLIP UUIDs
+            clip_uuids = []
+            clip_files = list(clip_dir.glob("*.pt"))
+            logger.info(f"Found {len(clip_files)} CLIP files")
+            
+            # Extract UUIDs from filenames
+            for clip_file in clip_files:
+                uuid_str = clip_file.stem.split('_rank')[0]
+                clip_uuids.append(uuid_str)
+                
+            # Check if T5 files already exist
+            existing_t5_uuids = set()
+            if not args.force_recompute and t5_dir.exists():
+                for t5_file in t5_dir.glob("*.pt"):
+                    existing_t5_uuids.add(t5_file.stem.split('_rank')[0])
+                    
+            # Filter out UUIDs that already have T5 embeddings
+            if not args.force_recompute:
+                clip_uuids = [uuid for uuid in clip_uuids if uuid not in existing_t5_uuids]
+                
+            logger.info(f"Found {len(clip_uuids)} CLIP files needing T5 embeddings")
+            
+            # Load captions for these UUIDs
+            captions = []
+            for uuid_str in clip_uuids:
+                # Try to get caption from mapping
+                caption = _get_caption_from_mapping(config, uuid_str)
+                if caption:
+                    captions.append(caption)
+                else:
+                    logger.warning(f"No caption found for {uuid_str}, using empty placeholder")
+                    captions.append("")  # Use empty caption as placeholder
+            
+            # Save for distributed processing
+            with open(f"{config.feature_cache_path}/t5_task.pkl", 'wb') as f:
+                pickle.dump((clip_uuids, captions), f)
+                
+            # Flag that we're in captions-only mode for T5
+            with open(f"{config.feature_cache_path}/captions_only_mode", 'w') as f:
+                f.write("1")
+            
+            logger.info(f"Prepared {len(clip_uuids)} captions for T5 embedding generation")
     
     # Get image-caption pairs efficiently, respecting force-recompute flag
     result = _process_directory(
