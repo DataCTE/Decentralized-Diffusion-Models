@@ -507,15 +507,33 @@ class EmbedND(nn.Module):
         self.dim = dim
         self.theta = theta
         self.axes_dim = axes_dim
-
+        
     def forward(self, ids: Tensor) -> Tensor:
+        # Get the number of axes from the input tensor shape
         n_axes = ids.shape[-1]
-        emb = torch.cat(
-            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
-            dim=-3,
-        )
-
-        return emb.unsqueeze(1)
+        
+        # Check if n_axes matches the length of self.axes_dim
+        if n_axes > len(self.axes_dim):
+            # Handle the error gracefully by extending axes_dim with the last value
+            # or using a default value
+            extended_axes_dim = self.axes_dim + [self.axes_dim[-1]] * (n_axes - len(self.axes_dim))
+            
+            # Log this issue
+            print(f"Warning: Input has {n_axes} axes but axes_dim only has {len(self.axes_dim)} elements. Extending axes_dim.")
+            
+            # Create positional embeddings using the extended list
+            posemb = torch.cat(
+                [rope(ids[..., i], extended_axes_dim[i], self.theta) for i in range(n_axes)],
+                dim=-2
+            )
+        else:
+            # Original code path when dimensions match
+            posemb = torch.cat(
+                [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+                dim=-2
+            )
+        
+        return posemb
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -915,7 +933,7 @@ class Flux(nn.Module):
         cluster_ids: Tensor,  # [B] cluster indices per sample
         guidance: Tensor | None = None,
     ) -> Tensor:
-        print(f"[DEBUG MMDiT] forward called")
+        # Log shapes for debugging
         print(f"[DEBUG MMDiT] img shape: {img.shape}")
         print(f"[DEBUG MMDiT] img_ids shape: {img_ids.shape}")
         print(f"[DEBUG MMDiT] txt shape: {txt.shape}")
@@ -925,36 +943,28 @@ class Flux(nn.Module):
         print(f"[DEBUG MMDiT] cluster_ids shape: {cluster_ids.shape}")
         
         try:
-            # Get cluster embeddings [B, D]
+            # Ensure cluster_ids has correct dimensionality (add a dimension if it's just a batch)
+            if cluster_ids.dim() == 1:
+                # Add dimension for positional embedding (convert from [B] to [B, 1])
+                cluster_ids = cluster_ids.unsqueeze(-1)
+            
+            # Get positional embeddings for cluster indices
             cluster_embeddings = self.pe_embedder(cluster_ids)
             print(f"[DEBUG MMDiT] cluster_embeddings shape: {cluster_embeddings.shape}")
             
-            # Merge with conditioning
-            combined_cond = y + cluster_embeddings
+            # Project cluster embeddings to the model dimension
+            projected_embeddings = self.cluster_proj(cluster_embeddings.squeeze())
+            print(f"[DEBUG MMDiT] projected_embeddings shape: {projected_embeddings.shape}")
+            
+            # Combine with text embeddings
+            combined_cond = y + projected_embeddings
             print(f"[DEBUG MMDiT] combined_cond shape: {combined_cond.shape}")
             
-            # Continue with regular forward logic
-            result = super().forward(
-                img=img,
-                img_ids=img_ids,
-                txt=txt,
-                txt_ids=txt_ids,
-                timesteps=timesteps,
-                y=combined_cond,
-                cluster_ids=cluster_ids,
-                guidance=guidance
-            )
-            print(f"[DEBUG MMDiT] forward result shape: {result.shape}")
-            
-            # Explicitly ensure we only return one tensor
-            return result
-            
+            # Continue with the forward pass using the parent class's implementation
+            return super().forward(img, img_ids, txt, txt_ids, timesteps, combined_cond, cluster_ids, guidance)
         except Exception as e:
             print(f"[CRITICAL ERROR MMDiT] Forward pass failed: {str(e)}")
-            # Print detailed traceback
-            import traceback
-            traceback.print_exc()
-            # IMPORTANT: Raise the error instead of silently continuing
+            # Re-raise the exception to be caught by the training loop
             raise
 
 
@@ -992,16 +1002,25 @@ class ExpertMMDiT(Flux):
         super().__init__(params)
         self.num_clusters = params.num_clusters
         
-        # Initialize cluster embeddings
-        self.cluster_embed = nn.Embedding(params.num_clusters, params.cluster_embed_dim)
+        # Add more robust initialization for pe_embedder
+        # Ensure axes_dim is a list with at least one element
+        if not hasattr(params, 'axes_dim') or not params.axes_dim:
+            params.axes_dim = [16]  # Default value
         
-        # Add this new projection layer to match dimensions
-        self.cluster_projection = nn.Linear(params.cluster_embed_dim, params.vec_in_dim)
+        # Initialize positional embedding for cluster IDs
+        self.pe_embedder = EmbedND(
+            dim=params.cluster_embed_dim,
+            theta=params.theta,
+            axes_dim=params.axes_dim
+        )
+        
+        # Projection for cluster embeddings
+        self.cluster_proj = nn.Linear(params.cluster_embed_dim, params.hidden_size)
         
         # Initialize weights properly
-        nn.init.normal_(self.cluster_embed.weight, std=0.02)
-        nn.init.normal_(self.cluster_projection.weight, std=0.02)
-        nn.init.zeros_(self.cluster_projection.bias)
+        nn.init.normal_(self.pe_embedder.weight, std=0.02)
+        nn.init.normal_(self.cluster_proj.weight, std=0.02)
+        nn.init.zeros_(self.cluster_proj.bias)
 
     def forward(
         self,
@@ -1014,7 +1033,7 @@ class ExpertMMDiT(Flux):
         cluster_ids: Tensor,  # [B] cluster indices per sample
         guidance: Tensor | None = None,
     ) -> Tensor:
-        print(f"[DEBUG MMDiT] forward called")
+        # Log shapes for debugging
         print(f"[DEBUG MMDiT] img shape: {img.shape}")
         print(f"[DEBUG MMDiT] img_ids shape: {img_ids.shape}")
         print(f"[DEBUG MMDiT] txt shape: {txt.shape}")
@@ -1024,16 +1043,20 @@ class ExpertMMDiT(Flux):
         print(f"[DEBUG MMDiT] cluster_ids shape: {cluster_ids.shape}")
         
         try:
-            # Don't use pe_embedder, use the cluster_embed layer directly
-            # This fixes the dimensionality issue
-            cluster_embeddings = self.cluster_embed(cluster_ids)
+            # Ensure cluster_ids has correct dimensionality (add a dimension if it's just a batch)
+            if cluster_ids.dim() == 1:
+                # Add dimension for positional embedding (convert from [B] to [B, 1])
+                cluster_ids = cluster_ids.unsqueeze(-1)
+            
+            # Get positional embeddings for cluster indices
+            cluster_embeddings = self.pe_embedder(cluster_ids)
             print(f"[DEBUG MMDiT] cluster_embeddings shape: {cluster_embeddings.shape}")
             
-            # Project cluster embeddings to match conditioning dimension [B, vec_in_dim]
-            projected_embeddings = self.cluster_projection(cluster_embeddings)
+            # Project cluster embeddings to the model dimension
+            projected_embeddings = self.cluster_proj(cluster_embeddings.squeeze())
             print(f"[DEBUG MMDiT] projected_embeddings shape: {projected_embeddings.shape}")
             
-            # Now we can safely add the tensors with matching dimensions
+            # Combine with text embeddings
             combined_cond = y + projected_embeddings
             print(f"[DEBUG MMDiT] combined_cond shape: {combined_cond.shape}")
             
