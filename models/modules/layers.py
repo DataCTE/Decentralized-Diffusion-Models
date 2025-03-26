@@ -9,49 +9,20 @@ from models.modules.math import attention, rope
 
 
 class EmbedND(nn.Module):
-    """N-dimensional positional embeddings using RoPE (Rotary Position Embedding)"""
     def __init__(self, dim: int, theta: int, axes_dim: list[int]):
         super().__init__()
         self.dim = dim
         self.theta = theta
-        # Ensure axes_dim is a valid list with at least one element
-        self.axes_dim = list(axes_dim) if axes_dim else [dim]
-        
+        self.axes_dim = axes_dim
+
     def forward(self, ids: Tensor) -> Tensor:
-        from models.modules.math import rope  # Local import to avoid circular imports
-        
-        # Get number of axes from input tensor
         n_axes = ids.shape[-1]
-        
-        try:
-            # Handle case where input has more axes than expected
-            if n_axes > len(self.axes_dim):
-                print(f"Warning: Input has {n_axes} axes but axes_dim only has {len(self.axes_dim)} elements.")
-                
-                # Extend axes_dim by repeating the last element
-                extended_axes_dim = self.axes_dim.copy()
-                last_val = self.axes_dim[-1] if self.axes_dim else self.dim
-                extended_axes_dim.extend([last_val] * (n_axes - len(self.axes_dim)))
-                
-                # Create and concatenate embeddings for each axis
-                embeddings = []
-                for i in range(n_axes):
-                    embeddings.append(rope(ids[..., i], extended_axes_dim[i], self.theta))
-                posemb = torch.cat(embeddings, dim=-2)
-            else:
-                # Standard case: input dimensions match expected dimensions
-                embeddings = []
-                for i in range(n_axes):
-                    embeddings.append(rope(ids[..., i], self.axes_dim[i], self.theta))
-                posemb = torch.cat(embeddings, dim=-2)
-                
-            return posemb
-            
-        except Exception as e:
-            print(f"Error in EmbedND.forward: {e}")
-            # Return a basic positional embedding in case of error
-            batch_size = ids.shape[0]
-            return torch.zeros(batch_size, n_axes, self.dim // n_axes, 2, 2, device=ids.device)
+        emb = torch.cat(
+            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            dim=-3,
+        )
+
+        return emb.unsqueeze(1)
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):

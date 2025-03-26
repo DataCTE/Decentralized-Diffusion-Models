@@ -18,12 +18,8 @@ from data.clip import CLIPTextEncoder
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from concurrent.futures import as_completed
-from collections import defaultdict
 from tqdm.auto import tqdm
-import shutil
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from datetime import datetime, timedelta
 import time
 import argparse
 

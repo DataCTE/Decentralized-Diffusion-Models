@@ -6,7 +6,7 @@ This file integrates modular components from the modules directory.
 import torch
 from torch import Tensor, nn
 from dataclasses import dataclass
-import math
+
 
 # Import core modules
 from models.modules.layers import (
@@ -18,8 +18,7 @@ from models.modules.layers import (
     timestep_embedding
 )
 from models.modules.lora import LinearLora, replace_linear_with_lora
-from models.modules.conditioner import print_load_warning, CLIPEmbedder
-from models.modules.math import attention, rope, apply_rope
+
 
 
 @dataclass

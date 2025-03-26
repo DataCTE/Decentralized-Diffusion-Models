@@ -20,6 +20,7 @@ def print_load_warning(missing: list[str], unexpected: list[str]) -> None:
         print(f"Got {len(unexpected)} unexpected keys:\n\t" + "\n\t".join(unexpected))
 
 
+
 class DepthImageEncoder:
     depth_model_name = "LiheYoung/depth-anything-large-hf"
 
