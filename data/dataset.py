@@ -174,45 +174,72 @@ class DDMDataset(Dataset):
         """Load a sample by index, supporting both CLIP and T5 embeddings"""
         try:
             # Get filename from index mapping
-            filename = self.base_names[idx]
-            
+            base_name = self.base_names[idx] # Use base_name directly
+
+            # Initialize sample dictionary
+            sample = {}
+
             # Load latent feature
-            latent_path = os.path.join(self.latent_dir, f"{filename}_rank{self.rank}.pt")
-            latent = torch.load(latent_path, map_location='cpu')
-            
-            # Load text embedding (either CLIP, T5, or both depending on config)
-            text_embeddings = {}
-            
-            # CLIP embedding (always try to load if path exists)
-            if hasattr(self.config, 'use_clip') and self.config.use_clip:
-                clip_path = os.path.join(self.clip_dir, f"{filename}_rank{self.rank}.pt")
-                if os.path.exists(clip_path):
-                    text_embeddings['clip'] = torch.load(clip_path, map_location='cpu')
-            
-            # T5 embedding (load if configured)
+            latent_path = os.path.join(self.latent_dir, f"{base_name}_rank{self.rank}.pt")
+            if os.path.exists(latent_path):
+                sample['latent'] = torch.load(latent_path, map_location='cpu')
+            else:
+                if self.verbose:
+                    print(f"Missing latent file: {latent_path}")
+                # Decide how to handle missing essential data (e.g., skip, raise error)
+                # Returning None will cause the collate_fn to skip this sample
+                return idx, None
+
+            # --- MODIFIED CLIP EMBEDDING LOADING ---
+            # Load CLIP embedding using the expected key 'clip_embedding'
+            clip_path = os.path.join(self.clip_dir, f"{base_name}_rank{self.rank}.pt")
+            if os.path.exists(clip_path):
+                try:
+                    sample['clip_embedding'] = torch.load(clip_path, map_location='cpu')
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error loading CLIP embedding {clip_path}: {str(e)}")
+                    # Handle corrupted/unreadable file - returning None skips the sample
+                    return idx, None
+            else:
+                # If CLIP embeddings are required for training, this is a critical issue
+                # For now, we print a warning and skip the sample by returning None
+                # Consider raising an error if CLIP is mandatory
+                print(f"WARNING: Missing required CLIP embedding file: {clip_path}")
+                return idx, None
+            # --- END OF MODIFIED CLIP LOADING ---
+
+            # Load T5 embedding (if configured and exists)
+            # Note: The trainer might expect 't5_embedding' key if T5 is used
             if hasattr(self.config, 'use_t5') and self.config.use_t5:
-                t5_path = os.path.join(self.config.feature_cache_path, "t5", f"{filename}_rank{self.rank}.pt")
+                t5_path = os.path.join(self.config.feature_cache_path, "t5", f"{base_name}_rank{self.rank}.pt")
                 if os.path.exists(t5_path):
-                    text_embeddings['t5'] = torch.load(t5_path, map_location='cpu')
-            
+                    try:
+                        sample['t5_embedding'] = torch.load(t5_path, map_location='cpu') # Use 't5_embedding' key
+                    except Exception as e:
+                         if self.verbose:
+                            print(f"Error loading T5 embedding {t5_path}: {str(e)}")
+                         # Optionally handle T5 loading errors differently if T5 is optional
+
             # Get bucket and expert assignments
             bucket = self.bucket_assignments[idx] if self.bucket_assignments is not None else torch.tensor(0)
             expert = self.expert_assignments[idx] if self.expert_assignments is not None else torch.tensor(0)
             
             # Construct sample dictionary
             sample = {
-                'latent': latent,
+                'latent': sample['latent'],
                 'bucket': bucket,
                 'expert': expert,
-                **text_embeddings  # Add all available text embeddings
+                **sample  # Add all available text embeddings
             }
             
             return idx, sample
             
         except Exception as e:
             if self.verbose:
-                print(f"Error loading sample {idx}: {str(e)}")
-            return idx, None
+                # Log the specific file and index causing the error
+                print(f"Error loading sample at index {idx} (base_name: {self.base_names[idx]}): {str(e)}")
+            return idx, None # Return None to indicate failure for this sample
 
     def _load_bucket_assignments(self):
         """Load bucket assignments efficiently"""
@@ -237,24 +264,55 @@ class DDMDataset(Dataset):
 
     def __getitem__(self, idx):
         """Get item with cache"""
+        data = None # Initialize data to None
         if idx in self.cache:
-            data = self.cache[idx]
-        else:
+            # Ensure cached data is not None before using it
+            cached_item = self.cache[idx]
+            if cached_item is not None:
+                 data = cached_item
+            else:
+                 # If cached item is None (due to previous loading error), try loading again
+                 if self.verbose:
+                      print(f"Retrying load for previously failed index {idx} from cache.")
+                 idx_data = self._load_sample(idx)
+                 if idx_data[1] is not None:
+                      data = idx_data[1]
+                      # Update cache only if loading succeeds this time
+                      self.cache[idx] = data
+                 else:
+                      # If loading fails again, handle appropriately (e.g., raise error or return placeholder)
+                      # For now, raising an error might be best to avoid silent failures
+                      raise RuntimeError(f"Failed to load sample {idx} even after retry.")
+
+        else: # Not in cache, load it
             idx_data = self._load_sample(idx)
-            if idx_data[1] is None:
-                raise RuntimeError(f"Failed to load sample {idx}")
-            data = idx_data[1]
-            
-            # Update cache with LRU policy
-            if len(self.cache) >= self.cache_size:
-                oldest_idx = min(self.cache.keys())
-                del self.cache[oldest_idx]
-            self.cache[idx] = data
-        
-        # Add assignments
-        data['expert'] = self.expert_assignments[idx]
-        data['bucket'] = self.bucket_assignments[idx]
-        
+            if idx_data[1] is not None:
+                data = idx_data[1]
+                # Update cache with LRU policy only if loading succeeded
+                if len(self.cache) >= self.cache_size:
+                    # Simple LRU: remove the item with the smallest index (approximates oldest)
+                    try:
+                        oldest_idx = min(self.cache.keys())
+                        del self.cache[oldest_idx]
+                    except ValueError: # Cache might be empty
+                        pass
+                self.cache[idx] = data
+            else:
+                 # Store None in cache to avoid repeatedly trying to load a bad sample
+                 self.cache[idx] = None
+                 # Raise error to stop training if a sample cannot be loaded
+                 raise RuntimeError(f"Failed to load sample {idx}. Cannot continue.")
+
+
+        # Add assignments - Ensure these tensors are valid for the index
+        # These assignments are loaded in __init__ and should cover all valid indices
+        if idx < len(self.expert_assignments) and idx < len(self.bucket_assignments):
+             data['expert'] = self.expert_assignments[idx]
+             data['bucket'] = self.bucket_assignments[idx]
+        else:
+             # This case should ideally not happen if initialization is correct
+             raise IndexError(f"Index {idx} out of bounds for expert/bucket assignments.")
+
         return data
 
     def __len__(self):
@@ -306,42 +364,55 @@ class DDMDataset(Dataset):
     @staticmethod
     def collate_fn(batch):
         """Modified collate that handles variable-length sequences and multiple embedding types"""
+        # Filter out None items resulting from loading errors
         batch = [b for b in batch if b is not None]
         if len(batch) == 0:
-            return None
-        
+            # Return None or an empty dictionary if the entire batch failed
+            return None # Or perhaps {} depending on how the training loop handles it
+
+        # Initialize result dictionary with keys that are always present
         result = {
             'latent': torch.stack([item['latent'] for item in batch]),
             'bucket': torch.stack([item['bucket'] for item in batch]),
             'expert': torch.stack([item['expert'] for item in batch])
         }
-        
-        # Handle CLIP embeddings if present
-        if 'clip' in batch[0]:
-            clip_embeddings = [item['clip'] for item in batch]
-            max_len = max(e.size(1) for e in clip_embeddings)
-            
-            padded_embeddings = []
-            for emb in clip_embeddings:
-                pad_size = max_len - emb.size(1)
-                padded = torch.nn.functional.pad(emb, (0,0,0,pad_size), value=0)
-                padded_embeddings.append(padded)
-            
-            result['clip_embedding'] = torch.stack(padded_embeddings)
-        
-        # Handle T5 embeddings if present
-        if 't5' in batch[0]:
-            t5_embeddings = [item['t5'] for item in batch]
-            max_len = max(e.size(1) for e in t5_embeddings)
-            
-            padded_embeddings = []
-            for emb in t5_embeddings:
-                pad_size = max_len - emb.size(1)
-                padded = torch.nn.functional.pad(emb, (0,0,0,pad_size), value=0)
-                padded_embeddings.append(padded)
-            
-            result['t5_embedding'] = torch.stack(padded_embeddings)
-        
+
+        # Handle CLIP embeddings if present - Use the correct key 'clip_embedding'
+        if 'clip_embedding' in batch[0]:
+            clip_embeddings = [item['clip_embedding'] for item in batch]
+            # Check if padding is necessary (all sequences might have the same length)
+            if all(e.size(1) == clip_embeddings[0].size(1) for e in clip_embeddings):
+                 result['clip_embedding'] = torch.stack(clip_embeddings)
+            else:
+                 # Pad only if lengths differ
+                 max_len = max(e.size(1) for e in clip_embeddings)
+                 padded_embeddings = []
+                 for emb in clip_embeddings:
+                     pad_size = max_len - emb.size(1)
+                     # Pad sequence length dimension (dim=1), value=0
+                     padded = torch.nn.functional.pad(emb, (0, 0, 0, pad_size), value=0)
+                     padded_embeddings.append(padded)
+                 result['clip_embedding'] = torch.stack(padded_embeddings)
+        # else: # Optional: Log if clip_embedding is expected but missing
+        #     print("Warning: 'clip_embedding' key not found in the first item of the batch.")
+
+
+        # Handle T5 embeddings if present - Use the correct key 't5_embedding'
+        if 't5_embedding' in batch[0]:
+            t5_embeddings = [item['t5_embedding'] for item in batch]
+            # Check if padding is necessary
+            if all(e.size(1) == t5_embeddings[0].size(1) for e in t5_embeddings):
+                 result['t5_embedding'] = torch.stack(t5_embeddings)
+            else:
+                 # Pad only if lengths differ
+                 max_len = max(e.size(1) for e in t5_embeddings)
+                 padded_embeddings = []
+                 for emb in t5_embeddings:
+                     pad_size = max_len - emb.size(1)
+                     padded = torch.nn.functional.pad(emb, (0, 0, 0, pad_size), value=0)
+                     padded_embeddings.append(padded)
+                 result['t5_embedding'] = torch.stack(padded_embeddings)
+
         return result
 
 class CombinedBatchSampler(Sampler):
