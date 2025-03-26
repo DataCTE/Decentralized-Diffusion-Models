@@ -407,38 +407,139 @@ class FeatureGenerator:
             print(f"Rank {self.rank} failed processing {img_path}: {str(e)}")
             return False
 
-def _process_directory(config, rank=0, world_size=1):
-    """Efficiently scan and divide dataset for distributed processing"""
+    def _process_image_caption_pair_with_uuid(self, img_path, caption_path, base_name):
+        """Process a single image-caption pair with pre-determined UUID"""
+        try:
+            # First check if this feature already exists for the enabled features
+            feature_dir = self.feature_dir
+            missing_features = []
+            for feat in self.enabled_features:
+                if feat in self.FEATURE_PROCESSORS:
+                    save_prefix = self.FEATURE_PROCESSORS[feat]['save_prefix']
+                    filename = f"{base_name}_rank{self.rank}.pt"
+                    if not (feature_dir/save_prefix/filename).exists():
+                        missing_features.append(feat)
+            
+            # If all features exist, skip processing
+            if not missing_features:
+                return True
+            
+            # Read caption text only once if needed
+            caption_text = None
+            if 'clip' in missing_features or 't5' in missing_features:
+                caption_text = Path(caption_path).read_text()
+            
+            # Load image only if needed
+            img = None
+            if any(f in missing_features for f in ['vae', 'dino', 'dims', 'buckets']):
+                img = Image.open(img_path).convert('RGB')
+            
+            # Extract only the missing features
+            features = {}
+            
+            if 'vae' in missing_features:
+                features['vae'] = self._extract_vae_latent(img)
+            
+            if 'clip' in missing_features:
+                features['clip'] = self._extract_clip_embedding(caption_text)
+            
+            if 't5' in missing_features:
+                features['t5'] = self._extract_t5_embedding(caption_text)
+            
+            if 'dino' in missing_features:
+                features['dino'] = self._extract_dino_features(img)
+            
+            if 'dims' in missing_features:
+                features['dims'] = torch.tensor(img.size, dtype=torch.int16)
+            
+            if 'buckets' in missing_features:
+                features['bucket'] = torch.tensor(self._get_bucket_index(img.width, img.height), dtype=torch.int16)
+            
+            # Save only the missing features
+            for feat, data in features.items():
+                if feat in self.enabled_features:
+                    save_prefix = self.FEATURE_PROCESSORS[feat]['save_prefix']
+                    save_path = feature_dir/save_prefix/f"{base_name}_rank{self.rank}.pt"
+                    torch.save(data, save_path)
+            
+            # Close image if opened
+            if img is not None:
+                img.close()
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Rank {self.rank} failed processing {img_path}: {str(e)}")
+            return False
+
+    def _check_existing_features(self, feature_type):
+        """List all existing features of a certain type"""
+        dir_path = self.feature_dir / self.FEATURE_PROCESSORS[feature_type]['save_prefix']
+        if not dir_path.exists():
+            return set()
+        
+        # Get all UUIDs from files (removing _rank suffix)
+        pattern = f"*_rank{self.rank}.pt"
+        return {p.stem.split('_rank')[0] for p in dir_path.glob(pattern)}
+
+def _process_directory(config, rank=0, world_size=1, only_missing=True):
+    """Efficiently scan and divide dataset for distributed processing with support for incremental processing"""
     dataset_path = Path(config.dataset_path)
+    feature_path = Path(config.feature_cache_path)
     
     # Only have rank 0 scan the dataset once
     if rank == 0:
         logger.info(f"Scanning dataset directory: {dataset_path}")
-        # Use a more efficient file system walk with extension filtering
+        
+        # If only processing missing files, first gather existing UUIDs
+        existing_uuids = {}
+        if only_missing:
+            for feat_dir in ['latents', 'clip', 't5']:
+                dir_path = feature_path / feat_dir
+                if dir_path.exists():
+                    existing_uuids[feat_dir] = {
+                        p.stem.split('_rank')[0] for p in dir_path.glob('*_rank*.pt')
+                    }
+                    logger.info(f"Found {len(existing_uuids[feat_dir])} existing {feat_dir} files")
+        
+        # Use more efficient file system walk 
         image_paths = []
         caption_paths = []
+        uuids = []
         
-        # Cache the lower-cased valid extensions for faster checking
+        # Cache the lower-cased valid extensions
         valid_exts = {'.jpg', '.jpeg', '.png', '.webp'}
         
-        # Walk the directory tree efficiently using os.walk
+        # Walk the directory tree efficiently
         for root, _, files in os.walk(dataset_path):
-            for file in files:
-                lower_file = file.lower()
-                # Check image extensions first
-                if any(lower_file.endswith(ext) for ext in valid_exts):
-                    img_path = Path(root) / file
-                    # Check for caption file with same name but .txt extension
-                    caption_path = img_path.with_suffix('.txt')
-                    if caption_path.exists():
+            root_path = Path(root)
+            image_files = [f for f in files if any(f.lower().endswith(ext) for ext in valid_exts)]
+            
+            for img_file in image_files:
+                img_path = root_path / img_file
+                caption_path = img_path.with_suffix('.txt')
+                
+                if caption_path.exists():
+                    # Generate UUID from file content hashes
+                    with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
+                        img_hash = hashlib.md5(f.read()).hexdigest()
+                        text_hash = hashlib.md5(cf.read()).hexdigest()
+                    
+                    file_uuid = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
+                    
+                    # Add to processing list if:
+                    # 1. We're processing all files, or
+                    # 2. We're only processing missing files and this one needs t5 embedding
+                    if not only_missing or ('t5' not in existing_uuids or file_uuid not in existing_uuids['t5']):
                         image_paths.append(str(img_path))
                         caption_paths.append(str(caption_path))
+                        uuids.append(file_uuid)
         
-        print(f"Found {len(image_paths)} valid image-caption pairs")
+        print(f"Found {len(image_paths)} image-caption pairs requiring processing")
         
         # Save the paths to a temporary file for other ranks to read
         with open(f"{config.feature_cache_path}/image_paths.pkl", 'wb') as f:
-            pickle.dump((image_paths, caption_paths), f)
+            pickle.dump((image_paths, caption_paths, uuids), f)
     
     # Synchronize to ensure rank 0 has finished writing the file
     if world_size > 1:
@@ -446,7 +547,7 @@ def _process_directory(config, rank=0, world_size=1):
     
     # All ranks read the paths file
     with open(f"{config.feature_cache_path}/image_paths.pkl", 'rb') as f:
-        image_paths, caption_paths = pickle.load(f)
+        image_paths, caption_paths, uuids = pickle.load(f)
     
     # Distribute paths among ranks
     total_pairs = len(image_paths)
@@ -460,6 +561,7 @@ def _process_directory(config, rank=0, world_size=1):
     # Get this rank's subset of paths
     rank_image_paths = image_paths[start_idx:end_idx]
     rank_caption_paths = caption_paths[start_idx:end_idx]
+    rank_uuids = uuids[start_idx:end_idx]
     
     print(f"Rank {rank} processing {len(rank_image_paths)} image-caption pairs")
     
@@ -467,7 +569,7 @@ def _process_directory(config, rank=0, world_size=1):
     if rank == world_size - 1 and os.path.exists(f"{config.feature_cache_path}/image_paths.pkl"):
         os.remove(f"{config.feature_cache_path}/image_paths.pkl")
     
-    return rank_image_paths, rank_caption_paths
+    return rank_image_paths, rank_caption_paths, rank_uuids
 
 def main():
     # Parse command line arguments
@@ -479,6 +581,7 @@ def main():
     parser.add_argument('--t5-embeddings', action='store_true', help='Extract T5 embeddings')
     parser.add_argument('--dino-features', action='store_true', help='Extract DINO features')
     parser.add_argument('--all', action='store_true', help='Run all processing stages')
+    parser.add_argument('--force-recompute', action='store_true', help='Force recomputation of all features')
     parser.add_argument('--use-existing-dino', action='store_true',
                         help='Use existing DINO features from disk')
     parser.add_argument('--batch-size', type=int, default=32,
@@ -487,11 +590,7 @@ def main():
                         help='Number of worker threads for I/O operations')
     args = parser.parse_args()
 
-    # Import necessary libraries
-    import pickle
-    import logging
-    
-    logger = logging.getLogger(__name__)
+    # Configure logging
     logging.basicConfig(level=logging.INFO, 
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -544,8 +643,13 @@ def main():
     # Create feature cache directory if it doesn't exist
     os.makedirs(config.feature_cache_path, exist_ok=True)
     
-    # Get image-caption pairs efficiently
-    image_paths, caption_paths = _process_directory(config, rank, world_size)
+    # Get image-caption pairs efficiently, respecting force-recompute flag
+    image_paths, caption_paths, uuids = _process_directory(
+        config, 
+        rank, 
+        world_size, 
+        only_missing=not args.force_recompute
+    )
     
     # Initialize feature generator
     processor = FeatureGenerator(config, enabled_features)
@@ -564,13 +668,16 @@ def main():
                 # Process a batch of image-caption pairs
                 batch_image_paths = image_paths[start_idx:end_idx]
                 batch_caption_paths = caption_paths[start_idx:end_idx]
+                batch_uuids = uuids[start_idx:end_idx]
                 
                 # Process batch in parallel
                 try:
                     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                        futures = [executor.submit(processor._process_image_caption_pair, 
-                                                  img_path, cap_path) 
-                                  for img_path, cap_path in zip(batch_image_paths, batch_caption_paths)]
+                        futures = [executor.submit(processor._process_image_caption_pair_with_uuid, 
+                                                  img_path, cap_path, uuid_str) 
+                                  for img_path, cap_path, uuid_str in zip(batch_image_paths, 
+                                                                          batch_caption_paths, 
+                                                                          batch_uuids)]
                         
                         # Process results as they complete
                         for future in as_completed(futures):
@@ -586,7 +693,7 @@ def main():
                 # Update progress
                 pbar.update(end_idx - start_idx)
                 
-        # Add GPU health check
+        # GPU health check
         processor._gpu_health_check()
         
         # Clustering phase if enabled
