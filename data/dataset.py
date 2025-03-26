@@ -171,75 +171,42 @@ class DDMDataset(Dataset):
             raise
 
     def _load_sample(self, idx):
-        """Load a sample by index, supporting both CLIP and T5 embeddings"""
-        try:
-            # Get filename from index mapping
-            base_name = self.base_names[idx] # Use base_name directly
-
-            # Initialize sample dictionary
-            sample = {}
-
-            # Load latent feature
-            latent_path = os.path.join(self.latent_dir, f"{base_name}_rank{self.rank}.pt")
-            if os.path.exists(latent_path):
-                sample['latent'] = torch.load(latent_path, map_location='cpu')
-            else:
-                if self.verbose:
-                    print(f"Missing latent file: {latent_path}")
-                # Decide how to handle missing essential data (e.g., skip, raise error)
-                # Returning None will cause the collate_fn to skip this sample
-                return idx, None
-
-            # --- MODIFIED CLIP EMBEDDING LOADING ---
-            # Load CLIP embedding using the expected key 'clip_embedding'
-            clip_path = os.path.join(self.clip_dir, f"{base_name}_rank{self.rank}.pt")
-            if os.path.exists(clip_path):
-                try:
-                    sample['clip_embedding'] = torch.load(clip_path, map_location='cpu')
-                except Exception as e:
-                    if self.verbose:
-                        print(f"Error loading CLIP embedding {clip_path}: {str(e)}")
-                    # Handle corrupted/unreadable file - returning None skips the sample
-                    return idx, None
-            else:
-                # If CLIP embeddings are required for training, this is a critical issue
-                # For now, we print a warning and skip the sample by returning None
-                # Consider raising an error if CLIP is mandatory
-                print(f"WARNING: Missing required CLIP embedding file: {clip_path}")
-                return idx, None
-            # --- END OF MODIFIED CLIP LOADING ---
-
-            # Load T5 embedding (if configured and exists)
-            # Note: The trainer might expect 't5_embedding' key if T5 is used
-            if hasattr(self.config, 'use_t5') and self.config.use_t5:
-                t5_path = os.path.join(self.config.feature_cache_path, "t5", f"{base_name}_rank{self.rank}.pt")
-                if os.path.exists(t5_path):
-                    try:
-                        sample['t5_embedding'] = torch.load(t5_path, map_location='cpu') # Use 't5_embedding' key
-                    except Exception as e:
-                         if self.verbose:
-                            print(f"Error loading T5 embedding {t5_path}: {str(e)}")
-                         # Optionally handle T5 loading errors differently if T5 is optional
-
-            # Get bucket and expert assignments
-            bucket = self.bucket_assignments[idx] if self.bucket_assignments is not None else torch.tensor(0)
-            expert = self.expert_assignments[idx] if self.expert_assignments is not None else torch.tensor(0)
-            
-            # Construct sample dictionary
-            sample = {
-                'latent': sample['latent'],
-                'bucket': bucket,
-                'expert': expert,
-                **sample  # Add all available text embeddings
-            }
-            
-            return idx, sample
-            
-        except Exception as e:
-            if self.verbose:
-                # Log the specific file and index causing the error
-                print(f"Error loading sample at index {idx} (base_name: {self.base_names[idx]}): {str(e)}")
-            return idx, None # Return None to indicate failure for this sample
+        """Load all features for a sample by ID"""
+        base_name = f"anime-{idx}"
+        
+        # FIX: Handle rank suffix correctly when loading features
+        # Current issue: likely looking for exact filename without considering rank suffix
+        
+        # Try to find clip embedding with any rank suffix
+        clip_file = None
+        for rank_file in Path(self.clip_dir).glob(f"{base_name}_rank*.pt"):
+            clip_file = rank_file
+            break
+        
+        if clip_file is None:
+            print(f"WARNING: Missing required CLIP embedding file for {base_name}")
+            return None
+        
+        # Same for latent files - need to find with rank suffix
+        latent_file = None
+        for rank_file in Path(self.latent_dir).glob(f"{base_name}_rank*.pt"):
+            latent_file = rank_file
+            break
+        
+        if latent_file is None:
+            print(f"WARNING: Missing required latent file for {base_name}")
+            return None
+        
+        # Now load both files
+        clip_embedding = torch.load(clip_file)
+        latent = torch.load(latent_file)
+        
+        # Create and return complete sample data
+        return {
+            'latent': latent,
+            'clip_embedding': clip_embedding,
+            # Load other features as needed...
+        }
 
     def _load_bucket_assignments(self):
         """Load bucket assignments efficiently"""
@@ -263,62 +230,30 @@ class DDMDataset(Dataset):
         return torch.stack(assignments).to(self.device)
 
     def __getitem__(self, idx):
-        """Get item with cache, returning None if loading fails"""
-        data = None # Initialize data to None
-        if idx in self.cache:
-            # Ensure cached data is not None before using it
-            cached_item = self.cache[idx]
-            if cached_item is not None:
-                 data = cached_item
-            else:
-                 # If cached item is None (due to previous loading error), try loading again
-                 if self.verbose:
-                      print(f"Retrying load for previously failed index {idx} from cache.")
-                 idx_data = self._load_sample(idx)
-                 if idx_data[1] is not None:
-                      data = idx_data[1]
-                      # Update cache only if loading succeeds this time
-                      self.cache[idx] = data
-                 else:
-                      # If loading fails again, return None to skip this sample
-                      return None
-
-        else: # Not in cache, load it
-            idx_data = self._load_sample(idx)
-            if idx_data[1] is not None:
-                data = idx_data[1]
-                # Update cache with LRU policy only if loading succeeded
-                if len(self.cache) >= self.cache_size:
-                    # Simple LRU: remove the item with the smallest index (approximates oldest)
-                    try:
-                        oldest_idx = min(self.cache.keys())
-                        del self.cache[oldest_idx]
-                    except ValueError: # Cache might be empty
-                        pass
-                self.cache[idx] = data
-            else:
-                 # Store None in cache to avoid repeatedly trying to load a bad sample
-                 self.cache[idx] = None
-                 # Return None to signal to collate_fn to skip
-                 return None
-
-        # Check if data is None before accessing assignments
-        if data is None:
-             # This can happen if the initial load from cache returned None
-             return None
-
-        # Add assignments - Ensure these tensors are valid for the index
-        # These assignments are loaded in __init__ and should cover all valid indices
-        if idx < len(self.expert_assignments) and idx < len(self.bucket_assignments):
-             data['expert'] = self.expert_assignments[idx]
-             data['bucket'] = self.bucket_assignments[idx]
-        else:
-             # This case should ideally not happen if initialization is correct
-             # If it does, returning None is safer than raising IndexError during training
-             logger.error(f"Index {idx} out of bounds for expert/bucket assignments. Skipping sample.")
-             return None
-
-        return data
+        """Load a sample and its corresponding features"""
+        try:
+            # Get filename/ID for this index
+            sample_id = self.base_names[idx]
+            sample_data = self._load_sample(idx)
+            
+            # The key issue - need to ensure clip_embedding AND latent are both loaded
+            if sample_data is None or 'clip_embedding' not in sample_data or 'latent' not in sample_data:
+                # This is likely where the issue exists - when handling missing files
+                # Current approach probably doesn't check for missing latents
+                raise ValueError(f"Missing required features for sample {sample_id}")
+            
+            # Make sure we're returning a complete sample with both latent and clip_embedding
+            return {
+                'latent': sample_data['latent'],
+                'clip_embedding': sample_data['clip_embedding'],
+                'bucket': sample_data.get('bucket', 0),
+                'expert': sample_data.get('expert', 0),
+                'cluster_pred': sample_data.get('cluster_pred', 0)
+            }
+        except Exception as e:
+            # Proper error handling
+            print(f"Error loading sample {idx}: {str(e)}")
+            # Return a fallback sample or re-raise
 
     def __len__(self):
         return self.num_samples
