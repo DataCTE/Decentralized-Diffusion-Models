@@ -314,11 +314,35 @@ class FeatureGenerator:
         
         # 1. Determine aspect ratio group
         aspect_group = None
-        for group, (min_ratio, max_ratio) in config.bucket_thresholds.items():
-            if min_ratio <= aspect <= max_ratio:
-                aspect_group = group
-                break
+        
+        # Handle the case where bucket_thresholds might be a SimpleNamespace
+        if hasattr(config.bucket_thresholds, 'items'):
+            # It's a dictionary
+            for group, (min_ratio, max_ratio) in config.bucket_thresholds.items():
+                if min_ratio <= aspect <= max_ratio:
+                    aspect_group = group
+                    break
+        else:
+            # It's a SimpleNamespace - access attributes directly
+            if hasattr(config.bucket_thresholds, 'square'):
+                min_ratio, max_ratio = config.bucket_thresholds.square
+                if min_ratio <= aspect <= max_ratio:
+                    aspect_group = 'square'
             
+            if aspect_group is None and hasattr(config.bucket_thresholds, 'portrait'):
+                min_ratio, max_ratio = config.bucket_thresholds.portrait
+                if min_ratio <= aspect <= max_ratio:
+                    aspect_group = 'portrait'
+            
+            if aspect_group is None and hasattr(config.bucket_thresholds, 'landscape'):
+                min_ratio, max_ratio = config.bucket_thresholds.landscape
+                if min_ratio <= aspect <= max_ratio:
+                    aspect_group = 'landscape'
+        
+        # If no aspect group was determined, use the first bucket
+        if aspect_group is None:
+            return 0
+        
         # 2. Calculate scaled dimensions
         scale = config.bucket_scale
         scaled_w = round(width / scale) * scale
