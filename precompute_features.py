@@ -392,6 +392,37 @@ def main():
         success = cluster_processor.run_clustering()
         sys.exit(0 if success else 1)
 
+    # Parse command line arguments EARLY
+    parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
+    parser.add_argument('--buckets', action='store_true', help='Process image buckets')
+    parser.add_argument('--clustering', action='store_true', help='Run clustering')
+    parser.add_argument('--vae-latents', action='store_true', help='Extract VAE latents')
+    parser.add_argument('--clip-latents', action='store_true', help='Extract CLIP embeddings')
+    parser.add_argument('--t5-latents', action='store_true', help='Extract T5 embeddings')
+    parser.add_argument('--dino-features', action='store_true', help='Extract DINO features')
+    parser.add_argument('--all', action='store_true', help='Run all processing stages')
+    parser.add_argument('--use-existing-dino', action='store_true',
+                     help='Use existing DINO features from disk')
+    args = parser.parse_args()
+
+    # Determine enabled features EARLY
+    enabled_features = []
+    if args.all:
+        enabled_features = ['vae', 'clip', 't5', 'dino', 'buckets', 'dims', 'clustering']
+    else:
+        if args.clip_latents:
+            enabled_features.append('clip')
+        if args.t5_latents:
+            enabled_features.append('t5')
+        if args.dino_features:
+            enabled_features.append('dino')
+        if args.vae_latents:
+            enabled_features.append('vae')
+        if args.buckets:
+            enabled_features.append('buckets')
+        if args.clustering:
+            enabled_features.append('clustering')
+
     # Initialize distributed processing with fallback
     try:
         rank = int(os.environ['LOCAL_RANK'])
@@ -416,41 +447,6 @@ def main():
     else:
         device = torch.device('cpu')
 
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
-    parser.add_argument('--buckets', action='store_true', help='Process image buckets')
-    parser.add_argument('--clustering', action='store_true', help='Run clustering')
-    parser.add_argument('--vae-latents', action='store_true', help='Extract VAE latents')
-    parser.add_argument('--clip-latents', action='store_true', help='Extract CLIP embeddings')
-    parser.add_argument('--t5-latents', action='store_true', help='Extract T5 embeddings')
-    parser.add_argument('--dino-features', action='store_true', help='Extract DINO features')
-    parser.add_argument('--all', action='store_true', help='Run all processing stages')
-    parser.add_argument('--use-existing-dino', action='store_true',
-                     help='Use existing DINO features from disk')
-    args = parser.parse_args()
-
-    # Determine enabled features
-    enabled_features = []
-    if args.all:
-        enabled_features = ['vae', 'clip', 't5', 'dino', 'buckets', 'dims', 'clustering']
-    else:
-        if args.clip_latents:
-            enabled_features.append('clip')
-        if args.t5_latents:
-            enabled_features.append('t5')
-        if args.dino_features:
-            enabled_features.append('dino')
-        if args.vae_latents:
-            enabled_features.append('vae')
-        if args.buckets:
-            enabled_features.append('buckets')
-        if args.clustering:
-            enabled_features.append('clustering')
-            
-    # Print enabled features for debugging - NOW RANK IS DEFINED
-    if rank == 0:
-        print("Enabled features:", enabled_features)
-    
     # Load config after distributed init
     config = get_config()
     # Add command line args to config
