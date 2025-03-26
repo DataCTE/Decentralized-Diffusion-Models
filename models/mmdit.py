@@ -56,7 +56,6 @@ class Flux(nn.Module):
         pe_dim = params.hidden_size // params.num_heads
         if sum(params.axes_dim) != pe_dim:
             raise ValueError(f"Got {params.axes_dim} but expected positional dim {pe_dim}")
-
         self.hidden_size = params.hidden_size
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
@@ -100,60 +99,31 @@ class Flux(nn.Module):
         cluster_ids: Tensor | None = None,
         guidance: Tensor | None = None,
     ) -> Tensor:
-        # Log dimensions for debugging
-        if getattr(self, 'debug', False):
-            print(f"[DEBUG] img shape: {img.shape}")
-            print(f"[DEBUG] img_ids shape: {img_ids.shape}")
-            print(f"[DEBUG] txt shape: {txt.shape}")
-            print(f"[DEBUG] txt_ids shape: {txt_ids.shape}")
-            print(f"[DEBUG] timesteps shape: {timesteps.shape}")
-            print(f"[DEBUG] y shape: {y.shape}")
-            if cluster_ids is not None:
-                print(f"[DEBUG] cluster_ids shape: {cluster_ids.shape}")
-        
         if img.ndim != 3 or txt.ndim != 3:
-            # Handle CLIP embedding tensors which might have a different structure
-            if txt.ndim == 4:  # [B, 1, S, D] format from CLIP
-                txt = txt.squeeze(1)
-            if img.ndim == 4:  # [B, C, H, W] format
-                B, C, H, W = img.shape
-                img = img.reshape(B, C, H*W).permute(0, 2, 1)
-            
-            # Check dimensions again after reshaping
-            if img.ndim != 3 or txt.ndim != 3:
-                raise ValueError(f"Input img {img.shape} and txt {txt.shape} must have 3 dimensions after reshaping.")
+            raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
-        # Process through model
+        # running on sequences img
         img = self.img_in(img)
         vec = self.time_in(timestep_embedding(timesteps, 256))
         if self.params.guidance_embed:
             if guidance is None:
                 raise ValueError("Didn't get guidance strength for guidance distilled model.")
             vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
-
         vec = vec + self.vector_in(y)
         txt = self.txt_in(txt)
 
-        # Concatenate position IDs for proper attention
         ids = torch.cat((txt_ids, img_ids), dim=1)
-        # Apply rotary position embeddings (RoPE)
         pe = self.pe_embedder(ids)
 
-        # Process through double stream blocks 
         for block in self.double_blocks:
             img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
 
-        # Concatenate text and image for single stream processing
         img = torch.cat((txt, img), 1)
-        # Process through single stream blocks
         for block in self.single_blocks:
             img = block(img, vec=vec, pe=pe)
+        img = img[:, txt.shape[1] :, ...]
 
-        # Extract relevant part (skip text portion)
-        img = img[:, txt.shape[1]:, ...]
-        # Apply final layer
-        img = self.final_layer(img, vec)
-
+        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         return img
 
     def generate_position_ids(self, txt_embed: Tensor, img_embed: Tensor) -> tuple[Tensor, Tensor]:
@@ -161,7 +131,7 @@ class Flux(nn.Module):
         Generate position IDs for text and image inputs.
         
         Args:
-            txt_embed: Text embeddings from CLIP [B, S, D]
+            txt_embed: Text embeddings [B, S, D]
             img_embed: Image embeddings [B, P, C]
             
         Returns:

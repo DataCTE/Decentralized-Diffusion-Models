@@ -27,6 +27,11 @@ DEFAULT_CONFIG = {
     'clip_embedding_dim': 768,  # ViT-L/14 output dim
     'max_token_length': 77,     # CLIP standard
 
+    # T5 model settings
+    't5_model': 'google/t5-v1_1-base',  
+    'max_token_length': 128,
+    'use_mixed_precision': True,
+
     # ===== Flux MMDiT Architecture =====
     'hidden_size': 768,          # Transformer hidden size
     'in_channels': 3,
@@ -208,6 +213,23 @@ DEFAULT_CONFIG = {
     'use_precomputed_latents': True,  # Set to True to disable VAE loading
 }
 
+def dict_to_namespace(d):
+    """Convert a dictionary to a SimpleNamespace recursively."""
+    from types import SimpleNamespace
+    
+    # Handle the case where d might be None
+    if d is None:
+        return None
+        
+    # Convert dict to namespace
+    namespace = SimpleNamespace()
+    for key, value in d.items():
+        if isinstance(value, dict):
+            setattr(namespace, key, dict_to_namespace(value))
+        else:
+            setattr(namespace, key, value)
+    return namespace
+
 def get_config(config_path=None):
     """Load config from a Python file or create default config"""
     if config_path:
@@ -250,14 +272,6 @@ def get_config(config_path=None):
             w, h = config.buckets[0]
             config.image_size = (3, h, w)
             logger.info(f"Derived image_size {config.image_size} from first bucket")
-        
-        # Add this function to convert nested dicts to SimpleNamespace
-        def dict_to_namespace(d):
-            if isinstance(d, dict):
-                for k, v in d.items():
-                    d[k] = dict_to_namespace(v)
-                return SimpleNamespace(**d)
-            return d
         
         # Convert all nested dictionaries to SimpleNamespace
         for key in dir(config_module):
