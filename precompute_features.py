@@ -175,9 +175,17 @@ class FeatureGenerator:
             return torch.zeros(1, 1024)  # Return zero features for corrupt images
 
     def _extract_t5_embedding(self, caption):
-        """Extract T5 embedding for captions - similar to CLIP but with T5"""
+        """Extract T5 embedding for captions with batch support"""
         with torch.no_grad():
-            return self.t5.encode([caption]).cpu()
+            # Handle single caption or list of captions
+            if isinstance(caption, str):
+                caption = [caption]
+            
+            # Process on GPU
+            embeddings = self.t5.encode(caption)
+            
+            # Return CPU tensor
+            return embeddings.cpu()
 
     def _save_features(self, base_name, features):
         """Force-save features with rank ID"""
@@ -361,56 +369,54 @@ class FeatureGenerator:
     }
 
 def process_t5_from_clip(processor, rank):
-    """Process T5 embeddings from original captions on GPU, matching existing latent UUIDs"""
-    clip_dir = processor.feature_dir/"clip"
-    t5_dir = processor.feature_dir/"t5"
+    """Process T5 embeddings like other latents using direct image-to-caption pairing"""
     dataset_path = Path(processor.config.dataset_path)
-    device = processor.device  # Use the GPU device assigned to this rank
+    t5_dir = processor.feature_dir/"t5"
     
-    if not clip_dir.exists():
-        print(f"Rank {rank}: CLIP directory not found at {clip_dir}")
-        return
+    # Get all images in the dataset
+    all_images = [p for p in dataset_path.rglob('*') 
+                 if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
     
-    # Get all CLIP files for this rank
-    all_clip_files = sorted(list(clip_dir.glob(f"*_rank{rank}.pt")))
+    # Distribute images among ranks (using the same logic as main processing)
+    world_size = dist.get_world_size()
+    chunk_size = len(all_images) // world_size
+    remainder = len(all_images) % world_size
     
-    print(f"Rank {rank}: Processing {len(all_clip_files)} files for T5 embedding (GPU mode)")
+    start = rank * chunk_size + min(rank, remainder)
+    end = (rank + 1) * chunk_size + min(rank + 1, remainder)
+    local_images = all_images[start:end]
     
-    # Process files with progress tracking
+    print(f"Rank {rank}: Processing {len(local_images)} images for T5 embedding")
+    
+    # Batch processing with progress tracking
     processed = 0
     errors = 0
     skipped = 0
     
-    # Ensure T5 model is loaded and on GPU
-    if not hasattr(processor, 't5'):
-        from data.t5 import T5TextEncoder
-        processor.t5 = T5TextEncoder(device, processor.config)
-    else:
-        # Ensure model is on the correct device
-        processor.t5.model = processor.t5.model.to(device)
+    # Process in batches for better GPU utilization
+    batch_size = 32  # Standard batch size to match other latents
     
-    print(f"Rank {rank}: T5 model is on device {processor.t5.model.device}")
-    
-    # Create an index of filenames to captions for faster lookup
-    caption_index = {}
-    print(f"Rank {rank}: Building caption index...")
-    
-    # Process in smaller batches to avoid memory issues
-    batch_size = 128  # Larger batch size for caption processing
-    with tqdm(total=len(all_clip_files), desc=f"T5 Rank {rank}") as pbar:
-        for i in range(0, len(all_clip_files), batch_size):
-            batch_files = all_clip_files[i:i+batch_size]
+    # Use tqdm for progress tracking
+    with tqdm(total=len(local_images), desc=f"T5 Rank {rank}") as pbar:
+        for i in range(0, len(local_images), batch_size):
+            batch_images = local_images[i:i+batch_size]
             batch_captions = []
-            batch_indices = []
-            batch_t5_files = []
+            batch_base_names = []
             
-            # First pass: collect captions for all files in the batch
-            for j, clip_file in enumerate(batch_files):
+            # First collect valid image-caption pairs
+            for img_path in batch_images:
                 try:
-                    # Extract base name without rank suffix
-                    base_name = clip_file.stem
-                    if "_rank" in base_name:
-                        base_name = base_name.split("_rank")[0]
+                    # Check if there's a corresponding caption file
+                    caption_path = img_path.with_suffix('.txt')
+                    if not caption_path.exists():
+                        continue
+                    
+                    # Create UUID from image and caption contents
+                    with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
+                        img_hash = hashlib.md5(f.read()).hexdigest()
+                        text_hash = hashlib.md5(cf.read()).hexdigest()
+                    
+                    base_name = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
                     
                     # Check if T5 embedding already exists
                     t5_file = t5_dir/f"{base_name}_rank{rank}.pt"
@@ -418,72 +424,49 @@ def process_t5_from_clip(processor, rank):
                         skipped += 1
                         continue
                     
-                    # Find the caption if we haven't already
-                    if base_name not in caption_index:
-                        found = False
-                        for img_path in dataset_path.rglob('*'):
-                            if img_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:
-                                caption_path = img_path.with_suffix('.txt')
-                                if caption_path.exists():
-                                    # Recreate the UUID hash to see if it matches
-                                    with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
-                                        img_hash = hashlib.md5(f.read()).hexdigest()
-                                        text_hash = hashlib.md5(cf.read()).hexdigest()
-                                    
-                                    computed_uuid = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
-                                    
-                                    # If hash matches, store this caption
-                                    if computed_uuid == base_name:
-                                        caption_index[base_name] = caption_path.read_text()
-                                        found = True
-                                        break
-                        
-                        if not found:
-                            caption_index[base_name] = None  # Mark as not found
+                    # Read caption text
+                    caption_text = caption_path.read_text()
                     
-                    # Add to batch if we have a caption
-                    if caption_index[base_name] is not None:
-                        batch_captions.append(caption_index[base_name])
-                        batch_indices.append(j)
-                        batch_t5_files.append(t5_file)
-                    else:
-                        errors += 1
+                    # Add to batch
+                    batch_captions.append(caption_text)
+                    batch_base_names.append(base_name)
                 
                 except Exception as e:
-                    print(f"Rank {rank} failed in preparation for file {clip_file}: {str(e)}")
+                    print(f"Rank {rank} failed processing {img_path}: {str(e)}")
                     errors += 1
             
-            # Second pass: generate T5 embeddings in batches on GPU for better performance
+            # Process batch of captions on GPU
             if batch_captions:
                 try:
-                    # Process the whole batch at once on GPU
-                    with torch.cuda.amp.autocast(enabled=processor.config.use_mixed_precision):
-                        t5_embeddings = processor.t5.encode(batch_captions)
+                    # Generate T5 embeddings in a single batch
+                    t5_embeddings = processor._extract_t5_embedding(batch_captions)
                     
-                    # Save each embedding with matching filename
-                    for idx, t5_file in enumerate(batch_t5_files):
-                        # Extract the individual embedding
-                        t5_embedding = t5_embeddings[idx:idx+1]  # Keep batch dimension
+                    # Save each embedding 
+                    for idx, base_name in enumerate(batch_base_names):
+                        # Extract single embedding (keep batch dimension)
+                        t5_embedding = t5_embeddings[idx:idx+1] if t5_embeddings.dim() > 2 else t5_embeddings[idx:idx+1, :]
                         
-                        # Save CPU version to disk
+                        # Save with standard naming pattern
+                        t5_file = t5_dir/f"{base_name}_rank{rank}.pt"
                         torch.save(t5_embedding.cpu(), t5_file)
                         processed += 1
                 
                 except Exception as e:
-                    print(f"Rank {rank} failed batch processing: {str(e)}")
+                    print(f"Rank {rank} batch processing failed: {str(e)}")
                     import traceback
                     traceback.print_exc()
                     errors += len(batch_captions)
             
-            # Update progress for the entire batch
-            pbar.update(len(batch_files))
-            # Print interim status every 10 batches
-            if i % (10 * batch_size) == 0:
+            # Update progress bar
+            pbar.update(len(batch_images))
+            
+            # Periodic status report
+            if i % (batch_size * 10) == 0 and i > 0:
                 print(f"Rank {rank} status: Processed {processed}, Skipped {skipped}, Errors {errors}")
     
     print(f"Rank {rank}: T5 processing complete. Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
     
-    # Clear CUDA cache to free memory
+    # Clear CUDA cache
     torch.cuda.empty_cache()
 
 def main():

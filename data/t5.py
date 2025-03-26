@@ -74,19 +74,16 @@ class T5TextEncoder:
                 inputs = self.tokenizer(
                     text, 
                     return_tensors="pt", 
-                    padding="longest", 
+                    padding="max_length",  # Standard padding to max_length for consistent output 
                     truncation=True,
                     max_length=self.max_length
                 )
                 
-                # Get sequence length for this batch
-                seq_len = inputs.input_ids.size(1)
-                
-                # Move input IDs to the correct device
+                # Move inputs to device
                 input_ids = inputs.input_ids.to(self.device)
                 attention_mask = inputs.attention_mask.to(self.device)
                 
-                # Perform inference with optimizations
+                # Perform inference
                 with torch.no_grad():
                     outputs = self.model(
                         input_ids=input_ids,
@@ -95,17 +92,14 @@ class T5TextEncoder:
                         return_dict=True
                     )
                     
-                    embeddings = outputs.last_hidden_state.to(torch.float32)
+                    # Get last hidden state
+                    embeddings = outputs.last_hidden_state
                     
-                    # Verify we're on the GPU
-                    if not embeddings.is_cuda:
-                        logger.warning(f"T5 embeddings not on GPU! Moving to {self.device}")
-                        embeddings = embeddings.to(self.device)
-                    
-                    return embeddings
+                    # Return in float32 for consistency with other embedders
+                    return embeddings.to(torch.float32)
         except Exception as e:
             logger.error(f"Error during T5 encoding: {str(e)}")
             import traceback
             traceback.print_exc()
-            # Return a zero tensor as fallback (with expected dimensions)
+            # Return a zero tensor as fallback with expected dimensions
             return torch.zeros((batch_size, self.max_length, 768), device=self.device) 
