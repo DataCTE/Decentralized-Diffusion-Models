@@ -23,6 +23,10 @@ from tqdm.auto import tqdm
 import torch.distributed as dist
 import time
 import argparse
+import pickle
+import logging
+
+logger = logging.getLogger(__name__)
 
 class FeatureGenerator:
     def __init__(self, config, enabled_features):
@@ -351,6 +355,120 @@ class FeatureGenerator:
         }
     }
 
+    def _process_image_caption_pair(self, img_path, caption_path):
+        """Process a single image-caption pair efficiently"""
+        try:
+            # Create a unique identifier based on content hashes
+            with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
+                img_hash = hashlib.md5(f.read()).hexdigest()
+                text_hash = hashlib.md5(cf.read()).hexdigest()
+            
+            base_name = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
+            
+            # Read caption text only once
+            caption_text = Path(caption_path).read_text()
+            
+            # Load and process image
+            with Image.open(img_path) as img:
+                # Force RGB conversion
+                img = img.convert('RGB')
+                orig_w, orig_h = img.size
+                
+                # Calculate bucket index
+                bucket_idx = self._get_bucket_index(orig_w, orig_h)
+                
+                # Extract features based on enabled features
+                features = {}
+                
+                # Only process required features
+                if 'latent' in self.enabled_features:
+                    features['latent'] = self._extract_vae_latent(img)
+                
+                if 'clip' in self.enabled_features:
+                    features['clip'] = self._extract_clip_embedding(caption_text)
+                
+                if 't5' in self.enabled_features:
+                    features['t5'] = self._extract_t5_embedding(caption_text)
+                
+                if 'dino' in self.enabled_features:
+                    features['dino'] = self._extract_dino_features(img)
+                
+                if 'dims' in self.enabled_features:
+                    features['dims'] = torch.tensor(img.size, dtype=torch.int16)
+                
+                if 'buckets' in self.enabled_features:
+                    features['bucket'] = torch.tensor(bucket_idx, dtype=torch.int16)
+            
+            # Save features
+            self._save_features(base_name, features)
+            return True
+        
+        except Exception as e:
+            print(f"Rank {self.rank} failed processing {img_path}: {str(e)}")
+            return False
+
+def _process_directory(config, rank=0, world_size=1):
+    """Efficiently scan and divide dataset for distributed processing"""
+    dataset_path = Path(config.dataset_path)
+    
+    # Only have rank 0 scan the dataset once
+    if rank == 0:
+        logger.info(f"Scanning dataset directory: {dataset_path}")
+        # Use a more efficient file system walk with extension filtering
+        image_paths = []
+        caption_paths = []
+        
+        # Cache the lower-cased valid extensions for faster checking
+        valid_exts = {'.jpg', '.jpeg', '.png', '.webp'}
+        
+        # Walk the directory tree efficiently using os.walk
+        for root, _, files in os.walk(dataset_path):
+            for file in files:
+                lower_file = file.lower()
+                # Check image extensions first
+                if any(lower_file.endswith(ext) for ext in valid_exts):
+                    img_path = Path(root) / file
+                    # Check for caption file with same name but .txt extension
+                    caption_path = img_path.with_suffix('.txt')
+                    if caption_path.exists():
+                        image_paths.append(str(img_path))
+                        caption_paths.append(str(caption_path))
+        
+        print(f"Found {len(image_paths)} valid image-caption pairs")
+        
+        # Save the paths to a temporary file for other ranks to read
+        with open(f"{config.feature_cache_path}/image_paths.pkl", 'wb') as f:
+            pickle.dump((image_paths, caption_paths), f)
+    
+    # Synchronize to ensure rank 0 has finished writing the file
+    if world_size > 1:
+        dist.barrier()
+    
+    # All ranks read the paths file
+    with open(f"{config.feature_cache_path}/image_paths.pkl", 'rb') as f:
+        image_paths, caption_paths = pickle.load(f)
+    
+    # Distribute paths among ranks
+    total_pairs = len(image_paths)
+    pairs_per_rank = total_pairs // world_size
+    remainder = total_pairs % world_size
+    
+    # Calculate this rank's start and end indices with balanced distribution
+    start_idx = rank * pairs_per_rank + min(rank, remainder)
+    end_idx = start_idx + pairs_per_rank + (1 if rank < remainder else 0)
+    
+    # Get this rank's subset of paths
+    rank_image_paths = image_paths[start_idx:end_idx]
+    rank_caption_paths = caption_paths[start_idx:end_idx]
+    
+    print(f"Rank {rank} processing {len(rank_image_paths)} image-caption pairs")
+    
+    # Clean up the paths file if we're the last rank
+    if rank == world_size - 1 and os.path.exists(f"{config.feature_cache_path}/image_paths.pkl"):
+        os.remove(f"{config.feature_cache_path}/image_paths.pkl")
+    
+    return rank_image_paths, rank_caption_paths
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
@@ -363,7 +481,19 @@ def main():
     parser.add_argument('--all', action='store_true', help='Run all processing stages')
     parser.add_argument('--use-existing-dino', action='store_true',
                         help='Use existing DINO features from disk')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='Batch size for processing')
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='Number of worker threads for I/O operations')
     args = parser.parse_args()
+
+    # Import necessary libraries
+    import pickle
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO, 
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     # Determine enabled features
     enabled_features = []
@@ -382,144 +512,109 @@ def main():
         enabled_features = [feature_map[f] for f in vars(args) if vars(args)[f] and f in feature_map]
 
     # Initialize distributed processing
-    rank = int(os.environ['LOCAL_RANK'])
-    print(f"Rank {rank} starting initialization")
+    rank = int(os.environ.get('LOCAL_RANK', '0'))
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    
+    logger.info(f"Rank {rank} starting initialization")
     
     # Set device BEFORE initializing process group
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
     
     # Initialize process group with default settings
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',  # Use automatic environment initialization
-        world_size=int(os.environ['WORLD_SIZE']),
-        rank=rank
-    )
+    if world_size > 1:
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=world_size,
+            rank=rank
+        )
     
     # Load config after distributed init
     config = get_config()
     
+    # Update batch size from args
+    batch_size = args.batch_size
+    num_workers = args.num_workers
+    
     # Verify dataset path exists
-    if rank == 0:
-        if not Path(config.dataset_path).exists():
-            raise FileNotFoundError(f"Dataset path {config.dataset_path} not found")
+    if not Path(config.dataset_path).exists():
+        raise FileNotFoundError(f"Dataset path {config.dataset_path} not found")
     
-    # Get all images
-    if rank == 0:
-        print("Scanning dataset directory...")
-    all_images = [str(p) for p in Path(config.dataset_path).rglob('*') 
-                 if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
+    # Create feature cache directory if it doesn't exist
+    os.makedirs(config.feature_cache_path, exist_ok=True)
     
-    # Distribute images with remainder handling
-    world_size = dist.get_world_size()
-    chunk_size = len(all_images) // world_size
-    remainder = len(all_images) % world_size
-    
-    start = rank * chunk_size + min(rank, remainder)
-    end = (rank + 1) * chunk_size + min(rank + 1, remainder)
-    local_images = all_images[start:end]
-    
-    print(f"Rank {rank} received {len(local_images)} images to process")
+    # Get image-caption pairs efficiently
+    image_paths, caption_paths = _process_directory(config, rank, world_size)
     
     # Initialize feature generator
     processor = FeatureGenerator(config, enabled_features)
+    processor.batch_size = batch_size  # Set batch size from command line
     
     try:
-        # Main processing loop
-        with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
-            for img_path in local_images:
-                try:
-                    base_name = uuid.UUID(hashlib.md5(img_path.encode()).hexdigest()).hex
-                    
-                    # Only process enabled features
-                    features = {}
-                    for feat in enabled_features:
-                        if feat in FeatureGenerator.FEATURE_PROCESSORS:
-                            handler_info = FeatureGenerator.FEATURE_PROCESSORS[feat]
-                            handler = handler_info['handler']
-                            features[feat] = getattr(processor, handler)(img_path)
-                    
-                    # Save enabled features
-                    for feat, data in features.items():
-                        prefix = FeatureGenerator.FEATURE_PROCESSORS[feat]['save_prefix']
-                        torch.save(data, processor.feature_dir/f"{prefix}/{base_name}_rank{rank}.pt")
-                    
-                    pbar.update(1)
-                except Exception as e:
-                    print(f"Rank {rank} failed to process {img_path}: {str(e)}")
-                    continue  # Skip to next image
-
-        # Add final completion marker
-        status_path = processor.feature_dir/f"status_rank{rank}.pt"
-        torch.save({'status': 'done', 'count': len(local_images)}, status_path)
+        # Process image-text pairs in batches for better memory efficiency
+        total_samples = len(image_paths)
+        batch_indices = list(range(0, total_samples, batch_size))
         
-        # Final synchronization before clustering
-        dist.barrier()
-
-        # Clustering phase with coordinated error handling
-        if 'clustering' in enabled_features:
-            # All ranks participate in clustering workflow
-            cluster_start_time = time.time()
-            cluster_error = torch.tensor([0], device=device)
-            
-            if rank == 0:
+        with tqdm(total=total_samples, desc=f"GPU {rank}", position=rank) as pbar:
+            for i in range(0, len(batch_indices)):
+                start_idx = batch_indices[i]
+                end_idx = start_idx + batch_size if i < len(batch_indices) - 1 else total_samples
+                
+                # Process a batch of image-caption pairs
+                batch_image_paths = image_paths[start_idx:end_idx]
+                batch_caption_paths = caption_paths[start_idx:end_idx]
+                
+                # Process batch in parallel
                 try:
-                    # Clear previous cluster markers
-                    (processor.feature_dir/"clusters/started.pt").unlink(missing_ok=True)
-                    (processor.feature_dir/"clusters/error.pt").unlink(missing_ok=True)
-                    
-                    # Signal clustering start
-                    (processor.feature_dir/"clusters/started.pt").touch()
-                    
-                    # Actual clustering execution
-                    processor.run_clustering()
-                except Exception as e:
-                    print(f"Clustering failed: {str(e)}")
-                    cluster_error.fill_(1)
-                    (processor.feature_dir/"clusters/error.pt").touch()
-            
-            # Broadcast error status to all ranks
-            dist.broadcast(cluster_error, src=0)
-            
-            if cluster_error.item() == 1:
-                raise RuntimeError("Clustering failed on rank 0")
-            
-            # Unified waiting logic using distributed status
-            clustering_status = torch.tensor([0], device=device)
-            while True:
-                # Check status every 5 seconds with timeout
-                dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX)
+                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                        futures = [executor.submit(processor._process_image_caption_pair, 
+                                                  img_path, cap_path) 
+                                  for img_path, cap_path in zip(batch_image_paths, batch_caption_paths)]
+                        
+                        # Process results as they complete
+                        for future in as_completed(futures):
+                            # Handle or log any errors
+                            try:
+                                future.result()
+                            except Exception as e:
+                                logger.error(f"Error processing pair: {str(e)}")
                 
-                if clustering_status.item() == 2:
-                    break  # Clustering completed
-                elif clustering_status.item() == 1:
-                    raise RuntimeError("Clustering failed on rank 0")
+                except Exception as batch_e:
+                    logger.error(f"Error processing batch: {str(batch_e)}")
                 
-                if time.time() - cluster_start_time > 7200:  # 2 hour timeout
-                    raise RuntimeError("Clustering timed out")
+                # Update progress
+                pbar.update(end_idx - start_idx)
                 
-                # Progress reporting
-                if rank == 0:
-                    print(f"Clustering progress: {time.time() - cluster_start_time:.1f}s elapsed")
-                
-                time.sleep(5)
-
         # Add GPU health check
         processor._gpu_health_check()
-
+        
+        # Clustering phase if enabled
+        if 'clustering' in enabled_features:
+            # Only rank 0 performs clustering
+            if rank == 0:
+                logger.info("Starting clustering process...")
+                processor.run_clustering()
+            
+            # Wait for clustering to complete
+            if world_size > 1:
+                dist.barrier()
+            
+            logger.info(f"Rank {rank} completed all processing")
+    
     except Exception as e:
-        print(f"Rank {rank} failed: {str(e)}")
+        logger.error(f"Rank {rank} failed: {str(e)}")
         # Emergency barrier with timeout
-        dist.barrier(timeout=60)
+        if world_size > 1:
+            try:
+                dist.barrier(timeout=60)
+            except:
+                pass
         raise
     finally:
-        # Cleanup status files
-        if rank == 0:
-            for r in range(dist.get_world_size()):
-                (processor.feature_dir/f"status_rank{r}.pt").unlink(missing_ok=True)
-        dist.barrier()
-        dist.destroy_process_group()
+        # Clean up
+        if world_size > 1:
+            dist.destroy_process_group()
 
 if __name__ == "__main__":
     main() 
