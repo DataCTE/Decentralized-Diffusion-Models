@@ -157,30 +157,47 @@ class DDMDataset(Dataset):
             raise
 
     def _load_sample(self, idx):
-        """Load a single sample with error handling"""
+        """Load a sample by index, supporting both CLIP and T5 embeddings"""
         try:
-            base_name = self.base_names[idx]
-            rank_suffix = f"_rank{self.rank}"
+            # Get filename from index mapping
+            filename = self.base_names[idx]
             
-            # Load with weights_only=False for feature tensors
-            data = {
-                'latent': torch.load(
-                    os.path.join(self.latent_dir, f"{base_name}{rank_suffix}.pt"),
-                    weights_only=False
-                ).to(self.device),
-                'clip_embedding': torch.load(
-                    os.path.join(self.clip_dir, f"{base_name}{rank_suffix}.pt"),
-                    weights_only=False
-                ).to(self.device),
-                'dims': torch.load(
-                    os.path.join(self.dim_dir, f"{base_name}{rank_suffix}.pt"),
-                    weights_only=False
-                ).to(self.device)
+            # Load latent feature
+            latent_path = os.path.join(self.latent_dir, f"{filename}_rank{self.rank}.pt")
+            latent = torch.load(latent_path, map_location='cpu')
+            
+            # Load text embedding (either CLIP, T5, or both depending on config)
+            text_embeddings = {}
+            
+            # CLIP embedding (always try to load if path exists)
+            if hasattr(self.config, 'use_clip') and self.config.use_clip:
+                clip_path = os.path.join(self.clip_dir, f"{filename}_rank{self.rank}.pt")
+                if os.path.exists(clip_path):
+                    text_embeddings['clip'] = torch.load(clip_path, map_location='cpu')
+            
+            # T5 embedding (load if configured)
+            if hasattr(self.config, 'use_t5') and self.config.use_t5:
+                t5_path = os.path.join(self.clip_dir, f"{filename}_rank{self.rank}_t5.pt")
+                if os.path.exists(t5_path):
+                    text_embeddings['t5'] = torch.load(t5_path, map_location='cpu')
+            
+            # Get bucket and expert assignments
+            bucket = self.bucket_assignments[idx] if self.bucket_assignments is not None else torch.tensor(0)
+            expert = self.expert_assignments[idx] if self.expert_assignments is not None else torch.tensor(0)
+            
+            # Construct sample dictionary
+            sample = {
+                'latent': latent,
+                'bucket': bucket,
+                'expert': expert,
+                **text_embeddings  # Add all available text embeddings
             }
             
-            return idx, data
+            return idx, sample
+            
         except Exception as e:
-            logger.error(f"Error loading sample {idx}: {str(e)}")
+            if self.verbose:
+                print(f"Error loading sample {idx}: {str(e)}")
             return idx, None
 
     def _load_bucket_assignments(self):
@@ -274,27 +291,44 @@ class DDMDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Modified collate that handles variable-length sequences"""
+        """Modified collate that handles variable-length sequences and multiple embedding types"""
         batch = [b for b in batch if b is not None]
         if len(batch) == 0:
             return None
         
-        # Pad CLIP embeddings to max length
-        clip_embeddings = [item['clip_embedding'] for item in batch]
-        max_len = max(e.size(1) for e in clip_embeddings)
-        
-        padded_embeddings = []
-        for emb in clip_embeddings:
-            pad_size = max_len - emb.size(1)
-            padded = torch.nn.functional.pad(emb, (0,0,0,pad_size), value=0)
-            padded_embeddings.append(padded)
-        
-        return {
+        result = {
             'latent': torch.stack([item['latent'] for item in batch]),
-            'clip_embedding': torch.stack(padded_embeddings),
             'bucket': torch.stack([item['bucket'] for item in batch]),
             'expert': torch.stack([item['expert'] for item in batch])
         }
+        
+        # Handle CLIP embeddings if present
+        if 'clip' in batch[0]:
+            clip_embeddings = [item['clip'] for item in batch]
+            max_len = max(e.size(1) for e in clip_embeddings)
+            
+            padded_embeddings = []
+            for emb in clip_embeddings:
+                pad_size = max_len - emb.size(1)
+                padded = torch.nn.functional.pad(emb, (0,0,0,pad_size), value=0)
+                padded_embeddings.append(padded)
+            
+            result['clip_embedding'] = torch.stack(padded_embeddings)
+        
+        # Handle T5 embeddings if present
+        if 't5' in batch[0]:
+            t5_embeddings = [item['t5'] for item in batch]
+            max_len = max(e.size(1) for e in t5_embeddings)
+            
+            padded_embeddings = []
+            for emb in t5_embeddings:
+                pad_size = max_len - emb.size(1)
+                padded = torch.nn.functional.pad(emb, (0,0,0,pad_size), value=0)
+                padded_embeddings.append(padded)
+            
+            result['t5_embedding'] = torch.stack(padded_embeddings)
+        
+        return result
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""

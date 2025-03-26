@@ -373,11 +373,18 @@ class ExpertMMDiT(Flux):
         # Handle text input
         if isinstance(text_input, list) and isinstance(text_input[0], str):
             # This is a list of text prompts
-            if not hasattr(self, 'text_embedder'):
-                from models.modules.conditioner import CLIPEmbedder
-                self.text_embedder = CLIPEmbedder("openai/clip-vit-large-patch14", max_length=77).to(self.device)
-                
-            txt_embed = self.text_embedder(text_input)
+            if hasattr(self, 'text_embedder_type') and self.text_embedder_type == 't5':
+                # Use T5 embedder if specified
+                if not hasattr(self, 'text_embedder'):
+                    from models.modules.conditioner import T5Embedder
+                    self.text_embedder = T5Embedder("google/t5-v1_1-base", max_length=128).to(self.device)
+                txt_embed = self.text_embedder(text_input)
+            else:
+                # Default to CLIP embedder
+                if not hasattr(self, 'text_embedder'):
+                    from models.modules.conditioner import CLIPEmbedder
+                    self.text_embedder = CLIPEmbedder("openai/clip-vit-large-patch14", max_length=77).to(self.device)
+                txt_embed = self.text_embedder(text_input)
         else:
             # Assume these are already embeddings
             txt_embed = text_input

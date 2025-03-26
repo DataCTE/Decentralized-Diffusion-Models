@@ -15,6 +15,7 @@ from torchvision import transforms
 from config import get_config
 from data.vae import VAEWrapper
 from data.clip import CLIPTextEncoder
+from data.t5 import T5TextEncoder
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from concurrent.futures import as_completed
@@ -36,6 +37,8 @@ class FeatureGenerator:
             self.vae = VAEWrapper(self.device, config)
         if 'clip' in enabled_features:
             self.clip = CLIPTextEncoder(self.device, config)
+        if 't5' in enabled_features:
+            self.t5 = T5TextEncoder(self.device, config)
         if 'dino' in enabled_features and not config.use_existing_dino:
             self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).eval()
         else:
@@ -55,6 +58,7 @@ class FeatureGenerator:
         dir_map = {
             'vae': 'latents',
             'clip': 'clip',
+            't5': 't5',
             'dino': 'dino_features',
             'buckets': 'buckets',
             'dims': 'dims',
@@ -109,6 +113,7 @@ class FeatureGenerator:
                 features = {
                     'latent': self._extract_vae_latent(img),
                     'clip': self._extract_clip_embedding(caption_path.read_text()),
+                    't5': self._extract_t5_embedding(caption_path.read_text()),
                     'dino': self._extract_dino_features(img) if self.dino is not None else None,
                     'dims': torch.tensor(img.size, dtype=torch.int16),
                     'bucket': torch.tensor(bucket_idx, dtype=torch.int16)
@@ -133,6 +138,11 @@ class FeatureGenerator:
         """Raw text embedding without validation"""
         with torch.no_grad():
             return self.clip.encode([caption]).cpu()
+
+    def _extract_t5_embedding(self, caption):
+        """T5 text embedding extraction"""
+        with torch.no_grad():
+            return self.t5.encode([caption]).cpu()
 
     def _extract_dino_features(self, img):
         """Robust DINO feature extraction with model check"""
@@ -323,6 +333,10 @@ class FeatureGenerator:
             'handler': '_extract_clip_embedding',
             'save_prefix': 'clip'
         },
+        't5': {
+            'handler': '_extract_t5_embedding',
+            'save_prefix': 't5'
+        },
         'dino': {
             'handler': '_extract_dino_features', 
             'save_prefix': 'dino_features'
@@ -344,6 +358,7 @@ def main():
     parser.add_argument('--clustering', action='store_true', help='Run clustering')
     parser.add_argument('--vae-latents', action='store_true', help='Extract VAE latents')
     parser.add_argument('--clip-latents', action='store_true', help='Extract CLIP embeddings')
+    parser.add_argument('--t5-embeddings', action='store_true', help='Extract T5 embeddings')
     parser.add_argument('--dino-features', action='store_true', help='Extract DINO features')
     parser.add_argument('--all', action='store_true', help='Run all processing stages')
     parser.add_argument('--use-existing-dino', action='store_true',
@@ -353,11 +368,12 @@ def main():
     # Determine enabled features
     enabled_features = []
     if args.all:
-        enabled_features = ['vae', 'clip', 'dino', 'buckets', 'dims', 'clustering']
+        enabled_features = ['vae', 'clip', 't5', 'dino', 'buckets', 'dims', 'clustering']
     else:
         feature_map = {
             'vae-latents': 'vae',
             'clip-latents': 'clip', 
+            't5-embeddings': 't5',
             'dino-features': 'dino',
             'buckets': 'buckets',
             'dims': 'dims',
