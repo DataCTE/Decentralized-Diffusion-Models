@@ -40,8 +40,11 @@ class FeatureGenerator:
             # Add T5 text encoder initialization
             from data.t5 import T5TextEncoder
             self.t5 = T5TextEncoder(self.device, config)
-        if 'dino' in enabled_features and not config.use_existing_dino:
-            self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).eval()
+        if 'dino' in enabled_features:
+            # Check if we should use existing features or load model
+            self.dino = None
+            if not getattr(config, 'use_existing_dino', False):
+                self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).eval()
         else:
             self.dino = None  # Explicitly set to None if not loading
         
@@ -421,6 +424,8 @@ def main():
     
     # Load config after distributed init
     config = get_config()
+    # Add command line args to config
+    config.use_existing_dino = args.use_existing_dino
     
     # Verify dataset path exists
     if rank == 0:
