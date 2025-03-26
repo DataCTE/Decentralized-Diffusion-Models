@@ -25,6 +25,8 @@ import time
 import argparse
 import pickle
 import logging
+from queue import Queue
+from threading import Lock
 
 logger = logging.getLogger(__name__)
 
@@ -483,10 +485,36 @@ class FeatureGenerator:
         return {p.stem.split('_rank')[0] for p in dir_path.glob(pattern)}
 
     def _extract_t5_embeddings_batch(self, captions):
-        """Extract T5 embeddings for a batch of captions more efficiently"""
-        with torch.no_grad():
-            embeddings = self.t5.encode(captions).cpu()
-            return embeddings
+        """Extract T5 embeddings for a batch of captions with enhanced performance"""
+        # Use mixed precision for faster processing
+        with torch.cuda.amp.autocast():
+            with torch.no_grad():
+                # Add timing benchmarks to detect bottlenecks
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                
+                start.record()
+                # Process in sub-batches if needed for very large batches
+                if len(captions) > 256:
+                    all_embeddings = []
+                    for i in range(0, len(captions), 256):
+                        sub_captions = captions[i:i+256]
+                        sub_embeddings = self.t5.encode(sub_captions)
+                        all_embeddings.append(sub_embeddings.cpu())
+                    embeddings = torch.cat(all_embeddings, dim=0)
+                else:
+                    embeddings = self.t5.encode(captions).cpu()
+                
+                end.record()
+                torch.cuda.synchronize()
+                
+                # Measure and log inference time for performance tuning
+                if len(captions) > 32:  # Only log for larger batches
+                    inference_ms = start.elapsed_time(end)
+                    logger.debug(f"T5 embedding time for {len(captions)} captions: {inference_ms:.2f}ms " 
+                               f"({inference_ms/len(captions):.2f}ms per caption)")
+                
+                return embeddings
 
     def _save_t5_embedding(self, uuid_str, embedding):
         """Save a T5 embedding with the given UUID"""
@@ -844,6 +872,10 @@ def main():
                         help='Number of worker threads for I/O operations')
     parser.add_argument('--direct-captions', action='store_true',
                         help='Use direct caption processing for T5 (faster)')
+    parser.add_argument('--t5-threads', type=int, default=3,
+                        help='Number of threads for T5 processing pipeline')
+    parser.add_argument('--t5-batch', type=int, default=256,
+                        help='Manual override for T5 batch size')
     args = parser.parse_args()
 
     # Configure logging
@@ -993,52 +1025,130 @@ def main():
             dist.destroy_process_group()
 
 def process_t5_embeddings_directly(processor, uuids, captions, batch_size, num_workers):
-    """Process T5 embeddings directly from caption texts - much more efficient"""
+    """Process T5 embeddings directly from caption texts with optimized multi-threading"""
     total_samples = len(uuids)
     logger.info(f"Processing {total_samples} T5 embeddings directly")
     
-    # Use much larger batch sizes for direct T5 processing (it's very efficient)
-    t5_batch_size = batch_size * 8
+    # Determine optimal batch sizes based on GPU memory
+    # T5 processing is very VRAM efficient so we can use larger batches
+    gpu_mem = torch.cuda.get_device_properties(processor.device).total_memory / (1024**3)  # GB
+    suggested_batch = min(512, int(gpu_mem * 48))  # Empirical formula for good T5 batch size
+    t5_batch_size = suggested_batch - (suggested_batch % 64)  # Make divisible by 64
     
-    with tqdm(total=total_samples, desc=f"T5 GPU {processor.rank}", position=processor.rank) as pbar:
+    logger.info(f"Using T5 batch size of {t5_batch_size} on GPU with {gpu_mem:.2f}GB memory")
+    
+    # Create a thread pool for I/O operations (saving)
+    io_pool = ThreadPoolExecutor(max_workers=min(32, num_workers * 2))
+    io_futures = []
+    
+    # Create a queue system for processing with multiple CPU threads
+    caption_queue = Queue(maxsize=4)  # Limit queue size to prevent memory issues
+    result_queue = Queue(maxsize=4)
+    
+    # Create a custom thread safe progress bar
+    pbar_lock = Lock()
+    pbar = tqdm(total=total_samples, desc=f"T5 GPU {processor.rank}", position=processor.rank)
+    
+    def enqueue_captions():
+        """Thread that prepares batches and puts them in the queue"""
         for batch_idx in range(0, total_samples, t5_batch_size):
             end_idx = min(batch_idx + t5_batch_size, total_samples)
             
-            # Get the batch
             batch_uuids = uuids[batch_idx:end_idx]
             batch_captions = captions[batch_idx:end_idx]
             
-            # Process in parallel with thread pool
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                # Split into smaller chunks to avoid OOM
-                chunk_size = 128  # Adjust based on available GPU memory
-                for i in range(0, len(batch_uuids), chunk_size):
-                    chunk_end = min(i + chunk_size, len(batch_uuids))
-                    
-                    chunk_uuids = batch_uuids[i:chunk_end]
-                    chunk_captions = batch_captions[i:chunk_end]
-                    
-                    # Process captions in chunks
+            # Split into smaller chunks for processing
+            for i in range(0, len(batch_uuids), 128):
+                chunk_end = min(i + 128, len(batch_uuids))
+                
+                chunk_uuids = batch_uuids[i:chunk_end]
+                chunk_captions = batch_captions[i:chunk_end]
+                
+                caption_queue.put((chunk_uuids, chunk_captions))
+        
+        # Signal that we're done
+        caption_queue.put(None)
+    
+    def process_captions():
+        """Thread that processes captions through T5 model"""
+        while True:
+            item = caption_queue.get()
+            if item is None:
+                # Signal end of processing
+                result_queue.put(None)
+                break
+                
+            chunk_uuids, chunk_captions = item
+            
+            try:
+                # Process on GPU
+                with torch.cuda.amp.autocast(enabled=True):  # Use mixed precision for speed
                     embeddings = processor._extract_t5_embeddings_batch(chunk_captions)
-                    
-                    # Save embeddings
-                    futures = []
-                    for j, uuid_str in enumerate(chunk_uuids):
-                        futures.append(executor.submit(
-                            processor._save_t5_embedding, 
-                            uuid_str, 
-                            embeddings[j]
-                        ))
-                    
-                    # Wait for all saves to complete
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            logger.error(f"Error saving T5 embedding: {str(e)}")
+                
+                # Push to result queue
+                result_queue.put((chunk_uuids, embeddings))
+            except Exception as e:
+                logger.error(f"Error processing captions: {str(e)}")
+                # Put a placeholder to keep counts aligned
+                result_queue.put((chunk_uuids, None))
+    
+    def save_results():
+        """Thread that saves results from the queue"""
+        processed = 0
+        while True:
+            item = result_queue.get()
+            if item is None:
+                break
+                
+            chunk_uuids, embeddings = item
+            if embeddings is None:
+                with pbar_lock:
+                    pbar.update(len(chunk_uuids))
+                processed += len(chunk_uuids)
+                continue
+            
+            # Save embeddings in parallel
+            for j, uuid_str in enumerate(chunk_uuids):
+                future = io_pool.submit(
+                    processor._save_t5_embedding,
+                    uuid_str,
+                    embeddings[j]
+                )
+                io_futures.append(future)
             
             # Update progress
-            pbar.update(end_idx - batch_idx)
+            with pbar_lock:
+                pbar.update(len(chunk_uuids))
+            processed += len(chunk_uuids)
+    
+    # Start the threads
+    import threading
+    enqueue_thread = threading.Thread(target=enqueue_captions)
+    process_thread = threading.Thread(target=process_captions)
+    save_thread = threading.Thread(target=save_results)
+    
+    # Start the pipeline
+    enqueue_thread.start()
+    process_thread.start()
+    save_thread.start()
+    
+    # Wait for all threads to complete
+    enqueue_thread.join()
+    process_thread.join()
+    save_thread.join()
+    
+    # Close the progress bar
+    pbar.close()
+    
+    # Wait for all I/O operations to complete and check for errors
+    for future in as_completed(io_futures):
+        try:
+            future.result()
+        except Exception as e:
+            logger.error(f"Error saving T5 embedding: {str(e)}")
+    
+    io_pool.shutdown()
+    logger.info(f"Completed processing {total_samples} T5 embeddings")
 
 if __name__ == "__main__":
     main() 
