@@ -351,7 +351,7 @@ class FeatureGenerator:
         # If this hangs, it indicates GPU health issues
         dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
 
-    # Add this class attribute
+    # Update the FEATURE_PROCESSORS dictionary to handle bucket calculation correctly
     FEATURE_PROCESSORS = {
         'vae': {
             'handler': '_extract_vae_latent',
@@ -370,7 +370,7 @@ class FeatureGenerator:
             'save_prefix': 'dino_features'
         },
         'buckets': {
-            'handler': '_get_bucket_index',
+            'handler': '_extract_bucket_index',  # Changed this to a new wrapper function
             'save_prefix': 'buckets'
         },
         'dims': {
@@ -378,6 +378,13 @@ class FeatureGenerator:
             'save_prefix': 'dims'
         }
     }
+
+    # Add a new wrapper function to extract bucket index from an image path
+    def _extract_bucket_index(self, img_path):
+        """Extract bucket index from image dimensions"""
+        with Image.open(img_path) as img:
+            width, height = img.size
+            return torch.tensor(self._get_bucket_index(width, height), dtype=torch.int16)
 
 def main():
     # Parse command line arguments
