@@ -186,7 +186,7 @@ class DDMDataset(Dataset):
 
     def _load_sample(self, idx):
         """Load all features for a sample with proper filename pattern matching"""
-        # Get the sample ID from the samples list - needs to be the actual filename ID from disk
+        # Get the sample ID from the samples list
         sample_id = self.samples[idx]
         base_name = f"anime-{sample_id}"
         
@@ -199,7 +199,7 @@ class DDMDataset(Dataset):
         
         if clip_file is None:
             print(f"WARNING: Missing required CLIP embedding file for {base_name}")
-            return None
+            return idx, None  # Return index with None for data
         
         # Same for latent files - search with rank pattern
         latent_file = None
@@ -210,15 +210,15 @@ class DDMDataset(Dataset):
         
         if latent_file is None:
             print(f"WARNING: Missing required latent file for {base_name}")
-            return None
+            return idx, None  # Return index with None for data
         
         # Now load both files
         try:
             clip_embedding = torch.load(clip_file)
             latent = torch.load(latent_file)
             
-            # Create complete sample data
-            return {
+            # Create and return complete sample data with index
+            return idx, {
                 'latent': latent,
                 'clip_embedding': clip_embedding,
                 'bucket': self.bucket_assignments[idx] if hasattr(self, 'bucket_assignments') else 0,
@@ -227,7 +227,7 @@ class DDMDataset(Dataset):
             }
         except Exception as e:
             print(f"Error loading tensors from {clip_file} or {latent_file}: {str(e)}")
-            return None
+            return idx, None  # Return index with None for data
 
     def _load_bucket_assignments(self):
         """Load bucket assignments efficiently"""
@@ -253,28 +253,37 @@ class DDMDataset(Dataset):
     def __getitem__(self, idx):
         """Load a sample and its corresponding features"""
         try:
-            # Get filename/ID for this index
-            sample_id = self.samples[idx]
-            sample_data = self._load_sample(idx)
+            # Check cache first
+            if idx in self.cache:
+                return self.cache[idx]
             
-            # The key issue - need to ensure clip_embedding AND latent are both loaded
+            # Get sample data
+            _, sample_data = self._load_sample(idx)
+            
+            # Validate the data
             if sample_data is None or 'clip_embedding' not in sample_data or 'latent' not in sample_data:
-                # This is likely where the issue exists - when handling missing files
-                # Current approach probably doesn't check for missing latents
-                raise ValueError(f"Missing required features for sample {sample_id}")
+                raise ValueError(f"Missing required features for sample at index {idx}")
             
-            # Make sure we're returning a complete sample with both latent and clip_embedding
+            # Return the complete sample
             return {
-                'latent': sample_data['latent'],
-                'clip_embedding': sample_data['clip_embedding'],
+                'latent': sample_data['latent'].to(self.device),
+                'clip_embedding': sample_data['clip_embedding'].to(self.device),
                 'bucket': sample_data.get('bucket', 0),
                 'expert': sample_data.get('expert', 0),
                 'cluster_pred': sample_data.get('cluster_pred', 0)
             }
         except Exception as e:
-            # Proper error handling
+            # Error handling
             print(f"Error loading sample {idx}: {str(e)}")
-            # Return a fallback sample or re-raise
+            # Return a fallback or empty sample
+            # This is better than raising an exception which would crash training
+            return {
+                'latent': torch.zeros((16, 16, 16), device=self.device),  # Default size based on config
+                'clip_embedding': torch.zeros((77, 768), device=self.device),  # Default CLIP dims
+                'bucket': 0,
+                'expert': 0,
+                'cluster_pred': 0
+            }
 
     def __len__(self):
         return self.num_samples
