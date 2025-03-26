@@ -103,17 +103,31 @@ class DDMDataset(Dataset):
         logger.info(f"[Rank {self.rank}] Preloaded {len(self.cache)} samples")
 
     def _verify_cache_dirs(self):
-        """Validate cache directory structure"""
-        required_dirs = {
-            'latents': self.latent_dir,
-            'clip': self.clip_dir,
-            'clusters': self.cluster_dir,
-            'dims': self.dim_dir
-        }
+        """Verify cache directories and initialize sample IDs"""
+        # Make sure these directories exist
+        self.clip_dir = os.path.join(self.config.feature_cache_path, 'clip')
+        self.latent_dir = os.path.join(self.config.feature_cache_path, 'latents')
         
-        for name, path in required_dirs.items():
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"Missing required cache directory: {name} ({path})")
+        # Check directory existence
+        if not os.path.exists(self.clip_dir) or not os.path.exists(self.latent_dir):
+            raise ValueError(f"Cache directories not found: {self.clip_dir}, {self.latent_dir}")
+        
+        # Get sample IDs from actual files
+        sample_ids = []
+        # Iterate through clip files to extract actual sample IDs
+        for file_path in Path(self.clip_dir).glob("anime-*_rank*.pt"):
+            file_name = file_path.stem  # Get filename without extension
+            # Parse the ID from the filename pattern "anime-{ID}_rank{N}"
+            try:
+                sample_id = int(file_name.split("-")[1].split("_rank")[0])
+                sample_ids.append(sample_id)
+            except (IndexError, ValueError) as e:
+                print(f"Warning: Could not parse sample ID from {file_name}: {e}")
+        
+        # Remove duplicates and sort
+        self.samples = sorted(set(sample_ids))
+        self.num_samples = len(self.samples)
+        print(f"Found {self.num_samples} valid samples with both latent and CLIP embeddings")
 
     def _lazy_load_clusters(self):
         """Load precomputed cluster assignments with proper device placement"""
@@ -171,15 +185,15 @@ class DDMDataset(Dataset):
             raise
 
     def _load_sample(self, idx):
-        """Load all features for a sample by ID"""
-        base_name = f"anime-{idx}"
+        """Load all features for a sample with proper filename pattern matching"""
+        # Get the sample ID from the samples list - needs to be the actual filename ID from disk
+        sample_id = self.samples[idx]
+        base_name = f"anime-{sample_id}"
         
-        # FIX: Handle rank suffix correctly when loading features
-        # Current issue: likely looking for exact filename without considering rank suffix
-        
-        # Try to find clip embedding with any rank suffix
+        # Search for any file matching the base name with any rank suffix
         clip_file = None
-        for rank_file in Path(self.clip_dir).glob(f"{base_name}_rank*.pt"):
+        clip_pattern = f"{base_name}_rank*.pt"
+        for rank_file in Path(self.clip_dir).glob(clip_pattern):
             clip_file = rank_file
             break
         
@@ -187,9 +201,10 @@ class DDMDataset(Dataset):
             print(f"WARNING: Missing required CLIP embedding file for {base_name}")
             return None
         
-        # Same for latent files - need to find with rank suffix
+        # Same for latent files - search with rank pattern
         latent_file = None
-        for rank_file in Path(self.latent_dir).glob(f"{base_name}_rank*.pt"):
+        latent_pattern = f"{base_name}_rank*.pt"
+        for rank_file in Path(self.latent_dir).glob(latent_pattern):
             latent_file = rank_file
             break
         
@@ -198,15 +213,21 @@ class DDMDataset(Dataset):
             return None
         
         # Now load both files
-        clip_embedding = torch.load(clip_file)
-        latent = torch.load(latent_file)
-        
-        # Create and return complete sample data
-        return {
-            'latent': latent,
-            'clip_embedding': clip_embedding,
-            # Load other features as needed...
-        }
+        try:
+            clip_embedding = torch.load(clip_file)
+            latent = torch.load(latent_file)
+            
+            # Create complete sample data
+            return {
+                'latent': latent,
+                'clip_embedding': clip_embedding,
+                'bucket': self.bucket_assignments[idx] if hasattr(self, 'bucket_assignments') else 0,
+                'expert': self.cluster_assignments[idx] if hasattr(self, 'cluster_assignments') else 0,
+                'cluster_pred': 0  # Default value, will be predicted by router
+            }
+        except Exception as e:
+            print(f"Error loading tensors from {clip_file} or {latent_file}: {str(e)}")
+            return None
 
     def _load_bucket_assignments(self):
         """Load bucket assignments efficiently"""
@@ -233,7 +254,7 @@ class DDMDataset(Dataset):
         """Load a sample and its corresponding features"""
         try:
             # Get filename/ID for this index
-            sample_id = self.base_names[idx]
+            sample_id = self.samples[idx]
             sample_data = self._load_sample(idx)
             
             # The key issue - need to ensure clip_embedding AND latent are both loaded
