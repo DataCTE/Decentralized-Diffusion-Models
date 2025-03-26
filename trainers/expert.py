@@ -27,10 +27,19 @@ class ExpertTrainer(BaseTrainer):
     Each expert trains in complete isolation on its assigned data cluster,
     with no cross-communication between experts as described in paper Section 3.2
     """
-    def __init__(self, expert_idx, config, device, rank, world_size):
+    def __init__(self, expert_idx, config, device, rank, world_size, router=None):
         # Paper-recommended initialization (section 4.1)
         super().__init__(config, device, rank)
-        self.expert_idx = expert_idx  # Store the expert index for identification
+        
+        # Validate router existence before initializing components
+        if router is None:
+            raise ValueError(
+                f"ExpertTrainer requires router reference. "
+                f"Missing router for expert {expert_idx} (rank {rank})"
+            )
+        
+        self.router = router
+        self.expert_idx = expert_idx
         self.world_size = world_size
         
         # --- FIX: Ensure model config uses latent_channels for in_channels ---
@@ -143,6 +152,13 @@ class ExpertTrainer(BaseTrainer):
 
     def train_step(self, batch):
         """Train expert with flow matching loss per paper Section 3.2"""
+        # Pre-step validation
+        if not hasattr(self, 'router') or self.router is None:
+            raise RuntimeError(
+                f"Expert {self.expert_idx} lost router reference during training! "
+                f"Rank {self.rank}, World Size {self.world_size}"
+            )
+        
         print(f"[DEBUG Expert {self.expert_idx}] Starting train_step")
         print(f"[DEBUG Expert {self.expert_idx}] Batch keys: {batch.keys()}")
         

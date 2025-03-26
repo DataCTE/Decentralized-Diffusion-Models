@@ -83,6 +83,9 @@ class ExpertCacheManager:
                     # Initialize scaler for mixed precision training
                     expert.scaler = torch.amp.GradScaler('cuda', enabled=self.config.use_mixed_precision)
                 
+                if not hasattr(expert, 'router'):
+                    expert.router = self.config.router  # Fallback assignment
+                
                 self._add_to_cache(expert_idx, expert)
                 return expert
 

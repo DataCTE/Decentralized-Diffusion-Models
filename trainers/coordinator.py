@@ -562,7 +562,8 @@ class DDMTrainingCoordinator:
                 config=self.config,
                 device=self.device,
                 rank=self.rank,
-                world_size=self.world_size
+                world_size=self.world_size,
+                router=self.router  # Pass coordinator's router
             )
         
         experts_dict = {}
@@ -885,7 +886,8 @@ class DDMTrainingCoordinator:
                     config=self.config,
                     device=self.device,
                     rank=self.rank,
-                    world_size=self.world_size
+                    world_size=self.world_size,
+                    router=self.router  # Pass coordinator's router
                 )
                 return expert
             
@@ -971,16 +973,14 @@ class DDMTrainingCoordinator:
     def _create_expert(self, expert_idx):
         """Create expert trainer instance"""
         from trainers.expert import ExpertTrainer
-        
-        expert_trainer = ExpertTrainer(
+        return ExpertTrainer(
             expert_idx=expert_idx,
             config=self.config,
             device=self.device,
             rank=self.rank,
-            world_size=self.world_size
+            world_size=self.world_size,
+            router=self.router  # Pass coordinator's router
         )
-        
-        return expert_trainer
 
     def _verify_sharding(self):
         """No-op verification since we trust FSDP's sharding"""
