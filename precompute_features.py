@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 import torch.distributed as dist
 import time
 import argparse
+import random
 
 class FeatureGenerator:
     def __init__(self, config, enabled_features):
@@ -94,6 +95,7 @@ class FeatureGenerator:
             img_path_obj = Path(img_path)
             caption_path = img_path_obj.with_suffix('.txt')
             if not caption_path.exists():
+                print(f"Rank {self.rank}: No caption found for {img_path}")
                 return False
             
             # Use the filename as the base for latent storage
@@ -122,6 +124,11 @@ class FeatureGenerator:
             # Save with rank-specific naming, only save enabled features
             features = {k: v for k, v in features.items() if v is not None}
             self._save_features(base_name, features)
+            
+            # Log successful processing
+            if self.rank == 0 and random.random() < 0.01:  # Log ~1% of successful files on rank 0
+                print(f"Rank {self.rank}: Successfully processed {img_path}, saved {len(features)} features")
+            
             return True
         except Exception as e:
             print(f"Rank {self.rank} failed {img_path}: {str(e)}", flush=True)
@@ -184,9 +191,32 @@ class FeatureGenerator:
 
     def _save_features(self, base_name, features):
         """Force-save features with rank ID"""
-        for feat, data in features.items():
-            if feat in self.enabled_features:
-                torch.save(data, self.feature_dir/f"{feat}/{base_name}_rank{self.rank}.pt")
+        saved_files = []
+        
+        # Create a reverse mapping from feature keys to feature types
+        key_to_type = {v['feature_key']: k for k, v in self.FEATURE_PROCESSORS.items()}
+        
+        for feat_key, data in features.items():
+            if feat_key in key_to_type and key_to_type[feat_key] in self.enabled_features:
+                feat_type = key_to_type[feat_key]
+                save_dir = self.feature_dir/self.FEATURE_PROCESSORS[feat_type]['save_prefix']
+                save_path = save_dir/f"{base_name}_rank{self.rank}.pt"
+                
+                try:
+                    # Ensure directory exists
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save data
+                    torch.save(data, save_path)
+                    saved_files.append(str(save_path))
+                except Exception as e:
+                    print(f"Rank {self.rank} failed to save {save_path}: {str(e)}")
+        
+        # Occasional logging of saved files
+        if self.rank == 0 and random.random() < 0.005:  # Log ~0.5% of files on rank 0
+            print(f"Rank {self.rank}: Saved files: {saved_files}")
+        
+        return len(saved_files) > 0
 
     def run_clustering(self):
         """Pure CPU clustering implementation"""
@@ -375,31 +405,37 @@ class FeatureGenerator:
         # If this hangs, it indicates GPU health issues
         dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
 
-    # Update the FEATURE_PROCESSORS dictionary to handle bucket calculation correctly
+    # Update the FEATURE_PROCESSORS dictionary to clearly indicate feature type and save key
     FEATURE_PROCESSORS = {
         'vae': {
             'handler': '_extract_vae_latent',
-            'save_prefix': 'latents'
+            'save_prefix': 'latents',
+            'feature_key': 'latent'  # The key used in the features dictionary
         },
         'clip': {
             'handler': '_extract_clip_embedding',
-            'save_prefix': 'clip'
+            'save_prefix': 'clip',
+            'feature_key': 'clip'
         },
         't5': {
             'handler': '_extract_t5_embedding',
-            'save_prefix': 't5'
+            'save_prefix': 't5',
+            'feature_key': 't5'
         },
         'dino': {
             'handler': '_extract_dino_features', 
-            'save_prefix': 'dino_features'
+            'save_prefix': 'dino_features',
+            'feature_key': 'dino'
         },
         'buckets': {
-            'handler': '_extract_bucket_index',  # Changed this to a new wrapper function
-            'save_prefix': 'buckets'
+            'handler': '_extract_bucket_index',
+            'save_prefix': 'buckets',
+            'feature_key': 'bucket'  # This is the critical mapping!
         },
         'dims': {
             'handler': '_extract_dims',
-            'save_prefix': 'dims'
+            'save_prefix': 'dims',
+            'feature_key': 'dims'
         }
     }
 
@@ -434,7 +470,7 @@ def main():
             'clip-latents': 'clip', 
             't5-latents': 't5',
             'dino-features': 'dino',
-            'buckets': 'buckets',
+            'buckets': 'buckets',  # This maps directly from arg name to feature type
             'dims': 'dims',
             'clustering': 'clustering'
         }
@@ -481,107 +517,206 @@ def main():
     
     print(f"Rank {rank} received {len(local_images)} images to process")
     
-    # Initialize feature generator
-    processor = FeatureGenerator(config, enabled_features)
+    # Define fixed processing order
+    processing_order = ['vae', 'clip', 't5', 'dino', 'buckets', 'dims']
+
+    # Only process features that are enabled
+    features_to_process = [f for f in processing_order if f in enabled_features]
     
-    try:
-        # Main processing loop
-        with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
-            for img_path in local_images:
-                try:
-                    # Use the actual image filename as the base name
-                    # This maintains consistency with image-caption pairs
-                    img_path_obj = Path(img_path)
-                    base_name = img_path_obj.stem
-                    
-                    # Only process enabled features
-                    features = {}
-                    for feat in enabled_features:
-                        if feat in FeatureGenerator.FEATURE_PROCESSORS:
-                            handler_info = FeatureGenerator.FEATURE_PROCESSORS[feat]
-                            handler = handler_info['handler']
-                            features[feat] = getattr(processor, handler)(img_path)
-                    
-                    # Save enabled features
-                    for feat, data in features.items():
-                        prefix = FeatureGenerator.FEATURE_PROCESSORS[feat]['save_prefix']
-                        torch.save(data, processor.feature_dir/f"{prefix}/{base_name}_rank{rank}.pt")
-                    
-                    pbar.update(1)
-                except Exception as e:
-                    print(f"Rank {rank} failed to process {img_path}: {str(e)}")
-                    continue  # Skip to next image
-
-        # Add final completion marker
-        status_path = processor.feature_dir/f"status_rank{rank}.pt"
-        torch.save({'status': 'done', 'count': len(local_images)}, status_path)
+    # Process one feature type at a time for all images
+    for feature_type in features_to_process:
+        if rank == 0:
+            print(f"All ranks processing feature type: {feature_type}")
         
-        # Final synchronization before clustering
-        dist.barrier()
+        # Initialize feature generator with just this feature type
+        processor = FeatureGenerator(config, [feature_type])
+        
+        # This is the key fix - make sure we use the correct save directory
+        save_prefix = processor.FEATURE_PROCESSORS[feature_type]['save_prefix']
+        save_dir = processor.feature_dir/save_prefix
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Batch size depends on feature type - use larger batches for smaller features
+        if feature_type in ['buckets', 'dims']:
+            batch_size = 64
+        else:
+            batch_size = 16  # For larger models like VAE, DINO
+            
+        try:
+            # Main processing loop with batching
+            with tqdm(total=len(local_images), desc=f"GPU {rank} - {feature_type}", position=rank) as pbar:
+                for batch_start in range(0, len(local_images), batch_size):
+                    batch_end = min(batch_start + batch_size, len(local_images))
+                    batch_paths = local_images[batch_start:batch_end]
+                    
+                    # Track successfully processed items for pbar update
+                    processed_count = 0
+                    
+                    # Check which files already exist
+                    batch_to_process = []
+                    for img_path in batch_paths:
+                        img_path_obj = Path(img_path)
+                        base_name = img_path_obj.stem
+                        save_path = save_dir/f"{base_name}_rank{rank}.pt"
+                        
+                        # Skip if already processed
+                        if save_path.exists():
+                            processed_count += 1
+                            continue
+                            
+                        # For text features, check if caption exists
+                        if feature_type in ['clip', 't5']:
+                            caption_path = img_path_obj.with_suffix('.txt')
+                            if not caption_path.exists():
+                                processed_count += 1
+                                continue
+                                
+                        batch_to_process.append(img_path)
+                    
+                    # Skip if all files already processed
+                    if not batch_to_process:
+                        pbar.update(processed_count)
+                        continue
+                        
+                    # Process remaining batch
+                    for img_path in batch_to_process:
+                        try:
+                            img_path_obj = Path(img_path)
+                            base_name = img_path_obj.stem
+                            
+                            # Process based on feature type
+                            try:
+                                if feature_type in ['clip', 't5']:
+                                    # Text feature processing
+                                    caption_path = img_path_obj.with_suffix('.txt')
+                                    caption_text = caption_path.read_text()
+                                    
+                                    if feature_type == 'clip':
+                                        feature_data = processor._extract_clip_embedding(caption_text)
+                                    else:  # t5
+                                        feature_data = processor._extract_t5_embedding(caption_text)
+                                else:
+                                    # Image feature processing
+                                    with Image.open(img_path) as img:
+                                        img = img.convert('RGB')  # Ensure RGB format
+                                        
+                                        if feature_type == 'vae':
+                                            feature_data = processor._extract_vae_latent(img)
+                                        elif feature_type == 'dino':
+                                            feature_data = processor._extract_dino_features(img)
+                                        elif feature_type == 'buckets':
+                                            width, height = img.size
+                                            feature_data = torch.tensor(processor._get_bucket_index(width, height), dtype=torch.int16)
+                                        elif feature_type == 'dims':
+                                            feature_data = processor._extract_dims(img)
+                                
+                                # Save the feature
+                                save_path = save_dir/f"{base_name}_rank{rank}.pt"
+                                torch.save(feature_data, save_path)
+                                
+                                # Occasional logging
+                                if rank == 0 and random.random() < 0.001:
+                                    print(f"Rank {rank}: Saved {feature_type} for {base_name}")
+                                    
+                                processed_count += 1
+                                
+                            except Exception as e:
+                                print(f"Rank {rank} failed processing {feature_type} for {img_path}: {str(e)}")
+                                processed_count += 1  # Still count as processed for progress
+                                continue
+                                
+                        except Exception as e:
+                            print(f"Rank {rank} failed completely for {img_path}: {str(e)}")
+                            processed_count += 1
+                            continue
+                            
+                    # Update progress bar with batch results
+                    pbar.update(processed_count)
+                        
+            # Synchronize after each feature type
+            dist.barrier()
+            
+            # Free memory
+            del processor
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"Rank {rank} failed during {feature_type} processing: {str(e)}")
+            dist.barrier(timeout=60)
+            continue
 
-        # Clustering phase with coordinated error handling
-        if 'clustering' in enabled_features:
-            # All ranks participate in clustering workflow
-            cluster_start_time = time.time()
-            cluster_error = torch.tensor([0], device=device)
-            
-            if rank == 0:
-                try:
-                    # Clear previous cluster markers
-                    (processor.feature_dir/"clusters/started.pt").unlink(missing_ok=True)
-                    (processor.feature_dir/"clusters/error.pt").unlink(missing_ok=True)
-                    
-                    # Signal clustering start
-                    (processor.feature_dir/"clusters/started.pt").touch()
-                    
-                    # Actual clustering execution
-                    processor.run_clustering()
-                except Exception as e:
-                    print(f"Clustering failed: {str(e)}")
-                    cluster_error.fill_(1)
-                    (processor.feature_dir/"clusters/error.pt").touch()
-            
-            # Broadcast error status to all ranks
-            dist.broadcast(cluster_error, src=0)
-            
-            if cluster_error.item() == 1:
-                raise RuntimeError("Clustering failed on rank 0")
-            
-            # Unified waiting logic using distributed status
-            clustering_status = torch.tensor([0], device=device)
+    # Clustering code with proper status updates
+    if 'clustering' in enabled_features:
+        cluster_start_time = time.time()
+        cluster_error = torch.tensor([0], device=device)
+        clustering_status = torch.tensor([0], device=device)
+        
+        # Initialize processor for clustering
+        cluster_processor = FeatureGenerator(config, ['clustering'])
+        feature_dir = cluster_processor.feature_dir  # Define feature_dir properly
+        
+        if rank == 0:
+            try:
+                # Clear previous markers
+                (feature_dir/"clusters/started.pt").unlink(missing_ok=True)
+                (feature_dir/"clusters/error.pt").unlink(missing_ok=True)
+                
+                # Signal start
+                (feature_dir/"clusters/started.pt").touch()
+                
+                # Run clustering
+                cluster_processor.run_clustering()
+                
+                # Signal completion on success
+                clustering_status.fill_(2)
+                print("Clustering completed successfully")
+                
+            except Exception as e:
+                print(f"Clustering failed: {str(e)}")
+                cluster_error.fill_(1)
+                clustering_status.fill_(1)
+                (feature_dir/"clusters/error.pt").touch()
+        
+        # Broadcast status to all ranks
+        dist.broadcast(cluster_error, src=0)
+        dist.broadcast(clustering_status, src=0)
+        
+        # Check for immediate error
+        if cluster_error.item() == 1:
+            raise RuntimeError("Clustering failed on rank 0")
+        
+        # Wait for completion or timeout if not already done
+        if clustering_status.item() != 2:
             while True:
-                # Check status every 5 seconds with timeout
+                # Poll status
                 dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX)
                 
                 if clustering_status.item() == 2:
-                    break  # Clustering completed
+                    break  # Completed
                 elif clustering_status.item() == 1:
-                    raise RuntimeError("Clustering failed on rank 0")
+                    raise RuntimeError("Clustering failed after initial check")
                 
                 if time.time() - cluster_start_time > 7200:  # 2 hour timeout
                     raise RuntimeError("Clustering timed out")
                 
-                # Progress reporting
+                # Status reporting
                 if rank == 0:
                     print(f"Clustering progress: {time.time() - cluster_start_time:.1f}s elapsed")
                 
                 time.sleep(5)
 
-        # Add GPU health check
-        processor._gpu_health_check()
+    # Add GPU health check
+    test_tensor = torch.randn(1024, device=device)
+    torch.cuda.synchronize()
+    dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
 
-    except Exception as e:
-        print(f"Rank {rank} failed: {str(e)}")
-        # Emergency barrier with timeout
-        dist.barrier(timeout=60)
-        raise
-    finally:
-        # Cleanup status files
-        if rank == 0:
-            for r in range(dist.get_world_size()):
-                (processor.feature_dir/f"status_rank{r}.pt").unlink(missing_ok=True)
-        dist.barrier()
-        dist.destroy_process_group()
+    # Final cleanup
+    feature_dir = Path(config.feature_cache_path)  # Define feature_dir for cleanup
+    if rank == 0:
+        for r in range(dist.get_world_size()):
+            (feature_dir/f"status_rank{r}.pt").unlink(missing_ok=True)
+    dist.barrier()
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     try:
