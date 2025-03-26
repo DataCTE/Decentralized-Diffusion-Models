@@ -220,101 +220,121 @@ class FeatureGenerator:
     def run_clustering(self):
         """Pure CPU clustering implementation"""
         try:
+            # Create a status tensor for coordination
+            status = torch.zeros(1, dtype=torch.int32, device=self.device)
+            
             if self.rank == 0:
-                feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
-                total_files = len(feature_files)
-                
-                # Memory map setup
-                mmap_path = self.feature_dir/"clusters/features.mmap"
-                sample_feat = torch.load(feature_files[0], map_location='cpu')
-                feat_dim = sample_feat.shape[1]
-                
-                # Create memory-mapped array
-                with open(mmap_path, 'wb') as f:
-                    f.seek(total_files * feat_dim * 4 - 1)
-                    f.write(b'\0')
-                
-                mmap_array = np.memmap(mmap_path, dtype=np.float32, mode='r+', 
-                                     shape=(total_files, feat_dim))
-                
-                # Batched loading with error handling
-                batch_size = 8192
-                # Store file paths to maintain name association
-                file_paths = []
-                
-                with tqdm(total=total_files, desc="Loading features") as pbar:
-                    for batch_idx in range(0, total_files, batch_size):
-                        batch_files = feature_files[batch_idx:batch_idx+batch_size]
-                        
-                        with ThreadPoolExecutor(max_workers=32) as executor:
-                            futures = {executor.submit(self._safe_load_feature, f): (i, f) 
-                                     for i, f in enumerate(batch_files, batch_idx)}
-                            for future in as_completed(futures):
-                                idx, file_path = futures[future]
-                                try:
-                                    feat = future.result()
-                                    if feat is not None:
-                                        mmap_array[idx] = feat.numpy().squeeze()
-                                        file_paths.append(file_path)
-                                except Exception as e:
-                                    print(f"Skipping corrupted file: {str(e)}")
-                                pbar.update(1)
-                
-                # Filter invalid entries
-                valid_mask = ~np.all(mmap_array == 0, axis=1)
-                full_features = mmap_array[valid_mask]
-                valid_file_paths = [fp for i, fp in enumerate(file_paths) if valid_mask[i]]
-                del mmap_array  # Release memory map
+                try:
+                    print("Starting clustering on rank 0 (this may take a while)")
+                    feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
+                    total_files = len(feature_files)
+                    
+                    # Memory map setup
+                    mmap_path = self.feature_dir/"clusters/features.mmap"
+                    sample_feat = torch.load(feature_files[0], map_location='cpu')
+                    feat_dim = sample_feat.shape[1]
+                    
+                    # Create memory-mapped array
+                    with open(mmap_path, 'wb') as f:
+                        f.seek(total_files * feat_dim * 4 - 1)
+                        f.write(b'\0')
+                    
+                    mmap_array = np.memmap(mmap_path, dtype=np.float32, mode='r+', 
+                                         shape=(total_files, feat_dim))
+                    
+                    # Batched loading with error handling
+                    batch_size = 8192
+                    # Store file paths to maintain name association
+                    file_paths = []
+                    
+                    with tqdm(total=total_files, desc="Loading features") as pbar:
+                        for batch_idx in range(0, total_files, batch_size):
+                            batch_files = feature_files[batch_idx:batch_idx+batch_size]
+                            
+                            with ThreadPoolExecutor(max_workers=32) as executor:
+                                futures = {executor.submit(self._safe_load_feature, f): (i, f) 
+                                         for i, f in enumerate(batch_files, batch_idx)}
+                                for future in as_completed(futures):
+                                    idx, file_path = futures[future]
+                                    try:
+                                        feat = future.result()
+                                        if feat is not None:
+                                            mmap_array[idx] = feat.numpy().squeeze()
+                                            file_paths.append(file_path)
+                                    except Exception as e:
+                                        print(f"Skipping corrupted file: {str(e)}")
+                                    pbar.update(1)
+                    
+                    # Filter invalid entries
+                    valid_mask = ~np.all(mmap_array == 0, axis=1)
+                    full_features = mmap_array[valid_mask]
+                    valid_file_paths = [fp for i, fp in enumerate(file_paths) if valid_mask[i]]
+                    del mmap_array  # Release memory map
 
-                # CPU-only k-means
-                kmeans = faiss.Kmeans(
-                    full_features.shape[1], 1024,
-                    niter=100, 
-                    gpu=False,
-                    spherical=True,
-                    min_points_per_centroid=100,
-                    max_points_per_centroid=10000,
-                    nredo=3,
-                    verbose=True
-                )
-                kmeans.train(full_features)
-                
-                # CPU-based hierarchical clustering
-                agg = AgglomerativeClustering(
-                    n_clusters=8, 
-                    linkage='average',
-                    metric='cosine', 
-                    compute_full_tree=True
-                )
-                agg.fit(kmeans.centroids)
-                
-                # Save final clusters
-                _, labels = kmeans.index.search(full_features, 1)
-                cluster_labels = agg.labels_[labels.flatten()]
-                
-                # Save cluster labels with original file names
-                cluster_dict = {}
-                for i, file_path in enumerate(valid_file_paths):
-                    # Extract base name from file path without rank suffix
-                    base_name = Path(file_path).stem
-                    # Remove rank suffix if present (e.g., "_rank0")
-                    if "_rank" in base_name:
-                        base_name = base_name.split("_rank")[0]
-                    cluster_dict[base_name] = int(cluster_labels[i])
-                
-                torch.save(cluster_dict, self.feature_dir/"clusters/final_clusters.pt")
+                    # CPU-only k-means
+                    kmeans = faiss.Kmeans(
+                        full_features.shape[1], 1024,
+                        niter=100, 
+                        gpu=False,
+                        spherical=True,
+                        min_points_per_centroid=100,
+                        max_points_per_centroid=10000,
+                        nredo=3,
+                        verbose=True
+                    )
+                    kmeans.train(full_features)
+                    
+                    # CPU-based hierarchical clustering
+                    agg = AgglomerativeClustering(
+                        n_clusters=8, 
+                        linkage='average',
+                        metric='cosine', 
+                        compute_full_tree=True
+                    )
+                    agg.fit(kmeans.centroids)
+                    
+                    # Save final clusters
+                    _, labels = kmeans.index.search(full_features, 1)
+                    cluster_labels = agg.labels_[labels.flatten()]
+                    
+                    # Save cluster labels with original file names
+                    cluster_dict = {}
+                    for i, file_path in enumerate(valid_file_paths):
+                        # Extract base name from file path without rank suffix
+                        base_name = Path(file_path).stem
+                        # Remove rank suffix if present (e.g., "_rank0")
+                        if "_rank" in base_name:
+                            base_name = base_name.split("_rank")[0]
+                        cluster_dict[base_name] = int(cluster_labels[i])
+                    
+                    torch.save(cluster_dict, self.feature_dir/"clusters/final_clusters.pt")
 
-                # Cleanup
-                os.remove(mmap_path)
+                    # Cleanup
+                    os.remove(mmap_path)
 
-            # Simple barrier since we're CPU-only
-            if dist.is_initialized():
-                dist.barrier()
+                    # On success, set status to 1
+                    status[0] = 1
+                    print("Clustering completed successfully")
+                    
+                except Exception as e:
+                    print(f"Clustering failed on rank 0: {str(e)}")
+                    # On failure, set status to 2
+                    status[0] = 2
+            
+            # Broadcast status from rank 0 to all processes
+            dist.broadcast(status, src=0)
+            
+            if status[0] == 2:
+                raise RuntimeError("Clustering failed on rank 0")
+            
+            # If status is 1, clustering succeeded
+            if self.rank != 0:
+                print(f"Rank {self.rank}: Waiting for clustering to complete on rank 0")
+            
+            return status[0] == 1
             
         except Exception as e:
-            print(f"Clustering failed: {str(e)}")
-            if dist.is_initialized():
-                dist.barrier()
+            print(f"Clustering process failed: {str(e)}")
             raise
 
     def _safe_load_feature(self, path):
@@ -691,63 +711,26 @@ def main():
 
     # Clustering code with proper status updates
     if 'clustering' in enabled_features:
-        cluster_start_time = time.time()
-        cluster_error = torch.tensor([0], device=device)
-        clustering_status = torch.tensor([0], device=device)
-        
-        # Initialize processor for clustering
-        cluster_processor = FeatureGenerator(config, ['clustering'])
-        feature_dir = cluster_processor.feature_dir  # Define feature_dir properly
-        
         if rank == 0:
-            try:
-                # Clear previous markers
-                (feature_dir/"clusters/started.pt").unlink(missing_ok=True)
-                (feature_dir/"clusters/error.pt").unlink(missing_ok=True)
-                
-                # Signal start
-                (feature_dir/"clusters/started.pt").touch()
-                
-                # Run clustering
-                cluster_processor.run_clustering()
-                
-                # Signal completion on success
-                clustering_status.fill_(2)
-                print("Clustering completed successfully")
-                
-            except Exception as e:
-                print(f"Clustering failed: {str(e)}")
-                cluster_error.fill_(1)
-                clustering_status.fill_(1)
-                (feature_dir/"clusters/error.pt").touch()
+            print("Starting clustering process (only on rank 0)")
         
-        # Broadcast status to all ranks
-        dist.broadcast(cluster_error, src=0)
-        dist.broadcast(clustering_status, src=0)
+        cluster_processor = FeatureGenerator(config, ['clustering'])
         
-        # Check for immediate error
-        if cluster_error.item() == 1:
-            raise RuntimeError("Clustering failed on rank 0")
-        
-        # Wait for completion or timeout if not already done
-        if clustering_status.item() != 2:
-            while True:
-                # Poll status
-                dist.all_reduce(clustering_status, op=dist.ReduceOp.MAX)
-                
-                if clustering_status.item() == 2:
-                    break  # Completed
-                elif clustering_status.item() == 1:
-                    raise RuntimeError("Clustering failed after initial check")
-                
-                if time.time() - cluster_start_time > 7200:  # 2 hour timeout
-                    raise RuntimeError("Clustering timed out")
-                
-                # Status reporting
-                if rank == 0:
-                    print(f"Clustering progress: {time.time() - cluster_start_time:.1f}s elapsed")
-                
-                time.sleep(5)
+        try:
+            # Replace the previous code with a simpler approach
+            success = cluster_processor.run_clustering()
+            
+            if rank == 0 and success:
+                print("Clustering completed and saved")
+            
+        except Exception as e:
+            print(f"Rank {rank} encountered error during clustering: {str(e)}")
+            # Try to gracefully exit
+            if dist.is_initialized():
+                try:
+                    dist.barrier()
+                except:
+                    pass
 
     # Add GPU health check
     test_tensor = torch.randn(1024, device=device)
