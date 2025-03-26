@@ -377,6 +377,14 @@ def process_dims_and_buckets(img_path, dims_save_path, buckets_save_path, bucket
         return False
 
 def main():
+    # Initialize distributed processing - MOVE THIS UP
+    rank = int(os.environ['LOCAL_RANK'])
+    print(f"Rank {rank} starting initialization")
+    
+    # Set device BEFORE initializing process group
+    torch.cuda.set_device(rank)
+    device = torch.device(f'cuda:{rank}')
+    
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
     parser.add_argument('--buckets', action='store_true', help='Process image buckets')
@@ -387,7 +395,7 @@ def main():
     parser.add_argument('--dino-features', action='store_true', help='Extract DINO features')
     parser.add_argument('--all', action='store_true', help='Run all processing stages')
     parser.add_argument('--use-existing-dino', action='store_true',
-                      help='Use existing DINO features from disk')
+                     help='Use existing DINO features from disk')
     args = parser.parse_args()
 
     # Determine enabled features
@@ -408,17 +416,9 @@ def main():
         if args.clustering:
             enabled_features.append('clustering')
             
-    # Print enabled features for debugging
+    # Print enabled features for debugging - NOW RANK IS DEFINED
     if rank == 0:
         print("Enabled features:", enabled_features)
-    
-    # Initialize distributed processing
-    rank = int(os.environ['LOCAL_RANK'])
-    print(f"Rank {rank} starting initialization")
-    
-    # Set device BEFORE initializing process group
-    torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
     
     # Initialize process group with default settings
     dist.init_process_group(
