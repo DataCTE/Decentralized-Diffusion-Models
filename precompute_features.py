@@ -383,14 +383,39 @@ def process_dims_and_buckets(img_path, dims_save_path, buckets_save_path, bucket
         return False
 
 def main():
-    # Initialize distributed processing - MOVE THIS UP
-    rank = int(os.environ['LOCAL_RANK'])
+    # Handle standalone clustering without distributed
+    if 'clustering' in sys.argv and '--use-existing-dino' in sys.argv:
+        # Run clustering as standalone CPU process
+        config = get_config()
+        print("Starting standalone CPU clustering")
+        cluster_processor = FeatureGenerator(config, ['clustering'])
+        success = cluster_processor.run_clustering()
+        sys.exit(0 if success else 1)
+
+    # Initialize distributed processing with fallback
+    try:
+        rank = int(os.environ['LOCAL_RANK'])
+    except KeyError:
+        print("WARNING: Running in single-process mode for debugging")
+        rank = 0
+        os.environ['LOCAL_RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+
     print(f"Rank {rank} starting initialization")
     
-    # Set device BEFORE initializing process group
-    torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
-    
+    # Only initialize CUDA and distributed if needed
+    if any(feat in ['vae', 'clip', 't5', 'dino'] for feat in enabled_features):
+        torch.cuda.set_device(rank)
+        device = torch.device(f'cuda:{rank}')
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=int(os.getenv('WORLD_SIZE', 1)),
+            rank=rank
+        )
+    else:
+        device = torch.device('cpu')
+
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
     parser.add_argument('--buckets', action='store_true', help='Process image buckets')
@@ -425,14 +450,6 @@ def main():
     # Print enabled features for debugging - NOW RANK IS DEFINED
     if rank == 0:
         print("Enabled features:", enabled_features)
-    
-    # Initialize process group with default settings
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',  # Use automatic environment initialization
-        world_size=int(os.environ['WORLD_SIZE']),
-        rank=rank
-    )
     
     # Load config after distributed init
     config = get_config()
