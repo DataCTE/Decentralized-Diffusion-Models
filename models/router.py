@@ -38,10 +38,11 @@ class RouterModel(nn.Module):
         
         # Embedding layer - Changed input channels to match latent dimension
         self.embedder = nn.Conv2d(
-            config.latent_channels * 16,  # Changed: Account for the 16x channel dimension 
+            config.latent_channels,
             config.router_hidden_size,
-            kernel_size=config.patch_size,
-            stride=config.patch_size
+            kernel_size=3,
+            stride=2,
+            padding=1
         )
         
         # Efficient spatial attention pooling
