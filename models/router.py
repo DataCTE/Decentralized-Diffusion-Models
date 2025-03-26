@@ -96,87 +96,56 @@ class RouterModel(nn.Module):
             nn.init.zeros_(self.classifier[-1].bias)
 
     def forward(self, img, timesteps, txt):
-        """
-        Forward pass with temperature annealing (Section 3.3)
-        
-        Args:
-            img: Input image tensor [B, C, H, W] or [B, C, D, H, W] for latents
-            timesteps: Timestep values [B]
-            txt: Text embeddings [B, L, D]
-        """
+        """Router forward pass with proper argument handling"""
         batch_size = img.shape[0]
         
-        # Reshape 5D latents to 4D for conv2d
-        if img.dim() == 5:
+        # Handle different input dimensions
+        if img.dim() == 5:  # [B, C, D, H, W] latent format
             B, C, D, H, W = img.shape
-            #print(f"[Router] Input img shape: {img.shape}")
             img = img.reshape(B, C * D, H, W)
-            #print(f"[Router] Reshaped img shape: {img.shape}")
+        elif img.dim() == 4:  # Standard [B, C, H, W]
+            pass
         else:
-            print(f"[Router] Input img shape: {img.shape}")
+            raise ValueError(f"Unexpected input dimensions: {img.dim()}")
         
         # Patch embedding
         x = self.embedder(img)  # [B, D, H', W']
-        #print(f"[Router] After embedder shape: {x.shape}")
         
         # Spatial attention processing
         attn_features = self.spatial_attention(x)
-        #print(f"[Router] After spatial_attention shape: {attn_features.shape}")
         x = attn_features.mean(dim=(2, 3))  # [B, D]
-        #print(f"[Router] After spatial pooling shape: {x.shape}")
         
         # Timestep embedding
-        t_emb = self.time_embedder(timesteps.float())  # [B, D]
-        #print(f"[Router] Timestep embedding shape: {t_emb.shape}")
+        t_emb = self.time_embedder(timesteps.float())
         x = x + t_emb
-        #print(f"[Router] After adding timestep shape: {x.shape}")
 
-        # Text embedding integration
-        #print(f"[Router] Input text shape: {txt.shape}")
-        if txt.dim() == 4:
-            txt = txt.squeeze(1)  # Handle [B, 1, L, D] format
-            #print(f"[Router] After squeezing dim 1: {txt.shape}")
-
-        text_emb = self.text_embed_proj(txt)
-        #print(f"[Router] Projected text shape: {text_emb.shape}")
-
-        # Mean-pool if there's a sequence dimension
-        #print(f"[Router] Text embedding shape: {text_emb.shape}")
-        if text_emb.dim() == 3:
-            text_emb = text_emb.mean(dim=1)
-            #print(f"[Router] After mean pooling shape: {text_emb.shape}")
-
-        assert x.shape == text_emb.shape, f"Shape mismatch: x={x.shape}, text_emb={text_emb.shape}" 
-        x = x + text_emb
-        #print(f"[Router] After adding text shape: {x.shape}")
-
-        # Prepare for transformer - ensure correct dimensions
-        x = x.unsqueeze(1)  # [B, 1, D]
-        #print(f"[Router] After unsqueeze shape: {x.shape}")
+        # Text embedding processing
+        if txt.dim() == 4:  # Handle [B, 1, L, D] format
+            txt = txt.squeeze(1)
+        if txt.dim() == 3:
+            txt = self.text_embed_proj(txt).mean(dim=1)
+        else:
+            txt = self.text_embed_proj(txt)
         
-        # Add CLS token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [B, 1, D]
-        #print(f"[Router] CLS token shape: {cls_tokens.shape}")
-        x = torch.cat([cls_tokens, x], dim=1)  # [B, 2, D]
-        #print(f"[Router] After adding CLS token shape: {x.shape}")
+        x = x + txt
 
-        # Apply transformer blocks
-        for i, block in enumerate(self.blocks):
+        # Transformer processing
+        x = x.unsqueeze(1)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        
+        for block in self.blocks:
             x = block(x)
-            #print(f"[Router] After block {i} shape: {x.shape}")
-            
-        # Final processing
-        cls_output = x[:, 0]
-        #print(f"[Router] CLS output shape: {cls_output.shape}")
-        logits = self.classifier(cls_output)
-        #print(f"[Router] Logits shape: {logits.shape}")
         
-        # Apply temperature scaling with decay
+        # Final classification
+        cls_output = x[:, 0]
+        logits = self.classifier(cls_output)
+        
+        # Apply temperature scaling
         temperature = max(
             self.min_temp,
             self.initial_temp * (self.temp_decay ** self.current_step)
         )
-        #print(f"[Router] Temperature value: {temperature}")
         self.current_step += 1
         
         return logits / temperature 
