@@ -259,11 +259,26 @@ class DDMTrainingCoordinator:
         # Set up distributed data sampler
         self.train_loader.sampler.set_epoch(0)  # For epoch-based sampling
         
+        # Initialize step start time for duration calculation
+        self.step_start_time = time.time()
+        
         for step in range(num_steps):
             try:
                 # Synchronized batch loading
                 batch = next(iter(self.train_loader))
+                
+                # --- ADD CHECK FOR NONE BATCH ---
+                if batch is None:
+                    logger.warning(f"Skipping step {step} due to empty batch after filtering.")
+                    # Reset step start time for the next valid step
+                    self.step_start_time = time.time()
+                    continue # Skip to the next iteration
+                # --- END CHECK ---
+                    
                 batch = self._distribute_batch(batch)
+                
+                # Calculate step duration
+                step_duration = time.time() - self.step_start_time
                 
                 # Expert training phase - now returns tuple of (avg_loss, individual_losses)
                 expert_loss, expert_individual_losses = self._train_experts_sync(batch)
@@ -275,12 +290,42 @@ class DDMTrainingCoordinator:
                 if step % self.config.expert_update_interval == 0:
                     self._redistribute_experts()
 
-                # Synchronized logging - pass individual losses to logging function
+                # Synchronized logging - pass individual losses and duration
                 if self.rank == 0:
-                    self._log_metrics(step, expert_loss, router_loss, expert_individual_losses=expert_individual_losses)
+                    learning_rates = self._get_learning_rates()
+                    self._log_metrics(
+                        step,
+                        expert_loss,
+                        router_loss,
+                        duration=step_duration,
+                        learning_rates=learning_rates,
+                        expert_individual_losses=expert_individual_losses
+                    )
                 
+                # Update learning rate schedulers
+                if hasattr(self.router, 'lr_scheduler'):
+                    self.router.lr_scheduler.step()
+                # Note: Expert schedulers are handled within the ExpertTrainer or cache manager
+
+                # Reset step start time for the next iteration
+                self.step_start_time = time.time()
+
+                # --- Checkpointing and Validation ---
+                if step > 0:
+                    if self.config.enable_checkpointing and step % self.config.checkpoint_interval == 0:
+                        self.save_checkpoint(step)
+                    if self.config.enable_validation and step % self.config.validation_interval == 0:
+                        self.validate(step)
+                        
+            except StopIteration:
+                logger.info("DataLoader exhausted. Training finished.")
+                break # Exit loop if dataloader is exhausted
             except Exception as e:
                 self._handle_distributed_error(e, step)
+
+        # Final cleanup
+        self.cleanup()
+        self.flush_wandb_logs() # Ensure all logs are sent
 
     def _distribute_batch(self, batch):
         """Batch distribution handled by DataLoader sharding"""

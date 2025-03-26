@@ -263,7 +263,7 @@ class DDMDataset(Dataset):
         return torch.stack(assignments).to(self.device)
 
     def __getitem__(self, idx):
-        """Get item with cache"""
+        """Get item with cache, returning None if loading fails"""
         data = None # Initialize data to None
         if idx in self.cache:
             # Ensure cached data is not None before using it
@@ -280,9 +280,8 @@ class DDMDataset(Dataset):
                       # Update cache only if loading succeeds this time
                       self.cache[idx] = data
                  else:
-                      # If loading fails again, handle appropriately (e.g., raise error or return placeholder)
-                      # For now, raising an error might be best to avoid silent failures
-                      raise RuntimeError(f"Failed to load sample {idx} even after retry.")
+                      # If loading fails again, return None to skip this sample
+                      return None
 
         else: # Not in cache, load it
             idx_data = self._load_sample(idx)
@@ -300,9 +299,13 @@ class DDMDataset(Dataset):
             else:
                  # Store None in cache to avoid repeatedly trying to load a bad sample
                  self.cache[idx] = None
-                 # Raise error to stop training if a sample cannot be loaded
-                 raise RuntimeError(f"Failed to load sample {idx}. Cannot continue.")
+                 # Return None to signal to collate_fn to skip
+                 return None
 
+        # Check if data is None before accessing assignments
+        if data is None:
+             # This can happen if the initial load from cache returned None
+             return None
 
         # Add assignments - Ensure these tensors are valid for the index
         # These assignments are loaded in __init__ and should cover all valid indices
@@ -311,7 +314,9 @@ class DDMDataset(Dataset):
              data['bucket'] = self.bucket_assignments[idx]
         else:
              # This case should ideally not happen if initialization is correct
-             raise IndexError(f"Index {idx} out of bounds for expert/bucket assignments.")
+             # If it does, returning None is safer than raising IndexError during training
+             logger.error(f"Index {idx} out of bounds for expert/bucket assignments. Skipping sample.")
+             return None
 
         return data
 
@@ -364,11 +369,19 @@ class DDMDataset(Dataset):
     @staticmethod
     def collate_fn(batch):
         """Modified collate that handles variable-length sequences and multiple embedding types"""
-        # Filter out None items resulting from loading errors
+        # Filter out None items resulting from loading errors in __getitem__
+        original_batch_size = len(batch)
         batch = [b for b in batch if b is not None]
-        if len(batch) == 0:
+        filtered_batch_size = len(batch)
+
+        if filtered_batch_size == 0:
             # Return None or an empty dictionary if the entire batch failed
+            if original_batch_size > 0:
+                 logger.warning(f"Entire batch of size {original_batch_size} failed to load. Skipping batch.")
             return None # Or perhaps {} depending on how the training loop handles it
+
+        if filtered_batch_size < original_batch_size:
+             logger.warning(f"Filtered out {original_batch_size - filtered_batch_size} failed samples from batch.")
 
         # Initialize result dictionary with keys that are always present
         result = {
