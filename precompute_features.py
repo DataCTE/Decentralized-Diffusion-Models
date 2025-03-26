@@ -390,15 +390,6 @@ def process_dims_and_buckets(img_path, dims_save_path, buckets_save_path, bucket
         return False
 
 def main():
-    # Handle standalone clustering without distributed
-    if 'clustering' in sys.argv and '--use-existing-dino' in sys.argv:
-        # Run clustering as standalone CPU process
-        config = get_config()
-        print("Starting standalone CPU clustering")
-        cluster_processor = FeatureGenerator(config, ['clustering'])
-        success = cluster_processor.run_clustering()
-        sys.exit(0 if success else 1)
-
     # Parse command line arguments EARLY
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
     parser.add_argument('--buckets', action='store_true', help='Process image buckets')
@@ -411,6 +402,15 @@ def main():
     parser.add_argument('--use-existing-dino', action='store_true',
                      help='Use existing DINO features from disk')
     args = parser.parse_args()
+
+    # Handle standalone clustering without distributed
+    if args.clustering and args.use_existing_dino and not args.all and not args.vae_latents and not args.clip_latents and not args.t5_latents and not args.dino_features and not args.buckets:
+        # Run clustering as standalone CPU process
+        config = get_config()
+        print("Starting standalone CPU clustering")
+        cluster_processor = FeatureGenerator(config, ['clustering'])
+        success = cluster_processor.run_clustering()
+        sys.exit(0 if success else 1)
 
     # Determine enabled features EARLY
     enabled_features = []
