@@ -359,13 +359,12 @@ class ExpertTrainer(BaseTrainer):
                 logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 
 
     def _get_position_ids(self, x):
-        """Generate position IDs for the flattened latent sequence [B, H*W, 2]"""
-        print(f"[DEBUG Expert {self.expert_idx}] Position ID input shape: {x.shape}")
-
-        if x.dim() == 5:
+        """Generate position IDs for images with proper dimensionality"""
+        # Handle different possible input shapes
+        if x.dim() == 5:  # [B, S, C, H, W]
             B, S, C, H, W = x.shape
-            if S != 1:
-                 print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch for pos IDs, using first.")
+            if S > 1:
+                print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch for pos IDs, using first.")
             # Use dimensions from the first sequence element if S > 1
             H, W = x.shape[3], x.shape[4]
         elif x.dim() == 4:
@@ -373,16 +372,15 @@ class ExpertTrainer(BaseTrainer):
         else:
             raise ValueError(f"Unexpected tensor dimensions for pos IDs: {x.dim()}, shape: {x.shape}")
 
-        # Original code generated a 2D tensor [B, H*W]
-        # We need to make it 3D [B, H*W, 2] to match text_ids
-        
         # Create grid indices for H and W dimensions directly
         pos_h = torch.arange(H, device=self.device)
         pos_w = torch.arange(W, device=self.device)
         pos_grid = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), dim=-1)  # Shape [H, W, 2]
         
         # Reshape to [H*W, 2] and add batch dimension -> [B, H*W, 2]
-        pos_grid = pos_grid.reshape(-1, 2).repeat(B, 1, 1)
+        # The key change is adding another dimension to match text_ids dimensionality
+        pos_grid = pos_grid.reshape(-1, 2)
+        pos_grid = pos_grid.repeat(B, 1, 1)  # Shape: [B, H*W, 2]
         
         print(f"[DEBUG Expert {self.expert_idx}] Position ID output shape: {pos_grid.shape}")
         return pos_grid
