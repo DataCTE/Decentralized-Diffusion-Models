@@ -333,6 +333,46 @@ class FeatureGenerator:
             print(f"Failed to load {path}: {str(e)}")
             return None
 
+    # Optimize dimension and bucket extraction methods
+    def _extract_dims_fast(self, img_path):
+        """Extract image dimensions without fully loading the image"""
+        # Use PIL's faster size property - doesn't require full image loading
+        with Image.open(img_path) as img:
+            size = img.size  # Just get width and height
+        return torch.tensor(size, dtype=torch.int16)
+
+    def _get_bucket_index_from_path(self, img_path):
+        """Calculate bucket index directly from image path without full loading"""
+        with Image.open(img_path) as img:
+            width, height = img.size
+        
+        # Now calculate bucket index using the dimensions
+        return self._get_bucket_index(width, height)
+
+def process_dims_and_buckets(img_path, dims_save_path, buckets_save_path, bucket_func):
+    """Process dimensions and buckets together for efficiency."""
+    try:
+        # Just get the size, don't fully load the image
+        with Image.open(img_path) as img:
+            width, height = img.size
+        
+        # Calculate both in one go
+        dims_data = torch.tensor((width, height), dtype=torch.int16)
+        bucket_idx = bucket_func(width, height)
+        bucket_data = torch.tensor(bucket_idx, dtype=torch.int16)
+        
+        # Save both
+        if not dims_save_path.exists():
+            torch.save(dims_data, dims_save_path)
+        
+        if not buckets_save_path.exists():
+            torch.save(bucket_data, buckets_save_path)
+            
+        return True
+    except Exception as e:
+        print(f"Failed to process {img_path}: {str(e)}")
+        return False
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
@@ -407,8 +447,15 @@ def main():
     # Define processing order by computational intensity (most intensive first)
     processing_order = ['vae', 'dino', 't5', 'clip', 'buckets', 'dims']
 
-    # Only process features that are enabled
-    features_to_process = [f for f in processing_order if f in enabled_features]
+    # Special case for dimensions and buckets - they can be processed together efficiently
+    # using a single pass through the images
+    if 'dims' in enabled_features and 'buckets' in enabled_features:
+        # Move these to the end and process them together
+        features_to_process = [f for f in processing_order if f in enabled_features and f not in ['dims', 'buckets']]
+        # Add a special combined processing step
+        features_to_process.append('dims_and_buckets')
+    else:
+        features_to_process = [f for f in processing_order if f in enabled_features]
     
     if rank == 0:
         print(f"Processing features in order: {features_to_process}")
@@ -418,7 +465,100 @@ def main():
         if rank == 0:
             print(f"All ranks processing feature type: {feature_type}")
         
-        # Initialize feature generator with just this feature type
+        # Special case for combined dimension and bucket processing
+        if feature_type == 'dims_and_buckets':
+            # Process dimensions and buckets together efficiently
+            dims_processor = FeatureGenerator(config, ['dims'])
+            buckets_processor = FeatureGenerator(config, ['buckets'])
+            
+            dims_save_dir = dims_processor.feature_dir/dims_processor.FEATURE_PROCESSORS['dims']['save_prefix']
+            buckets_save_dir = buckets_processor.feature_dir/buckets_processor.FEATURE_PROCESSORS['buckets']['save_prefix']
+            
+            dims_save_dir.mkdir(parents=True, exist_ok=True)
+            buckets_save_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Larger batch size for these lightweight operations
+            batch_size = 256
+            
+            try:
+                # Main processing loop with batching and multi-threading
+                with tqdm(total=len(local_images), desc=f"GPU {rank} - dims+buckets", position=rank) as pbar:
+                    for batch_start in range(0, len(local_images), batch_size):
+                        batch_end = min(batch_start + batch_size, len(local_images))
+                        batch_paths = local_images[batch_start:batch_end]
+                        
+                        # Skip already processed files
+                        batch_to_process = []
+                        processed_count = 0
+                        
+                        for img_path in batch_paths:
+                            img_path_obj = Path(img_path)
+                            base_name = img_path_obj.stem
+                            
+                            dims_save_path = dims_save_dir/f"{base_name}_rank{rank}.pt"
+                            buckets_save_path = buckets_save_dir/f"{base_name}_rank{rank}.pt"
+                            
+                            # Skip if both already processed
+                            if dims_save_path.exists() and buckets_save_path.exists():
+                                processed_count += 1
+                                continue
+                                
+                            batch_to_process.append(img_path)
+                        
+                        # Skip if all files already processed
+                        if not batch_to_process:
+                            pbar.update(processed_count)
+                            continue
+                        
+                        # Process dimensions and buckets in parallel with threads
+                        with ThreadPoolExecutor(max_workers=min(32, len(batch_to_process))) as executor:
+                            futures = []
+                            
+                            for img_path in batch_to_process:
+                                img_path_obj = Path(img_path)
+                                base_name = img_path_obj.stem
+                                
+                                dims_save_path = dims_save_dir/f"{base_name}_rank{rank}.pt"
+                                buckets_save_path = buckets_save_dir/f"{base_name}_rank{rank}.pt"
+                                
+                                # Submit task to thread pool
+                                futures.append(executor.submit(
+                                    process_dims_and_buckets,
+                                    img_path, dims_save_path, buckets_save_path, 
+                                    buckets_processor._get_bucket_index
+                                ))
+                            
+                            # Wait for threads to complete
+                            for future in as_completed(futures):
+                                try:
+                                    future.result()
+                                    processed_count += 1
+                                except Exception as e:
+                                    print(f"Rank {rank} failed in dims/buckets: {str(e)}")
+                                    processed_count += 1
+                        
+                        pbar.update(processed_count)
+                
+                # Synchronize after completion
+                dist.barrier()
+                
+                # Free memory
+                del dims_processor
+                del buckets_processor
+                torch.cuda.empty_cache()
+                
+                if rank == 0:
+                    print("Completed processing dimensions and buckets")
+                
+            except Exception as e:
+                print(f"Rank {rank} failed during dims/buckets processing: {str(e)}")
+                dist.barrier(timeout=60)
+                continue
+            
+            # Continue to next feature type
+            continue
+        
+        # Regular feature processing for other types
         processor = FeatureGenerator(config, [feature_type])
         
         # Get save directory
@@ -497,10 +637,9 @@ def main():
                                         elif feature_type == 'dino':
                                             feature_data = processor._extract_dino_features(img)
                                         elif feature_type == 'buckets':
-                                            width, height = img.size
-                                            feature_data = torch.tensor(processor._get_bucket_index(width, height), dtype=torch.int16)
+                                            feature_data = torch.tensor(processor._get_bucket_index_from_path(img_path), dtype=torch.int16)
                                         elif feature_type == 'dims':
-                                            feature_data = processor._extract_dims(img)
+                                            feature_data = processor._extract_dims_fast(img_path)
                                 
                                 # Save the feature
                                 save_path = save_dir/f"{base_name}_rank{rank}.pt"
