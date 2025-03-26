@@ -378,6 +378,10 @@ class DDMTrainingCoordinator:
                 print(f"[DEBUG Coordinator] Getting expert {expert_idx} from cache")
                 expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
                 
+                # Add router prediction to batch
+                with torch.no_grad():
+                    batch['cluster_pred'] = self.router.router(batch['clip_embedding']).argmax(dim=-1)
+                
                 # DEFENSIVE: Instead of silently continuing, we'll raise errors
                 print(f"[DEBUG Coordinator] Calling train_step on expert {expert_idx}")
                 result = expert.train_step(batch)

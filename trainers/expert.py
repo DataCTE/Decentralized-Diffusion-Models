@@ -131,7 +131,7 @@ class ExpertTrainer(BaseTrainer):
             txt_ids=self._get_text_position_ids(text_embeds),
             timesteps=t * 1000,               # Scale timesteps like in train_step
             y=self._get_conditioning(x0.shape[0]),
-            cluster_ids=batch['expert']
+            cluster_ids=batch['cluster_pred']  # Use router predictions instead of ground truth
         )
 
         # --- Use flow_matcher for loss calculation ---
@@ -147,27 +147,15 @@ class ExpertTrainer(BaseTrainer):
         print(f"[DEBUG Expert {self.expert_idx}] Batch keys: {batch.keys()}")
         
         # Get data - ensure proper device placement
-        latents_full = batch["latent"].to(self.device, non_blocking=True)
-        text_embeds_full = batch["clip_embedding"].to(self.device, non_blocking=True)
-        cluster_ids_full = batch["expert"].to(self.device, non_blocking=True)
+        latents = batch["latent"].to(self.device, non_blocking=True)
+        text_embeds = batch["clip_embedding"].to(self.device, non_blocking=True)
         
-        # --- FIX: Filter batch for the current expert ---
-        expert_mask = (cluster_ids_full == self.expert_idx)
-        num_expert_samples = expert_mask.sum().item()
+        # Get router-predicted clusters instead of using ground truth
+        with torch.no_grad():
+            cluster_ids = self.router.router(text_embeds).argmax(dim=-1)
         
-        if num_expert_samples == 0:
-            print(f"[DEBUG Expert {self.expert_idx}] No samples for this expert in the current batch. Skipping step.")
-            # Return 0 loss and indicate no samples were processed, or handle as appropriate
-            # Returning 0.0 is simple, but check if coordinator needs more info
-            return 0.0 
-            
-        latents = latents_full[expert_mask]
-        text_embeds = text_embeds_full[expert_mask]
-        cluster_ids = cluster_ids_full[expert_mask] # Pass only relevant cluster IDs
-        # --- END FIX ---
-
         # Print shapes for debugging (using filtered tensors)
-        print(f"[DEBUG Expert {self.expert_idx}] Processing {num_expert_samples} samples for this expert.")
+        print(f"[DEBUG Expert {self.expert_idx}] Processing {latents.shape[0]} samples for this expert.")
         print(f"[DEBUG Expert {self.expert_idx}] latents shape: {latents.shape}")
         print(f"[DEBUG Expert {self.expert_idx}] text_embeds shape: {text_embeds.shape}")
         print(f"[DEBUG Expert {self.expert_idx}] cluster_ids shape: {cluster_ids.shape}")
@@ -218,7 +206,7 @@ class ExpertTrainer(BaseTrainer):
                     txt_ids=self._get_text_position_ids(text_embeds), # Use filtered text embeds
                     timesteps=torch.cos(t * math.pi/2), # Use scaled cosine scheduling
                     y=self._get_conditioning(latents.shape[0]), # Use B_expert size
-                    cluster_ids=self.router(text_embeds)           # Use predicted clusters
+                    cluster_ids=batch['cluster_pred']  # Use router predictions instead of ground truth
                 )
                 # --- END FIX ---
                 print(f"[DEBUG Expert {self.expert_idx}] pred_flow shape: {pred_flow.shape}")
