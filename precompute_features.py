@@ -395,17 +395,23 @@ def main():
     if args.all:
         enabled_features = ['vae', 'clip', 't5', 'dino', 'buckets', 'dims', 'clustering']
     else:
-        feature_map = {
-            'vae-latents': 'vae',
-            'clip-latents': 'clip', 
-            't5-latents': 't5',
-            'dino-features': 'dino',
-            'buckets': 'buckets',
-            'dims': 'dims',
-            'clustering': 'clustering'
-        }
-        enabled_features = [feature_map[f] for f in vars(args) if vars(args)[f] and f in feature_map]
-
+        if args.clip_latents:
+            enabled_features.append('clip')
+        if args.t5_latents:
+            enabled_features.append('t5')
+        if args.dino_features:
+            enabled_features.append('dino')
+        if args.vae_latents:
+            enabled_features.append('vae')
+        if args.buckets:
+            enabled_features.append('buckets')
+        if args.clustering:
+            enabled_features.append('clustering')
+            
+    # Print enabled features for debugging
+    if rank == 0:
+        print("Enabled features:", enabled_features)
+    
     # Initialize distributed processing
     rank = int(os.environ['LOCAL_RANK'])
     print(f"Rank {rank} starting initialization")
