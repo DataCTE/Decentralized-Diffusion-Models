@@ -75,19 +75,32 @@ class DDMDataset(Dataset):
         
         # Initialize memory-mapped cache
         self.cache = {}
-        self.cache_size = min(100, self.num_samples)  # Larger cache size
+        self.cache_size = min(100, self.num_samples)  # Adjust cache size if needed
         
-        # Pre-load frequently accessed data
+        # Pre-load frequently accessed data with improved parallelism
         logger.info(f"Pre-loading data for rank {self.rank}")
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = []
-            for idx in range(min(self.cache_size, self.num_samples)):
-                futures.append(executor.submit(self._load_sample, idx))
+        
+        # Use a more efficient preloading approach
+        with tqdm(total=min(self.cache_size, self.num_samples), 
+                  desc=f"Rank {self.rank} preloading",
+                  position=self.rank % 8,  # Stagger progress bars
+                  leave=False) as pbar:
             
-            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Rank {self.rank} preloading"):
-                idx, data = future.result()
-                if data is not None:
-                    self.cache[idx] = data
+            # Process in smaller batches to avoid memory issues
+            batch_size = 10
+            for batch_start in range(0, min(self.cache_size, self.num_samples), batch_size):
+                batch_end = min(batch_start + batch_size, self.cache_size, self.num_samples)
+                batch_indices = range(batch_start, batch_end)
+                
+                # Process one batch with multiple workers
+                with ThreadPoolExecutor(max_workers=min(4, len(batch_indices))) as executor:
+                    futures = [executor.submit(self._load_sample, idx) for idx in batch_indices]
+                    
+                    for future in as_completed(futures):
+                        idx, data = future.result()
+                        if data is not None:
+                            self.cache[idx] = data
+                        pbar.update(1)
         
         # Load global cluster assignments to GPU
         self.expert_assignments = self._lazy_load_clusters()
@@ -185,48 +198,57 @@ class DDMDataset(Dataset):
             raise
 
     def _load_sample(self, idx):
-        """Load all features for a sample with proper filename pattern matching"""
+        """Load all features for a sample with improved file pattern matching"""
         # Get the sample ID from the samples list
         sample_id = self.samples[idx]
         base_name = f"anime-{sample_id}"
         
-        # Search for any file matching the base name with any rank suffix
-        clip_file = None
-        clip_pattern = f"{base_name}_rank*.pt"
-        for rank_file in Path(self.clip_dir).glob(clip_pattern):
-            clip_file = rank_file
-            break
+        # Use a more direct path construction for the specific rank
+        # First try the file for this rank
+        clip_file = Path(self.clip_dir) / f"{base_name}_rank{self.rank}.pt"
         
-        if clip_file is None:
-            print(f"WARNING: Missing required CLIP embedding file for {base_name}")
+        # If not found, fall back to any rank
+        if not clip_file.exists():
+            # Try to find any rank file
+            for rank_file in Path(self.clip_dir).glob(f"{base_name}_rank*.pt"):
+                clip_file = rank_file
+                break
+        
+        if not clip_file.exists():
+            if self.verbose:
+                print(f"WARNING: Missing required CLIP embedding file for {base_name}")
             return idx, None  # Return index with None for data
         
-        # Same for latent files - search with rank pattern
-        latent_file = None
-        latent_pattern = f"{base_name}_rank*.pt"
-        for rank_file in Path(self.latent_dir).glob(latent_pattern):
-            latent_file = rank_file
-            break
+        # Same approach for latent files
+        latent_file = Path(self.latent_dir) / f"{base_name}_rank{self.rank}.pt"
         
-        if latent_file is None:
-            print(f"WARNING: Missing required latent file for {base_name}")
+        if not latent_file.exists():
+            # Try to find any rank file
+            for rank_file in Path(self.latent_dir).glob(f"{base_name}_rank*.pt"):
+                latent_file = rank_file
+                break
+        
+        if not latent_file.exists():
+            if self.verbose:
+                print(f"WARNING: Missing required latent file for {base_name}")
             return idx, None  # Return index with None for data
         
         # Now load both files
         try:
-            clip_embedding = torch.load(clip_file)
-            latent = torch.load(latent_file)
+            clip_embedding = torch.load(clip_file, map_location=self.device)
+            latent = torch.load(latent_file, map_location=self.device)
             
             # Create and return complete sample data with index
             return idx, {
                 'latent': latent,
                 'clip_embedding': clip_embedding,
-                'bucket': self.bucket_assignments[idx] if hasattr(self, 'bucket_assignments') else 0,
-                'expert': self.cluster_assignments[idx] if hasattr(self, 'cluster_assignments') else 0,
-                'cluster_pred': 0  # Default value, will be predicted by router
+                'bucket': self.bucket_assignments[idx] if hasattr(self, 'bucket_assignments') else torch.tensor(0, device=self.device),
+                'expert': self.cluster_assignments[idx] if hasattr(self, 'cluster_assignments') else torch.tensor(0, device=self.device),
+                'cluster_pred': torch.tensor(0, device=self.device)  # Default value, will be predicted by router
             }
         except Exception as e:
-            print(f"Error loading tensors from {clip_file} or {latent_file}: {str(e)}")
+            if self.verbose:
+                print(f"Error loading tensors from {clip_file} or {latent_file}: {str(e)}")
             return idx, None  # Return index with None for data
 
     def _load_bucket_assignments(self):

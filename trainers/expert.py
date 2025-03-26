@@ -373,15 +373,17 @@ class ExpertTrainer(BaseTrainer):
         else:
             raise ValueError(f"Unexpected tensor dimensions for pos IDs: {x.dim()}, shape: {x.shape}")
 
-        # --- FIX: Generate IDs for H*W sequence length ---
+        # Original code generated a 2D tensor [B, H*W]
+        # We need to make it 3D [B, H*W, 2] to match text_ids
+        
         # Create grid indices for H and W dimensions directly
         pos_h = torch.arange(H, device=self.device)
         pos_w = torch.arange(W, device=self.device)
-        pos_grid = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), dim=-1) # Shape [H, W, 2]
+        pos_grid = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), dim=-1)  # Shape [H, W, 2]
+        
         # Reshape to [H*W, 2] and add batch dimension -> [B, H*W, 2]
-        pos_grid = pos_grid.reshape(-1, 2)[None].repeat(B, 1, 1)
-        # --- END FIX ---
-
+        pos_grid = pos_grid.reshape(-1, 2).repeat(B, 1, 1)
+        
         print(f"[DEBUG Expert {self.expert_idx}] Position ID output shape: {pos_grid.shape}")
         return pos_grid
 
