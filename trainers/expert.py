@@ -372,18 +372,25 @@ class ExpertTrainer(BaseTrainer):
         else:
             raise ValueError(f"Unexpected tensor dimensions for pos IDs: {x.dim()}, shape: {x.shape}")
 
-        # Create grid indices for H and W dimensions directly
-        pos_h = torch.arange(H, device=self.device)
-        pos_w = torch.arange(W, device=self.device)
-        pos_grid = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), dim=-1)  # Shape [H, W, 2]
+        # Calculate position ids for a grid
+        pos_h = torch.arange(0, H, device=self.device)
+        pos_w = torch.arange(0, W, device=self.device)
         
-        # Reshape to [H*W, 2] and add batch dimension -> [B, H*W, 2]
-        # The key change is adding another dimension to match text_ids dimensionality
-        pos_grid = pos_grid.reshape(-1, 2)
-        pos_grid = pos_grid.repeat(B, 1, 1)  # Shape: [B, H*W, 2]
+        # Create a grid of coordinates
+        grid_h, grid_w = torch.meshgrid(pos_h, pos_w, indexing='ij')
         
-        print(f"[DEBUG Expert {self.expert_idx}] Position ID output shape: {pos_grid.shape}")
-        return pos_grid
+        # Flatten the grid coordinates
+        flat_h = grid_h.reshape(-1)
+        flat_w = grid_w.reshape(-1)
+        
+        # Stack to get [H*W, 2] tensor with (y, x) coordinates
+        grid_coords = torch.stack([flat_h, flat_w], dim=1)
+        
+        # Expand to batch dimension [B, H*W, 2]
+        pos_ids = grid_coords.unsqueeze(0).expand(B, -1, -1)
+        
+        print(f"[DEBUG Expert {self.expert_idx}] Position ID output shape: {pos_ids.shape}")
+        return pos_ids
 
     def _get_text_position_ids(self, text_emb):
         """Simple sequence position IDs for text with improved shape handling"""
