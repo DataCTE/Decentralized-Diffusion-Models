@@ -48,11 +48,6 @@ class FeatureGenerator:
         # Create feature directories aggressively
         self.feature_dir = Path(config.feature_cache_path)
         self._force_create_dirs()
-        
-        # Add batch processing buffers
-        self.batch_size = 32  # Images per batch
-        self.image_buffer = []
-        self.caption_buffer = []
 
     def _force_create_dirs(self):
         """Create only needed directories"""
@@ -73,67 +68,7 @@ class FeatureGenerator:
                     dir_path.mkdir(parents=True, exist_ok=True)
         dist.barrier()
 
-    def process_image(self, img_path):
-        """Batch image processing"""
-        self.image_buffer.append(img_path)
-        if len(self.image_buffer) >= self.batch_size:
-            self._process_batch()
-            
-    def _process_batch(self):
-        """Process a batch of images in parallel"""
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(self._single_process, path) 
-                      for path in self.image_buffer]
-            for future in as_completed(futures):
-                future.result()  # Handle exceptions here
-        self.image_buffer.clear()
-
-    def _single_process(self, img_path):
-        """Process a single image using filenames for latent storage"""
-        try:
-            # Check for caption file first
-            img_path_obj = Path(img_path)
-            caption_path = img_path_obj.with_suffix('.txt')
-            if not caption_path.exists():
-                print(f"Rank {self.rank}: No caption found for {img_path}")
-                return False
-            
-            # Use the filename as the base for latent storage
-            base_name = img_path_obj.stem
-            
-            # Read caption text
-            caption_text = caption_path.read_text()
-            
-            # Process the image
-            with Image.open(img_path) as img:
-                # Handle corrupt images and various color modes
-                img = img.convert('RGB')  # Force RGB conversion for all images
-                orig_w, orig_h = img.size
-                
-                # Calculate nearest bucket
-                bucket_idx = self._get_bucket_index(orig_w, orig_h)
-                features = {
-                    'latent': self._extract_vae_latent(img) if 'vae' in self.enabled_features else None,
-                    'clip': self._extract_clip_embedding(caption_text) if 'clip' in self.enabled_features else None,
-                    't5': self._extract_t5_embedding(caption_text) if 't5' in self.enabled_features else None,
-                    'dino': self._extract_dino_features(img) if 'dino' in self.enabled_features and self.dino is not None else None,
-                    'dims': torch.tensor(img.size, dtype=torch.int16) if 'dims' in self.enabled_features else None,
-                    'bucket': torch.tensor(bucket_idx, dtype=torch.int16) if 'buckets' in self.enabled_features else None
-                }
-            
-            # Save with rank-specific naming, only save enabled features
-            features = {k: v for k, v in features.items() if v is not None}
-            self._save_features(base_name, features)
-            
-            # Log successful processing
-            if self.rank == 0 and random.random() < 0.01:  # Log ~1% of successful files on rank 0
-                print(f"Rank {self.rank}: Successfully processed {img_path}, saved {len(features)} features")
-            
-            return True
-        except Exception as e:
-            print(f"Rank {self.rank} failed {img_path}: {str(e)}", flush=True)
-            return False
-
+    # Keep only the feature extraction methods that work with single inputs
     def _extract_vae_latent(self, img):
         """Direct latent encoding without caching"""
         # Ensure RGB and proper tensor format
@@ -189,34 +124,95 @@ class FeatureGenerator:
             # Return CPU version
             return embedding.cpu()
 
-    def _save_features(self, base_name, features):
-        """Force-save features with rank ID"""
-        saved_files = []
+    def _get_bucket_index(self, width, height):
+        """Find best matching bucket using config parameters"""
+        aspect = width / height
+        config = self.config
         
-        # Create a reverse mapping from feature keys to feature types
-        key_to_type = {v['feature_key']: k for k, v in self.FEATURE_PROCESSORS.items()}
+        # 1. Determine aspect ratio group
+        aspect_group = None
         
-        for feat_key, data in features.items():
-            if feat_key in key_to_type and key_to_type[feat_key] in self.enabled_features:
-                feat_type = key_to_type[feat_key]
-                save_dir = self.feature_dir/self.FEATURE_PROCESSORS[feat_type]['save_prefix']
-                save_path = save_dir/f"{base_name}_rank{self.rank}.pt"
-                
-                try:
-                    # Ensure directory exists
-                    save_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Save data
-                    torch.save(data, save_path)
-                    saved_files.append(str(save_path))
-                except Exception as e:
-                    print(f"Rank {self.rank} failed to save {save_path}: {str(e)}")
+        # Handle the case where bucket_thresholds might be a SimpleNamespace
+        if hasattr(config.bucket_thresholds, 'items'):
+            # It's a dictionary
+            for group, (min_ratio, max_ratio) in config.bucket_thresholds.items():
+                if min_ratio <= aspect <= max_ratio:
+                    aspect_group = group
+                    break
+        else:
+            # It's a SimpleNamespace - access attributes directly
+            if hasattr(config.bucket_thresholds, 'square'):
+                min_ratio, max_ratio = config.bucket_thresholds.square
+                if min_ratio <= aspect <= max_ratio:
+                    aspect_group = 'square'
+            
+            if aspect_group is None and hasattr(config.bucket_thresholds, 'portrait'):
+                min_ratio, max_ratio = config.bucket_thresholds.portrait
+                if min_ratio <= aspect <= max_ratio:
+                    aspect_group = 'portrait'
+            
+            if aspect_group is None and hasattr(config.bucket_thresholds, 'landscape'):
+                min_ratio, max_ratio = config.bucket_thresholds.landscape
+                if min_ratio <= aspect <= max_ratio:
+                    aspect_group = 'landscape'
         
-        # Occasional logging of saved files
-        if self.rank == 0 and random.random() < 0.005:  # Log ~0.5% of files on rank 0
-            print(f"Rank {self.rank}: Saved files: {saved_files}")
+        # If no aspect group was determined, use the first bucket
+        if aspect_group is None:
+            return 0
         
-        return len(saved_files) > 0
+        # 2. Calculate scaled dimensions
+        scale = config.bucket_scale
+        scaled_w = round(width / scale) * scale
+        scaled_h = round(height / scale) * scale
+        
+        # 3. Find matching bucket
+        for idx, (bw, bh) in enumerate(config.buckets):
+            if aspect_group == 'square' and bw == bh and scaled_w == bw and scaled_h == bh:
+                return idx
+            elif aspect_group == 'portrait' and bw < bh and scaled_w == bw and scaled_h == bh:
+                return idx
+            elif aspect_group == 'landscape' and bw > bh and scaled_w == bw and scaled_h == bh:
+                return idx
+            
+        # Fallback to nearest bucket
+        distances = [
+            (abs(scaled_w - bw) + abs(scaled_h - bh), idx)
+            for idx, (bw, bh) in enumerate(config.buckets)
+        ]
+        return min(distances)[1]
+
+    def _extract_dims(self, img):
+        """Extract original image dimensions"""
+        return torch.tensor(img.size, dtype=torch.int16)
+
+    def _gpu_health_check(self):
+        """Verify GPU is responsive"""
+        test_tensor = torch.randn(1024, device=self.device)
+        torch.cuda.synchronize()
+        # If this hangs, it indicates GPU health issues
+        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
+
+    # Update the FEATURE_PROCESSORS dictionary to clearly indicate feature type and save key
+    FEATURE_PROCESSORS = {
+        'vae': {
+            'save_prefix': 'latents',
+        },
+        'clip': {
+            'save_prefix': 'clip',
+        },
+        't5': {
+            'save_prefix': 't5',
+        },
+        'dino': {
+            'save_prefix': 'dino_features',
+        },
+        'buckets': {
+            'save_prefix': 'buckets',
+        },
+        'dims': {
+            'save_prefix': 'dims',
+        }
+    }
 
     def run_clustering(self):
         """Pure CPU clustering implementation"""
@@ -337,115 +333,6 @@ class FeatureGenerator:
             print(f"Failed to load {path}: {str(e)}")
             return None
 
-    def _get_bucket_index(self, width, height):
-        """Find best matching bucket using config parameters"""
-        aspect = width / height
-        config = self.config
-        
-        # 1. Determine aspect ratio group
-        aspect_group = None
-        
-        # Handle the case where bucket_thresholds might be a SimpleNamespace
-        if hasattr(config.bucket_thresholds, 'items'):
-            # It's a dictionary
-            for group, (min_ratio, max_ratio) in config.bucket_thresholds.items():
-                if min_ratio <= aspect <= max_ratio:
-                    aspect_group = group
-                    break
-        else:
-            # It's a SimpleNamespace - access attributes directly
-            if hasattr(config.bucket_thresholds, 'square'):
-                min_ratio, max_ratio = config.bucket_thresholds.square
-                if min_ratio <= aspect <= max_ratio:
-                    aspect_group = 'square'
-            
-            if aspect_group is None and hasattr(config.bucket_thresholds, 'portrait'):
-                min_ratio, max_ratio = config.bucket_thresholds.portrait
-                if min_ratio <= aspect <= max_ratio:
-                    aspect_group = 'portrait'
-            
-            if aspect_group is None and hasattr(config.bucket_thresholds, 'landscape'):
-                min_ratio, max_ratio = config.bucket_thresholds.landscape
-                if min_ratio <= aspect <= max_ratio:
-                    aspect_group = 'landscape'
-        
-        # If no aspect group was determined, use the first bucket
-        if aspect_group is None:
-            return 0
-        
-        # 2. Calculate scaled dimensions
-        scale = config.bucket_scale
-        scaled_w = round(width / scale) * scale
-        scaled_h = round(height / scale) * scale
-        
-        # 3. Find matching bucket
-        for idx, (bw, bh) in enumerate(config.buckets):
-            if aspect_group == 'square' and bw == bh and scaled_w == bw and scaled_h == bh:
-                return idx
-            elif aspect_group == 'portrait' and bw < bh and scaled_w == bw and scaled_h == bh:
-                return idx
-            elif aspect_group == 'landscape' and bw > bh and scaled_w == bw and scaled_h == bh:
-                return idx
-            
-        # Fallback to nearest bucket
-        distances = [
-            (abs(scaled_w - bw) + abs(scaled_h - bh), idx)
-            for idx, (bw, bh) in enumerate(config.buckets)
-        ]
-        return min(distances)[1]
-
-    def _extract_dims(self, img):
-        """Extract original image dimensions"""
-        return torch.tensor(img.size, dtype=torch.int16)
-
-    def _gpu_health_check(self):
-        """Verify GPU is responsive"""
-        test_tensor = torch.randn(1024, device=self.device)
-        torch.cuda.synchronize()
-        # If this hangs, it indicates GPU health issues
-        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
-
-    # Update the FEATURE_PROCESSORS dictionary to clearly indicate feature type and save key
-    FEATURE_PROCESSORS = {
-        'vae': {
-            'handler': '_extract_vae_latent',
-            'save_prefix': 'latents',
-            'feature_key': 'latent'  # The key used in the features dictionary
-        },
-        'clip': {
-            'handler': '_extract_clip_embedding',
-            'save_prefix': 'clip',
-            'feature_key': 'clip'
-        },
-        't5': {
-            'handler': '_extract_t5_embedding',
-            'save_prefix': 't5',
-            'feature_key': 't5'
-        },
-        'dino': {
-            'handler': '_extract_dino_features', 
-            'save_prefix': 'dino_features',
-            'feature_key': 'dino'
-        },
-        'buckets': {
-            'handler': '_extract_bucket_index',
-            'save_prefix': 'buckets',
-            'feature_key': 'bucket'  # This is the critical mapping!
-        },
-        'dims': {
-            'handler': '_extract_dims',
-            'save_prefix': 'dims',
-            'feature_key': 'dims'
-        }
-    }
-
-    # Add a new wrapper function to extract bucket index from an image path
-    def _extract_bucket_index(self, img_path):
-        """Extract bucket index from image dimensions"""
-        with Image.open(img_path) as img:
-            width, height = img.size
-            return torch.tensor(self._get_bucket_index(width, height), dtype=torch.int16)
-
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
@@ -531,7 +418,7 @@ def main():
         # Initialize feature generator with just this feature type
         processor = FeatureGenerator(config, [feature_type])
         
-        # This is the key fix - make sure we use the correct save directory
+        # Get save directory
         save_prefix = processor.FEATURE_PROCESSORS[feature_type]['save_prefix']
         save_dir = processor.feature_dir/save_prefix
         save_dir.mkdir(parents=True, exist_ok=True)
