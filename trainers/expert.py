@@ -33,8 +33,20 @@ class ExpertTrainer(BaseTrainer):
         self.expert_idx = expert_idx  # Store the expert index for identification
         self.world_size = world_size
         
-        # Initialize base model first
-        self.expert = ExpertMMDiT(config)
+        # --- FIX: Ensure model config uses latent_channels for in_channels ---
+        from types import SimpleNamespace
+        model_config_dict = vars(config).copy() # Create a mutable copy
+        if hasattr(config, 'latent_channels'):
+             model_config_dict['in_channels'] = config.latent_channels
+             logger.info(f"Expert {expert_idx}: Setting model in_channels to latent_channels ({config.latent_channels})")
+        else:
+             logger.warning(f"Expert {expert_idx}: config.latent_channels not found, using config.in_channels ({config.in_channels}) for model.")
+        # Use a SimpleNamespace or a dedicated dataclass if ExpertMMDiT expects one
+        model_config = SimpleNamespace(**model_config_dict)
+        # --- END FIX ---
+
+        # Initialize base model first using the corrected config
+        self.expert = ExpertMMDiT(model_config) # Pass the modified config
         
         # Don't wrap with FSDP here - let cache manager handle it
         
@@ -125,6 +137,11 @@ class ExpertTrainer(BaseTrainer):
                 print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch, using first sequence")
                 latents = latents[:, 0]  # Take only first sequence if multiple
                 print(f"[DEBUG Expert {self.expert_idx}] Using first sequence, shape: {latents.shape}")
+        # --- FIX: Reshape latents to [B, SeqLen, Channels] ---
+        B, C, H, W = latents.shape
+        img_seq = latents.reshape(B, C, H * W).permute(0, 2, 1) # Shape: [B, H*W, C]
+        print(f"[DEBUG Expert {self.expert_idx}] Reshaped img_seq for model: {img_seq.shape}")
+        # --- END FIX ---
         
         # Same for text embeddings if needed
         if text_embeds.dim() == 4:
@@ -140,21 +157,27 @@ class ExpertTrainer(BaseTrainer):
             print(f"[DEBUG Expert {self.expert_idx}] timesteps shape: {t.shape}")
             
             try:
+                # --- FIX: Use reshaped img_seq and corrected position IDs ---
+                img_pos_ids = self._get_position_ids(latents) # Pass original 4D latents to get H, W
+                print(f"[DEBUG Expert {self.expert_idx}] img_pos_ids shape: {img_pos_ids.shape}")
+
                 # Forward pass through expert model
                 print(f"[DEBUG Expert {self.expert_idx}] Calling expert forward pass")
                 pred_flow = self.expert(
-                    img=latents,
-                    img_ids=self._get_position_ids(latents),
+                    img=img_seq,                      # Use reshaped image sequence
+                    img_ids=img_pos_ids,              # Use generated position IDs
                     txt=text_embeds,
                     txt_ids=self._get_text_position_ids(text_embeds),
-                    timesteps=t * 1000,  # Scale timesteps
+                    timesteps=t * 1000,               # Scale timesteps
                     y=self._get_conditioning(latents.shape[0]),
                     cluster_ids=cluster_ids
                 )
+                # --- END FIX ---
                 print(f"[DEBUG Expert {self.expert_idx}] pred_flow shape: {pred_flow.shape}")
                 
                 # Calculate loss - need to reshape latents back if it was modified
                 print(f"[DEBUG Expert {self.expert_idx}] Computing loss with flow_matcher")
+                # Pass the reshaped prediction and original latents to the loss function
                 loss = self.flow_matcher.compute_loss(pred_flow, latents, t)
                 print(f"[DEBUG Expert {self.expert_idx}] Loss value: {loss.item()}")
                 
@@ -276,36 +299,29 @@ class ExpertTrainer(BaseTrainer):
                 logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 
 
     def _get_position_ids(self, x):
-        """Simple patch-based position IDs as described in paper with improved shape handling"""
-        # Handle 5D inputs (B, S, C, H, W) common in latent diffusion models
+        """Generate position IDs for the flattened latent sequence [B, H*W, 2]"""
         print(f"[DEBUG Expert {self.expert_idx}] Position ID input shape: {x.shape}")
-        
+
         if x.dim() == 5:
-            # Extract dimensions from 5D tensor (B, S, C, H, W)
             B, S, C, H, W = x.shape
-            # Reshape to 4D by combining batch and sequence dimensions if S=1
-            if S == 1:
-                # Just use the existing batch size and reshape while keeping original H/W
-                print(f"[DEBUG Expert {self.expert_idx}] Reshaping 5D->4D tensor for position IDs")
-            else:
-                # If sequence length > 1, maintain batch size but note for debugging
-                print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch, using first sequence")
+            if S != 1:
+                 print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch for pos IDs, using first.")
+            # Use dimensions from the first sequence element if S > 1
+            H, W = x.shape[3], x.shape[4]
         elif x.dim() == 4:
-            # Standard 4D tensor (B, C, H, W)
             B, C, H, W = x.shape
         else:
-            raise ValueError(f"Unexpected tensor dimensions: {x.dim()}, shape: {x.shape}")
-        
-        # Calculate grid dimensions based on patch size
-        h = H // self.config.patch_size
-        w = W // self.config.patch_size
-        
-        # Create grid of position indices
-        pos_h = torch.arange(h, device=self.device)
-        pos_w = torch.arange(w, device=self.device)
-        pos_grid = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), dim=-1)
+            raise ValueError(f"Unexpected tensor dimensions for pos IDs: {x.dim()}, shape: {x.shape}")
+
+        # --- FIX: Generate IDs for H*W sequence length ---
+        # Create grid indices for H and W dimensions directly
+        pos_h = torch.arange(H, device=self.device)
+        pos_w = torch.arange(W, device=self.device)
+        pos_grid = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), dim=-1) # Shape [H, W, 2]
+        # Reshape to [H*W, 2] and add batch dimension -> [B, H*W, 2]
         pos_grid = pos_grid.reshape(-1, 2)[None].repeat(B, 1, 1)
-        
+        # --- END FIX ---
+
         print(f"[DEBUG Expert {self.expert_idx}] Position ID output shape: {pos_grid.shape}")
         return pos_grid
 
