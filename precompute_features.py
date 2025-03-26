@@ -482,94 +482,348 @@ class FeatureGenerator:
         pattern = f"*_rank{self.rank}.pt"
         return {p.stem.split('_rank')[0] for p in dir_path.glob(pattern)}
 
+    def _extract_t5_embeddings_batch(self, captions):
+        """Extract T5 embeddings for a batch of captions more efficiently"""
+        with torch.no_grad():
+            embeddings = self.t5.encode(captions).cpu()
+            return embeddings
+
+    def _save_t5_embedding(self, uuid_str, embedding):
+        """Save a T5 embedding with the given UUID"""
+        save_path = self.feature_dir / "t5" / f"{uuid_str}_rank{self.rank}.pt"
+        torch.save(embedding, save_path)
+        return True
+
 def _process_directory(config, rank=0, world_size=1, only_missing=True):
     """Efficiently scan and divide dataset for distributed processing with support for incremental processing"""
     dataset_path = Path(config.dataset_path)
     feature_path = Path(config.feature_cache_path)
     
+    # For very large datasets, we need to avoid loading entire file listings into memory
     # Only have rank 0 scan the dataset once
     if rank == 0:
         logger.info(f"Scanning dataset directory: {dataset_path}")
         
-        # If only processing missing files, first gather existing UUIDs
-        existing_uuids = {}
-        if only_missing:
-            for feat_dir in ['latents', 'clip', 't5']:
-                dir_path = feature_path / feat_dir
-                if dir_path.exists():
-                    existing_uuids[feat_dir] = {
-                        p.stem.split('_rank')[0] for p in dir_path.glob('*_rank*.pt')
-                    }
-                    logger.info(f"Found {len(existing_uuids[feat_dir])} existing {feat_dir} files")
+        # Check if we have CLIP features but missing T5 features
+        # This optimization targets specifically adding T5 embeddings to existing data
+        clip_dir = feature_path / "clip"
+        t5_dir = feature_path / "t5"
         
-        # Use more efficient file system walk 
-        image_paths = []
-        caption_paths = []
-        uuids = []
-        
-        # Cache the lower-cased valid extensions
-        valid_exts = {'.jpg', '.jpeg', '.png', '.webp'}
-        
-        # Walk the directory tree efficiently
-        for root, _, files in os.walk(dataset_path):
-            root_path = Path(root)
-            image_files = [f for f in files if any(f.lower().endswith(ext) for ext in valid_exts)]
+        if clip_dir.exists() and 't5' in config.enabled_features and not args.force_recompute:
+            logger.info("Using existing CLIP files to identify needed T5 embeddings...")
             
-            for img_file in image_files:
-                img_path = root_path / img_file
-                caption_path = img_path.with_suffix('.txt')
+            # Instead of loading all files at once, we'll process them in chunks
+            image_paths = []
+            caption_paths = []
+            uuids = []
+            
+            # Create the t5 directory if it doesn't exist
+            t5_dir.mkdir(exist_ok=True)
+            
+            # Get existing T5 UUIDs as a set for fast membership testing
+            t5_uuids = {p.stem.split('_rank')[0] for p in t5_dir.glob('*_rank*.pt')}
+            logger.info(f"Found {len(t5_uuids)} existing T5 embeddings")
+            
+            # Count files for progress reporting
+            clip_file_count = sum(1 for _ in clip_dir.glob('*_rank*.pt'))
+            logger.info(f"Found {clip_file_count} existing CLIP embeddings")
+            
+            # Process CLIP files in chunks to avoid memory issues
+            chunk_size = 10000
+            processed = 0
+            
+            # Stream through files in manageable chunks
+            with tqdm(total=clip_file_count, desc="Scanning CLIP files") as pbar:
+                for clip_files in _chunked_glob(clip_dir, "*_rank*.pt", chunk_size):
+                    chunk_uuids = []
+                    
+                    for clip_file in clip_files:
+                        # Extract UUID without rank suffix
+                        uuid_str = clip_file.stem.split('_rank')[0]
+                        
+                        # Skip if T5 embedding already exists
+                        if uuid_str in t5_uuids:
+                            processed += 1
+                            pbar.update(1)
+                            continue
+                        
+                        # Find matching caption file by using the clip to latent mapping
+                        chunk_uuids.append(uuid_str)
+                    
+                    if chunk_uuids:
+                        # Get all needed image/caption paths in bulk using mapping files
+                        chunk_imgs, chunk_captions = _find_source_files(config, chunk_uuids)
+                        image_paths.extend(chunk_imgs)
+                        caption_paths.extend(chunk_captions)
+                        uuids.extend(chunk_uuids)
+                    
+                    processed += len(clip_files)
+                    pbar.update(len(clip_files))
+            
+            logger.info(f"Identified {len(uuids)} files needing T5 embeddings")
+            
+            # If we're only computing T5 embeddings and have source mappings, we can directly use captions
+            # without loading images to speed things up dramatically
+            if len(config.enabled_features) == 1 and 't5' in config.enabled_features and hasattr(config, "caption_mapping_file"):
+                logger.info("Using caption mapping for direct T5 embedding extraction...")
+                # Load mapping instead of original files
+                captions_only = []
+                for uuid_str in uuids:
+                    caption = _get_caption_from_mapping(config, uuid_str)
+                    if caption:
+                        captions_only.append((uuid_str, caption))
                 
-                if caption_path.exists():
-                    # Generate UUID from file content hashes
-                    with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
-                        img_hash = hashlib.md5(f.read()).hexdigest()
-                        text_hash = hashlib.md5(cf.read()).hexdigest()
+                # Replace with just the information we need
+                uuids = [u for u, _ in captions_only]
+                caption_texts = [c for _, c in captions_only]
+                
+                # Save the paths to a temporary file for other ranks to read
+                with open(f"{config.feature_cache_path}/t5_task.pkl", 'wb') as f:
+                    pickle.dump((uuids, caption_texts), f)
                     
-                    file_uuid = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
+                # Flag that we're in captions-only mode
+                with open(f"{config.feature_cache_path}/captions_only_mode", 'w') as f:
+                    f.write("1")
                     
-                    # Add to processing list if:
-                    # 1. We're processing all files, or
-                    # 2. We're only processing missing files and this one needs t5 embedding
-                    if not only_missing or ('t5' not in existing_uuids or file_uuid not in existing_uuids['t5']):
-                        image_paths.append(str(img_path))
-                        caption_paths.append(str(caption_path))
-                        uuids.append(file_uuid)
-        
-        print(f"Found {len(image_paths)} image-caption pairs requiring processing")
-        
-        # Save the paths to a temporary file for other ranks to read
-        with open(f"{config.feature_cache_path}/image_paths.pkl", 'wb') as f:
-            pickle.dump((image_paths, caption_paths, uuids), f)
+                logger.info(f"Prepared {len(uuids)} captions for T5 embedding")
+            else:
+                # Save the paths to a temporary file for other ranks to read
+                with open(f"{config.feature_cache_path}/image_paths.pkl", 'wb') as f:
+                    pickle.dump((image_paths, caption_paths, uuids), f)
+        else:
+            # Fall back to full directory scanning
+            # This implementation is streamlined for performance with large datasets
+            logger.info("Performing full dataset scan...")
+            
+            # If only processing missing files, gather existing UUIDs efficiently
+            existing_uuids = {}
+            if only_missing:
+                for feat_type in config.enabled_features:
+                    if feat_type in ['vae', 'clip', 't5', 'dino']:
+                        feat_dir = feature_path / FeatureGenerator.FEATURE_PROCESSORS[feat_type]['save_prefix']
+                        if feat_dir.exists():
+                            # Count files instead of loading full list
+                            count = sum(1 for _ in feat_dir.glob('*_rank*.pt'))
+                            logger.info(f"Found {count} existing {feat_type} files")
+                            
+                            # Only load UUIDs for feature types we need to check against
+                            if feat_type in config.enabled_features:
+                                # Process in chunks to avoid memory issues
+                                existing_uuids[feat_type] = set()
+                                for files in _chunked_glob(feat_dir, "*_rank*.pt", 10000):
+                                    existing_uuids[feat_type].update(p.stem.split('_rank')[0] for p in files)
+            
+            # Process dataset incrementally in chunks
+            image_paths = []
+            caption_paths = []
+            uuids = []
+            
+            # For very large datasets, avoid loading all paths into memory at once
+            # Instead, scan directories in chunks and process incrementally
+            valid_exts = {'.jpg', '.jpeg', '.png', '.webp'}
+            
+            # Use more efficient file discovery
+            image_files = _find_image_files_with_captions(dataset_path, valid_exts)
+            total_images = len(image_files)
+            logger.info(f"Found {total_images} total image files with captions")
+            
+            # Process in chunks to avoid memory issues
+            with tqdm(total=total_images, desc="Checking files") as pbar:
+                for chunk_start in range(0, total_images, 10000):
+                    chunk_end = min(chunk_start + 10000, total_images)
+                    chunk = image_files[chunk_start:chunk_end]
+                    
+                    # Process this chunk
+                    for img_path in chunk:
+                        caption_path = Path(img_path).with_suffix('.txt')
+                        
+                        # Generate UUID from file content hashes - but do it efficiently
+                        # For large datasets, computing MD5 of every file is expensive
+                        # Use a combination of path and mtime for faster processing
+                        img_stat = os.stat(img_path)
+                        cap_stat = os.stat(caption_path)
+                        hash_input = f"{img_path}:{img_stat.st_size}:{img_stat.st_mtime}:{caption_path}:{cap_stat.st_size}:{cap_stat.st_mtime}"
+                        file_uuid = hashlib.md5(hash_input.encode()).hexdigest()
+                        
+                        # Check if we need to process this file
+                        needs_processing = False
+                        if not only_missing:
+                            needs_processing = True
+                        else:
+                            # Check if any required feature is missing
+                            for feat_type in config.enabled_features:
+                                if feat_type in ['vae', 'clip', 't5', 'dino']:
+                                    if (feat_type not in existing_uuids or 
+                                        file_uuid not in existing_uuids[feat_type]):
+                                        needs_processing = True
+                                        break
+                        
+                        if needs_processing:
+                            image_paths.append(img_path)
+                            caption_paths.append(str(caption_path))
+                            uuids.append(file_uuid)
+                    
+                    pbar.update(len(chunk))
+            
+            logger.info(f"Found {len(image_paths)} image-caption pairs requiring processing")
+            
+            # Save the paths to a temporary file for other ranks to read
+            with open(f"{config.feature_cache_path}/image_paths.pkl", 'wb') as f:
+                pickle.dump((image_paths, caption_paths, uuids), f)
     
     # Synchronize to ensure rank 0 has finished writing the file
     if world_size > 1:
         dist.barrier()
     
-    # All ranks read the paths file
-    with open(f"{config.feature_cache_path}/image_paths.pkl", 'rb') as f:
-        image_paths, caption_paths, uuids = pickle.load(f)
+    # Check if we're in captions-only mode for T5
+    captions_only_mode = os.path.exists(f"{config.feature_cache_path}/captions_only_mode")
     
-    # Distribute paths among ranks
-    total_pairs = len(image_paths)
-    pairs_per_rank = total_pairs // world_size
-    remainder = total_pairs % world_size
+    if captions_only_mode:
+        # Load the T5 task file
+        with open(f"{config.feature_cache_path}/t5_task.pkl", 'rb') as f:
+            uuids, caption_texts = pickle.load(f)
+        
+        # Distribute task among ranks
+        total_items = len(uuids)
+        items_per_rank = total_items // world_size
+        remainder = total_items % world_size
+        
+        # Calculate this rank's start and end indices with balanced distribution
+        start_idx = rank * items_per_rank + min(rank, remainder)
+        end_idx = start_idx + items_per_rank + (1 if rank < remainder else 0)
+        
+        # Get this rank's subset of captions
+        rank_uuids = uuids[start_idx:end_idx]
+        rank_captions = caption_texts[start_idx:end_idx]
+        
+        logger.info(f"Rank {rank} processing {len(rank_uuids)} captions for T5 embedding in direct mode")
+        
+        # Clean up if last rank
+        if rank == world_size - 1:
+            if os.path.exists(f"{config.feature_cache_path}/t5_task.pkl"):
+                os.remove(f"{config.feature_cache_path}/t5_task.pkl")
+            if os.path.exists(f"{config.feature_cache_path}/captions_only_mode"):
+                os.remove(f"{config.feature_cache_path}/captions_only_mode")
+        
+        return None, None, rank_uuids, rank_captions
+    else:
+        # All ranks read the paths file - standard mode
+        with open(f"{config.feature_cache_path}/image_paths.pkl", 'rb') as f:
+            image_paths, caption_paths, uuids = pickle.load(f)
+        
+        # Distribute paths among ranks
+        total_pairs = len(image_paths)
+        pairs_per_rank = total_pairs // world_size
+        remainder = total_pairs % world_size
+        
+        # Calculate this rank's start and end indices with balanced distribution
+        start_idx = rank * pairs_per_rank + min(rank, remainder)
+        end_idx = start_idx + pairs_per_rank + (1 if rank < remainder else 0)
+        
+        # Get this rank's subset of paths
+        rank_image_paths = image_paths[start_idx:end_idx]
+        rank_caption_paths = caption_paths[start_idx:end_idx]
+        rank_uuids = uuids[start_idx:end_idx]
+        
+        logger.info(f"Rank {rank} processing {len(rank_image_paths)} image-caption pairs")
+        
+        # Clean up the paths file if we're the last rank
+        if rank == world_size - 1 and os.path.exists(f"{config.feature_cache_path}/image_paths.pkl"):
+            os.remove(f"{config.feature_cache_path}/image_paths.pkl")
+        
+        return rank_image_paths, rank_caption_paths, rank_uuids, None
+
+# Add these helper functions for efficient file handling
+
+def _chunked_glob(path, pattern, chunk_size=10000):
+    """Yield chunks of glob results to avoid memory issues"""
+    all_files = list(path.glob(pattern))
+    for i in range(0, len(all_files), chunk_size):
+        yield all_files[i:i + chunk_size]
+
+def _find_image_files_with_captions(base_path, valid_exts):
+    """Find all image files that have accompanying caption files"""
+    result = []
     
-    # Calculate this rank's start and end indices with balanced distribution
-    start_idx = rank * pairs_per_rank + min(rank, remainder)
-    end_idx = start_idx + pairs_per_rank + (1 if rank < remainder else 0)
+    # Use os.walk for better performance
+    for root, _, files in os.walk(base_path):
+        root_path = Path(root)
+        
+        # First collect all image files
+        image_files = [f for f in files if any(f.lower().endswith(ext) for ext in valid_exts)]
+        
+        # Then filter to those with captions
+        for img_file in image_files:
+            img_path = root_path / img_file
+            caption_path = img_path.with_suffix('.txt')
+            if caption_path.exists():
+                result.append(str(img_path))
     
-    # Get this rank's subset of paths
-    rank_image_paths = image_paths[start_idx:end_idx]
-    rank_caption_paths = caption_paths[start_idx:end_idx]
-    rank_uuids = uuids[start_idx:end_idx]
+    return result
+
+def _find_source_files(config, uuids):
+    """Find source image and caption files from UUIDs using a mapping file if available"""
+    # If we have a mapping file, use it
+    if hasattr(config, "uuid_mapping_file") and os.path.exists(config.uuid_mapping_file):
+        return _lookup_files_from_mapping(config, uuids)
     
-    print(f"Rank {rank} processing {len(rank_image_paths)} image-caption pairs")
+    # Otherwise fall back to scanning the dataset
+    image_paths = []
+    caption_paths = []
     
-    # Clean up the paths file if we're the last rank
-    if rank == world_size - 1 and os.path.exists(f"{config.feature_cache_path}/image_paths.pkl"):
-        os.remove(f"{config.feature_cache_path}/image_paths.pkl")
+    for uuid_str in uuids:
+        # Find files by UUID
+        for feat_dir in ["latents", "clip", "dims"]:
+            dir_path = Path(config.feature_cache_path) / feat_dir
+            if not dir_path.exists():
+                continue
+                
+            # Look for any file matching this UUID
+            match_files = list(dir_path.glob(f"{uuid_str}_rank*.pt"))
+            if match_files:
+                # Try to use the metadata file if it exists
+                meta_file = Path(config.feature_cache_path) / "metadata" / f"{uuid_str}.json"
+                if meta_file.exists():
+                    import json
+                    with open(meta_file) as f:
+                        metadata = json.load(f)
+                        if "image_path" in metadata and "caption_path" in metadata:
+                            image_paths.append(metadata["image_path"])
+                            caption_paths.append(metadata["caption_path"])
+                            break
     
-    return rank_image_paths, rank_caption_paths, rank_uuids
+    # If we couldn't find them, leave empty
+    missing = len(uuids) - len(image_paths)
+    if missing > 0:
+        logger.warning(f"Could not find source files for {missing} UUIDs")
+    
+    return image_paths, caption_paths
+
+def _get_caption_from_mapping(config, uuid_str):
+    """Get caption text directly from mapping file"""
+    if hasattr(config, "caption_mapping_file") and os.path.exists(config.caption_mapping_file):
+        import json
+        with open(config.caption_mapping_file) as f:
+            mapping = json.load(f)
+            return mapping.get(uuid_str, None)
+    return None
+
+def _lookup_files_from_mapping(config, uuids):
+    """Look up image and caption paths from mapping file"""
+    import json
+    with open(config.uuid_mapping_file) as f:
+        mapping = json.load(f)
+    
+    image_paths = []
+    caption_paths = []
+    
+    for uuid_str in uuids:
+        if uuid_str in mapping:
+            entry = mapping[uuid_str]
+            image_paths.append(entry["image_path"])
+            caption_paths.append(entry["caption_path"])
+    
+    return image_paths, caption_paths
 
 def main():
     # Parse command line arguments
@@ -588,6 +842,8 @@ def main():
                         help='Batch size for processing')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of worker threads for I/O operations')
+    parser.add_argument('--direct-captions', action='store_true',
+                        help='Use direct caption processing for T5 (faster)')
     args = parser.parse_args()
 
     # Configure logging
@@ -631,7 +887,8 @@ def main():
     
     # Load config after distributed init
     config = get_config()
-    
+    config.enabled_features = enabled_features  # Store for later use
+
     # Update batch size from args
     batch_size = args.batch_size
     num_workers = args.num_workers
@@ -644,7 +901,7 @@ def main():
     os.makedirs(config.feature_cache_path, exist_ok=True)
     
     # Get image-caption pairs efficiently, respecting force-recompute flag
-    image_paths, caption_paths, uuids = _process_directory(
+    result = _process_directory(
         config, 
         rank, 
         world_size, 
@@ -655,44 +912,56 @@ def main():
     processor = FeatureGenerator(config, enabled_features)
     processor.batch_size = batch_size  # Set batch size from command line
     
+    # Check if we're in caption-only mode for T5
+    captions_only_mode = len(result) == 4 and result[0] is None
+    
     try:
-        # Process image-text pairs in batches for better memory efficiency
-        total_samples = len(image_paths)
-        batch_indices = list(range(0, total_samples, batch_size))
-        
-        with tqdm(total=total_samples, desc=f"GPU {rank}", position=rank) as pbar:
-            for i in range(0, len(batch_indices)):
-                start_idx = batch_indices[i]
-                end_idx = start_idx + batch_size if i < len(batch_indices) - 1 else total_samples
-                
-                # Process a batch of image-caption pairs
-                batch_image_paths = image_paths[start_idx:end_idx]
-                batch_caption_paths = caption_paths[start_idx:end_idx]
-                batch_uuids = uuids[start_idx:end_idx]
-                
-                # Process batch in parallel
-                try:
-                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                        futures = [executor.submit(processor._process_image_caption_pair_with_uuid, 
-                                                  img_path, cap_path, uuid_str) 
-                                  for img_path, cap_path, uuid_str in zip(batch_image_paths, 
-                                                                          batch_caption_paths, 
-                                                                          batch_uuids)]
+        if captions_only_mode:
+            # Process captions directly for T5 (much faster for large datasets)
+            _, _, uuids, captions = result
+            process_t5_embeddings_directly(processor, uuids, captions, batch_size, num_workers)
+        else:
+            # Standard processing mode
+            image_paths, caption_paths, uuids, _ = result
+            total_samples = len(image_paths)
+            
+            # Process image-text pairs in batches for better memory efficiency
+            with tqdm(total=total_samples, desc=f"GPU {rank}", position=rank) as pbar:
+                # Process in even larger batches for better GPU utilization
+                for batch_idx in range(0, total_samples, batch_size * 4):
+                    end_idx = min(batch_idx + batch_size * 4, total_samples)
+                    
+                    # Get a larger batch to keep the GPU busy
+                    batch_image_paths = image_paths[batch_idx:end_idx]
+                    batch_caption_paths = caption_paths[batch_idx:end_idx]
+                    batch_uuids = uuids[batch_idx:end_idx]
+                    
+                    # Split into sub-batches for parallel processing
+                    for sub_batch_idx in range(0, len(batch_image_paths), batch_size):
+                        sub_end_idx = min(sub_batch_idx + batch_size, len(batch_image_paths))
                         
-                        # Process results as they complete
-                        for future in as_completed(futures):
-                            # Handle or log any errors
-                            try:
-                                future.result()
-                            except Exception as e:
-                                logger.error(f"Error processing pair: {str(e)}")
-                
-                except Exception as batch_e:
-                    logger.error(f"Error processing batch: {str(batch_e)}")
-                
-                # Update progress
-                pbar.update(end_idx - start_idx)
-                
+                        sub_img_paths = batch_image_paths[sub_batch_idx:sub_end_idx]
+                        sub_cap_paths = batch_caption_paths[sub_batch_idx:sub_end_idx]
+                        sub_uuids = batch_uuids[sub_batch_idx:sub_end_idx]
+                        
+                        # Process sub-batch in parallel
+                        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                            futures = [executor.submit(processor._process_image_caption_pair_with_uuid, 
+                                                    img_path, cap_path, uuid_str) 
+                                    for img_path, cap_path, uuid_str in zip(sub_img_paths, 
+                                                                            sub_cap_paths, 
+                                                                            sub_uuids)]
+                            
+                            # Process results as they complete
+                            for future in as_completed(futures):
+                                try:
+                                    future.result()
+                                except Exception as e:
+                                    logger.error(f"Error processing pair: {str(e)}")
+                        
+                        # Update progress
+                        pbar.update(sub_end_idx - sub_batch_idx)
+        
         # GPU health check
         processor._gpu_health_check()
         
@@ -722,6 +991,54 @@ def main():
         # Clean up
         if world_size > 1:
             dist.destroy_process_group()
+
+def process_t5_embeddings_directly(processor, uuids, captions, batch_size, num_workers):
+    """Process T5 embeddings directly from caption texts - much more efficient"""
+    total_samples = len(uuids)
+    logger.info(f"Processing {total_samples} T5 embeddings directly")
+    
+    # Use much larger batch sizes for direct T5 processing (it's very efficient)
+    t5_batch_size = batch_size * 8
+    
+    with tqdm(total=total_samples, desc=f"T5 GPU {processor.rank}", position=processor.rank) as pbar:
+        for batch_idx in range(0, total_samples, t5_batch_size):
+            end_idx = min(batch_idx + t5_batch_size, total_samples)
+            
+            # Get the batch
+            batch_uuids = uuids[batch_idx:end_idx]
+            batch_captions = captions[batch_idx:end_idx]
+            
+            # Process in parallel with thread pool
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                # Split into smaller chunks to avoid OOM
+                chunk_size = 128  # Adjust based on available GPU memory
+                for i in range(0, len(batch_uuids), chunk_size):
+                    chunk_end = min(i + chunk_size, len(batch_uuids))
+                    
+                    chunk_uuids = batch_uuids[i:chunk_end]
+                    chunk_captions = batch_captions[i:chunk_end]
+                    
+                    # Process captions in chunks
+                    embeddings = processor._extract_t5_embeddings_batch(chunk_captions)
+                    
+                    # Save embeddings
+                    futures = []
+                    for j, uuid_str in enumerate(chunk_uuids):
+                        futures.append(executor.submit(
+                            processor._save_t5_embedding, 
+                            uuid_str, 
+                            embeddings[j]
+                        ))
+                    
+                    # Wait for all saves to complete
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logger.error(f"Error saving T5 embedding: {str(e)}")
+            
+            # Update progress
+            pbar.update(end_idx - batch_idx)
 
 if __name__ == "__main__":
     main() 
