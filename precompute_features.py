@@ -31,10 +31,12 @@ class FeatureGenerator:
         try:
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
-        except RuntimeError:
+            self.distributed = True
+        except (RuntimeError, ValueError):  # Catch both exception types
             # Fallback for standalone clustering
             self.rank = 0
             self.world_size = 1
+            self.distributed = False
             
         self.device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
         self.enabled_features = enabled_features
@@ -77,7 +79,10 @@ class FeatureGenerator:
                 if feat in dir_map:
                     dir_path = self.feature_dir/dir_map[feat]
                     dir_path.mkdir(parents=True, exist_ok=True)
-        dist.barrier()
+                    
+        # Only call barrier if distributed mode is active
+        if hasattr(self, 'distributed') and self.distributed:
+            dist.barrier()
 
     # Keep only the feature extraction methods that work with single inputs
     def _extract_vae_latent(self, img):
