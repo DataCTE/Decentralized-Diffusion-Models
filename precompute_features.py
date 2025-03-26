@@ -16,14 +16,9 @@ from config import get_config
 from data.vae import VAEWrapper
 from data.clip import CLIPTextEncoder
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 from concurrent.futures import as_completed
-from collections import defaultdict
 from tqdm.auto import tqdm
-import shutil
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from datetime import datetime, timedelta
 import time
 import argparse
 
@@ -84,7 +79,7 @@ class FeatureGenerator:
             self._process_batch()
             
     def _process_batch(self):
-        """Parallel batch feature extraction"""
+        """Process a batch of images in parallel"""
         with ThreadPoolExecutor() as executor:
             futures = [executor.submit(self._single_process, path) 
                       for path in self.image_buffer]
@@ -93,24 +88,21 @@ class FeatureGenerator:
         self.image_buffer.clear()
 
     def _single_process(self, img_path):
-        """Actual processing moved here"""
+        """Process a single image using filenames for latent storage"""
         try:
             # Check for caption file first
-            caption_path = Path(img_path).with_suffix('.txt')
+            img_path_obj = Path(img_path)
+            caption_path = img_path_obj.with_suffix('.txt')
             if not caption_path.exists():
                 return False
             
-            # Use file contents instead of path for UUID
-            with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
-                img_hash = hashlib.md5(f.read()).hexdigest()
-                text_hash = hashlib.md5(cf.read()).hexdigest()
+            # Use the filename as the base for latent storage
+            base_name = img_path_obj.stem
             
-            base_name = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
-
-            # Read caption text - only read it once to use for both CLIP and T5
+            # Read caption text
             caption_text = caption_path.read_text()
             
-            # Process regardless of existing files
+            # Process the image
             with Image.open(img_path) as img:
                 # Handle corrupt images and various color modes
                 img = img.convert('RGB')  # Force RGB conversion for all images
@@ -175,17 +167,20 @@ class FeatureGenerator:
             return torch.zeros(1, 1024)  # Return zero features for corrupt images
 
     def _extract_t5_embedding(self, caption):
-        """Extract T5 embedding for captions with batch support"""
+        """Extract T5 embedding for captions - similar to CLIP but with T5"""
         with torch.no_grad():
-            # Handle single caption or list of captions
-            if isinstance(caption, str):
+            if not isinstance(caption, list):
                 caption = [caption]
             
-            # Process on GPU
-            embeddings = self.t5.encode(caption)
+            # Ensure model is on the correct device
+            if not hasattr(self.t5.model, 'device') or self.t5.model.device != self.device:
+                self.t5.model = self.t5.model.to(self.device)
             
-            # Return CPU tensor
-            return embeddings.cpu()
+            # Process on GPU
+            embedding = self.t5.encode(caption)
+            
+            # Return CPU version
+            return embedding.cpu()
 
     def _save_features(self, base_name, features):
         """Force-save features with rank ID"""
@@ -215,19 +210,23 @@ class FeatureGenerator:
                 
                 # Batched loading with error handling
                 batch_size = 8192
+                # Store file paths to maintain name association
+                file_paths = []
+                
                 with tqdm(total=total_files, desc="Loading features") as pbar:
                     for batch_idx in range(0, total_files, batch_size):
                         batch_files = feature_files[batch_idx:batch_idx+batch_size]
                         
                         with ThreadPoolExecutor(max_workers=32) as executor:
-                            futures = {executor.submit(self._safe_load_feature, f): i 
+                            futures = {executor.submit(self._safe_load_feature, f): (i, f) 
                                      for i, f in enumerate(batch_files, batch_idx)}
                             for future in as_completed(futures):
-                                idx = futures[future]
+                                idx, file_path = futures[future]
                                 try:
                                     feat = future.result()
                                     if feat is not None:
                                         mmap_array[idx] = feat.numpy().squeeze()
+                                        file_paths.append(file_path)
                                 except Exception as e:
                                     print(f"Skipping corrupted file: {str(e)}")
                                 pbar.update(1)
@@ -235,6 +234,7 @@ class FeatureGenerator:
                 # Filter invalid entries
                 valid_mask = ~np.all(mmap_array == 0, axis=1)
                 full_features = mmap_array[valid_mask]
+                valid_file_paths = [fp for i, fp in enumerate(file_paths) if valid_mask[i]]
                 del mmap_array  # Release memory map
 
                 # CPU-only k-means
@@ -262,7 +262,18 @@ class FeatureGenerator:
                 # Save final clusters
                 _, labels = kmeans.index.search(full_features, 1)
                 cluster_labels = agg.labels_[labels.flatten()]
-                torch.save(cluster_labels, self.feature_dir/"clusters/final_clusters.pt")
+                
+                # Save cluster labels with original file names
+                cluster_dict = {}
+                for i, file_path in enumerate(valid_file_paths):
+                    # Extract base name from file path without rank suffix
+                    base_name = Path(file_path).stem
+                    # Remove rank suffix if present (e.g., "_rank0")
+                    if "_rank" in base_name:
+                        base_name = base_name.split("_rank")[0]
+                    cluster_dict[base_name] = int(cluster_labels[i])
+                
+                torch.save(cluster_dict, self.feature_dir/"clusters/final_clusters.pt")
 
                 # Cleanup
                 os.remove(mmap_path)
@@ -368,107 +379,6 @@ class FeatureGenerator:
         }
     }
 
-def process_t5_from_clip(processor, rank):
-    """Process T5 embeddings like other latents using direct image-to-caption pairing"""
-    dataset_path = Path(processor.config.dataset_path)
-    t5_dir = processor.feature_dir/"t5"
-    
-    # Get all images in the dataset
-    all_images = [p for p in dataset_path.rglob('*') 
-                 if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
-    
-    # Distribute images among ranks (using the same logic as main processing)
-    world_size = dist.get_world_size()
-    chunk_size = len(all_images) // world_size
-    remainder = len(all_images) % world_size
-    
-    start = rank * chunk_size + min(rank, remainder)
-    end = (rank + 1) * chunk_size + min(rank + 1, remainder)
-    local_images = all_images[start:end]
-    
-    print(f"Rank {rank}: Processing {len(local_images)} images for T5 embedding")
-    
-    # Batch processing with progress tracking
-    processed = 0
-    errors = 0
-    skipped = 0
-    
-    # Process in batches for better GPU utilization
-    batch_size = 32  # Standard batch size to match other latents
-    
-    # Use tqdm for progress tracking
-    with tqdm(total=len(local_images), desc=f"T5 Rank {rank}") as pbar:
-        for i in range(0, len(local_images), batch_size):
-            batch_images = local_images[i:i+batch_size]
-            batch_captions = []
-            batch_base_names = []
-            
-            # First collect valid image-caption pairs
-            for img_path in batch_images:
-                try:
-                    # Check if there's a corresponding caption file
-                    caption_path = img_path.with_suffix('.txt')
-                    if not caption_path.exists():
-                        continue
-                    
-                    # Create UUID from image and caption contents
-                    with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
-                        img_hash = hashlib.md5(f.read()).hexdigest()
-                        text_hash = hashlib.md5(cf.read()).hexdigest()
-                    
-                    base_name = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
-                    
-                    # Check if T5 embedding already exists
-                    t5_file = t5_dir/f"{base_name}_rank{rank}.pt"
-                    if t5_file.exists():
-                        skipped += 1
-                        continue
-                    
-                    # Read caption text
-                    caption_text = caption_path.read_text()
-                    
-                    # Add to batch
-                    batch_captions.append(caption_text)
-                    batch_base_names.append(base_name)
-                
-                except Exception as e:
-                    print(f"Rank {rank} failed processing {img_path}: {str(e)}")
-                    errors += 1
-            
-            # Process batch of captions on GPU
-            if batch_captions:
-                try:
-                    # Generate T5 embeddings in a single batch
-                    t5_embeddings = processor._extract_t5_embedding(batch_captions)
-                    
-                    # Save each embedding 
-                    for idx, base_name in enumerate(batch_base_names):
-                        # Extract single embedding (keep batch dimension)
-                        t5_embedding = t5_embeddings[idx:idx+1] if t5_embeddings.dim() > 2 else t5_embeddings[idx:idx+1, :]
-                        
-                        # Save with standard naming pattern
-                        t5_file = t5_dir/f"{base_name}_rank{rank}.pt"
-                        torch.save(t5_embedding.cpu(), t5_file)
-                        processed += 1
-                
-                except Exception as e:
-                    print(f"Rank {rank} batch processing failed: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    errors += len(batch_captions)
-            
-            # Update progress bar
-            pbar.update(len(batch_images))
-            
-            # Periodic status report
-            if i % (batch_size * 10) == 0 and i > 0:
-                print(f"Rank {rank} status: Processed {processed}, Skipped {skipped}, Errors {errors}")
-    
-    print(f"Rank {rank}: T5 processing complete. Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
-    
-    # Clear CUDA cache
-    torch.cuda.empty_cache()
-
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
@@ -480,44 +390,8 @@ def main():
     parser.add_argument('--dino-features', action='store_true', help='Extract DINO features')
     parser.add_argument('--all', action='store_true', help='Run all processing stages')
     parser.add_argument('--use-existing-dino', action='store_true',
-                        help='Use existing DINO features from disk')
-    parser.add_argument('--t5-from-existing', action='store_true', 
-                      help='Extract T5 embeddings only from existing CLIP files')
+                      help='Use existing DINO features from disk')
     args = parser.parse_args()
-
-    # Special handling for t5-from-existing
-    if args.t5_from_existing:
-        # Only enable t5 feature
-        enabled_features = ['t5']
-        
-        # Initialize distributed processing
-        rank = int(os.environ['LOCAL_RANK'])
-        print(f"Rank {rank} starting T5-only initialization")
-        
-        # Set device BEFORE initializing process group
-        torch.cuda.set_device(rank)
-        device = torch.device(f'cuda:{rank}')
-        
-        # Initialize process group with default settings
-        dist.init_process_group(
-            backend='nccl',
-            init_method='env://',
-            world_size=int(os.environ['WORLD_SIZE']),
-            rank=rank
-        )
-        
-        # Load config after distributed init
-        config = get_config()
-        
-        # Create feature generator with only T5 enabled
-        processor = FeatureGenerator(config, enabled_features)
-        
-        # Process only existing CLIP files
-        process_t5_from_clip(processor, rank)
-        
-        # Clean exit
-        dist.destroy_process_group()
-        return
 
     # Determine enabled features
     enabled_features = []
@@ -584,7 +458,10 @@ def main():
         with tqdm(total=len(local_images), desc=f"GPU {rank}", position=rank) as pbar:
             for img_path in local_images:
                 try:
-                    base_name = uuid.UUID(hashlib.md5(img_path.encode()).hexdigest()).hex
+                    # Use the actual image filename as the base name
+                    # This maintains consistency with image-caption pairs
+                    img_path_obj = Path(img_path)
+                    base_name = img_path_obj.stem
                     
                     # Only process enabled features
                     features = {}

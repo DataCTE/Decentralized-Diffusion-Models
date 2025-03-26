@@ -51,6 +51,7 @@ class DDMDataset(Dataset):
         self.feature_dir = self.config.feature_cache_path
         self.rank = get_rank()
         self.world_size = get_world_size()
+        self.verbose = getattr(self.config, 'verbose', False)
         
         # Set device based on availability and rank
         self.device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
@@ -120,16 +121,29 @@ class DDMDataset(Dataset):
         try:
             # Add safe_globals context for numpy compatibility
             with torch.serialization.safe_globals([_reconstruct]):
-                cluster_assignments = torch.load(
+                cluster_dict = torch.load(
                     cluster_path,
                     map_location=self.device,
                     weights_only=False  # Required for numpy compatibility
                 )
             
-            if isinstance(cluster_assignments, np.ndarray):
-                cluster_assignments = torch.from_numpy(cluster_assignments).to(self.device)
+            # Handle the cluster dictionary (image name -> cluster id)
+            if isinstance(cluster_dict, dict):
+                # Create assignments tensor using base names
+                assignments = torch.zeros(len(self.base_names), dtype=torch.long, device=self.device)
+                
+                for idx, base_name in enumerate(self.base_names):
+                    # Get cluster assignment if it exists, otherwise use default (0)
+                    cluster_id = cluster_dict.get(base_name, 0)
+                    assignments[idx] = cluster_id
+                
+                cluster_assignments = assignments
+            elif isinstance(cluster_dict, np.ndarray):
+                # Legacy format - convert to tensor
+                cluster_assignments = torch.from_numpy(cluster_dict).to(self.device)
             else:
-                cluster_assignments = cluster_assignments.to(self.device)
+                # Already a tensor
+                cluster_assignments = cluster_dict.to(self.device)
             
             # Validate cluster assignments
             num_clusters = cluster_assignments.max().item() + 1
@@ -423,11 +437,23 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     device = torch.device('cpu')
     logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
 
+    # Get expert assignments directly from GPU tensor
+    expert_assignments = dataset.expert_assignments.cpu().numpy()
+    expert_indices = defaultdict(list)
+
     # Debug prints for initialization
     print(f"\n[Rank {rank}] ===== EXPERT LOADER INITIALIZATION =====")
     print(f"[Rank {rank}] Total dataset samples: {len(dataset)}")
     print(f"[Rank {rank}] Dataset latent files: {len(dataset.latent_files)}")
     print(f"[Rank {rank}] First 5 expert assignments: {dataset.expert_assignments[:5]}")
+    
+    # Use vectorized operations for expert index collection
+    for idx in range(len(dataset)):
+        if idx >= len(expert_assignments):
+            print(f"[Rank {rank}] WARNING: Index {idx} out of range for expert assignments")
+            continue
+        expert_idx = expert_assignments[idx]
+        expert_indices[expert_idx].append(idx)
 
     # Distributed progress tracking
     loader_pbar = tqdm(
@@ -439,22 +465,6 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         disable=not is_main_process()
     )
 
-    loader_start = time.time()
-    logger.info(f"Rank {rank}: Starting DataLoader creation for {dataset.num_experts.item()} experts")
-
-    # Get expert assignments directly from GPU tensor
-    expert_assignments = dataset.expert_assignments.cpu().numpy()
-    expert_indices = defaultdict(list)
-
-    # Use vectorized operations for expert index collection
-    for idx in np.nditer(np.where(expert_assignments >= 0)):
-        expert_idx = expert_assignments[idx]
-        # Add index validation
-        if idx >= len(dataset):
-            print(f"[Rank {rank}] WARNING: Invalid index {idx} in expert {expert_idx}")
-            continue
-        expert_indices[expert_idx].append(idx.item())
-
     # Log expert distribution stats with validation
     total_indices = sum(len(indices) for indices in expert_indices.values())
     print(f"[Rank {rank}] Collected {total_indices} valid indices across {len(expert_indices)} experts")
@@ -465,6 +475,9 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             print(f"    First index: {indices[0]}, Last index: {indices[-1]}")
             if indices[-1] >= len(dataset):
                 print(f"    ERROR: Last index {indices[-1]} exceeds dataset size {len(dataset)}")
+
+    loader_start = time.time()
+    logger.info(f"Rank {rank}: Starting DataLoader creation for {len(expert_indices)} experts")
 
     expert_loaders = {}
 
@@ -494,6 +507,8 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             sampler = BucketBatchSampler(
                 dataset=dataset,
                 batch_size=config.expert_batch_size,
+                bucket_indices=bucket_indices,  # Pass pre-computed bucket indices
+                device=device,
                 shuffle=True,
                 drop_last=True
             )
@@ -511,7 +526,8 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
                 dataset,
                 batch_sampler=sampler,
                 num_workers=0,
-                pin_memory=True
+                pin_memory=True,
+                collate_fn=dataset.collate_fn
             )
             print(f"[Rank {rank}] DataLoader created successfully")
         except Exception as e:
@@ -546,7 +562,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     print(f"[Rank {rank}] Created {len(expert_loaders)} expert loaders")
     print(f"[Rank {rank}] Total initialization time: {time.time() - loader_start:.2f}s")
 
-    return expert_loaders 
+    return expert_loaders
 
 def _init_data_loaders(self):
     # Replace with distributed sampler

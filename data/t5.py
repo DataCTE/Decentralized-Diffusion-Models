@@ -65,7 +65,7 @@ class T5TextEncoder:
             raise RuntimeError(f"Failed to load T5: {str(e)}")
     
     def encode(self, text):
-        """Encode text with performance optimizations for GPU processing"""
+        """Encode text with performance optimizations for consistent GPU processing"""
         batch_size = len(text)
         
         try:
@@ -74,16 +74,16 @@ class T5TextEncoder:
                 inputs = self.tokenizer(
                     text, 
                     return_tensors="pt", 
-                    padding="max_length",  # Standard padding to max_length for consistent output 
+                    padding="max_length", 
                     truncation=True,
                     max_length=self.max_length
                 )
                 
-                # Move inputs to device
+                # Move input tensors to the device
                 input_ids = inputs.input_ids.to(self.device)
                 attention_mask = inputs.attention_mask.to(self.device)
                 
-                # Perform inference
+                # Perform inference with optimizations
                 with torch.no_grad():
                     outputs = self.model(
                         input_ids=input_ids,
@@ -92,14 +92,18 @@ class T5TextEncoder:
                         return_dict=True
                     )
                     
-                    # Get last hidden state
+                    # Maintain format consistency with other embedders
                     embeddings = outputs.last_hidden_state
                     
-                    # Return in float32 for consistency with other embedders
+                    # Make sure we're on the GPU
+                    if not embeddings.is_cuda and hasattr(self, 'device'):
+                        embeddings = embeddings.to(self.device)
+                    
                     return embeddings.to(torch.float32)
+                
         except Exception as e:
             logger.error(f"Error during T5 encoding: {str(e)}")
             import traceback
             traceback.print_exc()
-            # Return a zero tensor as fallback with expected dimensions
+            # Return a zero tensor as fallback (with expected dimensions)
             return torch.zeros((batch_size, self.max_length, 768), device=self.device) 
