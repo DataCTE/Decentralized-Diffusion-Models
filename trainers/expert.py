@@ -215,24 +215,24 @@ class ExpertTrainer(BaseTrainer):
             print(f"[DEBUG Expert {self.expert_idx}] timesteps shape: {t.shape}")
             
             try:
-                # --- FIX: Use reshaped img_seq and corrected position IDs ---
-                # Get H and W from the original latents tensor
-                H, W = latents.shape[2], latents.shape[3]  # Use latents instead of undefined xt
-                pos_ids = torch.arange(H*W, device=latents.device).repeat(latents.shape[0], 1)
+                # --- FIXED: Use proper _get_position_ids method instead of manual creation ---
+                # Get position IDs using our existing method that returns 3D tensor [B, H*W, 2]
+                pos_ids = self._get_position_ids(latents)
                 print(f"[DEBUG Expert {self.expert_idx}] pos_ids shape: {pos_ids.shape}")
 
                 # Forward pass through expert model
                 print(f"[DEBUG Expert {self.expert_idx}] Calling expert forward pass")
                 pred_flow = self.expert(
                     img=img_seq,                      # Use filtered & reshaped image sequence
-                    img_ids=pos_ids,              # Use generated position IDs for filtered batch
+                    img_ids=pos_ids,                  # Use 3D position IDs from _get_position_ids method
                     txt=text_embeds,                  # Use filtered text embeds
                     txt_ids=self._get_text_position_ids(text_embeds), # Use filtered text embeds
-                    timesteps=torch.cos(t * math.pi/2), # Use scaled cosine scheduling
+                    timesteps=t * 1000,               # Scale timesteps to [0, 1000)
                     y=self._get_conditioning(latents.shape[0]), # Use B_expert size
-                    cluster_ids=batch['cluster_pred']  # Use router predictions instead of ground truth
+                    cluster_ids=batch['cluster_pred'] # Use router predictions instead of ground truth
                 )
                 # --- END FIX ---
+                
                 print(f"[DEBUG Expert {self.expert_idx}] pred_flow shape: {pred_flow.shape}")
                 
                 # Calculate loss - need to reshape latents back if it was modified
