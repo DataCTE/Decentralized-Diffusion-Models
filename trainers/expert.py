@@ -82,34 +82,64 @@ class ExpertTrainer(BaseTrainer):
         self.scaler = torch.amp.GradScaler(enabled=config.use_mixed_precision)
 
     def compute_loss(self, batch):
-        """Paper's per-expert loss calculation (Equation 6)"""
+        """Paper's per-expert loss calculation (Equation 6), aligned with train_step logic"""
         # FSDP handles device placement - no .to(device) needed
         x0 = batch["latent"]  # Already on correct device
-        
+
+        # --- Handle potential 5D input from dataloader ---
+        if x0.dim() == 5:
+            B, S, C, H, W = x0.shape
+            if S == 1:
+                x0 = x0.squeeze(1)
+            else:
+                # Use first sequence if multiple exist
+                x0 = x0[:, 0]
+        # --- End 5D handling ---
+
         # Sample timesteps uniformly as in paper
         t = torch.rand(x0.size(0), device=x0.device)  # Use tensor's device
-        
+
         # Forward process using paper's flow matching formulation
-        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
-        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+        # Ensure alpha_t and sigma_t match the dimensions of x0 (4D)
+        alpha_t = torch.cos(t * math.pi/2).view(-1, 1, 1, 1)
+        sigma_t = torch.sin(t * math.pi/2).view(-1, 1, 1, 1)
         noise = torch.randn_like(x0)
-        xt = alpha_t * x0 + sigma_t * noise
-        
+        xt = alpha_t * x0 + sigma_t * noise # xt is 4D: [B, C, H, W]
+
+        # --- Reshape xt for the model ---
+        B, C, H, W = xt.shape
+        xt_seq = xt.reshape(B, C, H * W).permute(0, 2, 1) # Shape: [B, H*W, C]
+        # --- End reshape ---
+
+        # --- Prepare text embeddings (handle potential 4D) ---
+        text_embeds = batch['clip_embedding']
+        if text_embeds.dim() == 4:
+            B_txt, S_txt, L_txt, D_txt = text_embeds.shape
+            if S_txt == 1:
+                text_embeds = text_embeds.squeeze(1)
+            else:
+                text_embeds = text_embeds[:, 0] # Use first sequence
+        # --- End text embedding prep ---
+
         # Expert forward pass with cluster conditioning
+        # Use reshaped xt_seq and scaled timesteps
+        img_pos_ids = self._get_position_ids(xt) # Pass original 4D xt to get H, W
         pred_flow = self.expert(
-            img=xt,
-            img_ids=self._get_position_ids(xt),
-            txt=batch['clip_embedding'],
-            txt_ids=self._get_text_position_ids(batch['clip_embedding']),
-            timesteps=t,
+            img=xt_seq,                       # Use reshaped image sequence
+            img_ids=img_pos_ids,              # Use generated position IDs
+            txt=text_embeds,
+            txt_ids=self._get_text_position_ids(text_embeds),
+            timesteps=t * 1000,               # Scale timesteps like in train_step
             y=self._get_conditioning(x0.shape[0]),
             cluster_ids=batch['expert']
         )
-        
-        # Flow matching target calculation from paper
-        target_flow = (x0 - alpha_t * xt) / (sigma_t**2 + 1e-7)
-        
-        return F.mse_loss(pred_flow, target_flow)
+
+        # --- Use flow_matcher for loss calculation ---
+        # Pass the model's prediction (pred_flow) and the original data (x0)
+        loss = self.flow_matcher.compute_loss(pred_flow, x0, t)
+        # --- End flow_matcher usage ---
+
+        return loss # flow_matcher.compute_loss already returns a scalar loss item
 
     def train_step(self, batch):
         """Train expert with flow matching loss per paper Section 3.2"""
