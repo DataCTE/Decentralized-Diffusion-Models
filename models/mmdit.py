@@ -40,9 +40,12 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     assert dim % 2 == 0
-    # Ensure pos has at least one dimension (this prevents a 0-D tensor error)
+    # Ensure pos has at least one dimension (prevents 0-D errors)
     if pos.dim() == 0:
         pos = pos.unsqueeze(0)
+    # If pos is 1-D (e.g. of shape (B,)), add a sequence dimension so einsum produces (B, n, d)
+    if pos.dim() == 1:
+        pos = pos.unsqueeze(1)
     scale = torch.arange(0, dim, 2, dtype=pos.dtype, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
     out = torch.einsum("...n,d->...nd", pos, omega)
