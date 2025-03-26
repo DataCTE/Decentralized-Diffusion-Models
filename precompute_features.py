@@ -360,6 +360,84 @@ class FeatureGenerator:
         }
     }
 
+def process_t5_from_clip(processor, rank):
+    """Process T5 embeddings from original captions, matching existing latent UUIDs"""
+    clip_dir = processor.feature_dir/"clip"
+    t5_dir = processor.feature_dir/"t5"
+    dataset_path = Path(processor.config.dataset_path)
+    
+    if not clip_dir.exists():
+        print(f"Rank {rank}: CLIP directory not found at {clip_dir}")
+        return
+    
+    # Get all CLIP files for this rank
+    all_clip_files = sorted(list(clip_dir.glob(f"*_rank{rank}.pt")))
+    
+    print(f"Rank {rank}: Processing {len(all_clip_files)} files for T5 embedding")
+    
+    # Process files with progress tracking
+    processed = 0
+    errors = 0
+    skipped = 0
+    
+    with tqdm(total=len(all_clip_files), desc=f"T5 Rank {rank}") as pbar:
+        for clip_file in all_clip_files:
+            try:
+                # Extract base name without rank suffix
+                base_name = clip_file.stem
+                if "_rank" in base_name:
+                    base_name = base_name.split("_rank")[0]
+                
+                # Check if T5 embedding already exists
+                t5_file = t5_dir/f"{base_name}_rank{rank}.pt"
+                if t5_file.exists():
+                    skipped += 1
+                    pbar.update(1)
+                    continue
+                
+                # Scan dataset for matching image-caption pair
+                # We need to compute the same hash as in _single_process
+                found_match = False
+                
+                # First find a matching image-caption pair by reconstructing the hash
+                for img_path in dataset_path.rglob('*'):
+                    if img_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:
+                        caption_path = img_path.with_suffix('.txt')
+                        if caption_path.exists():
+                            # Recreate the UUID hash to see if it matches
+                            with open(img_path, 'rb') as f, open(caption_path, 'rb') as cf:
+                                img_hash = hashlib.md5(f.read()).hexdigest()
+                                text_hash = hashlib.md5(cf.read()).hexdigest()
+                            
+                            computed_uuid = uuid.UUID(hashlib.md5((img_hash + text_hash).encode()).hexdigest()).hex
+                            
+                            # If hash matches, process this caption
+                            if computed_uuid == base_name:
+                                # Read the caption text
+                                caption_text = caption_path.read_text()
+                                
+                                # Generate T5 embedding using processor
+                                t5_embedding = processor._extract_t5_embedding(caption_text)
+                                
+                                # Save with the same naming pattern
+                                torch.save(t5_embedding, t5_file)
+                                
+                                processed += 1
+                                found_match = True
+                                break
+                
+                if not found_match:
+                    print(f"Rank {rank}: No matching caption found for {base_name}")
+                    errors += 1
+                
+            except Exception as e:
+                print(f"Rank {rank} failed on file {clip_file}: {str(e)}")
+                errors += 1
+            
+            pbar.update(1)
+    
+    print(f"Rank {rank}: T5 processing complete. Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
@@ -372,7 +450,43 @@ def main():
     parser.add_argument('--all', action='store_true', help='Run all processing stages')
     parser.add_argument('--use-existing-dino', action='store_true',
                         help='Use existing DINO features from disk')
+    parser.add_argument('--t5-from-existing', action='store_true', 
+                      help='Extract T5 embeddings only from existing CLIP files')
     args = parser.parse_args()
+
+    # Special handling for t5-from-existing
+    if args.t5_from_existing:
+        # Only enable t5 feature
+        enabled_features = ['t5']
+        
+        # Initialize distributed processing
+        rank = int(os.environ['LOCAL_RANK'])
+        print(f"Rank {rank} starting T5-only initialization")
+        
+        # Set device BEFORE initializing process group
+        torch.cuda.set_device(rank)
+        device = torch.device(f'cuda:{rank}')
+        
+        # Initialize process group with default settings
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=int(os.environ['WORLD_SIZE']),
+            rank=rank
+        )
+        
+        # Load config after distributed init
+        config = get_config()
+        
+        # Create feature generator with only T5 enabled
+        processor = FeatureGenerator(config, enabled_features)
+        
+        # Process only existing CLIP files
+        process_t5_from_clip(processor, rank)
+        
+        # Clean exit
+        dist.destroy_process_group()
+        return
 
     # Determine enabled features
     enabled_features = []
@@ -531,4 +645,12 @@ def main():
         dist.destroy_process_group()
 
 if __name__ == "__main__":
-    main() 
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"Fatal error: {str(e)}")
+        traceback.print_exc()
+        # Force exit with error code
+        import sys
+        sys.exit(1) 

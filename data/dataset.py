@@ -177,7 +177,7 @@ class DDMDataset(Dataset):
             
             # T5 embedding (load if configured)
             if hasattr(self.config, 'use_t5') and self.config.use_t5:
-                t5_path = os.path.join(self.clip_dir, f"{filename}_rank{self.rank}_t5.pt")
+                t5_path = os.path.join(self.config.feature_cache_path, "t5", f"{filename}_rank{self.rank}.pt")
                 if os.path.exists(t5_path):
                     text_embeddings['t5'] = torch.load(t5_path, map_location='cpu')
             

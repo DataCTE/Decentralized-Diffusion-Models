@@ -65,39 +65,55 @@ class T5TextEncoder:
             raise RuntimeError(f"Failed to load T5: {str(e)}")
     
     def encode(self, text):
-        """Encode text with performance optimizations"""
+        """Encode text with performance optimizations and additional debugging"""
         # Use cached attention masks for common lengths to avoid recomputation
         batch_size = len(text)
         
-        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            # Tokenize inputs
-            inputs = self.tokenizer(
-                text, 
-                return_tensors="pt", 
-                padding="longest", 
-                truncation=True,
-                max_length=self.max_length
-            )
+        try:
+            # Add debug print
+            logger.info(f"Encoding {batch_size} texts with T5 (first text: '{text[0][:50]}...')")
             
-            # Get sequence length for this batch
-            seq_len = inputs.input_ids.size(1)
-            
-            # Use cached attention mask if available for this sequence length
-            if seq_len in self.cached_masks and self.cached_masks[seq_len].size(0) >= batch_size:
-                # Reuse cached mask to avoid repetitive computations
-                attention_mask = self.cached_masks[seq_len][:batch_size, :seq_len].clone()
-            else:
-                # Create and cache a new mask for this sequence length
-                attention_mask = inputs.attention_mask.to(self.device)
-                self.cached_masks[seq_len] = attention_mask.clone()
-            
-            # Perform inference with optimizations
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=inputs.input_ids.to(self.device),
-                    attention_mask=attention_mask,
-                    output_hidden_states=False,
-                    return_dict=True
+            with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+                # Tokenize inputs
+                inputs = self.tokenizer(
+                    text, 
+                    return_tensors="pt", 
+                    padding="longest", 
+                    truncation=True,
+                    max_length=self.max_length
                 )
                 
-            return outputs.last_hidden_state.to(torch.float32) 
+                # Get sequence length for this batch
+                seq_len = inputs.input_ids.size(1)
+                logger.info(f"T5 sequence length: {seq_len}")
+                
+                # Use cached attention mask if available for this sequence length
+                if seq_len in self.cached_masks and self.cached_masks[seq_len].size(0) >= batch_size:
+                    # Reuse cached mask to avoid repetitive computations
+                    attention_mask = self.cached_masks[seq_len][:batch_size, :seq_len].clone()
+                else:
+                    # Create and cache a new mask for this sequence length
+                    attention_mask = inputs.attention_mask.to(self.device)
+                    self.cached_masks[seq_len] = attention_mask.clone()
+                
+                # Perform inference with optimizations
+                with torch.no_grad():
+                    outputs = self.model(
+                        input_ids=inputs.input_ids.to(self.device),
+                        attention_mask=attention_mask,
+                        output_hidden_states=False,
+                        return_dict=True
+                    )
+                    
+                    # Log shape of output 
+                    embeddings = outputs.last_hidden_state.to(torch.float32)
+                    logger.info(f"T5 embedding shape: {embeddings.shape}")
+                    
+                    return embeddings
+        except Exception as e:
+            # Add logging to help diagnose the issue
+            logger.error(f"Error during T5 encoding: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Return a zero tensor as fallback (with expected dimensions)
+            return torch.zeros((batch_size, self.max_length, 768), device=self.device) 
