@@ -357,7 +357,7 @@ def main():
             'clip-latents': 'clip', 
             't5-latents': 't5',
             'dino-features': 'dino',
-            'buckets': 'buckets',  # This maps directly from arg name to feature type
+            'buckets': 'buckets',
             'dims': 'dims',
             'clustering': 'clustering'
         }
@@ -404,11 +404,14 @@ def main():
     
     print(f"Rank {rank} received {len(local_images)} images to process")
     
-    # Define fixed processing order
-    processing_order = ['vae', 'clip', 't5', 'dino', 'buckets', 'dims']
+    # Define processing order by computational intensity (most intensive first)
+    processing_order = ['vae', 'dino', 't5', 'clip', 'buckets', 'dims']
 
     # Only process features that are enabled
     features_to_process = [f for f in processing_order if f in enabled_features]
+    
+    if rank == 0:
+        print(f"Processing features in order: {features_to_process}")
     
     # Process one feature type at a time for all images
     for feature_type in features_to_process:
@@ -425,9 +428,11 @@ def main():
         
         # Batch size depends on feature type - use larger batches for smaller features
         if feature_type in ['buckets', 'dims']:
-            batch_size = 64
+            batch_size = 128  # Very fast operations
+        elif feature_type in ['clip', 't5']:
+            batch_size = 64   # Text operations, medium speed
         else:
-            batch_size = 16  # For larger models like VAE, DINO
+            batch_size = 16   # Heavy image processing (VAE, DINO)
             
         try:
             # Main processing loop with batching
@@ -526,6 +531,8 @@ def main():
             # Free memory
             del processor
             torch.cuda.empty_cache()
+            if rank == 0:
+                print(f"Completed processing {feature_type} features")
             
         except Exception as e:
             print(f"Rank {rank} failed during {feature_type} processing: {str(e)}")
