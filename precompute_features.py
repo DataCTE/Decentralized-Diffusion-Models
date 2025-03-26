@@ -660,13 +660,13 @@ def main():
                             print(f"Rank {rank} failed completely for {img_path}: {str(e)}")
                             processed_count += 1
                             continue
-                            
+
                     # Update progress bar with batch results
                     pbar.update(processed_count)
-                        
+        
             # Synchronize after each feature type
             dist.barrier()
-            
+
             # Free memory
             del processor
             torch.cuda.empty_cache()

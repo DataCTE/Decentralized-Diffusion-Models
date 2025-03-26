@@ -55,7 +55,7 @@ class VAEWrapper:
             # Load VAE
             self._vae = AutoencoderKL.from_pretrained(
                 self.config.vae_model, 
-                torch_dtype=torch.float16 if self.config.use_half_precision else torch.float32
+                torch_dtype=torch.float16 if self.config.use_mixed_precision else torch.float32
             ).to(self.device)
             
             # Put in eval mode and disable grads
