@@ -523,7 +523,7 @@ class FeatureGenerator:
         return True
 
 def _process_directory(config, rank=0, world_size=1, only_missing=True):
-    """Efficiently scan and divide dataset for distributed processing with support for incremental processing"""
+    """Efficiently scan and divide dataset for distributed processing with special handling for T5 embeddings"""
     dataset_path = Path(config.dataset_path)
     feature_path = Path(config.feature_cache_path)
     
@@ -532,95 +532,140 @@ def _process_directory(config, rank=0, world_size=1, only_missing=True):
     if rank == 0:
         logger.info(f"Scanning dataset directory: {dataset_path}")
         
-        # Check if we have CLIP features but missing T5 features
-        # This optimization targets specifically adding T5 embeddings to existing data
-        clip_dir = feature_path / "clip"
-        t5_dir = feature_path / "t5"
-        
-        if clip_dir.exists() and 't5' in config.enabled_features and not args.force_recompute:
-            logger.info("Using existing CLIP files to identify needed T5 embeddings...")
+        # When only T5 embeddings are enabled, use a more targeted approach
+        if config.enabled_features == ['t5']:
+            logger.info("Targeting T5 embeddings specifically...")
             
-            # Instead of loading all files at once, we'll process them in chunks
-            image_paths = []
-            caption_paths = []
-            uuids = []
+            # Look for CLIP embeddings to derive T5 requirement from
+            clip_dir = feature_path / "clip"
+            t5_dir = feature_path / "t5"
             
-            # Create the t5 directory if it doesn't exist
+            if not clip_dir.exists():
+                logger.error("CLIP embeddings directory not found - needed as reference for T5 embeddings")
+                raise FileNotFoundError(f"CLIP directory {clip_dir} not found")
+                
+            # Make sure T5 directory exists
             t5_dir.mkdir(exist_ok=True)
             
             # Get existing T5 UUIDs as a set for fast membership testing
-            t5_uuids = {p.stem.split('_rank')[0] for p in t5_dir.glob('*_rank*.pt')}
-            logger.info(f"Found {len(t5_uuids)} existing T5 embeddings")
+            t5_pattern = "*_rank*.pt" 
+            t5_uuids = set()
             
-            # Count files for progress reporting
-            clip_file_count = sum(1 for _ in clip_dir.glob('*_rank*.pt'))
-            logger.info(f"Found {clip_file_count} existing CLIP embeddings")
-            
-            # Process CLIP files in chunks to avoid memory issues
-            chunk_size = 10000
-            processed = 0
-            
-            # Stream through files in manageable chunks
-            with tqdm(total=clip_file_count, desc="Scanning CLIP files") as pbar:
-                for clip_files in _chunked_glob(clip_dir, "*_rank*.pt", chunk_size):
-                    chunk_uuids = []
-                    
-                    for clip_file in clip_files:
-                        # Extract UUID without rank suffix
-                        uuid_str = clip_file.stem.split('_rank')[0]
-                        
-                        # Skip if T5 embedding already exists
-                        if uuid_str in t5_uuids:
-                            processed += 1
-                            pbar.update(1)
-                            continue
-                        
-                        # Find matching caption file by using the clip to latent mapping
-                        chunk_uuids.append(uuid_str)
-                    
-                    if chunk_uuids:
-                        # Get all needed image/caption paths in bulk using mapping files
-                        chunk_imgs, chunk_captions = _find_source_files(config, chunk_uuids)
-                        image_paths.extend(chunk_imgs)
-                        caption_paths.extend(chunk_captions)
-                        uuids.extend(chunk_uuids)
-                    
-                    processed += len(clip_files)
-                    pbar.update(len(clip_files))
-            
-            logger.info(f"Identified {len(uuids)} files needing T5 embeddings")
-            
-            # If we're only computing T5 embeddings and have source mappings, we can directly use captions
-            # without loading images to speed things up dramatically
-            if len(config.enabled_features) == 1 and 't5' in config.enabled_features and hasattr(config, "caption_mapping_file"):
-                logger.info("Using caption mapping for direct T5 embedding extraction...")
-                # Load mapping instead of original files
-                captions_only = []
-                for uuid_str in uuids:
-                    caption = _get_caption_from_mapping(config, uuid_str)
-                    if caption:
-                        captions_only.append((uuid_str, caption))
+            # Process in chunks to avoid memory explosion with millions of files
+            if t5_dir.exists():
+                logger.info("Scanning existing T5 embeddings...")
+                # Count files efficiently without loading all into memory
+                t5_count = 0
+                for batch in _chunked_glob(t5_dir, t5_pattern, 10000):
+                    # Extract UUIDs without rank suffix
+                    t5_uuids.update(p.stem.split('_rank')[0] for p in batch)
+                    t5_count += len(batch)
                 
-                # Replace with just the information we need
-                uuids = [u for u, _ in captions_only]
-                caption_texts = [c for _, c in captions_only]
+                logger.info(f"Found {len(t5_uuids)} existing T5 UUIDs across {t5_count} files")
+            
+            # Scan CLIP embeddings - don't try to load all files at once
+            logger.info("Scanning CLIP embeddings to find needed T5 processing...")
+            clip_uuids = set()
+            clip_total = 0
+            
+            # Create caption buffers
+            captions_to_process = []
+            uuids_to_process = []
+            
+            # Go through clip files in batches
+            with tqdm(desc="Scanning CLIP files") as pbar:
+                for batch in _chunked_glob(clip_dir, "*_rank*.pt", 10000):
+                    # Update progress for all files scanned
+                    pbar.update(len(batch))
+                    clip_total += len(batch)
+                    
+                    # Get UUIDs from this batch
+                    batch_uuids = [p.stem.split('_rank')[0] for p in batch]
+                    
+                    # Check which ones need T5 embeddings
+                    for uuid_str in batch_uuids:
+                        # Only consider UUIDs we haven't seen before
+                        if uuid_str not in clip_uuids:
+                            clip_uuids.add(uuid_str)
+                            
+                            # Check if T5 embedding already exists
+                            if uuid_str not in t5_uuids or not args.force_recompute:
+                                caption = _get_caption_from_mapping(config, uuid_str)
+                                
+                                if caption:
+                                    uuids_to_process.append(uuid_str)
+                                    captions_to_process.append(caption)
+                                else:
+                                    # Try to find the caption file directly if no mapping
+                                    img_path, caption_path = None, None
+                                    
+                                    # Check if we have a metadata directory with image paths
+                                    meta_dir = feature_path / "metadata"
+                                    if meta_dir.exists():
+                                        meta_file = meta_dir / f"{uuid_str}.json"
+                                        if meta_file.exists():
+                                            import json
+                                            with open(meta_file) as f:
+                                                metadata = json.load(f)
+                                                if "caption_path" in metadata:
+                                                    caption_path = metadata["caption_path"]
+                                    
+                                    # If no path found but we have the dataset, look for the image
+                                    if caption_path is None:
+                                        # This is a fallback and slower - prints a warning
+                                        logger.warning(f"No caption mapping found for {uuid_str}, "
+                                                     f"looking in dataset directly (slow)")
+                                        
+                                        # Try to get the caption from the dataset directly
+                                        for img_ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                                            # Look in first level directories of dataset
+                                            for img_dir in dataset_path.iterdir():
+                                                if img_dir.is_dir():
+                                                    # Try some common patterns
+                                                    for pattern in [f"*{uuid_str}*{img_ext}", f"*{img_ext}"]:
+                                                        matches = list(img_dir.glob(pattern))
+                                                        if matches:
+                                                            for img_file in matches:
+                                                                caption_file = img_file.with_suffix('.txt')
+                                                                if caption_file.exists():
+                                                                    caption_path = caption_file
+                                                                    break
+                                                            if caption_path:
+                                                                break
+                                                if caption_path:
+                                                    break
+                                            if caption_path:
+                                                break
+                                    
+                                    # If we found a caption file, read it
+                                    if caption_path and Path(caption_path).exists():
+                                        try:
+                                            caption = Path(caption_path).read_text()
+                                            uuids_to_process.append(uuid_str)
+                                            captions_to_process.append(caption)
+                                        except Exception as e:
+                                            logger.error(f"Error reading caption file {caption_path}: {e}")
+            
+            logger.info(f"Scanned {clip_total} CLIP files with {len(clip_uuids)} unique UUIDs")
+            logger.info(f"Found {len(uuids_to_process)} items needing T5 embeddings")
+            
+            # Save the captions and uuids for distributed processing
+            if not uuids_to_process:
+                logger.warning("No files found needing T5 embeddings! Check if:")
+                logger.warning("  1. All T5 embeddings already exist (use --force-recompute to regenerate)")
+                logger.warning("  2. CLIP embeddings exist in the expected location")
+                logger.warning("  3. Caption mapping or dataset structure is correctly configured")
+            
+            # Save for distributed processing
+            with open(f"{config.feature_cache_path}/t5_task.pkl", 'wb') as f:
+                pickle.dump((uuids_to_process, captions_to_process), f)
                 
-                # Save the paths to a temporary file for other ranks to read
-                with open(f"{config.feature_cache_path}/t5_task.pkl", 'wb') as f:
-                    pickle.dump((uuids, caption_texts), f)
-                    
-                # Flag that we're in captions-only mode
-                with open(f"{config.feature_cache_path}/captions_only_mode", 'w') as f:
-                    f.write("1")
-                    
-                logger.info(f"Prepared {len(uuids)} captions for T5 embedding")
-            else:
-                # Save the paths to a temporary file for other ranks to read
-                with open(f"{config.feature_cache_path}/image_paths.pkl", 'wb') as f:
-                    pickle.dump((image_paths, caption_paths, uuids), f)
+            # Flag that we're in captions-only mode
+            with open(f"{config.feature_cache_path}/captions_only_mode", 'w') as f:
+                f.write("1")
         else:
-            # Fall back to full directory scanning
-            # This implementation is streamlined for performance with large datasets
+            # Fallback to standard directory scan
+            # ... [existing directory scanning code] ...
             logger.info("Performing full dataset scan...")
             
             # If only processing missing files, gather existing UUIDs efficiently
@@ -876,10 +921,13 @@ def main():
                         help='Number of threads for T5 processing pipeline')
     parser.add_argument('--t5-batch', type=int, default=256,
                         help='Manual override for T5 batch size')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug output for troubleshooting')
     args = parser.parse_args()
 
     # Configure logging
-    logging.basicConfig(level=logging.INFO, 
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=log_level, 
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     # Determine enabled features
