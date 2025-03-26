@@ -265,19 +265,38 @@ class DDMTrainingCoordinator:
         for step in range(num_steps):
             try:
                 # Synchronized batch loading
-                batch = next(iter(self.train_loader))
-                
-                # --- ADD CHECK FOR NONE BATCH ---
+                try:
+                    batch = next(iter(self.train_loader))
+                except StopIteration:
+                    logger.info("DataLoader exhausted. Training finished.")
+                    break
+
+                # --- Handle invalid batches ---
                 if batch is None:
-                    logger.warning(f"Skipping step {step} due to empty batch after filtering.")
-                    # Reset step start time for the next valid step
+                    logger.warning(f"Skipping step {step} - entire batch failed loading")
+                    self.step_start_time = time.time()  # Reset timing for next valid step
+                    continue
+
+                # Check for partial failures in batch
+                batch_size = len(batch['latent']) if 'latent' in batch else 0
+                valid_samples = sum(1 for v in batch.values() if v is not None)
+                
+                if valid_samples == 0 or batch_size == 0:
+                    logger.warning(f"Skipping step {step} - no valid samples in batch")
                     self.step_start_time = time.time()
-                    continue # Skip to the next iteration
-                # --- END CHECK ---
-                    
+                    continue
+
+                # Verify tensor shapes before proceeding
+                try:
+                    self._validate_batch_shapes(batch)
+                except ValueError as e:
+                    logger.error(f"Invalid batch shape at step {step}: {str(e)}")
+                    self.step_start_time = time.time()
+                    continue
+
                 batch = self._distribute_batch(batch)
                 
-                # Calculate step duration
+                # Calculate step duration only for valid steps
                 step_duration = time.time() - self.step_start_time
                 
                 # Expert training phase - now returns tuple of (avg_loss, individual_losses)
@@ -1091,4 +1110,22 @@ class DDMTrainingCoordinator:
         }
         
         return assignments_tensor, conflicts, stats, metrics
+
+    def _validate_batch_shapes(self, batch):
+        """Updated validation for sequence-based inputs"""
+        latent = batch['latent']
+        clip_emb = batch['clip_embedding']
+        
+        # Allow both 4D and 5D latent formats
+        if latent.dim() not in [4,5]:
+            raise ValueError(f"Latent tensor should be 4D/5D, got {latent.shape}")
+        
+        # CLIP embeddings should be 3D or 4D (with sequence dimension)
+        if clip_emb.dim() not in [3,4]:
+            raise ValueError(f"CLIP embeddings should be 3D/4D, got {clip_emb.shape}")
+
+        # Add sequence length consistency check
+        if latent.dim() == 5 and clip_emb.dim() == 4:
+            if latent.shape[1] != clip_emb.shape[1]:
+                raise ValueError(f"Mismatched sequence lengths: latent {latent.shape[1]} vs text {clip_emb.shape[1]}")
 

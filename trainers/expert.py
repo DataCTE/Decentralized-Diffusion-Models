@@ -204,19 +204,21 @@ class ExpertTrainer(BaseTrainer):
             
             try:
                 # --- FIX: Use reshaped img_seq and corrected position IDs ---
-                img_pos_ids = self._get_position_ids(latents) # Pass filtered 4D latents
-                print(f"[DEBUG Expert {self.expert_idx}] img_pos_ids shape: {img_pos_ids.shape}")
+                # Get H and W from the original latents tensor
+                H, W = latents.shape[2], latents.shape[3]  # Use latents instead of undefined xt
+                pos_ids = torch.arange(H*W, device=latents.device).repeat(latents.shape[0], 1)
+                print(f"[DEBUG Expert {self.expert_idx}] pos_ids shape: {pos_ids.shape}")
 
                 # Forward pass through expert model
                 print(f"[DEBUG Expert {self.expert_idx}] Calling expert forward pass")
                 pred_flow = self.expert(
                     img=img_seq,                      # Use filtered & reshaped image sequence
-                    img_ids=img_pos_ids,              # Use generated position IDs for filtered batch
+                    img_ids=pos_ids,              # Use generated position IDs for filtered batch
                     txt=text_embeds,                  # Use filtered text embeds
                     txt_ids=self._get_text_position_ids(text_embeds), # Use filtered text embeds
-                    timesteps=t * 1000,               # Scale timesteps
+                    timesteps=torch.cos(t * math.pi/2), # Use scaled cosine scheduling
                     y=self._get_conditioning(latents.shape[0]), # Use B_expert size
-                    cluster_ids=cluster_ids           # Use filtered cluster IDs
+                    cluster_ids=self.router(text_embeds)           # Use predicted clusters
                 )
                 # --- END FIX ---
                 print(f"[DEBUG Expert {self.expert_idx}] pred_flow shape: {pred_flow.shape}")
