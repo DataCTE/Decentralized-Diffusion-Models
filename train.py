@@ -101,6 +101,10 @@ def main():
         # Train
         coordinator.train(config.num_steps)
         
+        # Enable memory efficient SDP and flash SDP
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_flash_sdp(True)
+        
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")
         raise

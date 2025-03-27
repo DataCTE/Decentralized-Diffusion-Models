@@ -22,8 +22,15 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+    # Reshape xq and xk to match RoPE dimensions
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 2)
+    
+    # Reshape freqs_cis to match the sequence length
+    freqs_cis = freqs_cis.view(*freqs_cis.shape[:-2], -1, 2)
+    
+    # Apply RoPE rotations using einsum for better memory efficiency
+    xq_out = torch.einsum("...qd,...qd->...q", xq_, freqs_cis)
+    xk_out = torch.einsum("...kd,...kd->...k", xk_, freqs_cis)
+    
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
