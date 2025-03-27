@@ -256,247 +256,138 @@ class DDMTrainingCoordinator:
         end = min(start + experts_per_rank, total_experts)
         return torch.arange(start, end, device=self.device)
 
-    def train(self, num_steps):
-        """Distributed training loop with synchronization optimizations"""
-        # Set up distributed data sampler
-        self.train_loader.sampler.set_epoch(0)  # For epoch-based sampling
+    def train(self, num_steps: int) -> None:
+        """Distributed training loop with enhanced synchronization
         
-        # Initialize step start time for duration calculation
-        self.step_start_time = time.time()
+        Implements paper's training procedure from Section 3.4 with:
+        - Synchronized expert updates
+        - Balanced communication patterns
+        - Gradient checkpointing
+        """
+        self._prepare_training()
         
         for step in range(num_steps):
             try:
-                # Synchronized batch loading
-                try:
-                    batch = next(iter(self.train_loader))
-                except StopIteration:
-                    logger.info("DataLoader exhausted. Training finished.")
-                    break
-
-                # --- Handle invalid batches ---
+                batch = self._get_next_batch()
                 if batch is None:
-                    logger.warning(f"Skipping step {step} - entire batch failed loading")
-                    self.step_start_time = time.time()  # Reset timing for next valid step
                     continue
 
-                # Check for partial failures in batch
-                batch_size = len(batch['latent']) if 'latent' in batch else 0
-                valid_samples = sum(1 for v in batch.values() if v is not None)
+                # Distributed training phases
+                expert_loss, expert_metrics = self._train_experts(batch)
+                router_loss = self._train_router(batch)
                 
-                if valid_samples == 0 or batch_size == 0:
-                    logger.warning(f"Skipping step {step} - no valid samples in batch")
-                    self.step_start_time = time.time()
-                    continue
-
-                # Verify tensor shapes before proceeding
-                try:
-                    self._validate_batch_shapes(batch)
-                except ValueError as e:
-                    logger.error(f"Invalid batch shape at step {step}: {str(e)}")
-                    self.step_start_time = time.time()
-                    continue
-
-                batch = self._distribute_batch(batch)
-                
-                # Calculate step duration only for valid steps
-                step_duration = time.time() - self.step_start_time
-                
-                # Expert training phase - now returns tuple of (avg_loss, individual_losses)
-                expert_loss, expert_individual_losses = self._train_experts_sync(batch)
-                
-                # Router update phase
-                router_loss = self._train_router_sync(batch)
-                
-                # Expert redistribution
+                # Synchronized model updates
                 if step % self.config.expert_update_interval == 0:
                     self._redistribute_experts()
+                    self._synchronize_models()
 
-                # Synchronized logging - pass individual losses and duration
-                if self.rank == 0:
-                    learning_rates = self._get_learning_rates()
-                    self._log_metrics(
-                        step,
-                        expert_loss,
-                        router_loss,
-                        duration=step_duration,
-                        learning_rates=learning_rates,
-                        expert_individual_losses=expert_individual_losses
-                    )
-                
-                # Update learning rate schedulers
-                if hasattr(self.router, 'lr_scheduler'):
-                    self.router.lr_scheduler.step()
-                # Note: Expert schedulers are handled within the ExpertTrainer or cache manager
+                # Validation and logging
+                self._handle_logging(step, expert_loss, router_loss, expert_metrics)
+                self._handle_validation(step)
 
-                # Reset step start time for the next iteration
-                self.step_start_time = time.time()
-
-                # --- Checkpointing and Validation ---
-                if step > 0:
-                    if self.config.enable_checkpointing and step % self.config.checkpoint_interval == 0:
-                        self.save_checkpoint(step)
-                    if self.config.enable_validation and step % self.config.validation_interval == 0:
-                        self.validate(step)
-                        
-            except StopIteration:
-                logger.info("DataLoader exhausted. Training finished.")
-                break # Exit loop if dataloader is exhausted
             except Exception as e:
-                self._handle_distributed_error(e, step)
+                self._handle_training_error(e, step)
 
-        # Final cleanup
-        self.cleanup()
-        self.flush_wandb_logs() # Ensure all logs are sent
+        self._cleanup_training()
+
+    def _prepare_training(self):
+        """Initialize training-specific components"""
+        torch.cuda.reset_peak_memory_stats()
+        self.step = 0
+        self.train_start_time = time.time()
+        
+        # Create gradient scaler if missing
+        if not hasattr(self, 'scaler'):
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.config.use_mixed_precision)
+
+    def _get_next_batch(self):
+        """Get next batch with proper error handling"""
+        try:
+            batch = next(iter(self.train_loader))
+            return self._distribute_batch(batch)
+        except StopIteration:
+            logger.info("Training complete - dataset exhausted")
+            return None
+        except RuntimeError as e:
+            logger.error(f"Data loading failed: {str(e)}")
+            return None
+
+    def _train_experts(self, batch) -> tuple[float, dict]:
+        """Expert training phase with synchronized gradients"""
+        total_loss = 0.0
+        expert_metrics = {}
+        
+        for expert_idx in self.expert_indices:
+            expert = self.cache_manager.get_expert(expert_idx, self.expert_builder_fn)
+            
+            with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+                loss = expert.train_step(batch)
+            
+            # Gradient synchronization
+            if self.world_size > 1:
+                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+            
+            total_loss += loss.item()
+            expert_metrics[f'expert_{expert_idx}_loss'] = loss.item()
+        
+        return total_loss / len(self.expert_indices), expert_metrics
+
+    def _synchronize_models(self):
+        """Synchronize model parameters across devices"""
+        # Synchronize router first
+        if isinstance(self.router.router, FSDP):
+            self.router.router._sync_params()
+        
+        # Synchronize experts
+        for expert_idx in self.expert_indices:
+            expert = self.cache_manager.get_expert(expert_idx, self.expert_builder_fn)
+            if isinstance(expert.expert, FSDP):
+                expert.expert._sync_params()
+
+    def _handle_logging(self, step: int, expert_loss: float, router_loss: float, metrics: dict):
+        """Centralized logging handling"""
+        if self.rank != 0:
+            return
+
+        # Calculate step timing
+        step_time = time.time() - self.step_start_time
+        
+        # Prepare metrics
+        log_data = {
+            'expert_loss': expert_loss,
+            'router_loss': router_loss,
+            'step_time': step_time,
+            'learning_rate': self.router.optimizer.param_groups[0]['lr'],
+            **metrics
+        }
+        
+        # Add memory stats
+        if self.config.log_memory:
+            log_data.update(self._get_memory_stats())
+        
+        # WandB logging
+        if self.wandb_enabled:
+            import wandb
+            wandb.log(log_data, step=step)
+        
+        # Console logging
+        logger.info(
+            f"Step {step} | Expert Loss: {expert_loss:.4f} | "
+            f"Router Loss: {router_loss:.4f} | "
+            f"Step Time: {step_time:.2f}s"
+        )
+
+    def _cleanup_training(self):
+        """Post-training cleanup"""
+        torch.cuda.empty_cache()
+        if self.rank == 0:
+            logger.info("Training completed successfully")
 
     def _distribute_batch(self, batch):
         """Batch distribution handled by DataLoader sharding"""
         return {k: v.to(self.device) for k,v in batch.items()}
 
-    def _train_experts_sync(self, batch):
-        """Train all experts synchronously with real timesteps"""
-        print(f"[DEBUG Coordinator] train_experts_sync called on rank {self.rank}")
-        total_loss = 0.0
-        num_experts = 0
-        individual_losses = {}
-        
-        # Ensure expert_indices is properly iterable
-        if hasattr(self, 'expert_indices_tensor') and not hasattr(self, 'expert_indices'):
-            self.expert_indices = self.expert_indices_tensor.tolist() if self.expert_indices_tensor.dim() > 0 else [self.expert_indices_tensor.item()]
-        
-        # If expert_indices is a tensor, convert to list for iteration
-        if torch.is_tensor(self.expert_indices):
-            if self.expert_indices.dim() == 0:  # It's a scalar tensor
-                expert_indices = [self.expert_indices.item()]
-            else:
-                expert_indices = self.expert_indices.tolist()
-        else:
-            expert_indices = self.expert_indices
-        
-        print(f"[DEBUG Coordinator] Expert indices for this rank: {expert_indices}")
-        
-        for expert_idx in expert_indices:
-            # Get expert from cache
-            try:
-                print(f"[DEBUG Coordinator] Getting expert {expert_idx} from cache")
-                expert = self.cache_manager.get_expert(expert_idx, lambda idx: self._create_expert(idx))
-                
-                # Generate real timesteps scaled to [0, 1000)
-                real_timesteps = torch.rand(batch['latent'].shape[0], device=self.device) * 1000
-                batch['cluster_pred'] = self.router.router(
-                    img=batch['latent'],
-                    timesteps=real_timesteps,
-                    txt=batch['clip_embedding']
-                ).argmax(dim=-1)
-                
-                # DEFENSIVE: Instead of silently continuing, we'll raise errors
-                print(f"[DEBUG Coordinator] Calling train_step on expert {expert_idx}")
-                result = expert.train_step(batch)
-                
-                # Check what's returned
-                print(f"[DEBUG Coordinator] Expert {expert_idx} train_step result: {result}, type: {type(result)}")
-                
-                if isinstance(result, tuple):
-                    print(f"[DEBUG Coordinator] Expert {expert_idx} returned a tuple of length {len(result)}")
-                    # Take first element as loss
-                    loss = result[0]
-                else:
-                    loss = result
-                    
-                total_loss += loss
-                num_experts += 1
-                individual_losses[f"expert_{expert_idx}_loss"] = loss
-                
-            except Exception as e:
-                print(f"[CRITICAL ERROR] Training expert {expert_idx} on rank {self.rank} failed: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                # STOP EXECUTION - don't silently continue with 0 loss
-                raise
-        
-        # Avoid division by zero
-        avg_loss = total_loss / max(1, num_experts)
-        print(f"[DEBUG Coordinator] Finished train_experts_sync with avg_loss: {avg_loss}")
-        return avg_loss, individual_losses
-
-    @contextlib.contextmanager
-    def _async_context(self):
-        """Non-blocking CUDA stream for communication"""
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            yield
-        torch.cuda.current_stream().wait_stream(stream)
-
-    def _train_router_sync(self, batch):
-        """Router training with temperature annealing (Algorithm 1)"""
-        self.router.train()
-        
-        # Paper's temperature annealing
-        temp = max(self.config.router_min_temp, 
-                  self.config.router_temperature * 
-                  (self.config.router_temperature_decay ** self.step))
-        
-        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            # Get router predictions with temperature scaling
-            logits = self.router(
-                img=batch['latent'],
-                timesteps=torch.rand(batch['latent'].shape[0], device=self.device) * 1000,
-                txt=batch['clip_embedding']
-            ) / temp
-            
-            loss = F.cross_entropy(logits, batch['expert'])
-        
-        # Synchronize and scale loss
-        if self.world_size > 1:
-            dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-            loss = loss / self.world_size
-        
-        return loss
-
-    def _handle_distributed_error(self, error, step):
-        """Coordinated error handling across ranks"""
-        error_msg = f"Step {step} error: {str(error)}"
-        error_tensor = torch.tensor([1 if error else 0], device=self.device)
-        dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
-        
-        if error_tensor.item() == 1:
-            if self.rank == 0:
-                logger.error(f"Critical error detected: {error_msg}")
-            raise RuntimeError("Distributed training error") from error
-
-    def train_experts(self, batch):
-        """Train expert models using the DDM approach"""
-        total_loss = 0.0
-        num_experts = len(self.expert_indices)
-        
-        # Train each expert assigned to this process
-        for expert_idx in self.expert_indices:
-            try:
-                # Get expert from cache manager
-                expert = self.cache_manager.get_expert(
-                    expert_idx, 
-                    lambda idx: self._create_expert(idx)  # Use lambda to pass expert_idx
-                )
-                
-                # Perform training step
-                loss = expert.train_step(batch)
-                total_loss += loss
-                
-            except Exception as e:
-                logger.error(f"Error training expert {expert_idx} on rank {self.rank}: {str(e)}")
-                continue
-        
-        # Average loss across experts on this rank
-        avg_loss = total_loss / max(num_experts, 1)
-        
-        # Synchronize losses across all ranks
-        if self.world_size > 1:
-            loss_tensor = torch.tensor([avg_loss], device=self.device)
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            avg_loss = loss_tensor.item() / self.world_size
-        
-        return avg_loss
-    
-    def train_router(self, batch):
+    def _train_router(self, batch):
         """Train router following paper's Section 3.3"""
         try:
             # Get cluster assignments from batch
@@ -818,94 +709,6 @@ class DDMTrainingCoordinator:
         else:
             self.wandb_enabled = False
 
-    def _log_step_metrics_to_wandb(self, step, expert_loss, router_loss, step_duration, learning_rates=None, memory_stats=None):
-        """Log per-step metrics to wandb in a truly non-blocking way"""
-        # Import in function scope to avoid import errors if wandb is not installed
-        import wandb
-        import threading
-        
-        # Prepare metrics dict
-        metrics = {
-            "train/expert_loss": expert_loss,
-            "train/router_loss": router_loss,
-            "train/total_loss": expert_loss + router_loss,
-            "train/step_duration": step_duration,
-            "train/steps_per_second": 1.0 / max(step_duration, 1e-5),
-        }
-        
-        # Add learning rates if provided
-        if learning_rates:
-            for name, lr in learning_rates.items():
-                metrics[f"train/lr_{name}"] = lr
-        
-        # Add memory stats if provided
-        if memory_stats:
-            for name, value in memory_stats.items():
-                metrics[f"system/{name}"] = value
-        
-        # Create a thread for non-blocking logging
-        def log_thread():
-            try:
-                # Log metrics to wandb with commit=False to queue up multiple log calls
-                wandb.log(metrics, step=step, commit=False)
-            except Exception as e:
-                # Don't let logging errors crash training
-                print(f"Warning: W&B logging error: {e}")
-        
-        # Start logging in a separate thread
-        threading.Thread(target=log_thread).start()
-        
-        # Get commit frequency from config (default to 10)
-        commit_frequency = getattr(self.config, 'wandb_commit_frequency', 10)
-
-        # Every N steps, commit the logs in another thread
-        if commit_frequency > 0 and step % commit_frequency == 0:
-            def commit_thread():
-                try:
-                    wandb.log({}, commit=True)  # Empty log with commit=True to flush queue
-                except Exception as e:
-                    print(f"Warning: W&B commit error: {e}")
-            
-            threading.Thread(target=commit_thread).start()
-
-    def _get_learning_rates(self):
-        """Get current learning rates from all optimizers"""
-        lrs = {}
-        
-        # Router learning rate
-        if hasattr(self.router, 'optimizer') and self.router.optimizer:
-            for param_group in self.router.optimizer.param_groups:
-                lrs["router"] = param_group['lr']
-                break
-        
-        # Expert learning rates - sample from first expert if available
-        if hasattr(self, 'expert_indices') and self.expert_indices:
-            # Define expert builder function
-            def expert_builder_fn(expert_idx):
-                # Import the actual expert trainer class 
-                from trainers.expert import ExpertTrainer
-                
-                # Create a new expert trainer with proper initialization 
-                expert = ExpertTrainer(
-                    expert_idx=expert_idx,
-                    config=self.config,
-                    device=self.device,
-                    rank=self.rank,
-                    world_size=self.world_size,
-                    router=self.router  # Pass coordinator's router
-                )
-                return expert
-            
-            for expert_idx in self.expert_indices:
-                expert = self.cache_manager.get_expert(expert_idx, expert_builder_fn)
-                if hasattr(expert, 'optimizer') and expert.optimizer:
-                    for param_group in expert.optimizer.param_groups:
-                        lrs[f"expert_{expert_idx}"] = param_group['lr']
-                        break
-                break  # Only get rate for first expert
-        
-        return lrs
-
     def _get_memory_stats(self):
         """Get current GPU memory usage"""
         stats = {}
@@ -917,31 +720,6 @@ class DDMTrainingCoordinator:
         except:
             pass
         return stats
-
-    def cleanup(self):
-        """Clean up resources on training completion"""
-        if self.rank == 0 and self.wandb_enabled:
-            import wandb
-            # Finish the wandb run
-            wandb.finish()
-            logger.info("W&B logging completed and run finalized")
-
-    def flush_wandb_logs(self):
-        """Flush any pending W&B logs"""
-        if self.rank == 0 and self.wandb_enabled:
-            try:
-                import wandb
-                import threading
-                
-                def flush_thread():
-                    try:
-                        wandb.log({}, commit=True)  # Force commit any queued logs
-                    except Exception as e:
-                        print(f"Warning: W&B flush error: {e}")
-                
-                threading.Thread(target=flush_thread).start()
-            except:
-                pass
 
     def _redistribute_experts(self):
         """Implements paper's load-balanced expert assignment (Section 3.4) with distributed sync"""
@@ -1044,128 +822,14 @@ class DDMTrainingCoordinator:
             logger.info(f"Reserved: μ={np.mean(reserved):.2f} ±{np.std(reserved):.2f} GB")
             logger.info(f"Active: μ={np.mean(active):.2f} ±{np.std(active):.2f} GB")
 
-    def _log_metrics(self, step, expert_loss, router_loss, duration=None, learning_rates=None, expert_individual_losses=None):
-        """Log training metrics to wandb and console"""
-        if self.rank != 0:
-            return  # Only log from rank 0
+    def _handle_training_error(self, error, step):
+        """Coordinated error handling across ranks"""
+        error_msg = f"Step {step} error: {str(error)}"
+        error_tensor = torch.tensor([1 if error else 0], device=self.device)
+        dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
         
-        # Get memory stats if enabled
-        memory_stats = self._get_memory_stats() if hasattr(self.config, 'wandb_log_memory') and self.config.wandb_log_memory else None
-        
-        # Get learning rates if not provided
-        if learning_rates is None and hasattr(self, '_get_learning_rates'):
-            learning_rates = self._get_learning_rates()
-        
-        # Calculate step duration if not provided
-        if duration is None and hasattr(self, 'step_start_time'):
-            duration = time.time() - self.step_start_time
-        
-        # Log to wandb
-        if hasattr(self, 'wandb') and self.config.wandb_enabled:
-            # Create log dictionary with all metrics
-            log_dict = {
-                "expert_loss_avg": expert_loss,
-                "router_loss": router_loss
-            }
-            
-            # Add individual expert losses if available
-            if expert_individual_losses:
-                log_dict.update(expert_individual_losses)
-                
-            # Add additional metrics if available
-            if duration is not None:
-                log_dict["step_duration_sec"] = duration
-                
-            if learning_rates:
-                for lr_name, lr_value in learning_rates.items():
-                    log_dict[f"lr_{lr_name}"] = lr_value
-                    
-            if memory_stats:
-                for mem_name, mem_value in memory_stats.items():
-                    log_dict[f"memory_{mem_name}"] = mem_value
-                    
-            # Log to wandb
-            import wandb
-            wandb.log(log_dict, step=step)
-            
-            # Handle commit frequency
-            if hasattr(self.config, 'wandb_commit_frequency') and step % self.config.wandb_commit_frequency == 0:
-                wandb.log({}, commit=True)
-        
-        # Log to console periodically (keep simple with just average loss)
-        if step % self.config.log_every == 0:
-            lr_str = f", LR: {learning_rates['expert']:.6f}" if learning_rates and 'expert' in learning_rates else ""
-            print(f"[Step {step}] Expert Loss: {expert_loss:.4f}, Router Loss: {router_loss:.4f}{lr_str}")
-            
-            # Optionally print individual expert losses in a more compact format
-            if expert_individual_losses and len(expert_individual_losses) > 0:
-                expert_str = ", ".join([f"E{k.split('_')[1]}: {v:.4f}" for k, v in expert_individual_losses.items()])
-                print(f"  Individual expert losses: {expert_str}")
-
-    def _calculate_expert_assignments(self):
-        """Calculate expert assignments across ranks based on a simple uniform distribution"""
-        # Simple uniform assignment - distribute experts evenly across ranks
-        total_experts = self.config.num_experts
-        experts_per_rank = max(1, total_experts // self.world_size)
-        
-        # Create a list of rank assignments for each expert
-        assignments = []
-        for expert_idx in range(total_experts):
-            # Assign each expert to a rank using simple division
-            rank = min(expert_idx // experts_per_rank, self.world_size - 1)
-            assignments.append(rank)
-        
-        # Convert to tensor for consistency with other methods
-        assignments_tensor = torch.tensor(assignments, device=self.device)
-        
-        # No conflicts in this simple assignment strategy
-        conflicts = []
-        
-        # Additional statistics for monitoring (optional)
-        stats = {
-            "experts_per_rank": experts_per_rank,
-            "total_experts": total_experts
-        }
-        
-        # Performance metrics (optional)
-        metrics = {
-            "assignment_balance": 1.0  # Perfect balance in uniform distribution
-        }
-        
-        return assignments_tensor, conflicts, stats, metrics
-
-    def _validate_batch_shapes(self, batch):
-        """Updated validation for sequence-based inputs"""
-        latent = batch['latent']
-        clip_emb = batch['clip_embedding']
-        
-        # Allow both 4D and 5D latent formats
-        if latent.dim() not in [4,5]:
-            raise ValueError(f"Latent tensor should be 4D/5D, got {latent.shape}")
-        
-        # CLIP embeddings should be 3D or 4D (with sequence dimension)
-        if clip_emb.dim() not in [3,4]:
-            raise ValueError(f"CLIP embeddings should be 3D/4D, got {clip_emb.shape}")
-
-        # Add sequence length consistency check
-        if latent.dim() == 5 and clip_emb.dim() == 4:
-            if latent.shape[1] != clip_emb.shape[1]:
-                raise ValueError(f"Mismatched sequence lengths: latent {latent.shape[1]} vs text {clip_emb.shape[1]}")
-
-    def _sync_experts(self):
-        # Paper's Byzantine-resistant consensus
-        expert_states = [e.state_dict() for e in self.experts]
-        validated_states = []
-        
-        # Validate states using Merkle proofs
-        for state in expert_states:
-            if validate_merkle_proof(state, self.consensus_tree):
-                validated_states.append(state)
-        
-        # Apply federated averaging only on validated states
-        avg_state = average_states(validated_states)
-        
-        # Update all experts with consensus state
-        for expert in self.experts:
-            expert.load_state_dict(avg_state)
+        if error_tensor.item() == 1:
+            if self.rank == 0:
+                logger.error(f"Critical error detected: {error_msg}")
+            raise RuntimeError("Distributed training error") from error
 

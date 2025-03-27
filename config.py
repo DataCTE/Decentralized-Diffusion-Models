@@ -12,225 +12,68 @@ logger = logging.getLogger(__name__)
 
 # Add this at the top under imports
 DEFAULT_CONFIG = {
-    # ===== Training parameters =====
-    'num_steps': 1000000,
+    # ===== Core Architecture =====
+    'hidden_size': 1152,
+    'num_heads': 16,
+    'depth': 30,
+    'mlp_ratio': 4.0,
+    'qkv_bias': True,
+    'vec_in_dim': 768,
+    'context_in_dim': 768,
+    
+    # ===== Expert Configuration =====
+    'num_experts': 8,
+    'num_clusters': 8,
+    'cluster_embed_dim': 512,
+    'expert_capacity_factor': 1.25,
+    
+    # ===== Training Parameters ===== 
     'batch_size': 1,
     'learning_rate': 1e-4,
-    'weight_decay': 1e-2,
-    'warmup_steps': 1000,
-    'max_grad_norm': 1.0,
-    'use_mixed_precision': True,
-    'resume_checkpoint': None,  # Add resume checkpoint path (None = don't resume)
-    
-    # ===== CLIP Configuration =====
-    'clip_model': "openai/clip-vit-large-patch14",
-    'clip_embedding_dim': 768,  # ViT-L/14 output dim
-    'max_token_length': 77,     # CLIP standard
-
-    # T5 model settings
-    't5_model': 'google/t5-v1_1-base',  
-    'max_token_length': 128,
-    'use_mixed_precision': True,
-
-    # ===== Flux MMDiT Architecture =====
-    'hidden_size': 1152,        # Transformer hidden size
-    'in_channels': 16,
-    'out_channels': 16,
-    'num_heads': 16,            # Attention heads per layer
-    'depth': 30,                # Total transformer blocks
-    'depth_single_blocks': 2,   # Transformer blocks with single stream
-    'patch_size': 2,            # Input patch dimension
-    'mlp_ratio': 4.0,           # FFN expansion factor
-    'qkv_bias': True,           # Enable QKV projection biases
-    'qk_rmsnorm': True,         # Use RMSNorm for Q/K projections
-    'axes_dim': [32, 32],       # For 64D positional embedding (768/12 heads)
-    'theta': 10000,             # RoPE base frequency
-    'vec_in_dim': 768,          # Input dimension for conditioning vector
-    'context_in_dim': 768,      # Input dimension for text context
-    'guidance_embed': False,     # Enable guidance embedding layer
-    'expert_update_interval': 1,  # How often to update experts (every step by default)
-    'router_update_interval': 5,  # How often to update router (every 5 steps)
-
-    # ===== Expert Configuration =====
-    'num_experts': 8,           # Number of data clusters
-    'cluster_embed_dim': 512,
-    'expert_specialization': 'cluster_token',  # From paper 3.3
-    'expert_capacity': 1.25,    # Cluster assignment buffer
-    
-    # ===== VAE Configuration =====
-    'vae_model': "AuraDiffusion/16ch-vae",
-    'latent_channels': 16,      # Must match VAE output
-    'vae_scaling_factor': 0.18215,
-
-    # ===== Router Network =====
-    'router_hidden_size': 512,
-    'router_num_heads': 8,
-    'router_num_layers': 4,
-    
-    # ===== Dataset parameters =====
-    'dataset_path': '/home/alex/workspace/datasets/danbooru2025',
-    'feature_cache_path': '/home/alex/workspace/Decentralized-Diffusion-Models/cache',
-    'dataset_size': 380000,
-    'min_size': 256,  # Minimum image dimension
-    'max_size': 1024,  # Maximum image dimension
-    'val_size': 1000,
-    'buckets': [
-        (512, 512),   # Square
-        (576, 448),   # Landscape 
-        (448, 576),   # Portrait
-        (640, 384),   # Wide landscape
-        (384, 640),   # Tall portrait
-    ],
-    'validation_batch_size': 4,  # Reduced from 1000 to prevent OOM
-    'num_workers': 8,  # Reduced from 8 to prevent I/O bottlenecks
-    'pin_memory': False,  # Enable pin_memory for faster data transfer
-    'persistent_workers': True,
-    'prefetch_factor': 2,
-    'broadcast_batch_size': 1000,  # Control broadcast chunk size
-    
-    # ===== Training parameters =====
-    'adam_betas': (0.9, 0.999),
     'weight_decay': 0.01,
-    'max_grad_norm': 1.0,
+    'warmup_steps': 1000,
+    'use_mixed_precision': True,
+    'gradient_accumulation_steps': 2,
     
-    # ===== Flow Matching parameters =====
-    'diffusion_steps': 1000,
-    'sigma': 0.5,
-    'loss_type': 'huber',
-    'beta_schedule': 'cosine',
-    'flow_matching_delta': 0.1,  # Delta parameter for Huber loss
-    
-    # ===== Sampling parameters =====
-    'sampling_steps': 50,
-    'cfg_scale': 7.5,
-    'top_k': 1,
-    'temperature': 1.0,
-    'eta': 0.0,
-    
-    # ===== Output paths =====
-    'output_dir': './outputs',
-    
-    # ===== Logging parameters =====
-    'log_every': 1,
-    'save_every': 5000,
-    'validate_every': 1000,
-    'generate_every': 1000,
-    'sample_count': 4,
-    'checkpoint_interval': 5000,  # How often to save checkpoints
-    'validation_interval': 1000,  # How often to run validation
-    
-    # ===== Distributed training =====
-    'save_from_all_ranks': False,
-    
-    # Changed from cluster-based parameters
-    'expert_batch_size': 1,
-    
-    # ===== Expert Cache parameters =====
-    'expert_offload_to_cpu': True,  # Whether to offload unused experts to CPU
-    
-    # Add to DEFAULT_CONFIG
+    # ===== Distributed Training =====
     'use_gradient_checkpointing': True,
     'fsdp_sharding_strategy': "FULL_SHARD",
-    'fsdp_cpu_offload': False,
-    'fsdp_backward_prefetch': "BACKWARD_PRE",
     'fsdp_auto_wrap_policy': "LAMBDA",
-    'fsdp_min_num_params': 1e6,
-    'router_learning_rate': 1e-4,
-    'fsdp_use_orig_params': True,
-    'fsdp_limit_all_gathers': True,
     
-    # ===== Distillation parameters =====
-    'ema_decay': 0.9999,  # Exponential moving average decay factor for model weights
+    # ===== Dataset & Bucketing =====
+    'buckets': [
+        (512, 512), (576, 448), 
+        (448, 576), (640, 384),
+        (384, 640)
+    ],
+    'latent_channels': 16,
+    'vae_scaling_factor': 0.18215,
     
-    # ===== Distributed Training ===== (simplified)
-    'batch_size_per_gpu': 1,  # Batch size per GPU
-    'num_clusters': 8, # or your desired number of clusters 
-    
-    # ===== W&B Logging Parameters =====
-    'wandb_enabled': True,                    # Whether to use wandb for logging
-    'wandb_project': 'decentralized-diffusion', # Project name
-    'wandb_entity': None,                     # Username or team name, None for default
-    'wandb_group': None,                      # Group related runs together
-    'wandb_name': None,                       # Run name, None for auto-generated name
-    'wandb_id': None,                         # Run ID for resuming, None for new run
-    'wandb_dir': './wandb',                   # Directory for local files
-    'wandb_tags': [],                         # List of tags for the run
-    'wandb_mode': 'online',                   # Options: online, offline, disabled
-    'wandb_save_code': False,                  # Save code snapshot with run
-    'wandb_watch_model': 'gradients',         # Options: gradients, parameters, all, None
-    'wandb_log_every': 1,                     # Log every step (not every N steps)
-    'wandb_log_artifacts': False,              # Save model checkpoints as artifacts
-    'wandb_log_batch_metrics': False,         # Log per-batch metrics (more overhead)
-    'wandb_log_memory': False,                 # Log memory usage
-    'wandb_commit_frequency': 1,   # Frequency to commit logs (N steps)
-
-    'fast_validation': True,    # Use fewer steps for validation
-    'sampling_steps': 20,       # Default number of sampling steps for validation
-    'validation_interval': 1000,  # How often to run validation
-    
-    # ===== Training controls =====
-    'enable_validation': False,
-    'enable_sampling': False,
-    'enable_checkpointing': True,
-    
-    # Add to DEFAULT_CONFIG
-    'dynamic_expert_count': 2,
-    'expert_selection_strategy': 'top_k',
-    'max_sampling_experts': 2,  # Maximum experts to use in sampling
-    'max_experts_in_memory': 2,  # Number of experts to keep in GPU memory
-    'num_fine_clusters': 1024,  # For initial KMeans clustering
-    'min_cluster_samples': 50000,  # Minimum samples per expert cluster
-    'kmeans_restarts': 3,  # Number of KMeans restarts
-    'cluster_linkage': 'average',  # Hierarchical clustering method
-    
-    # ===== Shape Test Controls =====
-    'bypass_cluster_validation': False, # Flag to bypass cluster size validation, set to True in shape_test.py
-    'use_cuda_graphs': False,
-
-    # Add to DEFAULT_CONFIG
-    'bucket_scale': 64,  # Base scaling factor for buckets
-    'min_bucket_dim': 256,  # Minimum dimension for any bucket
-    'bucket_thresholds': {  # Aspect ratio groupings
-        'square': (0.9, 1.1),
-        'portrait': (0.4, 0.9), 
-        'landscape': (1.1, 2.5)
-    },
-
     # ===== Router Configuration =====
-    'router_temperature': 2.0,  # Initial temperature for router softmax
-    'router_min_temperature': 0.5,  # Minimum temperature after annealing
-    'router_temp_decay': 0.9997,
-
-    # Add to DEFAULT_CONFIG
-    'distributed': {
-        'expert_sync_interval': 100,  # Steps between expert sync
-        'async_parameter_update': True,
-        'overlap_communication': True,
-        'consensus_timeout': 5.0  # Seconds for conflict resolution
-    },
-
-    # Add to DEFAULT_CONFIG
-    'use_precomputed_latents': True,  # Set to True to disable VAE loading
-
-    # Add to DEFAULT_CONFIG
-    'cluster_embed_init': 'orthogonal',  # From paper 3.3
-    'position_embed_type': 'rope_2d',  
-    'num_attention_pools': 2,  # For spatial reduction
-    'attention_pool_stride': 2,  
-    'use_flash_attention': True,  
-    'expert_capacity_factor': 1.25,  # Buffer for cluster assignment
-
-    # Add to DEFAULT_CONFIG
-    'gradient_accumulation_steps': 2,
-    'expert_batch_size': 16,  # Per-expert batch size
-    'router_batch_size': 512,
-    'max_sequence_length': 3600,  # 60x60 latent patches
-    'position_embedding': 'scaled_rope',
-    'cluster_temp_decay': 0.99995,
-    'expert_sync_interval': 100,  # Sync experts every 100 steps
-
-    'cluster_stages': 3,  # Multi-stage clustering from 1024->256->64->8
-    'max_cluster_variance': 0.25,  # Variance threshold for cluster splitting
+    'router_learning_rate': 1e-4,
+    'router_temperature': 2.0,
+    'router_min_temp': 0.5,
+    'router_temperature_decay': 0.9997,
+    
+    # ===== Sampling & Validation =====
+    'sampling_steps': 50,
+    'cfg_scale': 7.5,
+    'enable_validation': False,
+    'validation_interval': 1000,
+    
+    # ===== Paths & Logging =====
+    'output_dir': './outputs',
+    'feature_cache_path': './cache',
+    'wandb_enabled': True,
+    'wandb_project': 'decentralized-diffusion',
+    
+    # ===== Positional Embeddings =====
+    'position_embed_type': 'rope_2d',
+    'theta': 10000,
+    'axes_dim': [32, 32],
+    
+    # ===== Debug/Test Flags =====
+    'bypass_cluster_validation': False
 }
 
 def dict_to_namespace(d):

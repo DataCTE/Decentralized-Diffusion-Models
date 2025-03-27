@@ -1,0 +1,13 @@
+torch
+bitsandbytes
+transformers
+wandb
+datasets
+einops
+Pillow
+numpy
+tqdm
+matplotlib
+safetensors
+torchvision
+accelerate 

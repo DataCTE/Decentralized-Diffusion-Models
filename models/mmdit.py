@@ -248,20 +248,83 @@ class ExpertMMDiT(Flux):
         y: torch.Tensor,
         cluster_ids: torch.Tensor,
     ) -> torch.Tensor:
-        # Validate cluster IDs (Section 3.4)
+        """Implements paper's expert specialization with validated cluster conditioning
+        
+        Args:
+            img: Input image tensor [B, L, C]
+            img_ids: Position IDs for image tokens [B, L, 2]
+            txt: Text embeddings [B, S, D]
+            txt_ids: Position IDs for text tokens [B, S, 2]
+            timesteps: Diffusion timesteps [B]
+            y: Conditioning vector [B, D]
+            cluster_ids: Assigned cluster IDs [B]
+            
+        Returns:
+            Predicted flow vector [B, L, C]
+        """
+        # Validate input dimensions
+        self._validate_input_shapes(img, img_ids, txt, txt_ids, timesteps, y, cluster_ids)
+        
+        # Cluster conditioning (Equation 5)
+        cluster_emb = self._get_cluster_embeddings(cluster_ids)  # [B, D]
+        
+        # Capacity-aware scaling (Section 3.4)
+        conditioned_y = self._apply_capacity_scaling(y, cluster_emb)
+        
+        # Prepare embeddings with fused operations
+        img_emb, txt_emb = self._fuse_embeddings(img, txt, timesteps, conditioned_y)
+        
+        # Process through transformer blocks
+        return self._transformer_forward(img_emb, txt_emb, img_ids, txt_ids, timesteps)
+
+    def _validate_input_shapes(self, *inputs):
+        """Type and shape validation for all inputs"""
+        img, img_ids, txt, txt_ids, timesteps, y, cluster_ids = inputs
+        
+        if img.dim() != 3:
+            raise ValueError(f"img must be 3D [B,L,C], got {img.shape}")
+        if txt.dim() != 3:
+            raise ValueError(f"txt must be 3D [B,S,D], got {txt.shape}")
+        if cluster_ids.dim() != 1:
+            raise ValueError(f"cluster_ids must be 1D [B], got {cluster_ids.shape}")
+
+    def _get_cluster_embeddings(self, cluster_ids: torch.Tensor) -> torch.Tensor:
+        """Convert cluster IDs to embeddings with validation"""
         if (cluster_ids < 0).any() or (cluster_ids >= self.params.num_clusters).any():
             invalid = cluster_ids.unique().tolist()
             raise ValueError(f"Invalid cluster IDs {invalid}. Must be in [0, {self.params.num_clusters-1}]")
         
-        # Cluster conditioning (Equation 5)
-        cluster_emb = self.cluster_embed(cluster_ids)  # [B, D]
-        
-        # Capacity-aware scaling (Section 3.4)
+        return self.cluster_embed(cluster_ids)  # [B, D]
+
+    def _apply_capacity_scaling(self, y: torch.Tensor, cluster_emb: torch.Tensor) -> torch.Tensor:
+        """Apply paper's capacity-aware scaling (Equation 7)"""
         capacity_scale = 1.0 + self.expert_capacity * torch.sigmoid(cluster_emb.mean(dim=-1))
-        conditioned_y = y * capacity_scale[:, None] + cluster_emb.unsqueeze(1)
+        return y * capacity_scale[:, None] + cluster_emb.unsqueeze(1)
+
+    def _fuse_embeddings(self, img, txt, timesteps, y):
+        """Fuse embeddings with mixed precision safety"""
+        dtype = next(self.parameters()).dtype
+        img, txt = img.to(dtype), txt.to(dtype)
         
-        # Original processing with capacity conditioning
-        return super().forward(img, img_ids, txt, txt_ids, timesteps, conditioned_y, cluster_ids)
+        # Time-aware image projection
+        img_emb = self.img_in(img) * (1 + self.time_in(timesteps)[:, None])
+        
+        # Text conditioning with vector projection
+        txt_emb = self.txt_in(txt) + self.vector_in(y)[:, None]
+        
+        return img_emb, txt_emb
+
+    def _transformer_forward(self, img_emb, txt_emb, img_ids, txt_ids, timesteps):
+        """Core transformer processing with position embeddings"""
+        # Combine embeddings and position IDs
+        x = torch.cat([txt_emb, img_emb], dim=1)
+        pos_ids = torch.cat([txt_ids, img_ids], dim=1)
+        
+        # Process through transformer blocks
+        for block in self.double_blocks:
+            x = block(x, vec=timesteps, pe=self.pe_embedder(pos_ids))
+        
+        return self.final_layer(x[:, txt_emb.size(1):], timesteps)
 
     def create_embeddings(self, text_input, image_input):
         """
