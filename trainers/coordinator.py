@@ -527,26 +527,30 @@ class DDMTrainingCoordinator:
         """Initialize Weights & Biases logging with URL display"""
         self.wandb_enabled = False
         if self.rank == 0:
+            if not os.environ.get('WANDB_API_KEY'):
+                print("\nWARNING: WANDB_API_KEY environment variable not set!\n")
             try:
                 import wandb
                 # Initialize wandb with project name
                 wandb.init(
-                    project="DDM",
+                    project=self.config.wandb_project,  # Use config project name
                     config=vars(self.config),
-                    dir=self.config.output_dir
+                    dir=self.config.output_dir,
+                    settings=wandb.Settings(start_method="fork")
                 )
                 self.wandb_run_url = wandb.run.get_url()
                 self.wandb_enabled = True
                 
                 # Print the run URL with clear formatting
-                logger.info(f"W&B run started: {wandb.run.name}")
                 print(f"\n{'='*50}")
-                print(f"Track training progress at: {self.wandb_run_url}")
+                print(f"W&B Dashboard: {self.wandb_run_url}")
                 print(f"{'='*50}\n")
+                logger.info(f"W&B run started: {wandb.run.name}")
                 
             except Exception as e:
-                logger.warning(f"Failed to initialize W&B: {str(e)}")
+                logger.error(f"Failed to initialize W&B: {str(e)}")
                 self.wandb_enabled = False
+                print("\nWARNING: Could not initialize Weights & Biases logging\n")
 
     def _get_memory_stats(self):
         """Simplified memory logging matching test output"""
