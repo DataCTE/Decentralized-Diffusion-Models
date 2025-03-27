@@ -302,9 +302,9 @@ class BucketBatchSampler(torch.utils.data.Sampler):
         else:
             self.bucket_indices = bucket_indices
         
-        # Convert lists to tensors
+        # Convert lists to tensors - FIXED VERSION
         self.bucket_tensors = {
-            bucket: indices.to(self.device)  # Moves to sampler's device
+            bucket: torch.tensor(indices, device=self.device)  # Create tensor first
             for bucket, indices in self.bucket_indices.items()
         }
         
