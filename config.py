@@ -71,7 +71,7 @@ DEFAULT_CONFIG = {
     'cfg_scale': 7.5,
     'enable_validation': False,
     'validation_interval': 1000,
-    
+    'enable_sampling': True,
     # ===== Paths & Logging =====
     'output_dir': './outputs',
     'feature_cache_path': './cache',
