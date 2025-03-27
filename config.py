@@ -55,6 +55,7 @@ DEFAULT_CONFIG = {
     # ===== Router Configuration =====
     'router_learning_rate': 1e-4,
     'router_hidden_size': 512,
+    'router_num_heads': 8,
     'router_temperature': 2.0,
     'router_min_temp': 0.5,
     'router_temperature_decay': 0.9997,
