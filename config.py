@@ -34,6 +34,12 @@ DEFAULT_CONFIG = {
     'warmup_steps': 1000,
     'use_mixed_precision': True,
     'gradient_accumulation_steps': 2,
+
+    # ===== Diffusion & Loss =====
+    'loss_type': 'huber',         
+    'sigma': 1.0,
+    'sampling_steps': 10,
+    'top_p': 0.9, 
     
     # ===== Distributed Training =====
     'use_gradient_checkpointing': True,
