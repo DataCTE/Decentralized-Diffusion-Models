@@ -80,8 +80,8 @@ class RouterModel(nn.Module):
             nn.Linear(config.router_hidden_size, config.num_experts)
         )
         
-        # Add registered buffer for temperature
-        self.temperature = nn.Parameter(torch.tensor(config.router_temperature))
+        # Change temperature initialization to 1D tensor
+        self.register_buffer('temperature', torch.tensor([config.router_temperature]))  # Now 1D tensor
         
         # Initialize weights with smaller values for stability
         self._init_weights()
@@ -152,4 +152,5 @@ class RouterModel(nn.Module):
         )
         self.current_step += 1
         
-        return logits / self.temperature 
+        # Access first element of temperature tensor
+        return logits / self.temperature[0]  # Index into 1D tensor 
