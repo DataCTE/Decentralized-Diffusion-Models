@@ -70,8 +70,11 @@ class DDMDataset(Dataset):
         # Extract base names without rank suffix for loading other features
         self.base_names = [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
         
-        # Remove all preloading logic
-        logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples (lazy loading enabled)")
+        # New validation step - check file existence
+        self.valid_indices = self._validate_file_existence()
+        self.num_samples = len(self.valid_indices)
+        
+        logger.info(f"[Rank {self.rank}] Final dataset size after validation: {self.num_samples}")
         
         # Initialize bucket assignments as a property
         self._bucket_assignments = None  # Initialize cache
@@ -103,13 +106,35 @@ class DDMDataset(Dataset):
         self.num_samples = len(self.samples)
         print(f"Found {self.num_samples} valid samples with both latent and CLIP embeddings")
 
-    def __getitem__(self, idx):
-        """Load individual sample on demand"""
-        try:
+    def _validate_file_existence(self):
+        """Check that all required files exist for each sample"""
+        valid_indices = []
+        
+        for idx in tqdm(range(len(self.latent_files)), desc=f"[Rank {self.rank}] Validating files"):
             base_name = self.base_names[idx]
+            required_files = [
+                self.latent_files[idx],
+                os.path.join(self.clip_dir, f"{base_name}_rank{self.rank}.pt"),
+                os.path.join(self.cluster_dir, f"{base_name}_rank{self.rank}.pt"),
+                os.path.join(self.bucket_dir, f"{base_name}_rank{self.rank}.pt")
+            ]
+            
+            if all(os.path.exists(f) for f in required_files):
+                valid_indices.append(idx)
+            else:
+                missing = [f for f in required_files if not os.path.exists(f)]
+                logger.warning(f"Skipping sample {base_name} - missing files: {missing}")
+                
+        return valid_indices
+
+    def __getitem__(self, idx):
+        """Load individual sample with error handling"""
+        try:
+            actual_idx = self.valid_indices[idx]
+            base_name = self.base_names[actual_idx]
             
             # Load latent
-            latent = torch.load(self.latent_files[idx], map_location='cpu')
+            latent = torch.load(self.latent_files[actual_idx], map_location='cpu')
             
             # Load CLIP embeddings
             clip_path = os.path.join(self.clip_dir, f"{base_name}_rank{self.rank}.pt")
@@ -132,7 +157,7 @@ class DDMDataset(Dataset):
             
         except Exception as e:
             logger.error(f"Error loading sample {idx} on rank {self.rank}: {str(e)}")
-            raise
+            return None  # Return None to be filtered later
 
     def __len__(self):
         return self.num_samples
@@ -203,65 +228,18 @@ class DDMDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Modified collate that handles variable-length sequences and multiple embedding types"""
-        # Filter out None items resulting from loading errors in __getitem__
-        original_batch_size = len(batch)
+        """Modified collate that handles None results"""
         batch = [b for b in batch if b is not None]
-        filtered_batch_size = len(batch)
-
-        if filtered_batch_size == 0:
-            # Return None or an empty dictionary if the entire batch failed
-            if original_batch_size > 0:
-                 logger.warning(f"Entire batch of size {original_batch_size} failed to load. Skipping batch.")
-            return None # Or perhaps {} depending on how the training loop handles it
-
-        if filtered_batch_size < original_batch_size:
-             logger.warning(f"Filtered out {original_batch_size - filtered_batch_size} failed samples from batch.")
-
-        # Initialize result dictionary with keys that are always present
-        result = {
+        
+        if not batch:
+            return None
+        
+        return {
             'latent': torch.stack([item['latent'] for item in batch]),
+            'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
             'bucket': torch.stack([item['bucket'] for item in batch]),
             'expert': torch.stack([item['expert'] for item in batch])
         }
-
-        # Handle CLIP embeddings if present - Use the correct key 'clip_embedding'
-        if 'clip_embedding' in batch[0]:
-            clip_embeddings = [item['clip_embedding'] for item in batch]
-            # Check if padding is necessary (all sequences might have the same length)
-            if all(e.size(1) == clip_embeddings[0].size(1) for e in clip_embeddings):
-                 result['clip_embedding'] = torch.stack(clip_embeddings)
-            else:
-                 # Pad only if lengths differ
-                 max_len = max(e.size(1) for e in clip_embeddings)
-                 padded_embeddings = []
-                 for emb in clip_embeddings:
-                     pad_size = max_len - emb.size(1)
-                     # Pad sequence length dimension (dim=1), value=0
-                     padded = torch.nn.functional.pad(emb, (0, 0, 0, pad_size), value=0)
-                     padded_embeddings.append(padded)
-                 result['clip_embedding'] = torch.stack(padded_embeddings)
-        # else: # Optional: Log if clip_embedding is expected but missing
-        #     print("Warning: 'clip_embedding' key not found in the first item of the batch.")
-
-
-        # Handle T5 embeddings if present - Use the correct key 't5_embedding'
-        if 't5_embedding' in batch[0]:
-            t5_embeddings = [item['t5_embedding'] for item in batch]
-            # Check if padding is necessary
-            if all(e.size(1) == t5_embeddings[0].size(1) for e in t5_embeddings):
-                 result['t5_embedding'] = torch.stack(t5_embeddings)
-            else:
-                 # Pad only if lengths differ
-                 max_len = max(e.size(1) for e in t5_embeddings)
-                 padded_embeddings = []
-                 for emb in t5_embeddings:
-                     pad_size = max_len - emb.size(1)
-                     padded = torch.nn.functional.pad(emb, (0, 0, 0, pad_size), value=0)
-                     padded_embeddings.append(padded)
-                 result['t5_embedding'] = torch.stack(padded_embeddings)
-
-        return result
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
