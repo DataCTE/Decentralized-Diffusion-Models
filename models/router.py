@@ -32,8 +32,8 @@ class RouterModel(nn.Module):
         super().__init__()
         # Paper's temperature schedule
         self.initial_temp = 2.0  # Initial temperature
-        self.min_temp = 0.5     # Minimum temperature
-        self.temp_decay = 0.99995  # Decay rate
+        self.min_temp = config.router_min_temp
+        self.temp_decay = config.router_temperature_decay
         self.current_step = 0
         
         # Embedding layer - Changed input channels to match latent dimension
@@ -79,6 +79,9 @@ class RouterModel(nn.Module):
             nn.LayerNorm(config.router_hidden_size),
             nn.Linear(config.router_hidden_size, config.num_experts)
         )
+        
+        # Add registered buffer for temperature
+        self.temperature = nn.Parameter(torch.tensor(config.router_temperature))
         
         # Initialize weights with smaller values for stability
         self._init_weights()
@@ -143,10 +146,10 @@ class RouterModel(nn.Module):
         logits = self.classifier(cls_output)
         
         # Apply temperature scaling
-        temperature = max(
-            self.min_temp,
-            self.initial_temp * (self.temp_decay ** self.current_step)
+        self.temperature.data = torch.max(
+            self.temperature * self.temp_decay, 
+            torch.tensor(self.min_temp, device=self.temperature.device)
         )
         self.current_step += 1
         
-        return logits / temperature 
+        return logits / self.temperature 

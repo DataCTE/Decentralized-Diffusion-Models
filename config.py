@@ -70,11 +70,27 @@ DEFAULT_CONFIG = {
     # ===== Positional Embeddings =====
     'position_embed_type': 'rope_2d',
     'theta': 10000,
-    'axes_dim': [32, 32],
+    'axes_dim': [36, 36],
     
     # ===== Debug/Test Flags =====
     'bypass_cluster_validation': False,
     'depth_single_blocks': 5,  # Config-controlled value
+    
+    # Add these new parameters
+    'num_steps': 100000,
+    'save_interval': 5000,
+    'max_experts_in_memory': 3,
+    'expert_offload_to_cpu': True,
+    'expert_batch_size': 2,
+    'distilled_model': None,
+    'vae_model': 'AuraDiffusion/16ch-vae',
+    'clip_model': 'openai/clip-vit-large-patch14',
+    'verbose_training': False,
+    'log_memory': False,
+    'balance_lambda': 0.01,
+    'router_model': 'paper_baseline',
+    'use_scheduler': True,
+    'scheduler_type': 'cosine',
 }
 
 def dict_to_namespace(d):

@@ -91,6 +91,9 @@ class RouterTrainer:
             else 0.5*(1 + math.cos(math.pi*(step - self.warmup_steps)/self.total_steps))
         )
 
+        # Initialize step counter
+        self.step = 0
+
     def train(self):
         """Set router model to training mode"""
         self.router.train()
@@ -117,7 +120,12 @@ class RouterTrainer:
         # Update step counter and calculate temperature
         self.step += 1  # Maintain internal step counter
         current_step = max(1, self.step)
-        temp = self._calculate_temperature(current_step)
+        new_temp = max(
+            self.config.router_min_temp,
+            self.config.router_temperature * 
+            (self.config.router_temperature_decay ** current_step)
+        )
+        self.router.temperature.fill_(new_temp)
         
         # Forward pass with mixed precision
         with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
@@ -125,16 +133,24 @@ class RouterTrainer:
                 self._add_diffusion_noise(batch['latent']),
                 self._generate_timesteps(batch['latent'].size(0)),
                 batch['clip_embedding']
-            ) / temp
+            )
             
-            return F.cross_entropy(logits, batch['cluster_labels'])
+            # Add expert load balancing regularization
+            probs = torch.softmax(logits, dim=-1)
+            expert_load = probs.mean(dim=0)
+            balance_loss = torch.sum(expert_load * torch.log(expert_load * self.config.num_experts + 1e-10))
+            
+            # Combine losses with paper's λ coefficient
+            total_loss = F.cross_entropy(logits, batch['expert']) + self.config.balance_lambda * balance_loss
+            
+            return total_loss
 
     def _validate_batch(self, batch: Dict[str, torch.Tensor]) -> None:
         """Type and shape validation for training batches"""
         if not isinstance(batch, dict):
             raise TypeError(f"Expected batch to be dict, got {type(batch)}")
         
-        required_keys = {'latent', 'clip_embedding', 'cluster_labels'}
+        required_keys = {'latent', 'clip_embedding', 'expert'}
         missing = required_keys - set(batch.keys())
         if missing:
             raise ValueError(f"Missing required batch keys: {missing}")

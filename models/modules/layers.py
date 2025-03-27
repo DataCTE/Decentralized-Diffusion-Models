@@ -18,12 +18,12 @@ class EmbedND(nn.Module):
 
     def forward(self, ids: Tensor) -> Tensor:
         n_axes = ids.shape[-1]
-        embs = []
-        for i in range(n_axes):
-            axis_emb = rope(ids[..., i], self.axes_dim[i], self.theta)
-            embs.append(axis_emb)
-        emb = torch.cat(embs, dim=-1)
-        return emb.unsqueeze(1)  # Add dummy dimension for compatibility
+        emb = torch.cat(
+            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            dim=-3,
+        )
+
+        return emb.unsqueeze(1)
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -179,17 +179,8 @@ class DoubleStreamBlock(nn.Module):
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
 
-        # Flash attention implementation with memory optimization
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False):
-            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False
-            )
-        
-        txt_attn, img_attn = attn_out[:, : txt.shape[1]], attn_out[:, txt.shape[1] :]
+        attn = attention(q, k, v, pe=pe)
+        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
         # calculate the img bloks
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)

@@ -20,6 +20,7 @@ from utils.logging import logger
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from typing import Dict
+import torch.nn as nn
 
 
 
@@ -59,6 +60,9 @@ class ExpertTrainer(BaseTrainer):
         # Initialize base model first using the corrected config
         self.expert = ExpertMMDiT(model_config) # Pass the modified config
         
+        # After creating the expert:
+        self.expert = self.expert.to(device)
+        
         # Don't wrap with FSDP here - let cache manager handle it
         
         # Use standard optimizer initially - will be reconfigured when FSDP is applied
@@ -91,6 +95,12 @@ class ExpertTrainer(BaseTrainer):
 
         # Initialize scaler once in __init__
         self.scaler = torch.amp.GradScaler(enabled=config.use_mixed_precision)
+
+        # Add paper-recommended initialization
+        for p in self.expert.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p, gain=1/math.sqrt(config.num_experts))
+        nn.init.constant_(self.expert.cluster_embed.weight, 0.01)
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Implements paper's per-expert loss (Section 3.2, Equation 6)

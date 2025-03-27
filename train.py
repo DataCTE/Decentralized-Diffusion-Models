@@ -5,6 +5,7 @@
 import torch
 import logging
 import multiprocessing
+import os
 
 import torch.distributed as dist
 
@@ -17,36 +18,31 @@ from config import get_config
 from utils.logging import setup_logger, log_training_start
 from utils.expert_cache import ExpertCacheManager
 from utils.distributed import is_dist_initialized
+import logging
+
+logger = logging.getLogger(__name__)
 
 def setup_distributed():
-    """Initialize distributed training environment using our centralized utilities"""
-    # Use our centralized distributed setup
-    from utils.distributed import setup_distributed as dist_setup, is_dist_initialized
+    """Improved distributed setup with error handling"""
+    try:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    except KeyError as e:
+        raise RuntimeError(f"Missing environment variable: {str(e)}") from e
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank
+    )
     
-    # Only set up if not already initialized
-    if not is_dist_initialized():
-        # Get rank and world size
-        rank, world_size = dist_setup()
-    else:
-        # Get rank and world size if already initialized
-        from utils.distributed import get_rank, get_world_size
-        rank = get_rank()
-        world_size = get_world_size()
-    
-    # Verify device assignment
-    device = torch.device(f"cuda:{rank}")
-    with torch.no_grad():
-        test_tensor = torch.tensor([rank], device=device)
-        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
-        del test_tensor  # Explicitly delete test tensor
-        torch.cuda.synchronize(device)
-    
-    # Force memory cleanup before proceeding
-    torch.cuda.empty_cache()
-    
-    # Log success message
-    print(f"[Rank {rank}] Distributed setup complete with {world_size} processes")
-    
+    # Validate NCCL version
+    if dist.get_backend() == "nccl" and torch.cuda.nccl.version() < (2, 10):
+        logger.warning("Recommend NCCL 2.10+ for best FSDP performance")
+        
     return rank, world_size
 
 def main():

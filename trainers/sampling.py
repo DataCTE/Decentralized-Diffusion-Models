@@ -11,6 +11,9 @@ import torch.nn.functional as F
 from collections import defaultdict
 from config import get_config
 import torch.distributed as dist
+from config import get_config
+
+config = get_config("config.py")
 
 logger = logging.getLogger(__name__)
 
@@ -116,17 +119,89 @@ def ddm_sample(
         else:
             raise ValueError(f"Invalid inference strategy: {inference_strategy}")
 
+        # Convert tensor to numpy array and flatten
+        selected_indices_np = selected_indices.cpu().numpy()
+        flattened_indices = selected_indices_np.flatten().tolist()
+
         # Paper's batched expert execution
         expert_outputs = []
-        for expert_idx in selected_indices.unique():
-            mask = selected_indices == expert_idx
+        for expert_idx in set(flattened_indices):
+            # Create device-aware boolean mask
+            mask = torch.tensor(
+                [idx == expert_idx for idx in flattened_indices],
+                device=device,
+                dtype=torch.bool
+            )
+            
+            # Get valid batch indices
+            batch_indices = torch.nonzero(mask).squeeze()
+            
+            # Handle single sample case
+            if batch_indices.dim() == 0:
+                batch_indices = batch_indices.unsqueeze(0)
+            
+            # Extract relevant inputs
             expert = experts[expert_idx]
-            expert_outputs.append(expert(x[mask], timestep[mask], text_embeddings[mask]))
+            expert_input = x[batch_indices]
+
+            # Reshape latent tensor to sequence format [B, H*W, C]
+            B, C, H, W = expert_input.shape
+            expert_input = expert_input.reshape(B, C, H*W).permute(0, 2, 1)  # New shape: [B, L, C]
+
+            expert_timesteps = timestep[batch_indices]
+            expert_text = text_embeddings[batch_indices] if text_embeddings is not None else None
+            
+            # Generate position IDs using original H/W dimensions
+            img_len = H * W
+            img_ids = torch.stack([
+                torch.arange(H, device=device).repeat_interleave(W),
+                torch.arange(W, device=device).repeat(H)
+            ], dim=-1)
+            img_ids = img_ids.unsqueeze(0).repeat(B, 1, 1)
+            
+            # Generate text position IDs
+            txt_len = expert_text.shape[1] if expert_text is not None else 0
+            txt_ids = torch.arange(txt_len, device=device).unsqueeze(0).repeat(expert_input.shape[0], 1)
+            
+            # Create 2D position IDs for text (matching image position dimensions)
+            txt_ids = txt_ids[:, :, None].repeat(1, 1, 2)  # Shape: [B, txt_len, 2]
+
+            # Create conditioning vector (y) from text embeddings
+            y = expert_text.mean(dim=1) if expert_text is not None else torch.zeros(expert_input.shape[0], 
+                                                                                   config.vec_in_dim, 
+                                                                                   device=device)
+            
+            # Get cluster IDs from router selection
+            cluster_ids = torch.full((expert_input.shape[0],), expert_idx, 
+                                   device=device, dtype=torch.long)
+
+            # Modified expert call with reshaping
+            expert_output = expert(
+                img=expert_input,
+                img_ids=img_ids,
+                txt=expert_text,
+                txt_ids=txt_ids,
+                timesteps=expert_timesteps,
+                y=y,
+                cluster_ids=cluster_ids
+            )
+            
+            # Reshape from [B, L, C] to [B, C, H, W]
+            reshaped_output = expert_output.permute(0, 2, 1).view(B, C, H, W)
+            expert_outputs.append(reshaped_output)
         
         # Combine predictions
         pred = torch.zeros_like(x)
-        for idx, out in zip(selected_indices.unique(), expert_outputs):
-            pred[selected_indices == idx] = out
+        output_idx = 0
+        for idx in set(flattened_indices):
+            mask = torch.tensor(
+                [i == idx for i in flattened_indices],
+                device=device,
+                dtype=torch.bool
+            )
+            batch_indices = torch.nonzero(mask).squeeze()
+            pred[batch_indices] = expert_outputs[output_idx]
+            output_idx += 1
 
         #print("Shape of combined_pred before ddim_step:", pred.shape)
         #print("Shape of timestep before ddim_step:", timestep.shape)
