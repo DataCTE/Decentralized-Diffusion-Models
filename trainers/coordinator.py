@@ -228,7 +228,7 @@ class DDMTrainingCoordinator:
         persistent_workers = num_workers > 0  # Only enable if using workers
         
         # Create combined loader
-        train_loader = DataLoader(
+        self.train_loader = DataLoader(
             dataset,
             batch_sampler=bucket_sampler,
             collate_fn=dataset.collate_fn,
@@ -237,7 +237,10 @@ class DDMTrainingCoordinator:
             num_workers=num_workers
         )
         
-        return train_loader, None  # No validation loader in paper
+        # Initialize iterator
+        self.train_iter = iter(self.train_loader)
+        
+        return self.train_loader, None  # No validation loader in paper
 
     def _init_parallel_components(self):
         """Initialize critical components without manual synchronization"""
@@ -347,10 +350,12 @@ class DDMTrainingCoordinator:
     def _get_next_batch(self):
         """Get next batch with cluster-aware sampling"""
         try:
-            return next(self.train_loader)
-        except StopIteration:
-            self.train_loader = self._init_data_loaders()[0]
-            return next(self.train_loader)
+            # Get batch from iterator
+            return next(self.train_iter)
+        except (StopIteration, AttributeError):
+            # Initialize iterator if not exists or exhausted
+            self.train_iter = iter(self.train_loader)
+            return next(self.train_iter)
 
     def _train_router(self, batch):
         """Router training step aligned with shape test"""
@@ -648,3 +653,14 @@ class DDMTrainingCoordinator:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay
         )
+
+    @property
+    def train_iter(self):
+        """Lazy initialization of training iterator"""
+        if not hasattr(self, '_train_iter'):
+            self._train_iter = iter(self.train_loader)
+        return self._train_iter
+
+    @train_iter.setter
+    def train_iter(self, value):
+        self._train_iter = value
