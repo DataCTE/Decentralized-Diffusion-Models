@@ -524,33 +524,35 @@ class DDMTrainingCoordinator:
         return checkpoint.get('step', 0)
 
     def _init_wandb(self):
-        """Initialize Weights & Biases logging with URL display"""
+        """Initialize Weights & Biases with distributed safety"""
         self.wandb_enabled = False
-        if self.rank == 0:
-            if not os.environ.get('WANDB_API_KEY'):
-                print("\nWARNING: WANDB_API_KEY environment variable not set!\n")
+        if self.rank == 0 and self.config.wandb_enabled:
             try:
                 import wandb
-                # Initialize wandb with project name
-                wandb.init(
-                    project=self.config.wandb_project,  # Use config project name
-                    config=vars(self.config),
+                # Force initialization before any distributed ops
+                wandb.require(experiment="service")
+                
+                run = wandb.init(
+                    project=self.config.wandb_project,
+                    config=dict(vars(self.config)),
                     dir=self.config.output_dir,
-                    settings=wandb.Settings(start_method="fork")
+                    settings=wandb.Settings(
+                        start_method="thread",
+                        _disable_meta=True
+                    )
                 )
-                self.wandb_run_url = wandb.run.get_url()
+                
+                # Explicit URL printing with flush
+                print(f"\n\033[1;36mWANDB RUN URL:\033[0m {run.get_url()}\n", flush=True)
+                logger.info(f"WandB run started: {run.id}")
+                
+                self.wandb_run_url = run.get_url()
                 self.wandb_enabled = True
-                
-                # Print the run URL with clear formatting
-                print(f"\n{'='*50}")
-                print(f"W&B Dashboard: {self.wandb_run_url}")
-                print(f"{'='*50}\n")
-                logger.info(f"W&B run started: {wandb.run.name}")
-                
+
             except Exception as e:
-                logger.error(f"Failed to initialize W&B: {str(e)}")
+                logger.error(f"WandB init failed: {str(e)}")
+                print("\n\033[91mWARNING: Failed to initialize WandB - check API key\033[0m\n")
                 self.wandb_enabled = False
-                print("\nWARNING: Could not initialize Weights & Biases logging\n")
 
     def _get_memory_stats(self):
         """Simplified memory logging matching test output"""
