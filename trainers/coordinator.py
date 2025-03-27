@@ -524,35 +524,49 @@ class DDMTrainingCoordinator:
         return checkpoint.get('step', 0)
 
     def _init_wandb(self):
-        """Initialize Weights & Biases with distributed safety"""
+        """Initialize Weights & Biases with enhanced error handling and cleanup"""
         self.wandb_enabled = False
-        if self.rank == 0 and self.config.wandb_enabled:
-            try:
-                import wandb
-                # Force initialization before any distributed ops
-                wandb.require(experiment="service")
-                
-                run = wandb.init(
-                    project=self.config.wandb_project,
-                    config=dict(vars(self.config)),
-                    dir=self.config.output_dir,
-                    settings=wandb.Settings(
-                        start_method="thread",
-                        _disable_meta=True
-                    )
-                )
-                
-                # Explicit URL printing with flush
-                print(f"\n\033[1;36mWANDB RUN URL:\033[0m {run.get_url()}\n", flush=True)
-                logger.info(f"WandB run started: {run.id}")
-                
-                self.wandb_run_url = run.get_url()
-                self.wandb_enabled = True
+        
+        # Only attempt on rank 0 with config enabled
+        if self.rank != 0 or not getattr(self.config, 'wandb_enabled', False):
+            return
 
-            except Exception as e:
-                logger.error(f"WandB init failed: {str(e)}")
-                print("\n\033[91mWARNING: Failed to initialize WandB - check API key\033[0m\n")
-                self.wandb_enabled = False
+        try:
+            import wandb
+            # Check for existing run
+            if wandb.run is not None:
+                logger.warning("Existing WandB run detected - skipping initialization")
+                return
+
+            # Validate required config parameters
+            required_params = ['wandb_project', 'output_dir']
+            missing = [p for p in required_params if not hasattr(self.config, p)]
+            if missing:
+                logger.error(f"WandB disabled - missing config params: {missing}")
+                return
+
+            # Initialize with essential settings
+            run = wandb.init(
+                project=self.config.wandb_project,
+                config=dict(vars(self.config)),
+                dir=getattr(self.config, 'wandb_dir', self.config.output_dir),
+                settings=wandb.Settings(
+                    start_method="thread",
+                    _disable_meta=True  # Recommended for distributed training
+                )
+            )
+            
+            # Clearer URL logging
+            logger.info(f"\nWANDB RUN URL: {run.get_url()}\n")
+            self.wandb_run_url = run.get_url()
+            self.wandb_enabled = True
+
+        except ImportError:
+            logger.error("wandb package not installed - install with 'pip install wandb'")
+        except wandb.errors.UsageError as e:
+            logger.error(f"WandB configuration error: {str(e)}")
+        except Exception as e:
+            logger.error(f"WandB initialization failed: {str(e)}")
 
     def _get_memory_stats(self):
         """Simplified memory logging matching test output"""
