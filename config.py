@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     # ===== Training parameters =====
     'num_steps': 1000000,
-    'batch_size': 16,
+    'batch_size': 1,
     'learning_rate': 1e-4,
     'weight_decay': 1e-2,
     'warmup_steps': 1000,
@@ -33,11 +33,11 @@ DEFAULT_CONFIG = {
     'use_mixed_precision': True,
 
     # ===== Flux MMDiT Architecture =====
-    'hidden_size': 768,          # Transformer hidden size
+    'hidden_size': 1152,        # Transformer hidden size
     'in_channels': 16,
     'out_channels': 16,
-    'num_heads': 12,            # Attention heads per layer
-    'depth': 24,                # Transformer blocks with double stream
+    'num_heads': 16,            # Attention heads per layer
+    'depth': 30,                # Total transformer blocks
     'depth_single_blocks': 2,   # Transformer blocks with single stream
     'patch_size': 2,            # Input patch dimension
     'mlp_ratio': 4.0,           # FFN expansion factor
@@ -53,8 +53,9 @@ DEFAULT_CONFIG = {
 
     # ===== Expert Configuration =====
     'num_experts': 8,           # Number of data clusters
-    'cluster_embed_dim': 256,   # Expert specialization dimension
-    'expert_specialization': 'timestep',  # Cluster conditioning type
+    'cluster_embed_dim': 512,
+    'expert_specialization': 'cluster_token',  # From paper 3.3
+    'expert_capacity': 1.25,    # Cluster assignment buffer
     
     # ===== VAE Configuration =====
     'vae_model': "AuraDiffusion/16ch-vae",
@@ -143,7 +144,6 @@ DEFAULT_CONFIG = {
     
     # ===== Distributed Training ===== (simplified)
     'batch_size_per_gpu': 1,  # Batch size per GPU
-    'gradient_accumulation_steps': 2,  # Accumulate gradients
     'num_clusters': 8, # or your desired number of clusters 
     
     # ===== W&B Logging Parameters =====
@@ -199,7 +199,7 @@ DEFAULT_CONFIG = {
     # ===== Router Configuration =====
     'router_temperature': 2.0,  # Initial temperature for router softmax
     'router_min_temperature': 0.5,  # Minimum temperature after annealing
-    'router_temperature_decay': 0.99995,  # Temperature decay rate
+    'router_temp_decay': 0.9997,
 
     # Add to DEFAULT_CONFIG
     'distributed': {
@@ -211,6 +211,26 @@ DEFAULT_CONFIG = {
 
     # Add to DEFAULT_CONFIG
     'use_precomputed_latents': True,  # Set to True to disable VAE loading
+
+    # Add to DEFAULT_CONFIG
+    'cluster_embed_init': 'orthogonal',  # From paper 3.3
+    'position_embed_type': 'rope_2d',  
+    'num_attention_pools': 2,  # For spatial reduction
+    'attention_pool_stride': 2,  
+    'use_flash_attention': True,  
+    'expert_capacity_factor': 1.25,  # Buffer for cluster assignment
+
+    # Add to DEFAULT_CONFIG
+    'gradient_accumulation_steps': 2,
+    'expert_batch_size': 16,  # Per-expert batch size
+    'router_batch_size': 512,
+    'max_sequence_length': 3600,  # 60x60 latent patches
+    'position_embedding': 'scaled_rope',
+    'cluster_temp_decay': 0.99995,
+    'expert_sync_interval': 100,  # Sync experts every 100 steps
+
+    'cluster_stages': 3,  # Multi-stage clustering from 1024->256->64->8
+    'max_cluster_variance': 0.25,  # Variance threshold for cluster splitting
 }
 
 def dict_to_namespace(d):

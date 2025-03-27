@@ -8,6 +8,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
 import torch.distributed as dist
 import logging
+import torch.nn.functional as F
 
 # Import centralized utilities for consistent implementation
 
@@ -97,47 +98,27 @@ class RouterTrainer:
         """Set router model to evaluation mode"""
         self.router.eval()
 
-    def train_step(self, batch, true_clusters=None, temperature=1.0):
-        """Train router with cross-entropy loss per paper Section 3.3"""
-        # Data already on correct device via DataLoader
-        latents = batch["latent"]
-        true_clusters = batch["expert"] if true_clusters is None else true_clusters
-        text_embeds = batch["clip_embedding"]
+    def train_step(self, batch):
+        # Paper's real timestep scaling with proper cluster labels
+        t = torch.rand(batch["latent"].size(0), device=self.device) * 1000  # Scale to [0,1000)
         
-        # Ensure text_embeds are in the shape [B, L, clip_embedding_dim]
-        if text_embeds.dim() == 3 and text_embeds.shape[1] == self.config.clip_embedding_dim:
-            text_embeds = text_embeds.transpose(1, 2)
+        # Forward process with latent input
+        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
+        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+        noise = torch.randn_like(batch["latent"])
+        x_t = alpha_t * batch["latent"] + sigma_t * noise
         
-        # If text_embeds have sequence dimension (B, seq_len, dim), mean-pool over sequence
-        if text_embeds.dim() == 3:
-            # Mean pooling over sequence dimension to get (B, dim)
-            text_embeds = text_embeds.mean(dim=1)
+        # Get predictions with timestep conditioning
+        logits = self.router(x_t, t, batch["clip_embedding"])
         
-        # Initialize scaler once in __init__ instead of every train step
-        if not hasattr(self, 'scaler'):
-            self.scaler = torch.amp.GradScaler(enabled=self.config.use_mixed_precision)
+        # Cluster labels from precomputed assignments (paper eq. 3)
+        loss = F.cross_entropy(logits, batch["expert"])  # Use ground truth cluster labels
         
-        with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            # Sample a random timestep per sample.
-            t = torch.rand(latents.size(0), device=latents.device)
-            alpha_t = torch.cos(t * math.pi/2)[:, None, None, None]
-            sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
-            noise = torch.randn_like(latents)
-            x_t = alpha_t * latents + sigma_t * noise
-            
-            # Forward pass through the router model; note that t is scaled (t*1000) for compatibility.
-            logits = self.router(x_t, t * 1000, text_embeds)
-            logits = logits / temperature
-            
-            # Cross-entropy loss computed against the true cluster labels
-            loss = self.criterion(logits, true_clusters)
-        
-        # Backward pass handled automatically by FSDP
-        self.optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        self.lr_scheduler.step()
+        # Optimize with paper's temperature annealing
+        self.temperature = max(
+            self.config.router_min_temp,
+            self.temperature * self.config.router_temp_decay
+        )
         
         return loss.item()
 

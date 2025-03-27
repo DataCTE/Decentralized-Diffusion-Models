@@ -1145,3 +1145,20 @@ class DDMTrainingCoordinator:
             if latent.shape[1] != clip_emb.shape[1]:
                 raise ValueError(f"Mismatched sequence lengths: latent {latent.shape[1]} vs text {clip_emb.shape[1]}")
 
+    def _sync_experts(self):
+        # Paper's Byzantine-resistant consensus
+        expert_states = [e.state_dict() for e in self.experts]
+        validated_states = []
+        
+        # Validate states using Merkle proofs
+        for state in expert_states:
+            if validate_merkle_proof(state, self.consensus_tree):
+                validated_states.append(state)
+        
+        # Apply federated averaging only on validated states
+        avg_state = average_states(validated_states)
+        
+        # Update all experts with consensus state
+        for expert in self.experts:
+            expert.load_state_dict(avg_state)
+

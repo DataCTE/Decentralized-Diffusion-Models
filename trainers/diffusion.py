@@ -261,6 +261,14 @@ class DecentralizedFlowMatcher:
 
         return loss.mean()
 
+    def compute_loss(self, pred_flow, x0, t):
+        # Paper's exact flow matching loss calculation
+        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
+        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+        
+        target_flow = (x0 - alpha_t * pred_flow) / (sigma_t**2 + 1e-7)
+        return F.mse_loss(pred_flow, target_flow)
+
     def compute_loss(self, predictions, x0, t):
         """
         Compute flow matching loss with better error handling and shape compatibility

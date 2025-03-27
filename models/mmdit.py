@@ -6,6 +6,7 @@ This file integrates modular components from the modules directory.
 import torch
 from torch import Tensor, nn
 from dataclasses import dataclass
+import math
 
 
 # Import core modules
@@ -37,6 +38,7 @@ class FluxParams:
     qkv_bias: bool
     guidance_embed: bool
     latent_channels: int
+    gradient_checkpointing: bool
 
 
 class Flux(nn.Module):
@@ -72,6 +74,14 @@ class Flux(nn.Module):
 
         self.double_blocks = nn.ModuleList(
             [
+                torch.utils.checkpoint.checkpoint(
+                    DoubleStreamBlock(
+                        self.hidden_size,
+                        self.num_heads,
+                        mlp_ratio=params.mlp_ratio,
+                        qkv_bias=params.qkv_bias,
+                    )
+                ) if params.gradient_checkpointing else
                 DoubleStreamBlock(
                     self.hidden_size,
                     self.num_heads,
@@ -102,61 +112,55 @@ class Flux(nn.Module):
         cluster_ids: Tensor | None = None,
         guidance: Tensor | None = None,
     ) -> Tensor:
-        if img.ndim != 3 or txt.ndim != 3:
-            raise ValueError("Input img and txt tensors must have 3 dimensions.")
-
-        # running on sequences img
-        img = self.img_in(img)
-        vec = self.time_in(timestep_embedding(timesteps, 256))
-        if self.params.guidance_embed:
-            if guidance is None:
-                raise ValueError("Didn't get guidance strength for guidance distilled model.")
-            vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
-        vec = vec + self.vector_in(y)
-        txt = self.txt_in(txt)
-
-        ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe = self.pe_embedder(ids)
-
+        # Paper's cluster conditioning (Equation 5)
+        if cluster_ids is not None:
+            # Convert cluster IDs to embeddings
+            cluster_emb = self.pe_embedder_cluster(
+                cluster_ids.float() / self.params.num_clusters
+            )
+            # Project to hidden dimension
+            cluster_proj = self.cluster_proj(cluster_emb)
+            # Add to text conditioning vector
+            y = y + cluster_proj[:, None]  # [B, 1, D] -> [B, S, D]
+        
+        # Unified dtype handling
+        dtype = next(self.parameters()).dtype
+        img, txt = img.to(dtype), txt.to(dtype)
+        
+        # Fused embedding projections
+        img_emb = self.img_in(img) * (1 + self.time_in(timesteps)[:, None])
+        txt_emb = self.txt_in(txt) + self.vector_in(y)[:, None]
+        
+        # Combine embeddings
+        x = torch.cat([txt_emb, img_emb], dim=1)
+        pos_ids = torch.cat([txt_ids, img_ids], dim=1)
+        
+        # Process through transformer blocks
         for block in self.double_blocks:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+            x = block(x, vec=timesteps, pe=self.pe_embedder(pos_ids))
+        
+        return self.final_layer(x[:, txt_emb.size(1):], timesteps)
 
-        img = torch.cat((txt, img), 1)
-        for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe)
-        img = img[:, txt.shape[1] :, ...]
-
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
-        return img
-
-    def generate_position_ids(self, txt_embed: Tensor, img_embed: Tensor) -> tuple[Tensor, Tensor]:
-        """
-        Generate position IDs for text and image inputs.
+    def generate_position_ids(self, txt_embed: Tensor, img_embed: Tensor):
+        # Dynamic scaling based on sequence length
+        B, L_img, _ = img_embed.shape
+        H = W = int(math.sqrt(L_img))
         
-        Args:
-            txt_embed: Text embeddings [B, S, D]
-            img_embed: Image embeddings [B, P, C]
-            
-        Returns:
-            Tuple of (txt_ids, img_ids)
-        """
-        B = txt_embed.shape[0]
+        # Paper's Equation 8: Resolution-adaptive base frequency
+        base_theta = self.params.theta * (H * W / 64)  # Scale for resolution
         
-        # Create position IDs for text embeddings
-        txt_seq_len = txt_embed.shape[1]
-        txt_ids = torch.arange(txt_seq_len, device=txt_embed.device)
-        txt_ids = txt_ids.unsqueeze(0).expand(B, -1)  # [B, S]
+        # Generate grid with adaptive scaling
+        y_coords = torch.arange(H, device=img_embed.device, dtype=torch.float32)
+        x_coords = torch.arange(W, device=img_embed.device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(
+            y_coords / H * base_theta,
+            x_coords / W * base_theta,
+            indexing='ij'
+        )
         
-        # Create position IDs for image embeddings
-        img_seq_len = img_embed.shape[1]
-        img_ids = torch.arange(img_seq_len, device=img_embed.device) 
-        img_ids = img_ids.unsqueeze(0).expand(B, -1)  # [B, P]
-        
-        # Add extra dimension for RoPE
-        txt_ids = txt_ids.unsqueeze(-1)  # [B, S, 1]
-        img_ids = img_ids.unsqueeze(-1)  # [B, P, 1]
-        
-        return txt_ids, img_ids
+        # Combine and flatten
+        img_ids = torch.stack([grid_y, grid_x], dim=-1).flatten(0, 1)[None].expand(B, -1, -1)
+        return img_ids
 
 
 class FluxLoraWrapper(Flux):
@@ -212,6 +216,40 @@ class ExpertMMDiT(Flux):
         
         # Debug flag
         self.debug = True
+        
+        # Enable gradient checkpointing for large models
+        self.double_blocks = nn.ModuleList([
+            torch.utils.checkpoint.checkpoint_wrapper(
+                DoubleStreamBlock(
+                    self.hidden_size,
+                    self.num_heads,
+                    mlp_ratio=params.mlp_ratio,
+                    qkv_bias=params.qkv_bias,
+                ),
+                preserve_rng_state=False
+            ) if params.gradient_checkpointing else
+            DoubleStreamBlock(
+                self.hidden_size,
+                self.num_heads,
+                mlp_ratio=params.mlp_ratio,
+                qkv_bias=params.qkv_bias,
+            )
+            for _ in range(params.depth)
+        ])
+        
+        # Add gating mechanism for cluster specialization
+        self.cluster_gate = nn.Sequential(
+            nn.Linear(params.hidden_size, params.hidden_size * 4),
+            nn.GELU(),
+            nn.Linear(params.hidden_size * 4, params.hidden_size),
+            nn.Sigmoid()
+        )
+        
+        # Initialize gate weights properly
+        nn.init.orthogonal_(self.cluster_gate[0].weight)
+        nn.init.zeros_(self.cluster_gate[0].bias)
+        nn.init.orthogonal_(self.cluster_gate[2].weight)
+        nn.init.zeros_(self.cluster_gate[2].bias)
         
     def _validate_params(self, params):
         """Validate and prepare parameters for the expert model"""
@@ -313,7 +351,14 @@ class ExpertMMDiT(Flux):
             img = img[:, txt.shape[1]:, ...]
             img = self.final_layer(img, vec)
             
-            return img
+            # After combining cluster conditioning
+            cluster_emb = self.pe_embedder_cluster(cluster_ids.float()/self.params.num_clusters)
+            cluster_proj = self.cluster_proj(cluster_emb)
+            
+            # Modulate hidden states with cluster-specific gating
+            hidden = self.img_in(img) * (1 + self.cluster_gate(cluster_proj))
+            
+            return hidden
             
         except Exception as e:
             print(f"[CRITICAL ERROR MMDiT] Forward pass failed: {str(e)}")
@@ -405,7 +450,7 @@ class ExpertMMDiT(Flux):
             self.text_embedder = self.text_embedder.to(next(self.parameters()).device)
         
         # Get text embeddings
-        text_embeddings, uncond_embeddings = self.text_embedder.encode_with_uncond(prompts)
+        text_embeddings, uncond_embeddings = self.text_embeddings.encode_with_uncond(prompts)
         
         # Prepare for classifier-free guidance
         batch_size = text_embeddings.shape[0]

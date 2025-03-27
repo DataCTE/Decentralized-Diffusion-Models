@@ -153,41 +153,12 @@ def load_models(config, device, checkpoint_dir, cache_manager=None):
     else:
         logger.warning(f"Router checkpoint {router_checkpoint} not found")
     
-    # Create dictionary to hold expert models
-    expert_models = {}
-    
-    # Load expert models (lazily if cache manager is provided)
-    if cache_manager is None:
-        # Without cache manager, load all experts at once
-        for expert_idx in range(config.num_experts):
-            expert_checkpoint = os.path.join(checkpoint_dir, f"expert_{expert_idx}.pt")
-            if os.path.exists(expert_checkpoint):
-                logger.info(f"Loading expert {expert_idx}")
-                expert_model = ExpertMMDiT(config).to(device)
-                state_dict = torch.load(expert_checkpoint, map_location=device)
-                expert_model.load_state_dict(state_dict)
-                expert_models[expert_idx] = expert_model
-            else:
-                logger.warning(f"Expert checkpoint {expert_checkpoint} not found")
-    else:
-        # With cache manager, just verify checkpoints exist and create loader functions
-        for expert_idx in range(config.num_experts):
-            expert_checkpoint = os.path.join(checkpoint_dir, f"expert_{expert_idx}.pt")
-            if os.path.exists(expert_checkpoint):
-                # Create a builder function for this expert
-                def create_expert_builder(idx, checkpoint_path):
-                    def builder(_):
-                        logger.info(f"Loading expert {idx} with cache manager")
-                        expert_model = ExpertMMDiT(config).to(device)
-                        state_dict = torch.load(checkpoint_path, map_location=device)
-                        expert_model.load_state_dict(state_dict)
-                        return expert_model
-                    return builder
-                
-                # Store the builder in the expert_models dictionary
-                expert_models[expert_idx] = create_expert_builder(expert_idx, expert_checkpoint)
-            else:
-                logger.warning(f"Expert checkpoint {expert_checkpoint} not found")
+    # Add dynamic expert loading
+    expert_models = DynamicExpertCache(
+        capacity=config.max_experts_in_memory,
+        loader_fn=lambda idx: load_single_expert(idx, config, device),
+        eviction_policy="lru"
+    )
     
     return router_model, expert_models, vae, clip
 
@@ -400,6 +371,10 @@ def run_inference_pipeline(
                 top_k = min(getattr(config, 'top_k', 1), len(expert_models))
                 top_p = getattr(config, 'top_p', 0.9)
                 true_clusters = None  # Oracle strategy not supported in inference.py
+                
+                # Paper's top-k expert selection
+                expert_weights = router_model.get_expert_weights(text_embeddings, top_k)
+                topk_weights, topk_indices = torch.topk(expert_weights, k=top_k)
                 
                 latents = ddm_sample(
                     router=router_model,

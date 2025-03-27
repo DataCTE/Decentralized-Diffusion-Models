@@ -151,109 +151,78 @@ class ExpertTrainer(BaseTrainer):
         return loss # flow_matcher.compute_loss already returns a scalar loss item
 
     def train_step(self, batch):
-        """Train expert with flow matching loss per paper Section 3.2"""
-        # Pre-step validation
-        if not hasattr(self, 'router') or self.router is None:
-            raise RuntimeError(
-                f"Expert {self.expert_idx} lost router reference during training! "
-                f"Rank {self.rank}, World Size {self.world_size}"
-            )
+        # Paper-recommended modifications
+        self.expert.train()
+        self.router.eval()  # Freeze router during expert training
         
-        print(f"[DEBUG Expert {self.expert_idx}] Starting train_step")
-        print(f"[DEBUG Expert {self.expert_idx}] Batch keys: {batch.keys()}")
-        
-        # Get data - ensure proper device placement
-        latents = batch["latent"].to(self.device, non_blocking=True)
-        text_embeds = batch["clip_embedding"].to(self.device, non_blocking=True)
-        
-        # Get router-predicted clusters with proper timestep scaling
+        # Get router predictions with temperature annealing
         with torch.no_grad():
-            # Generate proper timesteps scaled to [0, 1000)
-            router_t = torch.rand(text_embeds.size(0), device=text_embeds.device) * 1000
-            
-            # Pass scaled timesteps to router
-            cluster_ids = self.router.router(
-                img=latents,
-                txt=text_embeds,
-                timesteps=router_t
-            ).argmax(dim=-1)
-        
-        # Print shapes for debugging (using filtered tensors)
-        print(f"[DEBUG Expert {self.expert_idx}] Processing {latents.shape[0]} samples for this expert.")
-        print(f"[DEBUG Expert {self.expert_idx}] latents shape: {latents.shape}")
-        print(f"[DEBUG Expert {self.expert_idx}] text_embeds shape: {text_embeds.shape}")
-        print(f"[DEBUG Expert {self.expert_idx}] cluster_ids shape: {cluster_ids.shape}")
-        
-        # Reshape latents if needed - handle 5D format [B, S, C, H, W] → [B, C, H, W]
-        original_shape = latents.shape
-        if latents.dim() == 5:
-            B, S, C, H, W = latents.shape
-            if S == 1:
-                latents = latents.squeeze(1)  # Remove sequence dimension if S=1
-                print(f"[DEBUG Expert {self.expert_idx}] Reshaped latents to: {latents.shape}")
-            else:
-                print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch, using first sequence")
-                latents = latents[:, 0]  # Take only first sequence if multiple
-                print(f"[DEBUG Expert {self.expert_idx}] Using first sequence, shape: {latents.shape}")
-        # --- FIX: Reshape latents to [B, SeqLen, Channels] ---
-        B, C, H, W = latents.shape # B is now the number of samples for this expert
-        img_seq = latents.reshape(B, C, H * W).permute(0, 2, 1) # Shape: [B_expert, H*W, C]
-        print(f"[DEBUG Expert {self.expert_idx}] Reshaped img_seq for model: {img_seq.shape}")
-        # --- END FIX ---
-        
-        # Same for text embeddings if needed
-        if text_embeds.dim() == 4:
-            B_txt, S_txt, L_txt, D_txt = text_embeds.shape # B_txt is B_expert
-            if S_txt == 1:
-                text_embeds = text_embeds.squeeze(1)
-                print(f"[DEBUG Expert {self.expert_idx}] Reshaped text_embeds to: {text_embeds.shape}")
-        
-        # Mixed precision context
-        with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            # Random timesteps
-            t = torch.rand(latents.size(0), device=self.device) # Use B_expert size
-            print(f"[DEBUG Expert {self.expert_idx}] timesteps shape: {t.shape}")
-            
-            try:
-                # --- FIXED: Use proper _get_position_ids method instead of manual creation ---
-                # Get position IDs using our existing method that returns 3D tensor [B, H*W, 2]
-                pos_ids = self._get_position_ids(latents)
-                print(f"[DEBUG Expert {self.expert_idx}] pos_ids shape: {pos_ids.shape}")
+            router_t = torch.rand(batch["latent"].size(0), device=self.device) * 1000
+            cluster_probs = F.softmax(
+                self.router(batch["latent"], router_t, batch["clip_embedding"]) / 
+                max(self.config.router_min_temp, 
+                    self.config.router_temperature * (self.config.router_temperature_decay ** self.step)),
+                dim=-1
+            )
+            cluster_ids = torch.multinomial(cluster_probs, 1).squeeze(-1)
 
-                # Forward pass through expert model
-                print(f"[DEBUG Expert {self.expert_idx}] Calling expert forward pass")
-                pred_flow = self.expert(
-                    img=img_seq,                      # Use filtered & reshaped image sequence
-                    img_ids=pos_ids,                  # Use 3D position IDs from _get_position_ids method
-                    txt=text_embeds,                  # Use filtered text embeds
-                    txt_ids=self._get_text_position_ids(text_embeds), # Use filtered text embeds
-                    timesteps=t * 1000,               # Scale timesteps to [0, 1000)
-                    y=self._get_conditioning(latents.shape[0]), # Use B_expert size
-                    cluster_ids=batch['cluster_pred'] # Use router predictions instead of ground truth
-                )
-                # --- END FIX ---
-                
-                print(f"[DEBUG Expert {self.expert_idx}] pred_flow shape: {pred_flow.shape}")
-                
-                # Calculate loss - need to reshape latents back if it was modified
-                print(f"[DEBUG Expert {self.expert_idx}] Computing loss with flow_matcher")
-                # Pass the reshaped prediction and original filtered latents to the loss function
-                loss = self.flow_matcher.compute_loss(pred_flow, latents, t)
-                print(f"[DEBUG Expert {self.expert_idx}] Loss value: {loss.item()}")
-                
-            except Exception as e:
-                print(f"[CRITICAL ERROR Expert {self.expert_idx}] Forward pass failed: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                raise
+        # Filter batch for expert's cluster
+        expert_mask = (cluster_ids == self.expert_idx)
+        if not torch.any(expert_mask):
+            return None  # No samples for this expert
         
-        # Backpropagation
-        self.optimizer.zero_grad()
+        expert_batch = {
+            k: v[expert_mask] for k,v in batch.items() 
+            if not isinstance(v, list)
+        }
+
+        # Add capacity-aware filtering
+        expert_capacity = int(self.config.expert_batch_size * self.config.expert_capacity_factor)
+        
+        # After getting expert_mask
+        if expert_mask.sum() > expert_capacity:
+            # Paper's capacity-aware random selection
+            selected_indices = torch.randperm(expert_mask.sum(), device=self.device)[:expert_capacity]
+            expert_mask[expert_mask.nonzero()[selected_indices]] = False
+
+        # Paper's recommended forward pass
+        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+            # Convert latent to sequence format
+            B, C, H, W = expert_batch["latent"].shape
+            img_seq = expert_batch["latent"].view(B, C, H*W).permute(0, 2, 1)
+            
+            # Get position IDs
+            pos_ids = self._get_position_ids(expert_batch["latent"])
+            
+            pred_flow = self.expert(
+                img=img_seq,
+                img_ids=pos_ids,
+                txt=expert_batch["clip_embedding"],
+                txt_ids=self._get_text_position_ids(expert_batch["clip_embedding"]),
+                timesteps=torch.rand(B, device=self.device) * 1000,
+                y=self._get_conditioning(B),
+                cluster_ids=cluster_ids[expert_mask]
+            )
+            
+            # Reshape prediction to match latent
+            pred_flow = pred_flow.permute(0, 2, 1).view(B, C, H, W)
+            
+            # Paper's equation 6
+            loss = self.flow_matcher.compute_loss(
+                pred_flow, 
+                expert_batch["latent"],
+                torch.rand(B, device=self.device)
+            )
+
+        # Gradient handling per paper appendix
         self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.step % self.config.gradient_accumulation_steps == 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.expert.parameters(), self.config.max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad()
         
-        print(f"[DEBUG Expert {self.expert_idx}] Successfully completed train_step")
         return loss.item()
     
     def save_checkpoint(self, save_dir, step):

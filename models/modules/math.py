@@ -35,18 +35,21 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    # Reshape xq/xk to [..., seq_len, head_dim]
-    xq = xq.transpose(1, 2)  # [B, seq_len, num_heads, head_dim]
-    xk = xk.transpose(1, 2)
+    # Reshape xq/xk to [batch, num_heads, seq_len, head_dim]
+    xq = xq.permute(0, 2, 1, 3)  # [B, nh, T, hs]
+    xk = xk.permute(0, 2, 1, 3)
     
-    # Remove dummy dimension and reshape freqs_cis
-    freqs_cis = freqs_cis.squeeze(1)  # [B, seq_len, head_dim]
+    # Reshape freqs_cis to match dimensions
+    freqs_cis = freqs_cis.view(xq.size(0), xq.size(2), 1, -1)  # [B, T, 1, D]
     
-    # Apply RoPE to first half of dimensions
-    head_dim = xq.shape[-1]
-    xq_rot = xq * freqs_cis[..., :head_dim//2] + \
-             torch.roll(xq, shifts=head_dim//2, dims=-1) * freqs_cis[..., head_dim//2:]
-    xk_rot = xk * freqs_cis[..., :head_dim//2] + \
-             torch.roll(xk, shifts=head_dim//2, dims=-1) * freqs_cis[..., head_dim//2:]
+    # Split dimensions for complex-valued computation
+    xq_float = xq.float().reshape(*xq.shape[:-1], -1, 2)
+    xk_float = xk.float().reshape(*xk.shape[:-1], -1, 2)
     
-    return xq_rot.transpose(1, 2), xk_rot.transpose(1, 2)
+    # Apply RoPE using einsum for efficiency
+    xq_out = torch.einsum('...td,...d->...td', xq_float, freqs_cis)
+    xk_out = torch.einsum('...td,...d->...td', xk_float, freqs_cis)
+    
+    # Recombine and cast back to original dtype
+    return (xq_out.flatten(3).type_as(xq),
+            xk_out.flatten(3).type_as(xk))
