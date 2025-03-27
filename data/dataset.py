@@ -51,6 +51,7 @@ class DDMDataset(Dataset):
         self.feature_dir = self.config.feature_cache_path
         self.rank = get_rank()
         self.world_size = get_world_size()
+        self.device = torch.device('cpu')
         
         # Cache directories
         self.latent_dir = os.path.join(self.config.feature_cache_path, "latents")
@@ -156,7 +157,9 @@ class DDMDataset(Dataset):
         assignments = []
         for base_name in self.base_names:
             path = os.path.join(self.bucket_dir, f"{base_name}_rank{self.rank}.pt")
-            assignments.append(torch.load(path, map_location='cpu'))
+            assignments.append(torch.load(path, map_location='cpu'))  # Load to CPU first
+        
+        # Stack and move to dataset's device
         return torch.stack(assignments).to(self.device)
 
     def _compute_cluster_statistics(self):
@@ -301,7 +304,7 @@ class BucketBatchSampler(torch.utils.data.Sampler):
         
         # Convert lists to tensors
         self.bucket_tensors = {
-            bucket: torch.tensor(indices, device=self.device)
+            bucket: indices.to(self.device)  # Moves to sampler's device
             for bucket, indices in self.bucket_indices.items()
         }
         
