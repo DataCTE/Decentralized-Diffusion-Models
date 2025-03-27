@@ -48,6 +48,9 @@ DEFAULT_CONFIG = {
     ],
     'latent_channels': 16,
     'vae_scaling_factor': 0.18215,
+    'in_channels': 16,
+    'out_channels': 16,
+    'clip_embedding_dim': 768,
     
     # ===== Router Configuration =====
     'router_learning_rate': 1e-4,
