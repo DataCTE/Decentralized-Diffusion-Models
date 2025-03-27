@@ -302,14 +302,14 @@ class DDMTrainingCoordinator:
         end = min(start + experts_per_rank, total_experts)
         return torch.arange(start, end, device=self.device)
 
-    def train(self):
+    def train(self, num_steps: int):
         """Main training loop with improved step tracking"""
         self.step = 0
-        progress_bar = tqdm(total=self.config.num_steps, 
+        progress_bar = tqdm(total=num_steps, 
                           desc="Training Progress",
                           disable=not self.rank == 0)
         
-        while self.step < self.config.num_steps:
+        while self.step < num_steps:
             batch = self._get_next_batch()
             
             # Unified training step
