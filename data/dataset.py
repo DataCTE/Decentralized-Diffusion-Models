@@ -71,6 +71,9 @@ class DDMDataset(Dataset):
         
         # Remove all preloading logic
         logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples (lazy loading enabled)")
+        
+        # Initialize bucket assignments as a property
+        self._bucket_assignments = None  # Initialize cache
 
     def _verify_cache_dirs(self):
         """Verify cache directories and initialize sample IDs"""
@@ -141,14 +144,20 @@ class DDMDataset(Dataset):
             self._cluster_assignments = torch.load(cluster_file, map_location='cpu')
         return self._cluster_assignments
 
-    def _load_bucket_assignments(self):
-        """Load bucket assignments on first access"""
-        if not hasattr(self, '_bucket_assignments'):
-            self._bucket_assignments = []
-            for base_name in self.base_names:
-                path = os.path.join(self.bucket_dir, f"{base_name}_rank{self.rank}.pt")
-                self._bucket_assignments.append(torch.load(path, map_location='cpu'))
+    @property
+    def bucket_assignments(self):
+        """Lazy-loaded bucket assignments tensor"""
+        if self._bucket_assignments is None:
+            self._bucket_assignments = self._load_bucket_assignments()
         return self._bucket_assignments
+
+    def _load_bucket_assignments(self):
+        """Load and cache bucket assignments as tensor"""
+        assignments = []
+        for base_name in self.base_names:
+            path = os.path.join(self.bucket_dir, f"{base_name}_rank{self.rank}.pt")
+            assignments.append(torch.load(path, map_location='cpu'))
+        return torch.stack(assignments).to(self.device)
 
     def _compute_cluster_statistics(self):
         """Compute and cache cluster statistics"""
@@ -274,7 +283,7 @@ class CombinedBatchSampler(Sampler):
 class BucketBatchSampler(torch.utils.data.Sampler):
     """Groups samples by bucket dimensions for efficient batching"""
     
-    def __init__(self, dataset, batch_size, bucket_indices=None, device='cpu', shuffle=True, drop_last=True):
+    def __init__(self, dataset, batch_size, device='cpu', shuffle=True, drop_last=True, bucket_indices=None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -470,20 +479,3 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     print(f"[Rank {rank}] Total initialization time: {time.time() - loader_start:.2f}s")
 
     return expert_loaders
-
-def _init_data_loaders(self):
-    # Replace with distributed sampler
-    sampler = DistributedSampler(
-        self.train_dataset,
-        num_replicas=self.world_size,
-        rank=self.rank,
-        shuffle=True
-    )
-    
-    self.train_loader = DataLoader(
-        self.train_dataset,
-        batch_size=self.config.batch_size,
-        sampler=sampler,
-        pin_memory=True,
-        persistent_workers=True
-    ) 
