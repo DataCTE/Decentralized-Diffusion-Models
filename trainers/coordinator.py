@@ -199,6 +199,9 @@ class DDMTrainingCoordinator:
             ).expert
             self.experts[str(expert_idx)] = expert
 
+        # FIX: Return the initialized models as tuple
+        return (self.router, self.experts)
+
     def _init_data_loaders(self):
         """Initialize distributed data loaders with bucket sampling"""
         dataset = DDMDataset(self.config)
