@@ -43,7 +43,7 @@ def simple_collate(batch):
         return None
 
 class DDMDataset(Dataset):
-    """Distributed-optimized dataset pipeline with lazy loading and prefetching"""
+    """Distributed-optimized dataset with on-demand loading"""
     
     def __init__(self, config_dict, split='train'):
         # Convert config dict to SimpleNamespace
@@ -51,10 +51,6 @@ class DDMDataset(Dataset):
         self.feature_dir = self.config.feature_cache_path
         self.rank = get_rank()
         self.world_size = get_world_size()
-        self.verbose = getattr(self.config, 'verbose', False)
-        
-        # Set device based on availability and rank
-        self.device = torch.device(f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu")
         
         # Cache directories
         self.latent_dir = os.path.join(self.config.feature_cache_path, "latents")
@@ -73,47 +69,8 @@ class DDMDataset(Dataset):
         # Extract base names without rank suffix for loading other features
         self.base_names = [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
         
-        # Initialize memory-mapped cache
-        self.cache = {}
-        self.cache_size = min(100, self.num_samples)  # Adjust cache size if needed
-        
-        # Pre-load frequently accessed data with improved parallelism
-        logger.info(f"Pre-loading data for rank {self.rank}")
-        
-        # Use a more efficient preloading approach
-        with tqdm(total=min(self.cache_size, self.num_samples), 
-                  desc=f"Rank {self.rank} preloading",
-                  position=self.rank % 8,  # Stagger progress bars
-                  leave=False) as pbar:
-            
-            # Process in smaller batches to avoid memory issues
-            batch_size = 10
-            for batch_start in range(0, min(self.cache_size, self.num_samples), batch_size):
-                batch_end = min(batch_start + batch_size, self.cache_size, self.num_samples)
-                batch_indices = range(batch_start, batch_end)
-                
-                # Process one batch with multiple workers
-                with ThreadPoolExecutor(max_workers=min(4, len(batch_indices))) as executor:
-                    futures = [executor.submit(self._load_sample, idx) for idx in batch_indices]
-                    
-                    for future in as_completed(futures):
-                        idx, data = future.result()
-                        if data is not None:
-                            self.cache[idx] = data
-                        pbar.update(1)
-        
-        # Load global cluster assignments to GPU
-        self.expert_assignments = self._lazy_load_clusters()
-        
-        # Load bucket assignments to GPU
-        self.bucket_assignments = self._load_bucket_assignments()
-        
-        # Load cluster assignments and compute statistics
-        self.cluster_assignments = self._lazy_load_clusters()
-        self._compute_cluster_statistics()
-        
-        logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples")
-        logger.info(f"[Rank {self.rank}] Preloaded {len(self.cache)} samples")
+        # Remove all preloading logic
+        logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples (lazy loading enabled)")
 
     def _verify_cache_dirs(self):
         """Verify cache directories and initialize sample IDs"""
@@ -142,177 +99,56 @@ class DDMDataset(Dataset):
         self.num_samples = len(self.samples)
         print(f"Found {self.num_samples} valid samples with both latent and CLIP embeddings")
 
-    def _lazy_load_clusters(self):
-        """Load precomputed cluster assignments with proper device placement"""
-        cluster_path = os.path.join(self.cluster_dir, "final_clusters.pt")
-        try:
-            # Add safe_globals context for numpy compatibility
-            with torch.serialization.safe_globals([_reconstruct]):
-                cluster_dict = torch.load(
-                    cluster_path,
-                    map_location=self.device,
-                    weights_only=False  # Required for numpy compatibility
-                )
-            
-            # Handle the cluster dictionary (image name -> cluster id)
-            if isinstance(cluster_dict, dict):
-                # Create assignments tensor using base names
-                assignments = torch.zeros(len(self.base_names), dtype=torch.long, device=self.device)
-                
-                for idx, base_name in enumerate(self.base_names):
-                    # Get cluster assignment if it exists, otherwise use default (0)
-                    cluster_id = cluster_dict.get(base_name, 0)
-                    assignments[idx] = cluster_id
-                
-                cluster_assignments = assignments
-            elif isinstance(cluster_dict, np.ndarray):
-                # Legacy format - convert to tensor
-                cluster_assignments = torch.from_numpy(cluster_dict).to(self.device)
-            else:
-                # Already a tensor
-                cluster_assignments = cluster_dict.to(self.device)
-            
-            # Validate cluster assignments
-            num_clusters = cluster_assignments.max().item() + 1
-            if num_clusters != self.config.num_experts:
-                logger.warning(
-                    f"Found {num_clusters} clusters but config specifies {self.config.num_experts} experts"
-                )
-            
-            # Log cluster distribution
-            unique_clusters, counts = torch.unique(cluster_assignments, return_counts=True)
-            for cluster, count in zip(unique_clusters.tolist(), counts.tolist()):
-                logger.info(f"Cluster {cluster}: {count} samples")
-            
-            # Ensure cluster assignments are within valid range
-            if (cluster_assignments < 0).any() or (cluster_assignments >= self.config.num_experts).any():
-                raise ValueError(
-                    f"Invalid cluster assignments found. Min: {cluster_assignments.min()}, "
-                    f"Max: {cluster_assignments.max()}, Expected range: [0, {self.config.num_experts-1}]"
-                )
-            
-            return cluster_assignments
-            
-        except Exception as e:
-            logger.error(f"Failed to load cluster assignments: {str(e)}")
-            raise
-
-    def _load_sample(self, idx):
-        """Load all features for a sample with improved file pattern matching"""
-        # Get the sample ID from the samples list
-        sample_id = self.samples[idx]
-        base_name = f"anime-{sample_id}"
-        
-        # Use a more direct path construction for the specific rank
-        # First try the file for this rank
-        clip_file = Path(self.clip_dir) / f"{base_name}_rank{self.rank}.pt"
-        
-        # If not found, fall back to any rank
-        if not clip_file.exists():
-            # Try to find any rank file
-            for rank_file in Path(self.clip_dir).glob(f"{base_name}_rank*.pt"):
-                clip_file = rank_file
-                break
-        
-        if not clip_file.exists():
-            if self.verbose:
-                print(f"WARNING: Missing required CLIP embedding file for {base_name}")
-            return idx, None  # Return index with None for data
-        
-        # Same approach for latent files
-        latent_file = Path(self.latent_dir) / f"{base_name}_rank{self.rank}.pt"
-        
-        if not latent_file.exists():
-            # Try to find any rank file
-            for rank_file in Path(self.latent_dir).glob(f"{base_name}_rank*.pt"):
-                latent_file = rank_file
-                break
-        
-        if not latent_file.exists():
-            if self.verbose:
-                print(f"WARNING: Missing required latent file for {base_name}")
-            return idx, None  # Return index with None for data
-        
-        # Now load both files
-        try:
-            clip_embedding = torch.load(clip_file, map_location=self.device)
-            latent = torch.load(latent_file, map_location=self.device)
-            
-            # Create and return complete sample data with index
-            return idx, {
-                'latent': latent,
-                'clip_embedding': clip_embedding,
-                'bucket': self.bucket_assignments[idx] if hasattr(self, 'bucket_assignments') else torch.tensor(0, device=self.device),
-                'expert': self.cluster_assignments[idx] if hasattr(self, 'cluster_assignments') else torch.tensor(0, device=self.device),
-                'cluster_pred': torch.tensor(0, device=self.device)  # Default value, will be predicted by router
-            }
-        except Exception as e:
-            if self.verbose:
-                print(f"Error loading tensors from {clip_file} or {latent_file}: {str(e)}")
-            return idx, None  # Return index with None for data
-
-    def _load_bucket_assignments(self):
-        """Load bucket assignments efficiently"""
-        assignments = []
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = []
-            for base in self.base_names:
-                futures.append(executor.submit(
-                    torch.load,
-                    os.path.join(self.bucket_dir, f"{base}_rank{self.rank}.pt"),
-                    weights_only=False
-                ))
-            
-            for future in futures:
-                try:
-                    assignments.append(future.result())
-                except Exception as e:
-                    logger.error(f"Error loading bucket assignment: {str(e)}")
-                    assignments.append(torch.tensor(0))  # Default bucket
-                    
-        return torch.stack(assignments).to(self.device)
-
     def __getitem__(self, idx):
-        """Load a sample and its corresponding features"""
+        """Load individual sample on demand"""
         try:
-            # Check cache first
-            if idx in self.cache:
-                return self.cache[idx]
+            base_name = self.base_names[idx]
             
-            # Get sample data
-            _, sample_data = self._load_sample(idx)
+            # Load latent
+            latent = torch.load(self.latent_files[idx], map_location='cpu')
             
-            # Validate the data
-            if sample_data is None or 'clip_embedding' not in sample_data or 'latent' not in sample_data:
-                raise ValueError(f"Missing required features for sample at index {idx}")
+            # Load CLIP embeddings
+            clip_path = os.path.join(self.clip_dir, f"{base_name}_rank{self.rank}.pt")
+            clip_embed = torch.load(clip_path, map_location='cpu')
             
-            # Return the complete sample
+            # Load cluster assignment
+            cluster_path = os.path.join(self.cluster_dir, f"{base_name}_rank{self.rank}.pt")
+            cluster_id = torch.load(cluster_path, map_location='cpu')
+            
+            # Load bucket dimensions
+            dim_path = os.path.join(self.dim_dir, f"{base_name}_rank{self.rank}.pt")
+            bucket_dims = torch.load(dim_path, map_location='cpu')
+            
             return {
-                'latent': sample_data['latent'].to(self.device),
-                'clip_embedding': sample_data['clip_embedding'].to(self.device),
-                'bucket': sample_data.get('bucket', 0),
-                'expert': sample_data.get('expert', 0),
-                'cluster_pred': sample_data.get('cluster_pred', 0)
+                'latent': latent,
+                'clip_embedding': clip_embed,
+                'expert': cluster_id,
+                'dims': bucket_dims
             }
+            
         except Exception as e:
-            # Error handling
-            print(f"Error loading sample {idx}: {str(e)}")
-            # Return a fallback or empty sample
-            # This is better than raising an exception which would crash training
-            return {
-                'latent': torch.zeros((16, 16, 16), device=self.device),  # Default size based on config
-                'clip_embedding': torch.zeros((77, 768), device=self.device),  # Default CLIP dims
-                'bucket': 0,
-                'expert': 0,
-                'cluster_pred': 0
-            }
+            logger.error(f"Error loading sample {idx} on rank {self.rank}: {str(e)}")
+            raise
 
     def __len__(self):
         return self.num_samples
-        
-    def __del__(self):
-        """Cleanup resources"""
-        pass
+
+    # Remove all preloading-related methods
+    def _lazy_load_clusters(self):
+        """Load cluster assignments on first access"""
+        if not hasattr(self, '_cluster_assignments'):
+            cluster_file = os.path.join(self.cluster_dir, "final_clusters.pt")
+            self._cluster_assignments = torch.load(cluster_file, map_location='cpu')
+        return self._cluster_assignments
+
+    def _load_bucket_assignments(self):
+        """Load bucket assignments on first access"""
+        if not hasattr(self, '_bucket_assignments'):
+            self._bucket_assignments = []
+            for base_name in self.base_names:
+                path = os.path.join(self.bucket_dir, f"{base_name}_rank{self.rank}.pt")
+                self._bucket_assignments.append(torch.load(path, map_location='cpu'))
+        return self._bucket_assignments
 
     def _compute_cluster_statistics(self):
         """Compute and cache cluster statistics"""
