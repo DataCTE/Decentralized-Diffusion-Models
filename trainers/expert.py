@@ -359,37 +359,23 @@ class ExpertTrainer(BaseTrainer):
                 logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 
 
     def _get_position_ids(self, x):
-        """Generate position IDs for images with proper dimensionality"""
-        # Handle different possible input shapes
-        if x.dim() == 5:  # [B, S, C, H, W]
-            B, S, C, H, W = x.shape
-            if S > 1:
-                print(f"[WARNING Expert {self.expert_idx}] Multiple sequences ({S}) in batch for pos IDs, using first.")
-            # Use dimensions from the first sequence element if S > 1
-            H, W = x.shape[3], x.shape[4]
-        elif x.dim() == 4:
-            B, C, H, W = x.shape
-        else:
-            raise ValueError(f"Unexpected tensor dimensions for pos IDs: {x.dim()}, shape: {x.shape}")
-
-        # Calculate position ids for a grid
-        pos_h = torch.arange(0, H, device=self.device)
-        pos_w = torch.arange(0, W, device=self.device)
+        # Get spatial dimensions
+        if x.dim() == 4:
+            _, _, H, W = x.shape
+        else:  # Handle sequence format
+            H = W = int(math.sqrt(x.shape[1]))
         
-        # Create a grid of coordinates
+        # Generate grid with matching dtype and device
+        device = x.device
+        dtype = x.dtype
+        pos_h = torch.arange(H, device=device, dtype=dtype)
+        pos_w = torch.arange(W, device=device, dtype=dtype)
         grid_h, grid_w = torch.meshgrid(pos_h, pos_w, indexing='ij')
         
-        # Flatten the grid coordinates
-        flat_h = grid_h.reshape(-1)
-        flat_w = grid_w.reshape(-1)
+        # Stack and flatten to [B, H*W, 2]
+        pos_ids = torch.stack([grid_h, grid_w], dim=-1).flatten(0, 1)[None]  # [1, L, 2]
+        pos_ids = pos_ids.expand(x.shape[0], -1, -1)  # [B, L, 2]
         
-        # Stack to get [H*W, 2] tensor with (y, x) coordinates
-        grid_coords = torch.stack([flat_h, flat_w], dim=1)
-        
-        # Expand to batch dimension [B, H*W, 2]
-        pos_ids = grid_coords.unsqueeze(0).expand(B, -1, -1)
-        
-        print(f"[DEBUG Expert {self.expert_idx}] Position ID output shape: {pos_ids.shape}")
         return pos_ids
 
     def _get_text_position_ids(self, text_emb):

@@ -22,15 +22,24 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    # Reshape xq and xk to match RoPE dimensions
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 2)
+    # Reshape xq/xk to [..., seq_len, head_dim]
+    xq = xq.transpose(1, 2)  # [B, seq_len, num_heads, head_dim]
+    xk = xk.transpose(1, 2)
     
-    # Reshape freqs_cis to match the sequence length
-    freqs_cis = freqs_cis.view(*freqs_cis.shape[:-2], -1, 2)
+    # Reshape freqs_cis to match xq dimensions
+    freqs_cis = freqs_cis.view(freqs_cis.shape[0], xq.shape[1], -1)
     
-    # Apply RoPE rotations using einsum for better memory efficiency
-    xq_out = torch.einsum("...qd,...qd->...q", xq_, freqs_cis)
-    xk_out = torch.einsum("...kd,...kd->...k", xk_, freqs_cis)
+    # Apply RoPE to first half of dimensions
+    head_dim = xq.shape[-1]
+    half_dim = head_dim // 2
+    freq_shape = (1, 1, half_dim)
     
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+    sin, cos = torch.sin(freqs_cis), torch.cos(freqs_cis)
+    xq_rot = xq[..., :half_dim] * cos + xq[..., half_dim:half_dim*2] * sin
+    xk_rot = xk[..., :half_dim] * cos + xk[..., half_dim:half_dim*2] * sin
+    
+    # Concatenate rotated and unrotated parts
+    xq_out = torch.cat([xq_rot, xq[..., half_dim*2:]], dim=-1)
+    xk_out = torch.cat([xk_rot, xk[..., half_dim*2:]], dim=-1)
+    
+    return xq_out.transpose(1, 2), xk_out.transpose(1, 2)

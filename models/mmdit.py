@@ -36,6 +36,7 @@ class FluxParams:
     theta: int
     qkv_bias: bool
     guidance_embed: bool
+    latent_channels: int
 
 
 class Flux(nn.Module):
@@ -47,15 +48,17 @@ class Flux(nn.Module):
         super().__init__()
 
         self.params = params
-        self.in_channels = params.in_channels
+        self.in_channels = params.latent_channels
         self.out_channels = params.out_channels
         if params.hidden_size % params.num_heads != 0:
             raise ValueError(
                 f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}"
             )
         pe_dim = params.hidden_size // params.num_heads
+        if len(params.axes_dim) != 2:  # Require 2D position encoding
+            raise ValueError(f"Positional axes must be 2D for image data")
         if sum(params.axes_dim) != pe_dim:
-            raise ValueError(f"Got {params.axes_dim} but expected positional dim {pe_dim}")
+            raise ValueError(f"Axes dim {params.axes_dim} sum != {pe_dim}")
         self.hidden_size = params.hidden_size
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)

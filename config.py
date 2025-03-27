@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
 
     # ===== Flux MMDiT Architecture =====
     'hidden_size': 768,          # Transformer hidden size
-    'in_channels': 3,
+    'in_channels': 16,
     'out_channels': 16,
     'num_heads': 12,            # Attention heads per layer
     'depth': 24,                # Transformer blocks with double stream
@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     'mlp_ratio': 4.0,           # FFN expansion factor
     'qkv_bias': True,           # Enable QKV projection biases
     'qk_rmsnorm': True,         # Use RMSNorm for Q/K projections
-    'axes_dim': [32, 32],       # Positional embedding axes dimension
+    'axes_dim': [32, 32],       # For 64D positional embedding (768/12 heads)
     'theta': 10000,             # RoPE base frequency
     'vec_in_dim': 768,          # Input dimension for conditioning vector
     'context_in_dim': 768,      # Input dimension for text context
@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     
     # ===== VAE Configuration =====
     'vae_model': "AuraDiffusion/16ch-vae",
-    'latent_channels': 16,      # VAE output channels
+    'latent_channels': 16,      # Must match VAE output
     'vae_scaling_factor': 0.18215,
 
     # ===== Router Network =====
