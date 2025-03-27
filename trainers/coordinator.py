@@ -205,7 +205,7 @@ class DDMTrainingCoordinator:
     def _init_data_loaders(self):
         """Initialize distributed data loaders with bucket sampling"""
         # Convert config to dict before passing to dataset
-        dataset = DDMDataset(vars(self.config))  # Changed from self.config to vars(self.config)
+        dataset = DDMDataset(vars(self.config))
         
         # Create distributed sampler
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -223,13 +223,18 @@ class DDMTrainingCoordinator:
             shuffle=True
         )
         
+        # Calculate workers based on available CPUs
+        num_workers = min(4, os.cpu_count() // self.world_size)  # Max 4 workers per process
+        persistent_workers = num_workers > 0  # Only enable if using workers
+        
         # Create combined loader
         train_loader = DataLoader(
             dataset,
             batch_sampler=bucket_sampler,
             collate_fn=dataset.collate_fn,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=persistent_workers,
+            num_workers=num_workers
         )
         
         return train_loader, None  # No validation loader in paper
