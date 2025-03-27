@@ -2,6 +2,7 @@ import os
 import tempfile
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from config import get_config
 from data.dataset import DDMDataset
 from models.mmdit import ExpertMMDiT
@@ -12,11 +13,22 @@ from trainers.expert import ExpertTrainer
 from utils.distributed import get_rank, is_main_process
 from utils.logging import setup_logger
 from types import SimpleNamespace
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+import torch.distributed as dist
 
 def test_full_pipeline():
     """End-to-end shape test of DDM pipeline with dummy data using FSDP"""
+    # Initialize distributed environment first
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo" if not torch.cuda.is_available() else "nccl",
+            init_method="env://",
+            world_size=1,
+            rank=0
+        )
+    
     # Setup distributed environment
-    rank = get_rank()
+    rank = dist.get_rank() if dist.is_initialized() else 0
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
     
@@ -40,6 +52,8 @@ def test_full_pipeline():
         'sampling_steps': 10,
         'router_hidden_size': 512,
         'router_num_heads': 8,
+        'top_p': 0.9,  # For nucleus sampling
+        'router_model': 'paper_baseline',
     }
     config = SimpleNamespace(**config_dict)
 
@@ -57,37 +71,59 @@ def test_full_pipeline():
         os.makedirs(os.path.join(config.feature_cache_path, "dims"), exist_ok=True)
         os.makedirs(os.path.join(config.feature_cache_path, "buckets"), exist_ok=True)
         
-        # Create dummy features and clusters
+        # Create per-sample dummy files with consistent naming
         num_dummy_images = 200
         image_size = config.image_size
+        all_cluster_ids = []  # Add this line to collect cluster IDs
         
-        # Create dimension files
-        torch.save(
-            torch.tensor([image_size]*num_dummy_images, dtype=torch.int16),
-            os.path.join(config.feature_cache_path, "dims", "train_features.pt")
-        )
-        
-        # Create bucket assignments
-        num_buckets = len(config.buckets)
-        torch.save(
-            torch.randint(0, num_buckets, (num_dummy_images,), dtype=torch.int16),
-            os.path.join(config.feature_cache_path, "buckets", "train_features.pt")
-        )
+        for i in range(num_dummy_images):
+            base_name = f"anime-{i}"
+            
+            # Create latent file
+            torch.save(
+                torch.randn(config.latent_channels, 32, 32),  # Match latent_channels
+                os.path.join(config.feature_cache_path, "latents", f"{base_name}_rank0.pt")
+            )
+            
+            # Create CLIP embedding
+            torch.save(
+                torch.randn(77, config.clip_embedding_dim),
+                os.path.join(config.feature_cache_path, "clip", f"{base_name}_rank0.pt")
+            )
+            
+            # Create T5 embedding 
+            torch.save(
+                torch.randn(128, config.t5_embedding_dim),
+                os.path.join(config.feature_cache_path, "t5", f"{base_name}_rank0.pt")
+            )
+            
+            # Create cluster assignment
+            cluster_id = torch.randint(0, config.num_clusters, (1,))
+            all_cluster_ids.append(cluster_id)  # Collect cluster IDs
+            torch.save(
+                cluster_id,
+                os.path.join(config.feature_cache_path, "clusters", f"{base_name}_rank0.pt")
+            )
+            
+            # Create bucket assignment
+            bucket_idx = torch.randint(0, len(config.buckets), (1,))
+            torch.save(
+                bucket_idx,
+                os.path.join(config.feature_cache_path, "buckets", f"{base_name}_rank0.pt")
+            )
+            
+            # Create dimension entry
+            bucket_dims = config.buckets[bucket_idx.item()]
+            torch.save(
+                torch.tensor(bucket_dims, dtype=torch.int16),
+                os.path.join(config.feature_cache_path, "dims", f"{base_name}_rank0.pt")
+            )
 
-        # Create dummy features and clusters
-        torch.save(torch.randn(num_dummy_images, 1024), 
-                 os.path.join(config.feature_cache_path, "train_features.pt"))
-        torch.save(torch.randint(0,4,(num_dummy_images,)), 
-                 os.path.join(config.feature_cache_path, "clusters", "final_clusters.pt"))
-
-        # Create dummy text embeddings
+        # Add this block after the loop to create final_clusters.pt
+        final_clusters = torch.cat(all_cluster_ids)
         torch.save(
-            torch.randn(num_dummy_images, 77, config.clip_embedding_dim),
-            os.path.join(config.feature_cache_path, "clip", "train_features.pt")
-        )
-        torch.save(
-            torch.randn(num_dummy_images, 128, config.t5_embedding_dim),
-            os.path.join(config.feature_cache_path, "t5", "train_features.pt")
+            final_clusters,
+            os.path.join(config.feature_cache_path, "clusters", "final_clusters.pt")
         )
 
         # Initialize dataset with proper config handling
@@ -190,5 +226,71 @@ def test_full_pipeline():
         )
         assert samples.shape == (2, config.latent_channels, 32, 32), "Sampling shape mismatch"
 
+        # Test router shapes
+        def test_router_shapes():
+            """Validate router input/output shapes and training behavior"""
+            # Test initialization
+            assert hasattr(router_trainer, 'router'), "Router not initialized"
+            assert isinstance(router_trainer.router, (nn.Module, FSDP)), "Invalid router type"
+            
+            # Test training forward pass
+            with torch.no_grad():
+                # Get initial predictions
+                logits = router_trainer.router(
+                    batch['latent'],
+                    torch.randint(0, 1000, (2,), device=device),
+                    batch['clip_embedding']
+                )
+                # Validate output shape
+                assert logits.shape == (2, config.num_experts), \
+                    f"Bad router logits shape: {logits.shape}"
+                    
+                # Validate probability calculations
+                probs = torch.softmax(logits, dim=-1)
+                assert torch.allclose(probs.sum(dim=1), torch.ones(2, device=device)), \
+                    "Router outputs not valid probabilities"
+
+            # Test inference modes
+            for strategy in ["top_k", "nucleus", "random"]:
+                expert_weights = router_trainer.get_expert_weights(
+                    batch['latent'],
+                    torch.randint(0, 1000, (2,), device=device),
+                    batch['clip_embedding'],
+                    strategy=strategy,
+                    k=1 if strategy == "top_k" else None
+                )
+                
+                # Validate expert weights
+                assert expert_weights.shape == (2, config.num_experts), \
+                    f"Bad expert weights shape for {strategy}"
+                assert torch.allclose(expert_weights.sum(dim=1), torch.ones(2, device=device)), \
+                    f"Expert weights don't sum to 1 for {strategy}"
+
+            # Test temperature scaling
+            original_logits = router_trainer.router(
+                batch['latent'],
+                torch.randint(0, 1000, (2,), device=device),
+                batch['clip_embedding']
+            )
+            
+            # Change temperature and verify effect
+            router_trainer.router.temperature = 0.5
+            scaled_logits = router_trainer.router(
+                batch['latent'],
+                torch.randint(0, 1000, (2,), device=device),
+                batch['clip_embedding']
+            )
+            
+            # Validate temperature scaling
+            assert not torch.allclose(original_logits, scaled_logits), \
+                "Temperature scaling not working"
+            assert torch.allclose(original_logits / 0.5, scaled_logits), \
+                "Incorrect temperature scaling implementation"
+
+        test_router_shapes()
+
 if __name__ == "__main__":
     test_full_pipeline()
+    # Cleanup distributed after test
+    if dist.is_initialized():
+        dist.destroy_process_group()
