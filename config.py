@@ -13,10 +13,10 @@ logger = logging.getLogger(__name__)
 # Add this at the top under imports
 DEFAULT_CONFIG = {
     # ===== Core Architecture =====
-    'hidden_size': 1152,
-    'num_heads': 16,
-    'depth': 30,
-    'mlp_ratio': 4.0,
+    'hidden_size': 864,
+    'num_heads': 12,
+    'depth': 22,
+    'mlp_ratio': 3.0,
     'qkv_bias': True,
     'vec_in_dim': 768,
     'context_in_dim': 768,
@@ -25,7 +25,7 @@ DEFAULT_CONFIG = {
     'num_experts': 8,
     'num_clusters': 8,
     'cluster_embed_dim': 512,
-    'expert_capacity_factor': 1.25,
+    'expert_capacity_factor': 1.0,
     
     # ===== Training Parameters ===== 
     'batch_size': 1,
@@ -33,12 +33,12 @@ DEFAULT_CONFIG = {
     'weight_decay': 0.01,
     'warmup_steps': 1000,
     'use_mixed_precision': True,
-    'gradient_accumulation_steps': 2,
+    'gradient_accumulation_steps': 4,
 
     # ===== Diffusion & Loss =====
     'loss_type': 'huber',         
     'sigma': 1.0,
-    'sampling_steps': 10,
+    'sampling_steps': 1000,
     'top_p': 0.9, 
     
     # ===== Distributed Training =====
@@ -60,8 +60,8 @@ DEFAULT_CONFIG = {
     
     # ===== Router Configuration =====
     'router_learning_rate': 1e-4,
-    'router_hidden_size': 512,
-    'router_num_heads': 8,
+    'router_hidden_size': 384,
+    'router_num_heads': 6,
     'router_temperature': 2.0,
     'router_min_temp': 0.5,
     'router_temperature_decay': 0.9997,

@@ -524,11 +524,29 @@ class DDMTrainingCoordinator:
         return checkpoint.get('step', 0)
 
     def _init_wandb(self):
-        """Initialize Weights & Biases logging with test-aligned settings"""
-        # Disable wandb for test alignment
+        """Initialize Weights & Biases logging with URL display"""
         self.wandb_enabled = False
         if self.rank == 0:
-            logger.info("W&B disabled for test alignment")
+            try:
+                import wandb
+                # Initialize wandb with project name
+                wandb.init(
+                    project="DDM",
+                    config=vars(self.config),
+                    dir=self.config.output_dir
+                )
+                self.wandb_run_url = wandb.run.get_url()
+                self.wandb_enabled = True
+                
+                # Print the run URL with clear formatting
+                logger.info(f"W&B run started: {wandb.run.name}")
+                print(f"\n{'='*50}")
+                print(f"Track training progress at: {self.wandb_run_url}")
+                print(f"{'='*50}\n")
+                
+            except Exception as e:
+                logger.warning(f"Failed to initialize W&B: {str(e)}")
+                self.wandb_enabled = False
 
     def _get_memory_stats(self):
         """Simplified memory logging matching test output"""
@@ -601,6 +619,3 @@ class DDMTrainingCoordinator:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay
         )
-        
-        # Expert optimizers are initialized inside ExpertTrainer
-
