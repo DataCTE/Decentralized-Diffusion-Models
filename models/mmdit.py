@@ -5,7 +5,7 @@ This file integrates modular components from the modules directory.
 
 import torch
 from torch import Tensor, nn
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 
@@ -28,22 +28,35 @@ config = get_config()
 
 
 @dataclass
-class FluxParams:
+class MMDiTParams:
+    # Core architecture parameters (paper Section 3.1)
     in_channels: int
     out_channels: int
-    vec_in_dim: int
-    context_in_dim: int
-    hidden_size: int
-    mlp_ratio: float
-    num_heads: int
-    depth: int
-    depth_single_blocks: int
-    axes_dim: list[int]
-    theta: int
-    qkv_bias: bool
-    guidance_embed: bool
-    latent_channels: int
-    gradient_checkpointing: bool
+    hidden_size: int = config.hidden_size
+    num_heads: int = config.num_heads
+    depth: int = config.depth
+    mlp_ratio: float = config.mlp_ratio
+    qkv_bias: bool = config.qkv_bias
+    
+    # Positional embedding config (paper Section 3.3)
+    axes_dim: list[int] = field(default_factory=lambda: config.axes_dim)
+    theta: int = config.theta
+    position_embed_type: str = config.position_embed_type
+    
+    # Expert specialization parameters (paper Section 3.2)
+    num_clusters: int = config.num_clusters
+    cluster_embed_dim: int = config.cluster_embed_dim
+    expert_capacity_factor: float = config.expert_capacity_factor
+    
+    # Conditional guidance (paper Section 3.5)
+    vec_in_dim: int = config.vec_in_dim
+    context_in_dim: int = config.context_in_dim
+    guidance_embed: bool = False
+    
+    # Performance config
+    gradient_checkpointing: bool = config.use_gradient_checkpointing
+    latent_channels: int = config.latent_channels
+    depth_single_blocks: int = config.depth_single_blocks
 
 
 class Flux(nn.Module):
@@ -51,7 +64,7 @@ class Flux(nn.Module):
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, params: FluxParams):
+    def __init__(self, params: MMDiTParams):
         super().__init__()
 
         self.params = params
@@ -183,60 +196,26 @@ class FluxLoraWrapper(Flux):
             if isinstance(module, LinearLora):
                 module.set_scale(scale=scale)
 
-@dataclass 
-class ExpertMMDiTParams(FluxParams):
-    """Parameters for expert MMDiT aligned with config defaults"""
-    # Cluster/expert configuration
-    num_clusters: int = config.num_clusters
-    cluster_embed_dim: int = config.cluster_embed_dim
-    expert_capacity_factor: float = config.expert_capacity_factor
-    
-    # Architecture parameters from config
-    hidden_size: int = config.hidden_size
-    depth: int = config.depth
-    num_heads: int = config.num_heads
-    mlp_ratio: float = config.mlp_ratio
-    qkv_bias: bool = config.qkv_bias
-    
-    # Positional embedding configuration
-    theta: int = config.theta
-    position_embed_type: str = config.position_embedding
-    
-    # Performance configurations
-    gradient_checkpointing: bool = config.use_gradient_checkpointing
 
 class ExpertMMDiT(Flux):
-    """Implements paper's expert specialization (Section 3.2) with capacity awareness"""
-    def __init__(self, params: ExpertMMDiTParams):
-        # Remove guidance-related components from base params
-        params.guidance_embed = False  # Disable unused guidance embedding
+    """Implements paper's expert specialization with unified parameters"""
+    def __init__(self, params: MMDiTParams):
+        # Disable guidance embedding for experts (paper Section 3.2)
+        params.guidance_embed = False
         
         self._validate_params(params)
         super().__init__(params)
 
-        # Paper's cluster embedding initialization (Section 4.1)
-        self.cluster_embed = nn.Sequential(
-            nn.Embedding(params.num_clusters, params.cluster_embed_dim),
-            nn.Linear(params.cluster_embed_dim, params.hidden_size)
-        )
-        
-        # Initialize with scaled normal distribution per paper
-        nn.init.normal_(self.cluster_embed[0].weight, std=0.02/math.sqrt(params.hidden_size))
-        nn.init.zeros_(self.cluster_embed[1].weight)
-        nn.init.zeros_(self.cluster_embed[1].bias)
-
-        # Paper's capacity-aware initialization (Section 3.4)
-        self.register_buffer('expert_capacity', 
-            torch.tensor(params.expert_capacity_factor, dtype=torch.float32))
-            
     def _validate_params(self, params):
-        """Ensure cluster config matches paper specifications"""
-        if not hasattr(params, 'num_clusters'):
-            raise ValueError("ExpertMMDiT requires num_clusters parameter")
-        if params.cluster_embed_dim % 2 != 0:
-            params.cluster_embed_dim += 1  # Ensure even dim for RoPE
+        """Validate unified parameters against paper constraints"""
+        if params.num_clusters <= 0:
+            raise ValueError("num_clusters must be > 0")
+            
         if params.hidden_size % params.num_heads != 0:
             raise ValueError("Hidden size must be divisible by num_heads")
+            
+        if params.cluster_embed_dim % 2 != 0:
+            params.cluster_embed_dim += 1  # Ensure even dim for RoPE
 
     def forward(
         self,

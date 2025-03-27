@@ -73,7 +73,8 @@ DEFAULT_CONFIG = {
     'axes_dim': [32, 32],
     
     # ===== Debug/Test Flags =====
-    'bypass_cluster_validation': False
+    'bypass_cluster_validation': False,
+    'depth_single_blocks': 5,  # Config-controlled value
 }
 
 def dict_to_namespace(d):
@@ -145,14 +146,14 @@ def get_config(config_path=None):
         
         return config
     else:
-        # For default config, convert the distributed dict
+        # For default config, remove distributed conversion
         defaults = DEFAULT_CONFIG
-        defaults['distributed'] = dict_to_namespace(defaults['distributed'])
         
         # Add all default values
         config = SimpleNamespace()
         for key, value in defaults.items():
-            setattr(config, key, dict_to_namespace(value) if isinstance(value, dict) else value)
+            # Remove special handling for 'distributed'
+            setattr(config, key, value)
         
         # Derive image_size from the first bucket
         if hasattr(config, 'buckets') and config.buckets:

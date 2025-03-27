@@ -1,10 +1,7 @@
 import os
 import tempfile
 import torch
-import numpy as np
-from torchvision.transforms import ToTensor
-from torch.utils.data import DataLoader
-from PIL import Image
+import torch.nn.functional as F
 from config import get_config
 from data.dataset import DDMDataset
 from models.mmdit import ExpertMMDiT
@@ -14,9 +11,6 @@ from trainers.router import RouterTrainer
 from trainers.expert import ExpertTrainer
 from utils.distributed import get_rank, is_main_process
 from utils.logging import setup_logger
-import matplotlib.pyplot as plt
-from torchvision import transforms
-from torch.nn import functional as F
 from types import SimpleNamespace
 
 def test_full_pipeline():
@@ -37,12 +31,15 @@ def test_full_pipeline():
         'bypass_cluster_validation': True,
         'buckets': [(256, 256), (288, 224), (224, 288)],
         'clip_embedding_dim': 768,
+        't5_embedding_dim': 512,
         'num_clusters': 4,
         'expert_capacity_factor': 1.2,
         'router_temperature': 2.0,
         'router_min_temp': 0.5,
         'router_temperature_decay': 0.99995,
-        'sampling_steps': 10
+        'sampling_steps': 10,
+        'router_hidden_size': 512,
+        'router_num_heads': 8,
     }
     config = SimpleNamespace(**config_dict)
 
@@ -52,12 +49,46 @@ def test_full_pipeline():
         config.feature_cache_path = os.path.join(tmpdir, "cache")
         os.makedirs(config.feature_cache_path, exist_ok=True)
         
+        # Create required subdirectories
+        os.makedirs(os.path.join(config.feature_cache_path, "clip"), exist_ok=True)
+        os.makedirs(os.path.join(config.feature_cache_path, "t5"), exist_ok=True)
+        os.makedirs(os.path.join(config.feature_cache_path, "latents"), exist_ok=True)
+        os.makedirs(os.path.join(config.feature_cache_path, "clusters"), exist_ok=True)
+        os.makedirs(os.path.join(config.feature_cache_path, "dims"), exist_ok=True)
+        os.makedirs(os.path.join(config.feature_cache_path, "buckets"), exist_ok=True)
+        
         # Create dummy features and clusters
         num_dummy_images = 200
+        image_size = config.image_size
+        
+        # Create dimension files
+        torch.save(
+            torch.tensor([image_size]*num_dummy_images, dtype=torch.int16),
+            os.path.join(config.feature_cache_path, "dims", "train_features.pt")
+        )
+        
+        # Create bucket assignments
+        num_buckets = len(config.buckets)
+        torch.save(
+            torch.randint(0, num_buckets, (num_dummy_images,), dtype=torch.int16),
+            os.path.join(config.feature_cache_path, "buckets", "train_features.pt")
+        )
+
+        # Create dummy features and clusters
         torch.save(torch.randn(num_dummy_images, 1024), 
                  os.path.join(config.feature_cache_path, "train_features.pt"))
         torch.save(torch.randint(0,4,(num_dummy_images,)), 
-                 os.path.join(config.feature_cache_path, "final_clusters.pt"))
+                 os.path.join(config.feature_cache_path, "clusters", "final_clusters.pt"))
+
+        # Create dummy text embeddings
+        torch.save(
+            torch.randn(num_dummy_images, 77, config.clip_embedding_dim),
+            os.path.join(config.feature_cache_path, "clip", "train_features.pt")
+        )
+        torch.save(
+            torch.randn(num_dummy_images, 128, config.t5_embedding_dim),
+            os.path.join(config.feature_cache_path, "t5", "train_features.pt")
+        )
 
         # Initialize dataset with proper config handling
         dataset = DDMDataset(vars(config), 'train')
@@ -74,7 +105,9 @@ def test_full_pipeline():
         batch = {
             'latent': dummy_latent,
             'clip_embedding': dummy_text_embeds,
-            'cluster_labels': torch.randint(0,4,(2,), device=device)
+            'cluster_labels': torch.load(
+                os.path.join(config.feature_cache_path, "clusters", "final_clusters.pt")
+            )[:2].to(device)
         }
         
         # Paper's recommended router warmup
@@ -83,6 +116,20 @@ def test_full_pipeline():
         for step in range(20):
             loss = router_trainer.train_step(batch)
             router_losses.append(loss)
+            
+            with torch.no_grad():
+                logits = router_trainer.router(
+                    batch['latent'],
+                    torch.randint(0, 1000, (2,), device=device),
+                    batch['clip_embedding']
+                )
+                assert logits.shape == (2, config.num_experts), \
+                    f"Bad router shape: {logits.shape}"
+                
+                probs = torch.softmax(logits, dim=-1)
+                assert torch.allclose(probs.sum(dim=1), torch.ones(2, device=device)), \
+                    "Router outputs not valid probabilities"
+            
             print(f"Step {step+1}/20 - Loss: {loss:.4f}")
 
         # Initialize expert trainer with paper's config
@@ -122,7 +169,12 @@ def test_full_pipeline():
 
         # Test sampling with paper's recommended settings
         def dummy_router(x_t, timestep, text_embeddings):
-            return torch.randn(2, config.num_experts, device=device)
+            with torch.no_grad():
+                cluster_preds = torch.load(
+                    os.path.join(config.feature_cache_path, "clusters", "final_clusters.pt")
+                )[:2].to(device)
+                
+                return F.one_hot(cluster_preds, num_classes=config.num_experts).float()
 
         experts = {0: expert_trainer.expert}
         

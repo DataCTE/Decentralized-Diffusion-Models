@@ -11,3 +11,4 @@ matplotlib
 safetensors
 torchvision
 accelerate 
+adamw_bf16
