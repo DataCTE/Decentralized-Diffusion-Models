@@ -100,34 +100,74 @@ class RouterTrainer:
         self.router.eval()
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Implements paper's router training (Algorithm 1) with temperature annealing
+        """Implements paper's router training with proper step tracking and type safety
         
         Args:
-            batch: Contains 'latent' (B, C, H, W), 'timesteps' (B,), and 'cluster_labels' (B,)
+            batch: Dictionary containing:
+                - 'latent': Tensor of shape [B, C, H, W]
+                - 'clip_embedding': Tensor of shape [B, seq_len, D]
+                - 'cluster_labels': LongTensor of shape [B]
             
         Returns:
-            Cross-entropy loss with temperature scaling
+            Computed cross-entropy loss with temperature scaling
         """
-        # Paper's temperature annealing (Section 3.3)
-        current_step = max(1, self.step)  # Prevent math error on step 0
-        temp = max(
+        # Validate input types and shapes
+        self._validate_batch(batch)
+        
+        # Update step counter and calculate temperature
+        self.step += 1  # Maintain internal step counter
+        current_step = max(1, self.step)
+        temp = self._calculate_temperature(current_step)
+        
+        # Forward pass with mixed precision
+        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+            logits = self.router(
+                self._add_diffusion_noise(batch['latent']),
+                self._generate_timesteps(batch['latent'].size(0)),
+                batch['clip_embedding']
+            ) / temp
+            
+            return F.cross_entropy(logits, batch['cluster_labels'])
+
+    def _validate_batch(self, batch: Dict[str, torch.Tensor]) -> None:
+        """Type and shape validation for training batches"""
+        if not isinstance(batch, dict):
+            raise TypeError(f"Expected batch to be dict, got {type(batch)}")
+        
+        required_keys = {'latent', 'clip_embedding', 'cluster_labels'}
+        missing = required_keys - set(batch.keys())
+        if missing:
+            raise ValueError(f"Missing required batch keys: {missing}")
+        
+        if batch['latent'].dim() != 4:
+            raise ValueError(f"Latent must be 4D tensor, got {batch['latent'].dim()}D")
+        
+        if batch['clip_embedding'].dim() != 3:
+            raise ValueError(f"CLIP embeddings must be 3D tensor, got {batch['clip_embedding'].dim()}D")
+
+    def _calculate_temperature(self, current_step: int) -> float:
+        """Compute temperature with exponential decay and minimum floor"""
+        return max(
             self.config.router_min_temp,
             self.config.router_temperature * 
             (self.config.router_temperature_decay ** current_step)
         )
+
+    def _add_diffusion_noise(self, x0: torch.Tensor) -> torch.Tensor:
+        """Add analytical diffusion noise per paper's cosine schedule"""
+        B = x0.size(0)
+        device = x0.device
         
-        # Forward pass with analytical noise addition (Appendix A)
-        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            # Generate timestep-conditioned inputs
-            t = torch.rand(batch["latent"].size(0), device=self.device)
-            alpha_t = torch.cos(t * math.pi/2)[:, None, None, None]
-            sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
-            noise = torch.randn_like(batch["latent"])
-            x_t = alpha_t * batch["latent"] + sigma_t * noise
-            
-            # Get predictions and compute loss
-            logits = self.router(x_t, t * 1000, batch["clip_embedding"]) / temp
-            return F.cross_entropy(logits, batch["cluster_labels"])
+        t = torch.rand(B, device=device)
+        alpha_t = torch.cos(t * math.pi/2)[:, None, None, None]
+        sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
+        noise = torch.randn_like(x0)
+        
+        return alpha_t * x0 + sigma_t * noise
+
+    def _generate_timesteps(self, batch_size: int) -> torch.Tensor:
+        """Generate timesteps scaled to [0, 1000) range"""
+        return torch.rand(batch_size, device=self.device) * 1000
 
     def train_epoch(self, loader):
         """

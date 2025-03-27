@@ -944,29 +944,67 @@ class DDMTrainingCoordinator:
                 pass
 
     def _redistribute_experts(self):
-        """Implements paper's load-balanced expert assignment (Section 3.4, Equation 9-10)"""
-        cluster_counts = self.dataset.get_cluster_sizes().cpu().numpy()
+        """Implements paper's load-balanced expert assignment (Section 3.4) with distributed sync"""
+        # Gather cluster statistics across all ranks
+        cluster_counts = self.dataset.get_cluster_sizes()
         total_samples = cluster_counts.sum()
         
-        # Sort clusters by size descending
-        expert_loads = sorted(enumerate(cluster_counts), key=lambda x: -x[1])
+        # Paper's load balancing equations (9-10)
+        expert_loads = cluster_counts.float()
+        target_load = (total_samples / self.world_size) * self.config.expert_capacity_factor
         
-        # Greedy assignment to balance loads
-        rank_loads = {r: 0 for r in range(self.world_size)}
-        new_assignments = defaultdict(list)
+        # Sort clusters by load descending
+        sorted_loads, sorted_indices = torch.sort(expert_loads, descending=True)
         
-        for expert_idx, load in expert_loads:
-            min_rank = min(rank_loads, key=lambda k: rank_loads[k])
-            new_assignments[min_rank].append(expert_idx)
-            rank_loads[min_rank] += load
-            
-            # Rebalance if exceeding capacity factor (Equation 10)
-            if rank_loads[min_rank] > (total_samples/self.world_size) * self.config.expert_capacity_factor:
-                total_samples = max(rank_loads.values())
+        # Distributed assignment using PyTorch collectives
+        assignments = torch.zeros_like(sorted_indices)
+        rank_loads = torch.zeros(self.world_size, device=self.device)
         
-        # Update assignments with synchronization
-        self.expert_indices = new_assignments[self.rank]
+        for idx in sorted_indices:
+            min_rank = torch.argmin(rank_loads)
+            if rank_loads[min_rank] + expert_loads[idx] <= target_load:
+                assignments[idx] = min_rank
+                rank_loads[min_rank] += expert_loads[idx]
+            else:
+                # Find next best rank with capacity
+                available = torch.where(rank_loads < target_load)[0]
+                if len(available) > 0:
+                    chosen_rank = available[torch.argmin(rank_loads[available])]
+                    assignments[idx] = chosen_rank
+                    rank_loads[chosen_rank] += expert_loads[idx]
+                else:
+                    # Fallback to round-robin assignment
+                    assignments[idx] = idx % self.world_size
+
+        # Synchronize assignments across all ranks
+        assignments = self._broadcast_assignments(assignments)
+        
+        # Update expert indices for this rank
+        self.expert_indices = torch.where(assignments == self.rank)[0].tolist()
         self.expert_indices_tensor = torch.tensor(self.expert_indices, device=self.device)
+
+    def _broadcast_assignments(self, assignments: torch.Tensor) -> torch.Tensor:
+        """Ensure consistent expert assignments across all ranks using PyTorch collectives"""
+        if self.world_size > 1:
+            # Gather all assignments at rank 0
+            assignment_list = [torch.empty_like(assignments) for _ in range(self.world_size)]
+            dist.gather(assignments, assignment_list if self.rank == 0 else None, dst=0)
+            
+            # Validate and select optimal assignment (rank 0 does consensus)
+            if self.rank == 0:
+                # Use assignment from rank 0 as authoritative
+                consensus = assignment_list[0]
+                for a in assignment_list[1:]:
+                    if not torch.allclose(consensus, a):
+                        logger.warning("Expert assignment mismatch, using rank 0's version")
+                        break
+            else:
+                consensus = torch.empty_like(assignments)
+            
+            # Broadcast final assignment to all ranks
+            dist.broadcast(consensus, src=0)
+            return consensus
+        return assignments
 
     def _verify_sharding(self):
         """No-op verification since we trust FSDP's sharding"""
