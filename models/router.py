@@ -81,7 +81,7 @@ class RouterModel(nn.Module):
         )
         
         # Change temperature initialization to 1D tensor
-        self.register_buffer('temperature', torch.tensor([config.router_temperature]))  # Now 1D tensor
+        self.register_buffer('temperature', torch.tensor([config.router_temperature]))
         
         # Initialize weights with smaller values for stability
         self._init_weights()

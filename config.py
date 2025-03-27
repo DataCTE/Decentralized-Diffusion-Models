@@ -96,6 +96,10 @@ DEFAULT_CONFIG = {
     'router_model': 'paper_baseline',
     'use_scheduler': True,
     'scheduler_type': 'cosine',
+
+    # ===== Optimization =====
+    'adam_betas': (0.9, 0.999),
+    'eps': 1e-8,
 }
 
 def dict_to_namespace(d):
