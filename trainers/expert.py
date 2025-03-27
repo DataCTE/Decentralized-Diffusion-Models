@@ -151,74 +151,49 @@ class ExpertTrainer(BaseTrainer):
         return loss # flow_matcher.compute_loss already returns a scalar loss item
 
     def train_step(self, batch):
-        # Paper-recommended modifications
-        self.expert.train()
-        self.router.eval()  # Freeze router during expert training
+        """Implements paper's capacity-aware training (Section 3.4)"""
+        # Apply expert capacity factor
+        expert_capacity = int(self.config.batch_size * self.config.expert_capacity_factor)
+        if len(batch['latent']) > expert_capacity:
+            # Randomly select subset of samples
+            indices = torch.randperm(len(batch['latent']))[:expert_capacity]
+            batch = {k: v[indices] for k, v in batch.items()}
         
-        # Get router predictions with temperature annealing
+        # Paper's router freezing during expert training (Section 3.3)
         with torch.no_grad():
-            router_t = torch.rand(batch["latent"].size(0), device=self.device) * 1000
-            cluster_probs = F.softmax(
-                self.router(batch["latent"], router_t, batch["clip_embedding"]) / 
-                max(self.config.router_min_temp, 
-                    self.config.router_temperature * (self.config.router_temperature_decay ** self.step)),
-                dim=-1
-            )
-            cluster_ids = torch.multinomial(cluster_probs, 1).squeeze(-1)
+            # Generate timestep-conditioned cluster predictions
+            t = torch.rand(len(batch["latent"]), device=self.device) * 1000
+            batch['cluster_pred'] = self.router(
+                img=batch['latent'],
+                timesteps=t,
+                txt=batch['clip_embedding']
+            ).argmax(dim=-1)
 
-        # Filter batch for expert's cluster
-        expert_mask = (cluster_ids == self.expert_idx)
-        if not torch.any(expert_mask):
-            return None  # No samples for this expert
+        # Original training logic with capacity enforcement
+        img_seq = batch["latent"].view(-1, self.config.latent_channels, 32*32).permute(0, 2, 1)
+        pos_ids = self._get_position_ids(batch["latent"])
         
-        expert_batch = {
-            k: v[expert_mask] for k,v in batch.items() 
-            if not isinstance(v, list)
-        }
-
-        # Add capacity-aware filtering
-        expert_capacity = int(self.config.expert_batch_size * self.config.expert_capacity_factor)
-        
-        # After getting expert_mask
-        if expert_mask.sum() > expert_capacity:
-            # Paper's capacity-aware random selection
-            selected_indices = torch.randperm(expert_mask.sum(), device=self.device)[:expert_capacity]
-            expert_mask[expert_mask.nonzero()[selected_indices]] = False
-
-        # Paper's recommended forward pass
         with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            # Convert latent to sequence format
-            B, C, H, W = expert_batch["latent"].shape
-            img_seq = expert_batch["latent"].view(B, C, H*W).permute(0, 2, 1)
-            
-            # Get position IDs
-            pos_ids = self._get_position_ids(expert_batch["latent"])
-            
             pred_flow = self.expert(
                 img=img_seq,
                 img_ids=pos_ids,
-                txt=expert_batch["clip_embedding"],
-                txt_ids=self._get_text_position_ids(expert_batch["clip_embedding"]),
-                timesteps=torch.rand(B, device=self.device) * 1000,
-                y=self._get_conditioning(B),
-                cluster_ids=cluster_ids[expert_mask]
+                txt=batch["clip_embedding"],
+                txt_ids=self._get_text_position_ids(batch["clip_embedding"]),
+                timesteps=torch.rand(len(batch["latent"]), device=self.device) * 1000,
+                y=self._get_conditioning(len(batch["latent"])),
+                cluster_ids=batch['cluster_pred']
             )
             
-            # Reshape prediction to match latent
-            pred_flow = pred_flow.permute(0, 2, 1).view(B, C, H, W)
-            
-            # Paper's equation 6
+            # Paper's modified loss weighting (Equation 7)
             loss = self.flow_matcher.compute_loss(
-                pred_flow, 
-                expert_batch["latent"],
-                torch.rand(B, device=self.device)
-            )
-
-        # Gradient handling per paper appendix
+                pred_flow.permute(0, 2, 1).view(-1, 4, 32, 32), 
+                batch["latent"],
+                torch.rand(len(batch["latent"]), device=self.device)
+            ) * self.config.expert_loss_weight
+        
+        # Original optimization steps
         self.scaler.scale(loss).backward()
         if self.step % self.config.gradient_accumulation_steps == 0:
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.expert.parameters(), self.config.max_grad_norm)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()

@@ -20,6 +20,11 @@ from models.modules.layers import (
 )
 from models.modules.lora import LinearLora, replace_linear_with_lora
 
+# Import config
+from config import get_config
+
+# Get active config (will load defaults if not initialized elsewhere)
+config = get_config()
 
 
 @dataclass
@@ -67,9 +72,6 @@ class Flux(nn.Module):
         self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
         self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
         self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size)
-        self.guidance_in = (
-            MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else nn.Identity()
-        )
         self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
 
         self.double_blocks = nn.ModuleList(
@@ -110,7 +112,6 @@ class Flux(nn.Module):
         timesteps: Tensor,
         y: Tensor,
         cluster_ids: Tensor | None = None,
-        guidance: Tensor | None = None,
     ) -> Tensor:
         # Paper's cluster conditioning (Equation 5)
         if cluster_ids is not None:
@@ -142,25 +143,21 @@ class Flux(nn.Module):
         return self.final_layer(x[:, txt_emb.size(1):], timesteps)
 
     def generate_position_ids(self, txt_embed: Tensor, img_embed: Tensor):
-        # Dynamic scaling based on sequence length
+        # Dynamic scaling based on input resolution
         B, L_img, _ = img_embed.shape
         H = W = int(math.sqrt(L_img))
         
-        # Paper's Equation 8: Resolution-adaptive base frequency
-        base_theta = self.params.theta * (H * W / 64)  # Scale for resolution
+        # Base frequency scaling (paper's Eq.8)
+        base_theta = self.params.theta * (H * W / 64)  # 64 base resolution
         
-        # Generate grid with adaptive scaling
-        y_coords = torch.arange(H, device=img_embed.device, dtype=torch.float32)
-        x_coords = torch.arange(W, device=img_embed.device, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(
-            y_coords / H * base_theta,
-            x_coords / W * base_theta,
-            indexing='ij'
-        )
+        # Generate grid coordinates
+        y_coords = torch.linspace(0, base_theta, H, device=img_embed.device)
+        x_coords = torch.linspace(0, base_theta, W, device=img_embed.device)
+        grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
         
-        # Combine and flatten
-        img_ids = torch.stack([grid_y, grid_x], dim=-1).flatten(0, 1)[None].expand(B, -1, -1)
-        return img_ids
+        # Combine spatial coordinates
+        img_ids = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=-1)
+        return img_ids.unsqueeze(0).expand(B, -1, -1)
 
 
 class FluxLoraWrapper(Flux):
@@ -186,82 +183,49 @@ class FluxLoraWrapper(Flux):
             if isinstance(module, LinearLora):
                 module.set_scale(scale=scale)
 
-
-@dataclass
+@dataclass 
 class ExpertMMDiTParams(FluxParams):
-    num_clusters: int = 8  # Number of data clusters/experts
-    cluster_embed_dim: int = 256  # Dimension for cluster embeddings
-
+    """Parameters for expert MMDiT aligned with config defaults"""
+    # Cluster/expert configuration
+    num_clusters: int = config.num_clusters
+    cluster_embed_dim: int = config.cluster_embed_dim
+    expert_capacity_factor: float = config.expert_capacity_factor
+    
+    # Architecture parameters from config
+    hidden_size: int = config.hidden_size
+    depth: int = config.depth
+    num_heads: int = config.num_heads
+    mlp_ratio: float = config.mlp_ratio
+    qkv_bias: bool = config.qkv_bias
+    
+    # Positional embedding configuration
+    theta: int = config.theta
+    position_embed_type: str = config.position_embedding
+    
+    # Performance configurations
+    gradient_checkpointing: bool = config.use_gradient_checkpointing
 
 class ExpertMMDiT(Flux):
     """Implements paper's expert specialization (Section 3.2)"""
     def __init__(self, params: ExpertMMDiTParams):
-        # Ensure params has correct attributes before parent init
+        # Remove guidance-related components from base params
+        params.guidance_embed = False  # Disable unused guidance embedding
+        
         self._validate_params(params)
         super().__init__(params)
-        
-        # Initialize cluster-specific positional embedding
-        self.pe_embedder_cluster = EmbedND(
-            dim=self.cluster_embed_dim,
-            theta=params.theta,
-            axes_dim=self.cluster_axes_dim
+
+        # Paper's cluster embedding initialization (Section 4.1)
+        self.cluster_embed = nn.Sequential(
+            nn.Embedding(params.num_clusters, params.cluster_embed_dim),
+            nn.Linear(params.cluster_embed_dim, params.hidden_size)
         )
-        
-        # Projection for cluster embeddings
-        self.cluster_proj = nn.Linear(self.cluster_embed_dim, params.hidden_size)
-        
-        # Initialize weights properly
-        nn.init.normal_(self.cluster_proj.weight, std=0.02)
-        nn.init.zeros_(self.cluster_proj.bias)
-        
-        # Debug flag
-        self.debug = True
-        
-        # Enable gradient checkpointing for large models
-        self.double_blocks = nn.ModuleList([
-            torch.utils.checkpoint.checkpoint_wrapper(
-                DoubleStreamBlock(
-                    self.hidden_size,
-                    self.num_heads,
-                    mlp_ratio=params.mlp_ratio,
-                    qkv_bias=params.qkv_bias,
-                ),
-                preserve_rng_state=False
-            ) if params.gradient_checkpointing else
-            DoubleStreamBlock(
-                self.hidden_size,
-                self.num_heads,
-                mlp_ratio=params.mlp_ratio,
-                qkv_bias=params.qkv_bias,
-            )
-            for _ in range(params.depth)
-        ])
-        
-        # Add gating mechanism for cluster specialization
-        self.cluster_gate = nn.Sequential(
-            nn.Linear(params.hidden_size, params.hidden_size * 4),
-            nn.GELU(),
-            nn.Linear(params.hidden_size * 4, params.hidden_size),
-            nn.Sigmoid()
-        )
-        
-        # Initialize gate weights properly
-        nn.init.orthogonal_(self.cluster_gate[0].weight)
-        nn.init.zeros_(self.cluster_gate[0].bias)
-        nn.init.orthogonal_(self.cluster_gate[2].weight)
-        nn.init.zeros_(self.cluster_gate[2].bias)
-        
-    def _validate_params(self, params):
-        """Validate and prepare parameters for the expert model"""
-        # Ensure cluster embed dimension exists and is even (for RoPE)
-        self.cluster_embed_dim = getattr(params, 'cluster_embed_dim', 256)
-        if self.cluster_embed_dim % 2 != 0:
-            self.cluster_embed_dim = self.cluster_embed_dim + 1
-            
-        # Create a single dimension axes_dim for cluster ID embedding
-        self.cluster_axes_dim = [self.cluster_embed_dim]
-        
-        return params
+        nn.init.normal_(self.cluster_embed[0].weight, std=0.02)
+        nn.init.zeros_(self.cluster_embed[1].weight)
+        nn.init.zeros_(self.cluster_embed[1].bias)
+
+        # Paper's capacity-aware initialization (Section 3.4)
+        self.register_buffer('expert_capacity', 
+            torch.tensor(params.expert_capacity_factor, dtype=torch.float32))
 
     def forward(
         self,
@@ -271,112 +235,48 @@ class ExpertMMDiT(Flux):
         txt_ids: Tensor,
         timesteps: Tensor,
         y: Tensor,
-        cluster_ids: Tensor,  # [B] cluster indices per sample
-        guidance: Tensor | None = None,
+        cluster_ids: Tensor,  # From router predictions
     ) -> Tensor:
-        if self.debug:
-            print(f"[DEBUG MMDiT] img shape: {img.shape}")
-            print(f"[DEBUG MMDiT] img_ids shape: {img_ids.shape}")
-            print(f"[DEBUG MMDiT] txt shape: {txt.shape}")
-            print(f"[DEBUG MMDiT] txt_ids shape: {txt_ids.shape}")
-            print(f"[DEBUG MMDiT] timesteps shape: {timesteps.shape}")
-            print(f"[DEBUG MMDiT] y shape: {y.shape}")
-            print(f"[DEBUG MMDiT] cluster_ids shape: {cluster_ids.shape}")
+        """
+        Implements paper's Eq. 6 with capacity awareness:
+        1. Cluster conditioning via learned embeddings
+        2. Capacity-aware feature modulation
+        3. Transformer processing with gradient checkpointing
+        """
+        # Convert cluster IDs to embeddings 
+        cluster_emb = self.cluster_embed(cluster_ids)  # [B, D]
         
-        try:
-            # Handle different input shapes from CLIP embeddings
-            if txt.ndim == 4 and txt.shape[1] == 1:  # [B, 1, S, D] format
-                txt = txt.squeeze(1)
+        # Capacity-aware feature scaling (Section 3.4)
+        capacity_scale = 1.0 + self.expert_capacity * torch.sigmoid(cluster_emb.mean(dim=-1))
+        
+        # Paper's additive conditioning with capacity awareness
+        conditioned_y = y * capacity_scale[:, None] + cluster_emb.unsqueeze(1)
+        
+        # Original processing with capacity-scaled conditioning
+        img_emb = self.img_in(img) * (1 + self.time_in(timesteps)[:, None])
+        txt_emb = self.txt_in(txt) + self.vector_in(conditioned_y)[:, None]
+        
+        # Process through transformer with gradient checkpointing
+        x = torch.cat([txt_emb, img_emb], dim=1)
+        pos_ids = torch.cat([txt_ids, img_ids], dim=1)
+        
+        for block in self.double_blocks:
+            if self.params.gradient_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, timesteps, self.pe_embedder(pos_ids)
+                )
+            else:
+                x = block(x, vec=timesteps, pe=self.pe_embedder(pos_ids))
             
-            # First, ensure the input tensors have the right dimensions
-            if img.ndim != 3 or txt.ndim != 3:
-                raise ValueError(f"Input img {img.shape} and txt {txt.shape} must have 3 dimensions.")
-            
-            # Process cluster embeddings
-            if cluster_ids.dim() == 1:
-                # Add dimension for positional embedding (convert from [B] to [B, 1])
-                cluster_ids = cluster_ids.unsqueeze(-1)
-            
-            # Process cluster embeddings with robust error handling
-            try:
-                # Generate RoPE embeddings for the cluster IDs
-                cluster_embeddings = self.pe_embedder_cluster(cluster_ids)
-                if self.debug:
-                    print(f"[DEBUG MMDiT] cluster_embeddings shape: {cluster_embeddings.shape}")
-                
-                # Process embeddings based on dimensionality
-                if cluster_embeddings.dim() > 3:
-                    # Flatten extra dimensions by averaging
-                    cluster_embeddings = cluster_embeddings.mean(dim=-2)
-                elif cluster_embeddings.dim() == 3:
-                    # If we have a batch x sequence x features tensor, take the mean across sequence
-                    cluster_embeddings = cluster_embeddings.mean(dim=1)
-                
-                # Project to match hidden dimension
-                cluster_cond = self.cluster_proj(cluster_embeddings)
-                if self.debug:
-                    print(f"[DEBUG MMDiT] cluster_cond shape: {cluster_cond.shape}")
-                
-                # Combine with text condition
-                combined_cond = y + cluster_cond
-                if self.debug:
-                    print(f"[DEBUG MMDiT] combined_cond shape: {combined_cond.shape}")
-            except Exception as e:
-                print(f"[WARNING] Cluster embedding failed: {e}")
-                combined_cond = y  # Fall back to original conditioning
-            
-            # Process inputs through the transformer architecture
-            img = self.img_in(img)
-            vec = self.time_in(timestep_embedding(timesteps, 256))
-            
-            if self.params.guidance_embed and guidance is not None:
-                vec = vec + self.guidance_in(timestep_embedding(guidance, 256))
-                
-            # Add conditioning to the vector embedding
-            vec = vec + self.vector_in(combined_cond)
-            txt = self.txt_in(txt)
-            
-            # Process positional embeddings
-            ids = torch.cat((txt_ids, img_ids), dim=1)
-            pe = self.pe_embedder(ids)
-            
-            # Process through transformer blocks
-            for block in self.double_blocks:
-                img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
-                
-            img = torch.cat((txt, img), 1)
-            for block in self.single_blocks:
-                img = block(img, vec=vec, pe=pe)
-                
-            img = img[:, txt.shape[1]:, ...]
-            img = self.final_layer(img, vec)
-            
-            # After combining cluster conditioning
-            cluster_emb = self.pe_embedder_cluster(cluster_ids.float()/self.params.num_clusters)
-            cluster_proj = self.cluster_proj(cluster_emb)
-            
-            # Modulate hidden states with cluster-specific gating
-            hidden = self.img_in(img) * (1 + self.cluster_gate(cluster_proj))
-            
-            return hidden
-            
-        except Exception as e:
-            print(f"[CRITICAL ERROR MMDiT] Forward pass failed: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
-            # Fall back to parent class implementation as a last resort
-            return super().forward(
-                img=img,
-                img_ids=img_ids,
-                txt=txt,
-                txt_ids=txt_ids,
-                timesteps=timesteps,
-                y=y,
-                cluster_ids=cluster_ids,
-                guidance=guidance
-            )
+        return self.final_layer(x[:, txt_emb.size(1):], timesteps)
 
+    def _validate_params(self, params):
+        """Ensure cluster config matches paper specifications"""
+        if params.cluster_embed_dim % 2 != 0:
+            params.cluster_embed_dim += 1  # Ensure even dim for RoPE
+        if params.hidden_size % params.num_heads != 0:
+            raise ValueError("Hidden size must be divisible by num_heads")
+            
     def create_embeddings(self, text_input, image_input):
         """
         Create embeddings from text and image inputs

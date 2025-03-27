@@ -99,28 +99,28 @@ class RouterTrainer:
         self.router.eval()
 
     def train_step(self, batch):
-        # Paper's real timestep scaling with proper cluster labels
-        t = torch.rand(batch["latent"].size(0), device=self.device) * 1000  # Scale to [0,1000)
+        """Implements paper's router training (Algorithm 1)"""
+        # Generate timesteps with paper's uniform sampling
+        t = torch.rand(batch["latent"].size(0), device=self.device) * 1000
         
-        # Forward process with latent input
+        # Forward process with cosine schedule (Section 3.1)
         alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
         sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
         noise = torch.randn_like(batch["latent"])
         x_t = alpha_t * batch["latent"] + sigma_t * noise
         
-        # Get predictions with timestep conditioning
+        # Get predictions and compute cross-entropy
         logits = self.router(x_t, t, batch["clip_embedding"])
+        loss = F.cross_entropy(logits, batch["expert"])
         
-        # Cluster labels from precomputed assignments (paper eq. 3)
-        loss = F.cross_entropy(logits, batch["expert"])  # Use ground truth cluster labels
+        # Paper's gradient clipping (Appendix B.3)
+        if self.config.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.router.parameters(), 
+                self.config.max_grad_norm
+            )
         
-        # Optimize with paper's temperature annealing
-        self.temperature = max(
-            self.config.router_min_temp,
-            self.temperature * self.config.router_temp_decay
-        )
-        
-        return loss.item()
+        return loss
 
     def train_epoch(self, loader):
         """
@@ -267,4 +267,23 @@ class RouterTrainer:
                 weights = probs  # Use raw probabilities
                 
             return weights
+
+    def _init_weights(self):
+        """Paper's initialization scheme (Section 4.1)"""
+        # Initialize embedder with scaled normal distribution
+        nn.init.normal_(self.embedder.weight, mean=0.0, std=0.02/math.sqrt(3))
+        nn.init.zeros_(self.embedder.bias)
+        
+        # Initialize CLS token with smaller variance
+        nn.init.normal_(self.cls_token, std=0.01)
+        
+        # Final classifier initialization
+        nn.init.normal_(self.classifier[-1].weight, std=0.01)
+        nn.init.zeros_(self.classifier[-1].bias)
+        
+        # Initialize text projection layers
+        for layer in self.text_embed_proj:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_normal_(layer.weight, gain=0.5)
+                nn.init.zeros_(layer.bias)
             

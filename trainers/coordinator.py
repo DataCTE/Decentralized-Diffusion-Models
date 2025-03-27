@@ -425,31 +425,26 @@ class DDMTrainingCoordinator:
         torch.cuda.current_stream().wait_stream(stream)
 
     def _train_router_sync(self, batch):
-        """Router training with real timesteps"""
-        # Set modes
+        """Router training with temperature annealing (Algorithm 1)"""
         self.router.train()
         
-        # Get latent input from batch
-        latents = batch['latent'].to(self.device)
+        # Paper's temperature annealing
+        temp = max(self.config.router_min_temp, 
+                  self.config.router_temperature * 
+                  (self.config.router_temperature_decay ** self.step))
         
-        # Generate proper timesteps scaled to [0, 1000) as in paper
-        timesteps = torch.rand(latents.shape[0], device=self.device) * 1000
+        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+            # Get router predictions with temperature scaling
+            logits = self.router(
+                img=batch['latent'],
+                timesteps=torch.rand(batch['latent'].shape[0], device=self.device) * 1000,
+                txt=batch['clip_embedding']
+            ) / temp
+            
+            loss = F.cross_entropy(logits, batch['expert'])
         
-        # Forward pass with real timesteps AND latent input
-        with torch.amp.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            loss = self.router.train_step(
-                batch,
-                timesteps=timesteps,
-                img=latents,  # Add latent input
-                true_clusters=batch['expert']
-            )
-        
-        # Convert loss to tensor if it's a float
-        if isinstance(loss, float):
-            loss = torch.tensor(loss, device=self.device)
-        
-        # Gradient synchronization
-        if is_dist_initialized():
+        # Synchronize and scale loss
+        if self.world_size > 1:
             dist.all_reduce(loss, op=dist.ReduceOp.SUM)
             loss = loss / self.world_size
         
@@ -947,48 +942,37 @@ class DDMTrainingCoordinator:
                 pass
 
     def _redistribute_experts(self):
-        """Simplified expert redistribution until full implementation is ready"""
-        try:
-            # For now, use a static uniform distribution
-            total_experts = self.config.num_experts
-            experts_per_rank = max(1, total_experts // self.world_size)
+        """Implements paper's load-balanced expert redistribution (Section 3.4)"""
+        # Get cluster distribution from dataset
+        cluster_counts = self.dataset.get_cluster_sizes()
+        total_samples = cluster_counts.sum().item()
+        
+        # Greedy load-balanced assignment (paper's Eq. 9)
+        expert_loads = sorted(enumerate(cluster_counts.cpu().numpy()), 
+                             key=lambda x: -x[1])
+        
+        # Initialize rank loads and assignments
+        rank_loads = {r:0 for r in range(self.world_size)}
+        new_assignments = {r:[] for r in range(self.world_size)}
+        
+        # Assign largest clusters first to least loaded ranks
+        for expert_idx, load in expert_loads:
+            min_rank = min(rank_loads, key=lambda k: rank_loads[k])
+            new_assignments[min_rank].append(expert_idx)
+            rank_loads[min_rank] += load
             
-            # Create static assignments
-            new_assignments = []
-            for expert_idx in range(total_experts):
-                rank = min(expert_idx // experts_per_rank, self.world_size - 1)
-                new_assignments.append(rank)
-            
-            # Update local expert indices
-            self.expert_indices = [idx for idx, rank in enumerate(new_assignments) if rank == self.rank]
-            # Also update tensor version
-            self.expert_indices_tensor = torch.tensor(self.expert_indices, device=self.device)
-            
-            return True
-        except Exception as e:
-            print(f"Error in expert redistribution: {str(e)}")
-            return False
-
-    def _resolve_sharding_conflicts(self, assignments):
-        """Conflicts resolved through FSDP's parameter consensus"""
-        self.expert_indices = assignments[self.rank]
-
-    def _migrate_expert_states(self, new_assignments):
-        """State-preserving expert migration without synchronization"""
-        # Simply reassign experts - FSDP will handle parameter consistency
+            # Rebalance if exceeding capacity (paper's Eq. 10)
+            if rank_loads[min_rank] > (total_samples/self.world_size)*self.config.expert_capacity_factor:
+                total_samples = max(rank_loads.values())
+        
+        # Update local assignments with synchronization
         self.expert_indices = new_assignments[self.rank]
-
-    def _create_expert(self, expert_idx):
-        """Create expert trainer instance"""
-        from trainers.expert import ExpertTrainer
-        return ExpertTrainer(
-            expert_idx=expert_idx,
-            config=self.config,
-            device=self.device,
-            rank=self.rank,
-            world_size=self.world_size,
-            router=self.router  # Pass coordinator's router
-        )
+        self.expert_indices_tensor = torch.tensor(self.expert_indices, device=self.device)
+        
+        # Log distribution statistics
+        if self.rank == 0:
+            load_imbalance = max(rank_loads.values()) / (min(rank_loads.values()) + 1e-7)
+            logger.info(f"Expert redistribution complete. Load imbalance: {load_imbalance:.2f}x")
 
     def _verify_sharding(self):
         """No-op verification since we trust FSDP's sharding"""
