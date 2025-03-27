@@ -204,7 +204,8 @@ class DDMTrainingCoordinator:
 
     def _init_data_loaders(self):
         """Initialize distributed data loaders with bucket sampling"""
-        dataset = DDMDataset(self.config)
+        # Convert config to dict before passing to dataset
+        dataset = DDMDataset(vars(self.config))  # Changed from self.config to vars(self.config)
         
         # Create distributed sampler
         sampler = torch.utils.data.distributed.DistributedSampler(
