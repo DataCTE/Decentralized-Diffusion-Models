@@ -7,6 +7,8 @@ import time
 import contextlib
 from tqdm.auto import tqdm
 import concurrent.futures
+from collections import defaultdict
+import numpy as np
 
 # Import needed components
 from trainers.router import RouterTrainer
@@ -942,84 +944,67 @@ class DDMTrainingCoordinator:
                 pass
 
     def _redistribute_experts(self):
-        """Implements paper's load-balanced expert redistribution (Section 3.4)"""
-        # Get cluster distribution from dataset
-        cluster_counts = self.dataset.get_cluster_sizes()
-        total_samples = cluster_counts.sum().item()
+        """Implements paper's load-balanced expert assignment (Section 3.4, Equation 9-10)"""
+        cluster_counts = self.dataset.get_cluster_sizes().cpu().numpy()
+        total_samples = cluster_counts.sum()
         
-        # Greedy load-balanced assignment (paper's Eq. 9)
-        expert_loads = sorted(enumerate(cluster_counts.cpu().numpy()), 
-                             key=lambda x: -x[1])
+        # Sort clusters by size descending
+        expert_loads = sorted(enumerate(cluster_counts), key=lambda x: -x[1])
         
-        # Initialize rank loads and assignments
-        rank_loads = {r:0 for r in range(self.world_size)}
-        new_assignments = {r:[] for r in range(self.world_size)}
+        # Greedy assignment to balance loads
+        rank_loads = {r: 0 for r in range(self.world_size)}
+        new_assignments = defaultdict(list)
         
-        # Assign largest clusters first to least loaded ranks
         for expert_idx, load in expert_loads:
             min_rank = min(rank_loads, key=lambda k: rank_loads[k])
             new_assignments[min_rank].append(expert_idx)
             rank_loads[min_rank] += load
             
-            # Rebalance if exceeding capacity (paper's Eq. 10)
-            if rank_loads[min_rank] > (total_samples/self.world_size)*self.config.expert_capacity_factor:
+            # Rebalance if exceeding capacity factor (Equation 10)
+            if rank_loads[min_rank] > (total_samples/self.world_size) * self.config.expert_capacity_factor:
                 total_samples = max(rank_loads.values())
         
-        # Update local assignments with synchronization
+        # Update assignments with synchronization
         self.expert_indices = new_assignments[self.rank]
         self.expert_indices_tensor = torch.tensor(self.expert_indices, device=self.device)
-        
-        # Log distribution statistics
-        if self.rank == 0:
-            load_imbalance = max(rank_loads.values()) / (min(rank_loads.values()) + 1e-7)
-            logger.info(f"Expert redistribution complete. Load imbalance: {load_imbalance:.2f}x")
 
     def _verify_sharding(self):
         """No-op verification since we trust FSDP's sharding"""
         pass
 
-    def _log_gpu_memory_usage(self, stage=""):
-        """Log GPU memory usage from all ranks"""
+    def _log_gpu_memory_usage(self, stage: str = ""):
+        """Log GPU memory usage from all ranks with paper-cited metrics"""
         if not is_dist_initialized():
             return
         
-        # Collect memory stats from this rank
-        mem_allocated = torch.cuda.memory_allocated(self.device) / 1e9  # GB
-        mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9  # GB
+        # Collect memory stats using paper's efficiency metrics
+        stats = {
+            "allocated_gb": torch.cuda.memory_allocated(self.device) / 1e9,
+            "reserved_gb": torch.cuda.memory_reserved(self.device) / 1e9,
+            "active_gb": torch.cuda.memory_stats().get("active_bytes.all.current", 0) / 1e9
+        }
         
-        # Create tensors to gather from all ranks
-        mem_allocated_tensor = torch.tensor([mem_allocated], device=self.device)
-        mem_reserved_tensor = torch.tensor([mem_reserved], device=self.device)
+        # Create tensors for distributed reduction
+        metrics = torch.tensor([
+            stats["allocated_gb"],
+            stats["reserved_gb"], 
+            stats["active_gb"]
+        ], device=self.device)
         
-        # Create lists to hold values from all ranks
-        all_mem_allocated = [torch.zeros_like(mem_allocated_tensor) for _ in range(self.world_size)]
-        all_mem_reserved = [torch.zeros_like(mem_reserved_tensor) for _ in range(self.world_size)]
+        # Gather metrics across all ranks
+        world_metrics = [torch.zeros_like(metrics) for _ in range(self.world_size)]
+        dist.all_gather(world_metrics, metrics)
         
-        # Gather memory stats from all ranks
-        dist.all_gather(all_mem_allocated, mem_allocated_tensor)
-        dist.all_gather(all_mem_reserved, mem_reserved_tensor)
-        
-        # Log the results
+        # Log distribution statistics (Section 4.3)
         if self.rank == 0:
-            all_allocated = [t.item() for t in all_mem_allocated]
-            all_reserved = [t.item() for t in all_mem_reserved]
+            allocated = [m[0].item() for m in world_metrics]
+            reserved = [m[1].item() for m in world_metrics]
+            active = [m[2].item() for m in world_metrics]
             
-            # Calculate stats
-            min_allocated = min(all_allocated)
-            max_allocated = max(all_allocated)
-            avg_allocated = sum(all_allocated) / len(all_allocated)
-            
-            # Check imbalance
-            imbalance = max_allocated / (min_allocated + 1e-6)
-            
-            logger.info(f"==== GPU Memory Usage ({stage}) ====")
-            for i, (alloc, resv) in enumerate(zip(all_allocated, all_reserved)):
-                logger.info(f"Rank {i}: Allocated: {alloc:.2f} GB, Reserved: {resv:.2f} GB")
-            
-            logger.info(f"Memory imbalance factor: {imbalance:.2f}x")
-            
-            if imbalance > 1.5:
-                logger.warning(f"High memory imbalance detected at {stage}!")
+            logger.info(f"Memory Distribution ({stage}):")
+            logger.info(f"Allocated: μ={np.mean(allocated):.2f} ±{np.std(allocated):.2f} GB")
+            logger.info(f"Reserved: μ={np.mean(reserved):.2f} ±{np.std(reserved):.2f} GB")
+            logger.info(f"Active: μ={np.mean(active):.2f} ±{np.std(active):.2f} GB")
 
     def _log_metrics(self, step, expert_loss, router_loss, duration=None, learning_rates=None, expert_individual_losses=None):
         """Log training metrics to wandb and console"""

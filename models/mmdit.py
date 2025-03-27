@@ -206,7 +206,7 @@ class ExpertMMDiTParams(FluxParams):
     gradient_checkpointing: bool = config.use_gradient_checkpointing
 
 class ExpertMMDiT(Flux):
-    """Implements paper's expert specialization (Section 3.2)"""
+    """Implements paper's expert specialization (Section 3.2) with capacity awareness"""
     def __init__(self, params: ExpertMMDiTParams):
         # Remove guidance-related components from base params
         params.guidance_embed = False  # Disable unused guidance embedding
@@ -219,64 +219,50 @@ class ExpertMMDiT(Flux):
             nn.Embedding(params.num_clusters, params.cluster_embed_dim),
             nn.Linear(params.cluster_embed_dim, params.hidden_size)
         )
-        nn.init.normal_(self.cluster_embed[0].weight, std=0.02)
+        
+        # Initialize with scaled normal distribution per paper
+        nn.init.normal_(self.cluster_embed[0].weight, std=0.02/math.sqrt(params.hidden_size))
         nn.init.zeros_(self.cluster_embed[1].weight)
         nn.init.zeros_(self.cluster_embed[1].bias)
 
         # Paper's capacity-aware initialization (Section 3.4)
         self.register_buffer('expert_capacity', 
             torch.tensor(params.expert_capacity_factor, dtype=torch.float32))
-
-    def forward(
-        self,
-        img: Tensor,
-        img_ids: Tensor,
-        txt: Tensor,
-        txt_ids: Tensor,
-        timesteps: Tensor,
-        y: Tensor,
-        cluster_ids: Tensor,  # From router predictions
-    ) -> Tensor:
-        """
-        Implements paper's Eq. 6 with capacity awareness:
-        1. Cluster conditioning via learned embeddings
-        2. Capacity-aware feature modulation
-        3. Transformer processing with gradient checkpointing
-        """
-        # Convert cluster IDs to embeddings 
-        cluster_emb = self.cluster_embed(cluster_ids)  # [B, D]
-        
-        # Capacity-aware feature scaling (Section 3.4)
-        capacity_scale = 1.0 + self.expert_capacity * torch.sigmoid(cluster_emb.mean(dim=-1))
-        
-        # Paper's additive conditioning with capacity awareness
-        conditioned_y = y * capacity_scale[:, None] + cluster_emb.unsqueeze(1)
-        
-        # Original processing with capacity-scaled conditioning
-        img_emb = self.img_in(img) * (1 + self.time_in(timesteps)[:, None])
-        txt_emb = self.txt_in(txt) + self.vector_in(conditioned_y)[:, None]
-        
-        # Process through transformer with gradient checkpointing
-        x = torch.cat([txt_emb, img_emb], dim=1)
-        pos_ids = torch.cat([txt_ids, img_ids], dim=1)
-        
-        for block in self.double_blocks:
-            if self.params.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, timesteps, self.pe_embedder(pos_ids)
-                )
-            else:
-                x = block(x, vec=timesteps, pe=self.pe_embedder(pos_ids))
             
-        return self.final_layer(x[:, txt_emb.size(1):], timesteps)
-
     def _validate_params(self, params):
         """Ensure cluster config matches paper specifications"""
+        if not hasattr(params, 'num_clusters'):
+            raise ValueError("ExpertMMDiT requires num_clusters parameter")
         if params.cluster_embed_dim % 2 != 0:
             params.cluster_embed_dim += 1  # Ensure even dim for RoPE
         if params.hidden_size % params.num_heads != 0:
             raise ValueError("Hidden size must be divisible by num_heads")
-            
+
+    def forward(
+        self,
+        img: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt: torch.Tensor,
+        txt_ids: torch.Tensor,
+        timesteps: torch.Tensor,
+        y: torch.Tensor,
+        cluster_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # Validate cluster IDs (Section 3.4)
+        if (cluster_ids < 0).any() or (cluster_ids >= self.params.num_clusters).any():
+            invalid = cluster_ids.unique().tolist()
+            raise ValueError(f"Invalid cluster IDs {invalid}. Must be in [0, {self.params.num_clusters-1}]")
+        
+        # Cluster conditioning (Equation 5)
+        cluster_emb = self.cluster_embed(cluster_ids)  # [B, D]
+        
+        # Capacity-aware scaling (Section 3.4)
+        capacity_scale = 1.0 + self.expert_capacity * torch.sigmoid(cluster_emb.mean(dim=-1))
+        conditioned_y = y * capacity_scale[:, None] + cluster_emb.unsqueeze(1)
+        
+        # Original processing with capacity conditioning
+        return super().forward(img, img_ids, txt, txt_ids, timesteps, conditioned_y, cluster_ids)
+
     def create_embeddings(self, text_input, image_input):
         """
         Create embeddings from text and image inputs
@@ -436,3 +422,12 @@ class ExpertMMDiT(Flux):
         
         # Return final latents
         return latents
+
+    def deterministic_sample(self, noise: torch.Tensor, steps: int = 50) -> torch.Tensor:
+        """Implements paper's deterministic sampler (Appendix B)"""
+        alpha_bar = torch.cos(torch.linspace(0, 1, steps+1) * math.pi/2)
+        for t in reversed(range(steps)):
+            # Paper's modified reverse process
+            pred = self(noise, t)
+            noise = (noise - (1 - alpha_bar[t])*pred) / alpha_bar[t]
+        return noise

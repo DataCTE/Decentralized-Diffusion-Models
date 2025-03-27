@@ -19,6 +19,8 @@ from utils.logging import logger
 # Import FSDP explicitly for type checking
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+from typing import Dict
+
 
 
 class ExpertTrainer(BaseTrainer):
@@ -90,65 +92,50 @@ class ExpertTrainer(BaseTrainer):
         # Initialize scaler once in __init__
         self.scaler = torch.amp.GradScaler(enabled=config.use_mixed_precision)
 
-    def compute_loss(self, batch):
-        """Paper's per-expert loss calculation (Equation 6), aligned with train_step logic"""
-        # FSDP handles device placement - no .to(device) needed
-        x0 = batch["latent"]  # Already on correct device
-
-        # --- Handle potential 5D input from dataloader ---
-        if x0.dim() == 5:
-            B, S, C, H, W = x0.shape
-            if S == 1:
-                x0 = x0.squeeze(1)
-            else:
-                # Use first sequence if multiple exist
-                x0 = x0[:, 0]
-        # --- End 5D handling ---
-
-        # Sample timesteps uniformly as in paper
-        t = torch.rand(x0.size(0), device=x0.device)  # Use tensor's device
-
-        # Forward process using paper's flow matching formulation
-        # Ensure alpha_t and sigma_t match the dimensions of x0 (4D)
+    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Implements paper's per-expert loss (Section 3.2, Equation 6)
+        
+        Args:
+            batch: Contains 'latent' (B, C, H, W) and 'clip_embedding' (B, L, D)
+            
+        Returns:
+            Scalar loss value
+        """
+        # Paper's cosine schedule handling
+        x0 = batch["latent"]
+        B = x0.shape[0]
+        
+        # Sample timesteps and noise following paper appendix A
+        t = torch.rand(B, device=x0.device)
         alpha_t = torch.cos(t * math.pi/2).view(-1, 1, 1, 1)
         sigma_t = torch.sin(t * math.pi/2).view(-1, 1, 1, 1)
         noise = torch.randn_like(x0)
-        xt = alpha_t * x0 + sigma_t * noise # xt is 4D: [B, C, H, W]
-
-        # --- Reshape xt for the model ---
-        B, C, H, W = xt.shape
-        xt_seq = xt.reshape(B, C, H * W).permute(0, 2, 1) # Shape: [B, H*W, C]
-        # --- End reshape ---
-
-        # --- Prepare text embeddings (handle potential 4D) ---
-        text_embeds = batch['clip_embedding']
-        if text_embeds.dim() == 4:
-            B_txt, S_txt, L_txt, D_txt = text_embeds.shape
-            if S_txt == 1:
-                text_embeds = text_embeds.squeeze(1)
-            else:
-                text_embeds = text_embeds[:, 0] # Use first sequence
-        # --- End text embedding prep ---
-
-        # Expert forward pass with cluster conditioning
-        # Use reshaped xt_seq and scaled timesteps
-        img_pos_ids = self._get_position_ids(xt) # Pass original 4D xt to get H, W
+        xt = alpha_t * x0 + sigma_t * noise
+        
+        # Reshape for transformer input (B, L, C)
+        xt_seq = xt.flatten(2).permute(0, 2, 1)  # [B, H*W, C]
+        
+        # Get cluster predictions from router (Section 3.3)
+        with torch.no_grad():
+            cluster_ids = self.router(
+                img=xt,
+                timesteps=t * 1000,  # Scale to [0,1000)
+                txt=batch['clip_embedding']
+            ).argmax(dim=-1)
+        
+        # Forward pass with cluster conditioning (Equation 5)
         pred_flow = self.expert(
-            img=xt_seq,                       # Use reshaped image sequence
-            img_ids=img_pos_ids,              # Use generated position IDs
-            txt=text_embeds,
-            txt_ids=self._get_text_position_ids(text_embeds),
-            timesteps=t * 1000,               # Scale timesteps like in train_step
-            y=self._get_conditioning(x0.shape[0]),
-            cluster_ids=batch['cluster_pred']  # Use router predictions instead of ground truth
+            img=xt_seq,
+            img_ids=self._get_position_ids(xt),
+            txt=batch['clip_embedding'],
+            txt_ids=self._get_text_position_ids(batch['clip_embedding']),
+            timesteps=t * 1000,
+            y=self._get_conditioning(B),
+            cluster_ids=cluster_ids
         )
-
-        # --- Use flow_matcher for loss calculation ---
-        # Pass the model's prediction (pred_flow) and the original data (x0)
-        loss = self.flow_matcher.compute_loss(pred_flow, x0, t)
-        # --- End flow_matcher usage ---
-
-        return loss # flow_matcher.compute_loss already returns a scalar loss item
+        
+        # Flow matching loss (Equation 6)
+        return self.flow_matcher.compute_loss(pred_flow, x0, t)
 
     def train_step(self, batch):
         """Implements paper's capacity-aware training (Section 3.4)"""

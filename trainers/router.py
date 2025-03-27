@@ -9,6 +9,7 @@ from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
 import torch.distributed as dist
 import logging
 import torch.nn.functional as F
+from typing import Dict
 
 # Import centralized utilities for consistent implementation
 
@@ -98,29 +99,35 @@ class RouterTrainer:
         """Set router model to evaluation mode"""
         self.router.eval()
 
-    def train_step(self, batch):
-        """Implements paper's router training (Algorithm 1)"""
-        # Generate timesteps with paper's uniform sampling
-        t = torch.rand(batch["latent"].size(0), device=self.device) * 1000
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Implements paper's router training (Algorithm 1) with temperature annealing
         
-        # Forward process with cosine schedule (Section 3.1)
-        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
-        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
-        noise = torch.randn_like(batch["latent"])
-        x_t = alpha_t * batch["latent"] + sigma_t * noise
+        Args:
+            batch: Contains 'latent' (B, C, H, W), 'timesteps' (B,), and 'cluster_labels' (B,)
+            
+        Returns:
+            Cross-entropy loss with temperature scaling
+        """
+        # Paper's temperature annealing (Section 3.3)
+        current_step = max(1, self.step)  # Prevent math error on step 0
+        temp = max(
+            self.config.router_min_temp,
+            self.config.router_temperature * 
+            (self.config.router_temperature_decay ** current_step)
+        )
         
-        # Get predictions and compute cross-entropy
-        logits = self.router(x_t, t, batch["clip_embedding"])
-        loss = F.cross_entropy(logits, batch["expert"])
-        
-        # Paper's gradient clipping (Appendix B.3)
-        if self.config.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.router.parameters(), 
-                self.config.max_grad_norm
-            )
-        
-        return loss
+        # Forward pass with analytical noise addition (Appendix A)
+        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
+            # Generate timestep-conditioned inputs
+            t = torch.rand(batch["latent"].size(0), device=self.device)
+            alpha_t = torch.cos(t * math.pi/2)[:, None, None, None]
+            sigma_t = torch.sin(t * math.pi/2)[:, None, None, None]
+            noise = torch.randn_like(batch["latent"])
+            x_t = alpha_t * batch["latent"] + sigma_t * noise
+            
+            # Get predictions and compute loss
+            logits = self.router(x_t, t * 1000, batch["clip_embedding"]) / temp
+            return F.cross_entropy(logits, batch["cluster_labels"])
 
     def train_epoch(self, loader):
         """
