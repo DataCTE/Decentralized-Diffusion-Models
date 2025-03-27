@@ -50,7 +50,7 @@ class ExpertTrainer(BaseTrainer):
         model_config_dict = vars(config).copy() # Create a mutable copy
         if hasattr(config, 'latent_channels'):
              model_config_dict['in_channels'] = config.latent_channels
-             logger.info(f"Expert {expert_idx}: Setting model in_channels to latent_channels ({config.latent_channels})")
+             #logger.info(f"Expert {expert_idx}: Setting model in_channels to latent_channels ({config.latent_channels})")
         else:
              logger.warning(f"Expert {expert_idx}: config.latent_channels not found, using config.in_channels ({config.in_channels}) for model.")
         # Use a SimpleNamespace or a dedicated dataclass if ExpertMMDiT expects one
