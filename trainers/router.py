@@ -43,15 +43,15 @@ def get_auto_wrap_policy(config):
 
 class RouterTrainer:
     """Trainer for the router model in DDM"""
-    def __init__(self, config, device, rank, world_size=None):
+    def __init__(self, config, device, rank, world_size=None, logger=None):
         # Initialize parameters
         self.config = config
         self.device = device
         self.rank = rank
         self.world_size = world_size or 1
         
-        # Initialize logger for this class
-        self.logger = logging.getLogger(__name__)
+        # Use the passed logger or create a fallback
+        self.logger = logger if logger else logging.getLogger(f"RouterTrainer_{rank}_fallback")
         
         # Create base router model with safe config access
         base_router = RouterModel(config)
@@ -93,6 +93,8 @@ class RouterTrainer:
 
         # Initialize step counter
         self.step = 0
+
+        self.logger.info(f"Initializing RouterTrainer on rank {rank}")
 
     def train(self):
         """Set router model to training mode"""
@@ -143,7 +145,10 @@ class RouterTrainer:
             # Combine losses with paper's λ coefficient
             total_loss = F.cross_entropy(logits, batch['expert']) + self.config.balance_lambda * balance_loss
             
-            return total_loss
+            # Example logging
+            self.logger.debug(f"Router train step with batch size {batch['latent'].shape[0]}")
+            
+            return total_loss.item()
 
     def _validate_batch(self, batch: Dict[str, torch.Tensor]) -> None:
         """Type and shape validation for training batches"""
@@ -217,6 +222,9 @@ class RouterTrainer:
             'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
         }
         
+        # Example logging
+        self.logger.info(f"Saving router checkpoint at step {step} to {checkpoint_path}")
+        
         # Save using the centralized utility
         return save_model_checkpoint(
             model=self.router,
@@ -229,6 +237,9 @@ class RouterTrainer:
         
     def load_checkpoint(self, checkpoint_path):
         """Load router checkpoint using centralized utility"""
+        # Example logging
+        self.logger.info(f"Loading router checkpoint from {checkpoint_path}")
+        
         # Load using the centralized utility
         metadata = load_model_checkpoint(
             model=self.router,
@@ -238,6 +249,9 @@ class RouterTrainer:
             is_fsdp=isinstance(self.router, FSDP),
             device=self.device
         )
+        
+        if metadata:
+            self.logger.info(f"Loaded router checkpoint, step {metadata.get('step', 'N/A')}")
         
         return metadata
 

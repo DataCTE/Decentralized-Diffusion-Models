@@ -4,23 +4,15 @@ import torch
 from bitsandbytes.optim import AdamW8bit
 import math
 import os
-import torch.nn.functional as F
-from utils.distributed import is_dist_initialized, synchronize
-from utils.fsdp import wrap_model_with_fsdp, configure_optimizer_for_fsdp
+import logging
+from typing import Dict
+import torch.nn as nn
 
 from models.mmdit import ExpertMMDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
-from data.vae import VAEWrapper
-from data.clip import CLIPTextEncoder
 from trainers.base import BaseTrainer
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
-from utils.logging import logger
 
-# Import FSDP explicitly for type checking
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-from typing import Dict
-import torch.nn as nn
 
 
 
@@ -30,12 +22,17 @@ class ExpertTrainer(BaseTrainer):
     Each expert trains in complete isolation on its assigned data cluster,
     with no cross-communication between experts as described in paper Section 3.2
     """
-    def __init__(self, expert_idx, config, device, rank, world_size, router=None):
+    def __init__(self, expert_idx, config, device, rank, world_size, router=None, logger=None):
         # Paper-recommended initialization (section 4.1)
         super().__init__(config, device, rank)
         
+        # Use the passed logger or create a fallback
+        self.logger = logger if logger else logging.getLogger(f"ExpertTrainer_{expert_idx}_fallback")
+        
         # Validate router existence before initializing components
         if router is None:
+            # Use self.logger for error messages
+            self.logger.error(f"ExpertTrainer requires router reference. Missing router for expert {expert_idx} (rank {rank})")
             raise ValueError(
                 f"ExpertTrainer requires router reference. "
                 f"Missing router for expert {expert_idx} (rank {rank})"
@@ -52,7 +49,7 @@ class ExpertTrainer(BaseTrainer):
              model_config_dict['in_channels'] = config.latent_channels
              #logger.info(f"Expert {expert_idx}: Setting model in_channels to latent_channels ({config.latent_channels})")
         else:
-             logger.warning(f"Expert {expert_idx}: config.latent_channels not found, using config.in_channels ({config.in_channels}) for model.")
+             self.logger.warning(f"Expert {expert_idx}: config.latent_channels not found, using config.in_channels ({config.in_channels}) for model.")
         # Use a SimpleNamespace or a dedicated dataclass if ExpertMMDiT expects one
         model_config = SimpleNamespace(**model_config_dict)
         # --- END FIX ---
@@ -210,7 +207,7 @@ class ExpertTrainer(BaseTrainer):
             'config': {k: v for k, v in self.config.__dict__.items() if not k.startswith('_')}
         }
         
-        # Save using the centralized utility
+        # Save using the centralized utility, passing the logger if needed by the utility
         return save_model_checkpoint(
             model=self.expert,
             optimizer=self.optimizer,
@@ -222,6 +219,9 @@ class ExpertTrainer(BaseTrainer):
     
     def load_checkpoint(self, checkpoint_path):
         """Load a checkpoint for the expert model using consolidated checkpoint utility"""
+        # Example: Make sure logging uses self.logger
+        self.logger.info(f"Loading checkpoint for expert {self.expert_idx} from {checkpoint_path}")
+
         # Load using the centralized utility
         metadata = load_model_checkpoint(
             model=self.expert,
@@ -230,7 +230,11 @@ class ExpertTrainer(BaseTrainer):
             path=checkpoint_path,
             is_fsdp=True
         )
-        
+        if metadata:
+            self.logger.info(f"Loaded checkpoint for expert {self.expert_idx}, step {metadata.get('step', 'N/A')}")
+        else:
+            self.logger.warning(f"Failed to load checkpoint for expert {self.expert_idx} from {checkpoint_path}")
+
         return metadata
     
     def forward_diffuse(self, x0, t, noise=None):
@@ -297,7 +301,7 @@ class ExpertTrainer(BaseTrainer):
             self.optimizer.load_state_dict(state)
             
             if self.rank == 0:
-                logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 
+                self.logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 
 
     def _get_position_ids(self, x):
         # Get spatial dimensions
