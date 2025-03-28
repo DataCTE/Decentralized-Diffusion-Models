@@ -260,9 +260,8 @@ class ExpertTrainer(BaseTrainer):
             self.scaler.update()
             self.optimizer.zero_grad()
             
-            # Update scheduler with validated step count
-            current_scheduler_step = max(0, self.step // self.config.expert_gradient_accumulation_steps)
-            self.lr_scheduler.step(current_scheduler_step)
+            # Update scheduler WITHOUT parameters to use internal step counter
+            self.lr_scheduler.step()  # Changed from manual step calculation
         
         self.step += 1
         
