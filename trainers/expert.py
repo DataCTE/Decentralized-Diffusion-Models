@@ -74,6 +74,8 @@ class ExpertTrainer(BaseTrainer):
         flux_fields = FluxParams.__annotations__.keys()
         # Filter config to only include valid fields
         filtered_config = {k: v for k, v in model_config_dict.items() if k in flux_fields}
+        # Add expert-specific parameters that aren't in the main config
+        filtered_config['guidance_embed'] = False  # Experts never use guidance
         flux_params = FluxParams(**filtered_config)
         
         self.expert = ExpertMMDiT(flux_params)
