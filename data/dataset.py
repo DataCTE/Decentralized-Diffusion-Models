@@ -112,8 +112,10 @@ class DDMDataset(Dataset):
         
         for idx in tqdm(range(len(self.latent_files)), desc=f"[Rank {self.rank}] Validating files"):
             base_name = self.base_names[idx]
+            
+            # CORRECTED: Use consistent naming across features
             required_files = [
-                self.latent_files[idx],
+                self.latent_files[idx],  # Already contains rank suffix
                 os.path.join(self.clip_dir, f"{base_name}_rank{self.rank}.pt"),
                 os.path.join(self.cluster_dir, f"{base_name}_rank{self.rank}.pt"),
                 os.path.join(self.bucket_dir, f"{base_name}_rank{self.rank}.pt")
@@ -123,7 +125,7 @@ class DDMDataset(Dataset):
                 valid_indices.append(idx)
             else:
                 missing = [f for f in required_files if not os.path.exists(f)]
-                logger.warning(f"Skipping sample {base_name} - missing files: {missing}")
+                logger.warning(f"Skipping sample {base_name} - missing files: {[Path(f).name for f in missing]}")
                 
         return valid_indices
 
@@ -137,15 +139,15 @@ class DDMDataset(Dataset):
             latent = torch.load(self.latent_files[actual_idx], map_location='cpu')
             
             # Load CLIP embeddings
-            clip_path = os.path.join(self.clip_dir, f"{base_name}_rank{self.rank}.pt")
+            clip_path = os.path.join(self.clip_dir, f"{base_name}.pt")
             clip_embed = torch.load(clip_path, map_location='cpu')
             
             # Load cluster assignment
-            cluster_path = os.path.join(self.cluster_dir, f"{base_name}_rank{self.rank}.pt")
+            cluster_path = os.path.join(self.cluster_dir, f"{base_name}.pt")
             cluster_id = torch.load(cluster_path, map_location='cpu')
             
             # Load bucket dimensions
-            dim_path = os.path.join(self.dim_dir, f"{base_name}_rank{self.rank}.pt")
+            dim_path = os.path.join(self.dim_dir, f"{base_name}.pt")
             bucket_dims = torch.load(dim_path, map_location='cpu')
             
             return {
