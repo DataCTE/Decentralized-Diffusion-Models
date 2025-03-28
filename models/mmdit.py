@@ -214,20 +214,16 @@ class ExpertMMDiT(Flux):
         y: torch.Tensor,
         cluster_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Implements paper's expert specialization with validated cluster conditioning
+        """Implements paper's expert specialization with validated dimensions"""
+        # Validate input dimensions
+        B, L, C = img.shape
+        expected_C = self.params.latent_channels * (self.params.patch_size ** 2)
         
-        Args:
-            img: Input image tensor [B, L, C]
-            img_ids: Position IDs for image tokens [B, L, 2]
-            txt: Text embeddings [B, S, D]
-            txt_ids: Position IDs for text tokens [B, S, 2]
-            timesteps: Diffusion timesteps [B]
-            y: Conditioning vector [B, D]
-            cluster_ids: Assigned cluster IDs [B]
-            
-        Returns:
-            Predicted flow vector [B, L, C]
-        """
+        if C != expected_C:
+            raise ValueError(
+                f"Input features have shape {img.shape}, but expected last dimension "
+                f"to be {expected_C} (patch_size²×latent_channels). Check patching configuration."
+            )
         
         # Cluster conditioning (Equation 5)
         cluster_emb = self.cluster_embed(cluster_ids)
@@ -248,13 +244,30 @@ class ExpertMMDiT(Flux):
         return y * capacity_scale + self.cluster_proj(cluster_emb)
 
     def _fuse_embeddings(self, img, txt, timesteps, y):
-        """Fuse embeddings with mixed precision safety"""
+        """Fuse embeddings with proper dimension handling"""
         dtype = next(self.parameters()).dtype
         img, txt = img.to(dtype), txt.to(dtype)
+        
+        # Get actual dimensions for debugging
+        B, L, C = img.shape
         
         # Add timestep embedding (paper's Eq.3)
         t_emb = timestep_embedding(timesteps.float(), 256)
         time_vec = self.time_in(t_emb)
+        
+        # Ensure dimensions match the expected input channel size
+        # The img_in layer expects dimensions matching self.in_channels
+        if C != self.params.in_channels:
+            # Handle the mismatch by reshaping or padding
+            if self.params.patch_size**2 * self.params.latent_channels == C:
+                # This is a patched input, matches our expectation
+                pass  # Keep as is
+            else:
+                raise ValueError(
+                    f"Expected input channels {self.params.in_channels}, but got {C}. "
+                    f"Check that patch_size ({self.params.patch_size}), latent_channels "
+                    f"({self.params.latent_channels}) and input dimension match."
+                )
         
         # Time-aware image projection
         img_emb = self.img_in(img) * (1 + time_vec[:, None])

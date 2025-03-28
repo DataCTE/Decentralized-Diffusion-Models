@@ -17,7 +17,6 @@ from types import SimpleNamespace
 
 
 
-
 class ExpertTrainer(BaseTrainer):
     """
     Trainer for expert DiT models in DDM.
@@ -48,9 +47,14 @@ class ExpertTrainer(BaseTrainer):
         patch_size = config.patch_size
         if hasattr(config, 'latent_channels'):
             model_config_dict = vars(config).copy()
-            model_config_dict['in_channels'] = config.latent_channels * (patch_size ** 2)
-            model_config_dict['out_channels'] = config.latent_channels * (patch_size ** 2)
+            expected_channels = config.latent_channels * (patch_size ** 2)
+            model_config_dict['in_channels'] = expected_channels
+            model_config_dict['out_channels'] = expected_channels
             model_config_dict['latent_channels'] = config.latent_channels
+            
+            # Log the dimension configuration for debugging
+            self.logger.info(f"Expert {expert_idx} configured with: in_channels={expected_channels}, "
+                             f"latent_channels={config.latent_channels}, patch_size={patch_size}")
         else:
             self.logger.warning(f"Using default in_channels {config.in_channels}")
         
