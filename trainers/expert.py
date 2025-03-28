@@ -132,7 +132,8 @@ class ExpertTrainer(BaseTrainer):
             batch: Contains 'latent' (B, C, H, W) and 'clip_embedding' (B, L, D)
             
         Returns:
-            Dictionary with 'raw_loss', 'weighted_loss', 'router_confidence', and 'cluster_alignment'
+            Dictionary with 'raw_loss', 'weighted_loss', 'router_confidence', 
+            'per_sample_confidence', and 'cluster_alignment'
         """
         # Paper's cosine schedule handling
         x0 = batch["latent"]
@@ -153,15 +154,7 @@ class ExpertTrainer(BaseTrainer):
             p2=self.config.patch_size
         )
         
-        # Get cluster predictions from router (Section 3.3)
-        with torch.no_grad():
-            cluster_ids = self.router(
-                img=xt,
-                timesteps=t * 1000,  # Scale to [0,1000)
-                txt=batch['clip_embedding']
-            ).argmax(dim=-1)
-        
-        # Get router confidence scores for ALL experts (paper Eq.4)
+        # Get router confidence scores and cluster assignments in single forward pass
         with torch.no_grad():
             router_logits = self.router(
                 img=xt,
@@ -169,6 +162,8 @@ class ExpertTrainer(BaseTrainer):
                 txt=batch['clip_embedding']
             )
             router_probs = torch.softmax(router_logits, dim=-1)
+            # Get maximum probability and corresponding cluster for each sample
+            expert_weight, cluster_ids = torch.max(router_probs, dim=-1)
         
         # Forward pass with cluster conditioning (Equation 5)
         pred_flow = self.expert(
@@ -185,7 +180,6 @@ class ExpertTrainer(BaseTrainer):
         raw_loss = self.flow_matcher.compute_loss(pred_flow, x0, xt, t)
         
         # New ensemble-weighted loss (paper Section 3.3)
-        expert_weight = router_probs[:, self.expert_idx]
         weighted_loss = raw_loss * expert_weight.mean()
         
         # Track specialization metrics
@@ -195,6 +189,7 @@ class ExpertTrainer(BaseTrainer):
             'raw_loss': raw_loss,
             'weighted_loss': weighted_loss,
             'router_confidence': expert_weight.mean(),
+            'per_sample_confidence': expert_weight,
             'cluster_alignment': cluster_match
         }
 
