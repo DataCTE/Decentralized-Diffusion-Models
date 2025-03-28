@@ -14,6 +14,7 @@ from types import SimpleNamespace
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, get_world_size
 from utils.logging import setup_distributed_logger
+import re  # Add regex module
 
 
 def chunks(lst, n):
@@ -64,93 +65,89 @@ class DDMDataset(Dataset):
         self._bucket_assignments = None  # Initialize cache
 
     def _verify_cache_dirs(self):
-        """
-        Verify cache directories and find valid base names where *all* required
-        feature files (latent, clip, expert, dims, bucket) exist.
-        """
+        """Verify cache directories with strict filename validation."""
         required_dirs = {
             "latents": self.latent_dir,
             "clip": self.clip_dir,
-            "clusters": self.cluster_dir, # Check cluster/expert files
-            "dims": self.dim_dir,         # Check dimension files
-            "buckets": self.bucket_dir    # Check bucket files
+            "clusters": self.cluster_dir,
+            "dims": self.dim_dir,
+            "buckets": self.bucket_dir
         }
 
-        if self.rank == 0:
-            self.logger.info("Verifying cache directories for all required features:")
-            for name, path in required_dirs.items():
-                self.logger.info(f" - {name}: {path}")
-
+        # Pattern to match 'basename_rankN.pt' where N is a digit
+        filename_pattern = re.compile(r"^(.*)_rank(\d+)\.pt$")
+        
         all_base_sets = []
         try:
-            for feature_type, dir_path in required_dirs.items():
-                if not os.path.isdir(dir_path):
-                     # If any required directory is missing, we cannot proceed.
-                     error_msg = f"Required cache directory not found: {dir_path} (for feature type: {feature_type})"
-                     self.logger.error(error_msg)
-                     raise FileNotFoundError(error_msg)
-
-                filenames = os.listdir(dir_path)
-                base_names_set = set()
-                # Use tqdm for progress, only display on rank 0
-                desc = f"Processing {feature_type} files"
-                for f in tqdm(filenames, desc=desc, unit="file", disable=(self.rank != 0)):
-                    # Check for the expected format basename_rank<N>.pt
-                    if f.endswith('.pt') and '_rank' in f:
-                        # Extract base name before the first '_rank'
-                        base_name = f.split('_rank')[0]
-                        base_names_set.add(base_name)
-                all_base_sets.append(base_names_set)
-                if self.rank == 0:
-                     self.logger.info(f"Found {len(base_names_set)} unique base names in {dir_path}")
-
-        except FileNotFoundError as e:
-            # Logged above, just re-raise
-            raise
-        except Exception as e:
-             self.logger.error(f"Error reading cache directories: {e}", exc_info=True)
-             raise
-
-        # Find the intersection of base names present in ALL directories
-        if not all_base_sets:
-            # This should not happen if directories exist, but handle defensively
-            error_msg = "No feature files found in any cache directory."
-            self.logger.error(error_msg)
-            raise FileNotFoundError(error_msg)
-
-        # Start intersection with the first set, then intersect with the rest
-        valid_bases = all_base_sets[0]
-        for i in range(1, len(all_base_sets)):
-            valid_bases.intersection_update(all_base_sets[i])
-            if not valid_bases: # Early exit if intersection becomes empty
-                break
-
-
-        if not valid_bases:
-            # Log error on all ranks
-            error_msg = (
-                f"No common base names found across all required directories: "
-                f"{list(required_dirs.values())}. "
-                f"Ensure precomputation generated all files (latent, clip, cluster, dim, bucket) "
-                f"with format 'basename_rank<N>.pt'."
+            # Add progress bar for directory verification
+            dir_progress = tqdm(
+                required_dirs.items(),
+                desc=f"Rank {self.rank} Verifying cache",
+                disable=not is_main_process(self.rank),
+                leave=False
             )
-            self.logger.error(error_msg)
-            # Ensure all processes are aware of the critical failure
-            if dist.is_initialized():
-                 dist.barrier() # Sync processes before potential divergence
-            raise FileNotFoundError(error_msg)
+            
+            for feature_type, dir_path in dir_progress:
+                dir_progress.set_description(f"Checking {feature_type} directory")
+                if not os.path.isdir(dir_path):
+                    raise FileNotFoundError(f"Missing directory: {dir_path}")
+                    
+                valid_files = []
+                base_names = set()
+                
+                # Update progress bar description
+                dir_progress.set_postfix({"current": feature_type, "status": "scanning"})
+                
+                # Use regex to validate filenames
+                for f in os.listdir(dir_path):
+                    match = filename_pattern.match(f)
+                    if match:
+                        base_name, rank = match.groups()
+                        if rank == str(self.rank):  # Only consider files for current rank
+                            base_names.add(base_name)
+                            valid_files.append(f)
+                
+                if not base_names:
+                    self.logger.error(f"No valid files found in {dir_path} for rank {self.rank}")
+                    
+                all_base_sets.append(base_names)
+                dir_progress.set_postfix({
+                    "current": feature_type,
+                    "files": len(valid_files),
+                    "bases": len(base_names)
+                })
+                
+                if self.rank == 0:
+                    self.logger.info(f"{feature_type.upper()} | Valid files: {len(valid_files)} | Unique bases: {len(base_names)}")
 
-        # Sort to ensure deterministic ordering across ranks
-        self.base_names = sorted(list(valid_bases))
-        self.num_samples = len(self.base_names)
+            # Find intersection of base names
+            valid_bases = set.intersection(*[set(s) for s in all_base_sets])
+            dir_progress.set_postfix({"status": f"found {len(valid_bases)} common bases"})
+            
+            if not valid_bases:
+                # Detailed error reporting
+                missing_in = []
+                for i, (feature, path) in enumerate(required_dirs.items()):
+                    if not all_base_sets[i]:
+                        missing_in.append(f"{feature} ({path})")
+                        
+                error_msg = "No common base names found. Missing/invalid files in:\n" + "\n".join(missing_in)
+                self.logger.error(error_msg)
+                raise FileNotFoundError(error_msg)
 
-        # Log completion only on rank 0
-        if self.rank == 0:
-            self.logger.info(f"Verified {self.num_samples} valid samples with all required features.")
+            # Sort to ensure deterministic ordering
+            self.base_names = sorted(valid_bases)
+            self.num_samples = len(self.base_names)
 
-        # Synchronize after verification to ensure all ranks have the list or failed
-        if dist.is_initialized():
-            dist.barrier()
+            if self.rank == 0:
+                self.logger.info(f"Verified {self.num_samples} samples with complete features")
+
+        except Exception as e:
+            self.logger.error("Cache verification failed:\n" + "\n".join([
+                f"- {k}: {v} ({len(all_base_sets[i])} bases)" 
+                for i, (k, v) in enumerate(required_dirs.items())
+            ]))
+            raise
 
     def __getitem__(self, idx):
         """Minimal check variant for research efficiency"""
