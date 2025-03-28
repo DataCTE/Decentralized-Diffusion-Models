@@ -8,22 +8,12 @@ import random
 from collections import defaultdict
 import logging
 import time  
-import glob
 from tqdm.auto import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from torch.serialization import safe_globals
-from numpy._core.multiarray import _reconstruct
-from types import SimpleNamespace
-from multiprocessing import Pool
 import torch.distributed as dist # Assuming dist is initialized elsewhere or handle initialization
 
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, get_world_size
 from utils.logging import setup_distributed_logger
-
-# Setup logging
-# logger = logging.getLogger(__name__)
 
 
 def chunks(lst, n):
@@ -67,11 +57,6 @@ class DDMDataset(Dataset):
         # Verify directories exist and find valid base names
         self._verify_cache_dirs()
         
-        # No need to glob for latent_files here anymore if __getitem__ uses base_names
-        # self.latent_files = sorted(glob.glob(os.path.join(self.latent_dir, f"*_rank{self.rank}.pt")))
-        # self.num_samples = len(self.latent_files)
-        # self.base_names = [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
-        
         # Use self.logger for logging
         self.logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples (lazy loading enabled)")
         
@@ -79,40 +64,75 @@ class DDMDataset(Dataset):
         self._bucket_assignments = None  # Initialize cache
 
     def _verify_cache_dirs(self):
-        """Verify cache directories and find valid pairs efficiently with progress."""
-        # Use self.logger
+        """
+        Verify cache directories and find valid base names where *all* required
+        feature files (latent, clip, expert, dims, bucket) exist.
+        """
+        required_dirs = {
+            "latents": self.latent_dir,
+            "clip": self.clip_dir,
+            "clusters": self.cluster_dir, # Check cluster/expert files
+            "dims": self.dim_dir,         # Check dimension files
+            "buckets": self.bucket_dir    # Check bucket files
+        }
+
         if self.rank == 0:
-            self.logger.info(f"Verifying cache directories: {self.clip_dir}, {self.latent_dir}")
+            self.logger.info("Verifying cache directories for all required features:")
+            for name, path in required_dirs.items():
+                self.logger.info(f" - {name}: {path}")
 
-        # Use os.listdir for faster directory reading
+        all_base_sets = []
         try:
-            clip_filenames = os.listdir(self.clip_dir)
-            latent_filenames = os.listdir(self.latent_dir)
+            for feature_type, dir_path in required_dirs.items():
+                if not os.path.isdir(dir_path):
+                     # If any required directory is missing, we cannot proceed.
+                     error_msg = f"Required cache directory not found: {dir_path} (for feature type: {feature_type})"
+                     self.logger.error(error_msg)
+                     raise FileNotFoundError(error_msg)
+
+                filenames = os.listdir(dir_path)
+                base_names_set = set()
+                # Use tqdm for progress, only display on rank 0
+                desc = f"Processing {feature_type} files"
+                for f in tqdm(filenames, desc=desc, unit="file", disable=(self.rank != 0)):
+                    # Check for the expected format basename_rank<N>.pt
+                    if f.endswith('.pt') and '_rank' in f:
+                        # Extract base name before the first '_rank'
+                        base_name = f.split('_rank')[0]
+                        base_names_set.add(base_name)
+                all_base_sets.append(base_names_set)
+                if self.rank == 0:
+                     self.logger.info(f"Found {len(base_names_set)} unique base names in {dir_path}")
+
         except FileNotFoundError as e:
-            self.logger.error(f"Cache directory not found: {e}")
+            # Logged above, just re-raise
             raise
+        except Exception as e:
+             self.logger.error(f"Error reading cache directories: {e}", exc_info=True)
+             raise
 
-        # Filter for .pt files and extract base names efficiently with tqdm progress
-        clip_bases = set()
-        # Wrap the loop with tqdm, disable if not rank 0
-        for f in tqdm(clip_filenames, desc="Processing clip files ", unit="file", disable=(self.rank != 0)):
-             if f.endswith('.pt') and '_rank' in f:
-                 clip_bases.add(f.split('_rank')[0])
+        # Find the intersection of base names present in ALL directories
+        if not all_base_sets:
+            # This should not happen if directories exist, but handle defensively
+            error_msg = "No feature files found in any cache directory."
+            self.logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
 
-        latent_bases = set()
-        # Wrap the loop with tqdm, disable if not rank 0
-        for f in tqdm(latent_filenames, desc="Processing latent files", unit="file", disable=(self.rank != 0)):
-             if f.endswith('.pt') and '_rank' in f:
-                 latent_bases.add(f.split('_rank')[0])
+        # Start intersection with the first set, then intersect with the rest
+        valid_bases = all_base_sets[0]
+        for i in range(1, len(all_base_sets)):
+            valid_bases.intersection_update(all_base_sets[i])
+            if not valid_bases: # Early exit if intersection becomes empty
+                break
 
-        # Find valid pairs using set intersection
-        valid_bases = clip_bases & latent_bases
 
         if not valid_bases:
-            # Log error on all ranks, but raise may only be needed on rank 0 depending on setup
+            # Log error on all ranks
             error_msg = (
-                f"No matching '*.pt' files found between {self.clip_dir} and {self.latent_dir}. "
-                f"Ensure files follow the 'name_rank<N>.pt' format."
+                f"No common base names found across all required directories: "
+                f"{list(required_dirs.values())}. "
+                f"Ensure precomputation generated all files (latent, clip, cluster, dim, bucket) "
+                f"with format 'basename_rank<N>.pt'."
             )
             self.logger.error(error_msg)
             # Ensure all processes are aware of the critical failure
@@ -126,8 +146,8 @@ class DDMDataset(Dataset):
 
         # Log completion only on rank 0
         if self.rank == 0:
-            self.logger.info(f"Verified {self.num_samples} valid sample base names")
-        
+            self.logger.info(f"Verified {self.num_samples} valid samples with all required features.")
+
         # Synchronize after verification to ensure all ranks have the list or failed
         if dist.is_initialized():
             dist.barrier()
@@ -136,53 +156,130 @@ class DDMDataset(Dataset):
         """Minimal check variant for research efficiency"""
         base_name = self.base_names[idx]
         rank_suffix = f"_rank{self.rank}.pt"
-        
+
+        # Construct all paths first
+        paths = {
+            'latent': os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"),
+            'clip_embedding': os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"),
+            'expert': os.path.join(self.cluster_dir, f"{base_name}{rank_suffix}"),
+            'dims': os.path.join(self.dim_dir, f"{base_name}{rank_suffix}"),
+            # Include bucket path for completeness, though not directly returned here
+            # 'bucket': os.path.join(self.bucket_dir, f"{base_name}{rank_suffix}")
+        }
+
         try:
-            # Ensure cluster_dir and dim_dir exist before trying to load
-            # (Could add checks here if they might be missing for some items)
+            # Optional: Add an explicit check here if paranoia is high,
+            # but _verify_cache_dirs should handle it.
+            # for feature, path in paths.items():
+            #     if not os.path.exists(path):
+            #         raise FileNotFoundError(f"Verified base name '{base_name}' but file missing at {path}")
+
             return {
-                'latent': torch.load(os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"), map_location='cpu'),
-                'clip_embedding': torch.load(os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"), map_location='cpu'),
-                'expert': torch.load(os.path.join(self.cluster_dir, f"{base_name}{rank_suffix}"), map_location='cpu'),
-                'dims': torch.load(os.path.join(self.dim_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
+                'latent': torch.load(paths['latent'], map_location='cpu'),
+                'clip_embedding': torch.load(paths['clip_embedding'], map_location='cpu'),
+                'expert': torch.load(paths['expert'], map_location='cpu'),
+                'dims': torch.load(paths['dims'], map_location='cpu'),
+                # Bucket data is loaded separately via the bucket_assignments property
             }
         except FileNotFoundError as e:
-            # Log file not found errors more informatively
-            self.logger.warning(f"[Rank {self.rank}] Missing file for base_name '{base_name}' at index {idx}: {str(e)}. Returning None.")
-            # Depending on collation, returning None might require careful handling later
-            return None # Or handle differently if None breaks collation
-        except Exception as e: # Catch other potential loading errors (like corrupt files)
-             self.logger.error(f"[Rank {self.rank}] Error loading data for base_name '{base_name}' at index {idx}: {str(e)}")
+            # This should ideally not happen now, but log if it does
+            self.logger.error(f"[Rank {self.rank}] CRITICAL: File missing for verified base_name '{base_name}' at index {idx}: {str(e)}. Check cache integrity.", exc_info=True)
+            # Decide how to handle this - raising might be better than returning None now
+            raise e # Re-raise the critical error
+        except Exception as e:
+             self.logger.error(f"[Rank {self.rank}] Error loading data for base_name '{base_name}' at index {idx}: {str(e)}", exc_info=True)
              # Decide on error handling: skip sample (return None), or raise error?
-             return None # Returning None is often safer for dataloading
+             return None # Returning None might still be necessary for corrupt files, handle in collate_fn
 
     def __len__(self):
         return self.num_samples
 
-    # Remove all preloading-related methods
-    def _lazy_load_clusters(self):
-        """Load cluster assignments on first access"""
-        if not hasattr(self, '_cluster_assignments'):
-            cluster_file = os.path.join(self.cluster_dir, "final_clusters.pt")
-            self._cluster_assignments = torch.load(cluster_file, map_location='cpu')
-        return self._cluster_assignments
-
     @property
-    def bucket_assignments(self):
-        """Lazy-loaded bucket assignments tensor"""
+    def bucket_assignments(self) -> torch.Tensor:
+        """
+        Lazy-loaded tensor containing the bucket index for each sample.
+        Loads from precomputed files on first access.
+        Shape: [num_samples]
+        """
+        # Check if already loaded or if loading is in progress to prevent race conditions
+        # (though less likely with standard DataLoader workers)
+        if hasattr(self, '_bucket_assignments_loading') and self._bucket_assignments_loading:
+             # Simple spin-wait or use a proper lock if threading issues are observed
+             while self._bucket_assignments is None:
+                 time.sleep(0.1)
+             return self._bucket_assignments
+
         if self._bucket_assignments is None:
-            self._bucket_assignments = self._load_bucket_assignments()
+            self._bucket_assignments_loading = True # Mark as loading
+            try:
+                if self.rank == 0:
+                    self.logger.info("Loading bucket assignments for the first time...")
+                start_time = time.time()
+                # Ensure result is stored on the correct device ('cpu')
+                self._bucket_assignments = self._load_bucket_assignments().to(self.device)
+                if self.rank == 0:
+                    load_time = time.time() - start_time
+                    self.logger.info(f"Finished loading {len(self._bucket_assignments)} bucket assignments in {load_time:.2f}s.")
+                if len(self._bucket_assignments) != self.num_samples:
+                     self.logger.error(f"Mismatch in number of loaded bucket assignments ({len(self._bucket_assignments)}) and dataset samples ({self.num_samples}).")
+                     # Decide on error handling - raise or try to recover? Raising is safer.
+                     raise RuntimeError("Bucket assignment count mismatch.")
+            except Exception as e:
+                 self.logger.error(f"Failed to load bucket assignments: {e}", exc_info=True)
+                 self._bucket_assignments = None # Ensure it remains None on failure
+                 raise # Re-raise the exception
+            finally:
+                 self._bucket_assignments_loading = False # Mark loading as complete/failed
+
+
         return self._bucket_assignments
 
-    def _load_bucket_assignments(self):
-        """Load and cache bucket assignments as tensor"""
+    def _load_bucket_assignments(self) -> torch.Tensor:
+        """Load bucket assignments for all verified samples from cache files."""
         assignments = []
-        for base_name in self.base_names:
+        missing_files = []
+        # Use tqdm for loading assignments, only display on rank 0
+        pbar_desc = f"Rank {self.rank} loading bucket files"
+        # Iterate through the verified base names
+        for base_name in tqdm(self.base_names, desc=pbar_desc, disable=(self.rank != 0), leave=False):
+            # Construct the expected path for the current rank
             path = os.path.join(self.bucket_dir, f"{base_name}_rank{self.rank}.pt")
-            assignments.append(torch.load(path, map_location='cpu'))  # Load to CPU first
-        
-        # Stack and move to dataset's device
-        return torch.stack(assignments).to(self.device)
+            try:
+                # Load directly to CPU, assumes assignment is a single tensor/value
+                assignment_tensor = torch.load(path, map_location='cpu')
+                # Ensure it's a scalar or has the expected format (e.g., single element tensor)
+                if not isinstance(assignment_tensor, torch.Tensor):
+                     assignment_tensor = torch.tensor(assignment_tensor) # Convert if not tensor
+                # Ensure it's treated as a bucket index (long)
+                assignments.append(assignment_tensor.long().squeeze()) # Use squeeze to remove extra dims if any
+            except FileNotFoundError:
+                 # This error should NOT happen if _verify_cache_dirs worked correctly
+                 self.logger.error(f"CRITICAL: Bucket file missing for verified base name '{base_name}' at {path}. Cache verification failed or file deleted during run.")
+                 missing_files.append(path)
+                 # Continue collecting all missing files before raising
+            except Exception as e:
+                 self.logger.error(f"Error loading bucket file {path}: {e}", exc_info=True)
+                 raise RuntimeError(f"Failed to load or process bucket file {path}") from e
+
+        if missing_files:
+             raise FileNotFoundError(f"Found {len(missing_files)} missing bucket files for verified samples. Example: {missing_files[0]}")
+
+        if not assignments:
+             # This case should also be prevented by _verify_cache_dirs
+             self.logger.error("No bucket assignments loaded, despite having verified base names. Check bucket cache contents and _verify_cache_dirs logic.")
+             raise RuntimeError("Failed to load any bucket assignments.")
+
+        # Stack the loaded tensors (should be scalars or 1-element tensors)
+        try:
+             stacked_assignments = torch.stack(assignments)
+        except Exception as e:
+             self.logger.error(f"Failed to stack loaded bucket assignments. Check individual file contents. Error: {e}", exc_info=True)
+             # Log shapes for debugging
+             if assignments:
+                 self.logger.error(f"Assignment shapes example: {[a.shape for a in assignments[:5]]}")
+             raise RuntimeError("Failed to stack bucket assignments.") from e
+
+        return stacked_assignments # Return on CPU, property moves to self.device
 
     def _compute_cluster_statistics(self):
         """Compute and cache cluster statistics"""
@@ -226,65 +323,30 @@ class DDMDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Modified collate that handles variable-length sequences and multiple embedding types"""
-        # Filter out None items resulting from loading errors in __getitem__
-        original_batch_size = len(batch)
-        batch = [b for b in batch if b is not None]
-        filtered_batch_size = len(batch)
+        """
+        Collate function that handles potential None values in the batch
+        (e.g., due to loading errors other than FileNotFoundError).
+        """
+        # Filter out None items first
+        batch = [item for item in batch if item is not None]
+        if not batch:
+            return None # Return None if the whole batch was invalid
 
-        if filtered_batch_size == 0:
-            # Return None or an empty dictionary if the entire batch failed
-            if original_batch_size > 0:
-                 logger.warning(f"Entire batch of size {original_batch_size} failed to load. Skipping batch.")
-            return None # Or perhaps {} depending on how the training loop handles it
-
-        if filtered_batch_size < original_batch_size:
-             logger.warning(f"Filtered out {original_batch_size - filtered_batch_size} failed samples from batch.")
-
-        # Initialize result dictionary with keys that are always present
-        result = {
-            'latent': torch.stack([item['latent'] for item in batch]),
-            'bucket': torch.stack([item['bucket'] for item in batch]),
-            'expert': torch.stack([item['expert'] for item in batch])
-        }
-
-        # Handle CLIP embeddings if present - Use the correct key 'clip_embedding'
-        if 'clip_embedding' in batch[0]:
-            clip_embeddings = [item['clip_embedding'] for item in batch]
-            # Check if padding is necessary (all sequences might have the same length)
-            if all(e.size(1) == clip_embeddings[0].size(1) for e in clip_embeddings):
-                 result['clip_embedding'] = torch.stack(clip_embeddings)
-            else:
-                 # Pad only if lengths differ
-                 max_len = max(e.size(1) for e in clip_embeddings)
-                 padded_embeddings = []
-                 for emb in clip_embeddings:
-                     pad_size = max_len - emb.size(1)
-                     # Pad sequence length dimension (dim=1), value=0
-                     padded = torch.nn.functional.pad(emb, (0, 0, 0, pad_size), value=0)
-                     padded_embeddings.append(padded)
-                 result['clip_embedding'] = torch.stack(padded_embeddings)
-        # else: # Optional: Log if clip_embedding is expected but missing
-        #     print("Warning: 'clip_embedding' key not found in the first item of the batch.")
-
-
-        # Handle T5 embeddings if present - Use the correct key 't5_embedding'
-        if 't5_embedding' in batch[0]:
-            t5_embeddings = [item['t5_embedding'] for item in batch]
-            # Check if padding is necessary
-            if all(e.size(1) == t5_embeddings[0].size(1) for e in t5_embeddings):
-                 result['t5_embedding'] = torch.stack(t5_embeddings)
-            else:
-                 # Pad only if lengths differ
-                 max_len = max(e.size(1) for e in t5_embeddings)
-                 padded_embeddings = []
-                 for emb in t5_embeddings:
-                     pad_size = max_len - emb.size(1)
-                     padded = torch.nn.functional.pad(emb, (0, 0, 0, pad_size), value=0)
-                     padded_embeddings.append(padded)
-                 result['t5_embedding'] = torch.stack(padded_embeddings)
-
-        return result
+        try:
+            # Proceed with stacking the valid items
+            return {
+                'latent': torch.stack([item['latent'] for item in batch]),
+                'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
+                # Bucket info is implicitly handled by BucketBatchSampler forming the batch
+                'expert': torch.stack([item['expert'] for item in batch]),
+                'dims': torch.stack([item['dims'] for item in batch])
+            }
+        except Exception as e:
+            logging.error(f"Collation error after filtering Nones: {str(e)}", exc_info=True)
+            # You might want to log the shapes here for debugging
+            # for i, item in enumerate(batch):
+            #    logging.error(f"Item {i} shapes: latent={item['latent'].shape}, clip={item['clip_embedding'].shape}, ...")
+            return None # Return None if collation fails even after filtering
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
@@ -306,67 +368,95 @@ class CombinedBatchSampler(Sampler):
     def __len__(self):
         return len(self.batch_indices) 
 
-class BucketBatchSampler(torch.utils.data.Sampler):
-    """Groups samples by bucket dimensions for efficient batching"""
-    
-    def __init__(self, dataset, batch_size, device='cpu', shuffle=True, drop_last=True, bucket_indices=None):
+class BucketBatchSampler(Sampler):
+    """
+    Groups samples by bucket ID and yields batches of indices from the same bucket.
+    Ensures samples within a batch have compatible dimensions (handled by bucketing).
+    """
+    def __init__(self, dataset: DDMDataset, batch_size: int, device=None, shuffle=True, drop_last=True, logger=None):
+        """
+        Args:
+            dataset: The DDMDataset instance. Must have `bucket_assignments` property.
+            batch_size: Size of batches to yield.
+            device: Unused in this implementation (operates on indices). Kept for compatibility.
+            shuffle: If True, shuffle indices within buckets and the order of batches.
+            drop_last: If True, drop the last incomplete batch from each bucket.
+            logger: Optional logger instance.
+        """
+        super().__init__(dataset) # Pass dataset to parent Sampler
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
-        self.device = device
-        
-        # Group indices by bucket if not provided
-        if bucket_indices is None:
-            self.bucket_indices = defaultdict(list)
-            for idx in range(len(dataset)):
-                bucket = dataset.bucket_assignments[idx].item()
-                self.bucket_indices[bucket].append(idx)
-        else:
-            self.bucket_indices = bucket_indices
-        
-        # Convert lists to tensors - FIXED VERSION
-        self.bucket_tensors = {
-            bucket: torch.tensor(indices, device=self.device)  # Create tensor first
-            for bucket, indices in self.bucket_indices.items()
-        }
-        
-        # Calculate total batches
-        self.total_batches = sum(
-            len(indices) // batch_size if drop_last 
-            else (len(indices) + batch_size - 1) // batch_size
-            for indices in self.bucket_indices.values()
-        )
-        
-        logger.info(f"Created BucketBatchSampler with {len(self.bucket_indices)} buckets")
-        for bucket, indices in self.bucket_indices.items():
-            logger.info(f"Bucket {bucket}: {len(indices)} samples")
+        self.logger = logger if logger else logging.getLogger(__name__)
+
+        # --- Group indices by bucket ---
+        self.indices_by_bucket = defaultdict(list)
+        try:
+            # Access the bucket assignments tensor (triggers loading if needed)
+            all_bucket_assignments = self.dataset.bucket_assignments.cpu().numpy() # Work with numpy on CPU
+            if len(all_bucket_assignments) != len(self.dataset):
+                 raise ValueError(f"Length mismatch: bucket_assignments ({len(all_bucket_assignments)}) vs dataset ({len(self.dataset)})")
+
+            for idx, bucket_id in enumerate(all_bucket_assignments):
+                self.indices_by_bucket[bucket_id].append(idx)
+
+        except Exception as e:
+             self.logger.error(f"Failed to group indices by bucket: {e}", exc_info=True)
+             raise
+
+        self.num_buckets = len(self.indices_by_bucket)
+        if self.dataset.rank == 0: # Log only on rank 0
+             self.logger.info(f"Created {self.num_buckets} buckets.")
+             for bucket_id, indices in self.indices_by_bucket.items():
+                 self.logger.info(f"  Bucket {bucket_id}: {len(indices)} samples")
+
+        # --- Create batches ---
+        self.batches = []
+        for bucket_id in self.indices_by_bucket:
+            indices = self.indices_by_bucket[bucket_id]
+            if self.shuffle:
+                # Shuffle indices within the bucket
+                np.random.shuffle(indices)
+
+            # Create batches for this bucket
+            for i in range(0, len(indices), self.batch_size):
+                batch_indices = indices[i : i + self.batch_size]
+                # Handle drop_last
+                if len(batch_indices) == self.batch_size or not self.drop_last:
+                    self.batches.append(batch_indices)
+
+        if not self.batches:
+             self.logger.warning("BucketBatchSampler created no batches. Check dataset size, batch size, and drop_last setting.")
+
+        if self.shuffle:
+            # Shuffle the order of the generated batches
+            np.random.shuffle(self.batches)
+
+        self.num_batches = len(self.batches)
+        if self.dataset.rank == 0:
+            self.logger.info(f"BucketBatchSampler initialized with {self.num_batches} batches.")
 
     def __iter__(self):
-        # Create batches for each bucket
-        all_batches = []
-        
-        for bucket, indices in self.bucket_tensors.items():
-            if self.shuffle:
-                indices = indices[torch.randperm(len(indices), device=indices.device)]
-            
-            # Split into batches
-            batches = torch.split(indices, self.batch_size)
-            
-            # Handle partial batches
-            if self.drop_last and len(batches[-1]) < self.batch_size:
-                batches = batches[:-1]
-            
-            all_batches.extend(batches)
-        
-        # Shuffle batches if requested
+        # If shuffling epoch-to-epoch is desired, re-shuffle here
         if self.shuffle:
-            random.shuffle(all_batches)
-        
-        return iter(all_batches)
+            # Re-shuffle indices within buckets AND the order of batches for each epoch
+            self.batches = []
+            for bucket_id in self.indices_by_bucket:
+                indices = self.indices_by_bucket[bucket_id]
+                np.random.shuffle(indices) # Shuffle within bucket
+                for i in range(0, len(indices), self.batch_size):
+                    batch_indices = indices[i : i + self.batch_size]
+                    if len(batch_indices) == self.batch_size or not self.drop_last:
+                        self.batches.append(batch_indices)
+            np.random.shuffle(self.batches) # Shuffle batch order
+
+        # Yield the pre-computed batches
+        yield from self.batches
 
     def __len__(self):
-        return self.total_batches
+        """Number of batches per epoch."""
+        return self.num_batches
 
 def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     """
@@ -443,39 +533,31 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         # Distributed logging
         logger.info(f"Rank {rank}: Expert {expert_idx} processing on GPU {rank % torch.cuda.device_count()}")
 
-        # Create GPU-accelerated sampler
-        sampler_start = time.time()
-        try:
-            sampler = BucketBatchSampler(
-                dataset=dataset,
-                batch_size=config.expert_batch_size,
-                bucket_indices=bucket_indices,  # Pass pre-computed bucket indices
-                device=device,
-                shuffle=True,
-                drop_last=True
-            )
-            print(f"[Rank {rank}] Sampler created with {len(sampler)} batches")
-        except Exception as e:
-            print(f"[Rank {rank}] ERROR creating sampler:")
-            print(f"Exception: {str(e)}")
-            print(f"Bucket indices: {list(bucket_indices.keys())}")
-            raise
+        # Use the refined BucketBatchSampler
+        batch_sampler = BucketBatchSampler(
+            dataset=dataset,
+            batch_size=config.batch_size,
+            # device=device, # device not used by sampler
+            shuffle=True,
+            drop_last=True,
+            logger=dataset.logger # Pass dataset's logger
+        )
 
         # Configure loader with GPU optimizations
         loader_config_start = time.time()
         try:
-            loader = DataLoader(
+            data_loader = DataLoader(
                 dataset,
-                batch_sampler=sampler,
+                batch_sampler=batch_sampler,
                 num_workers=0,
                 pin_memory=True,
-                collate_fn=dataset.collate_fn
+                collate_fn=DDMDataset.collate_fn # Use static collate_fn
             )
             print(f"[Rank {rank}] DataLoader created successfully")
         except Exception as e:
             print(f"[Rank {rank}] ERROR creating DataLoader:")
             print(f"Exception: {str(e)}")
-            print(f"Sampler indices: {list(sampler)[0] if len(sampler) > 0 else 'empty'}")
+            print(f"Sampler indices: {list(batch_sampler)[0] if len(batch_sampler) > 0 else 'empty'}")
             raise
 
         # Warmup pipeline
@@ -483,7 +565,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         try:
             print(f"[Rank {rank}] Warming up loader...")
             for _ in range(1):
-                batch = next(iter(loader))
+                batch = next(iter(data_loader))
                 print(f"[Rank {rank}] Warmup batch shapes:")
                 for k, v in batch.items():
                     print(f"  {k}: {v.shape if hasattr(v, 'shape') else type(v)}")
@@ -491,12 +573,12 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         except Exception as e:
             print(f"[Rank {rank}] Warmup failed:")
             print(f"Exception: {str(e)}")
-            print(f"Failing indices: {list(sampler)[0] if len(sampler) > 0 else 'empty'}")
+            print(f"Failing indices: {list(batch_sampler)[0] if len(batch_sampler) > 0 else 'empty'}")
             if hasattr(e, 'args') and len(e.args) > 1:
                 print(f"Problematic index: {e.args[1]}")
             print("Skipping warmup, continuing with training...")
 
-        expert_loaders[expert_idx] = loader
+        expert_loaders[expert_idx] = data_loader
         loader_pbar.update(1)
 
     loader_pbar.close()

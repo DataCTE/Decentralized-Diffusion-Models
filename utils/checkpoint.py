@@ -1,12 +1,13 @@
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp import FullStateDictConfig, StateDictType, FullOptimStateDictConfig
 import os
 import logging
 import time
 import json
 from utils.distributed import is_main_process, is_dist_initialized
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
@@ -325,3 +326,160 @@ def debug_checkpoint_hook(module, input, output):
     return None
 
 # Register this hook in appropriate places
+
+def save_ddm_checkpoint(
+    step: int,
+    checkpoint_path: str,
+    router_model: nn.Module,
+    expert_models: nn.ModuleDict,
+    router_optimizer: torch.optim.Optimizer = None,
+    expert_optimizers: dict = None, # Dict mapping expert_idx -> optimizer
+    config=None, # Optional config for context
+    logger=None # Pass logger instance
+):
+    """
+    Saves a DDM checkpoint including router, experts, and optionally optimizers.
+    Handles FSDP state dict saving correctly (rank 0 only, offloaded to CPU).
+
+    Args:
+        step (int): Current training step.
+        checkpoint_path (str): Full path to save the checkpoint file.
+        router_model (nn.Module): The router model (potentially FSDP wrapped).
+        expert_models (nn.ModuleDict): ModuleDict containing expert models (potentially FSDP wrapped).
+        router_optimizer (Optimizer, optional): Router optimizer. Defaults to None.
+        expert_optimizers (dict, optional): Dict of expert optimizers. Defaults to None.
+        config (optional): Training configuration. Defaults to None.
+        logger (optional): Logger instance. Defaults to None.
+
+    Returns:
+        str: The path where the checkpoint was saved, or None if saving failed or not on rank 0.
+    """
+    _logger = logger if logger else logging.getLogger(__name__) # Use passed logger or get default
+
+    # FSDP Save Policy: Save Full state dict from Rank 0 only, offload to CPU
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    optim_save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True) # For optimizers
+
+
+    checkpoint_data = {"step": step}
+
+    # --- Get Router State ---
+    try:
+        # Use FSDP context manager to get the full state dict on rank 0
+        with FSDP.state_dict_type(router_model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
+            # This block executes on all ranks, but state_dict() only returns data on rank 0
+            router_state = router_model.state_dict()
+
+        if is_main_process(): # Only rank 0 will have the actual state dict
+            if router_state:
+                checkpoint_data['router_model_state'] = router_state
+                _logger.info(f"Collected router state dict on rank 0.")
+            else:
+                 _logger.warning("Router state dict was empty on rank 0.")
+                 checkpoint_data['router_model_state'] = {} # Ensure key exists
+
+    except Exception as e:
+        _logger.error(f"Failed to get router state_dict: {e}", exc_info=True)
+        if is_main_process():
+            checkpoint_data['router_model_state'] = {}
+
+    # --- Get Expert States ---
+    experts_state = {}
+    for idx_str, expert_model in expert_models.items():
+        try:
+            with FSDP.state_dict_type(expert_model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
+                expert_state = expert_model.state_dict()
+
+            if is_main_process(): # Only rank 0 gets the data
+                 if expert_state:
+                     experts_state[idx_str] = expert_state
+                 else:
+                     _logger.warning(f"Expert {idx_str} state dict was empty on rank 0.")
+                     experts_state[idx_str] = {} # Ensure key exists
+
+        except Exception as e:
+            _logger.error(f"Failed to get state_dict for expert {idx_str}: {e}", exc_info=True)
+            if is_main_process():
+                experts_state[idx_str] = {}
+
+    if is_main_process():
+         checkpoint_data['expert_models_state'] = experts_state
+         _logger.info(f"Collected state dicts for {len(experts_state)} experts on rank 0.")
+
+    # --- Get Router Optimizer State ---
+    if router_optimizer is not None:
+         try:
+             # Use FSDP function to get optimizer state (rank 0 only)
+             with FSDP.state_dict_type(router_model, StateDictType.FULL_STATE_DICT, optim_state_dict_config=optim_save_policy):
+                 optim_state = FSDP.optim_state_dict(router_model, router_optimizer)
+
+             if is_main_process():
+                 if optim_state:
+                     checkpoint_data['router_optimizer_state'] = optim_state
+                     _logger.info("Collected router optimizer state dict on rank 0.")
+                 else:
+                     _logger.warning("Router optimizer state dict was empty on rank 0.")
+                     checkpoint_data['router_optimizer_state'] = {}
+
+         except Exception as e:
+             _logger.error(f"Failed to get router optimizer state_dict: {e}", exc_info=True)
+             if is_main_process():
+                 checkpoint_data['router_optimizer_state'] = {}
+
+    # --- Get Expert Optimizer States ---
+    if expert_optimizers is not None:
+         experts_optim_state = {}
+         for idx, expert_optim in expert_optimizers.items():
+             idx_str = str(idx)
+             if idx_str not in expert_models:
+                 _logger.warning(f"Expert model {idx_str} not found for saving optimizer state. Skipping.")
+                 continue
+             expert_model = expert_models[idx_str]
+             try:
+                 with FSDP.state_dict_type(expert_model, StateDictType.FULL_STATE_DICT, optim_state_dict_config=optim_save_policy):
+                     optim_state = FSDP.optim_state_dict(expert_model, expert_optim)
+
+                 if is_main_process():
+                     if optim_state:
+                         experts_optim_state[idx_str] = optim_state
+                     else:
+                         _logger.warning(f"Expert {idx_str} optimizer state dict was empty on rank 0.")
+                         experts_optim_state[idx_str] = {}
+
+             except Exception as e:
+                 _logger.error(f"Failed to get optimizer state_dict for expert {idx_str}: {e}", exc_info=True)
+                 if is_main_process():
+                     experts_optim_state[idx_str] = {}
+
+         if is_main_process():
+             checkpoint_data['expert_optimizers_state'] = experts_optim_state
+             _logger.info(f"Collected optimizer state dicts for {len(experts_optim_state)} experts on rank 0.")
+
+
+    # --- Saving ---
+    if not is_main_process():
+        # Non-rank 0 processes wait here until saving is done or failed
+        safe_synchronize()
+        return None
+
+    # Rank 0 performs the actual save
+    _logger.info(f"Rank 0 attempting to save checkpoint to {checkpoint_path}...")
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    try:
+        torch.save(checkpoint_data, checkpoint_path)
+        _logger.info(f"Checkpoint successfully saved to {checkpoint_path}")
+        save_success = True
+    except Exception as e:
+        _logger.error(f"Failed to save checkpoint to {checkpoint_path}: {e}", exc_info=True)
+        save_success = False
+
+    # Notify other ranks about success/failure (optional but good practice)
+    if is_dist_initialized():
+         success_tensor = torch.tensor([1 if save_success else 0], dtype=torch.int,
+                                      device='cuda' if torch.cuda.is_available() else 'cpu')
+         dist.broadcast(success_tensor, src=0)
+
+    # Final barrier to ensure all processes sync up after save attempt
+    safe_synchronize()
+
+    return checkpoint_path if save_success else None

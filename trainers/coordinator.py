@@ -14,10 +14,9 @@ import logging
 from trainers.router import RouterTrainer
 from trainers.expert import ExpertTrainer
 from trainers.sampling import ddm_sample
-from data.dataset import DDMDataset
+from data.dataset import DDMDataset, BucketBatchSampler
 from utils.logging import setup_logger
-from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint
-from data.dataset import BucketBatchSampler
+from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint, save_ddm_checkpoint
 from torch.utils.data import DataLoader 
 import torch.distributed as dist
 
@@ -165,10 +164,10 @@ class DDMTrainingCoordinator:
         torch.cuda.set_device(self.device)
 
     def _init_models(self):
-        """Initialize router and experts, passing the logger."""
-        self.logger.info("Initializing models...")
+        """Initialize router and experts, passing the logger and storing trainers."""
+        self.logger.info("Initializing models and trainers...")
 
-        # Pass self.logger to RouterTrainer constructor
+        # Initialize RouterTrainer and store it
         router_trainer = RouterTrainer(
             config=self.config,
             device=self.device,
@@ -176,88 +175,81 @@ class DDMTrainingCoordinator:
             world_size=self.world_size,
             logger=self.logger
         )
-        # Access the underlying FSDP-wrapped model
-        self.router = router_trainer.router
-        # Store the trainer if needed for its methods/optimizer
-        self._router_trainer = router_trainer
+        self.router = router_trainer.router # Keep reference to the model
+        self._router_trainer = router_trainer # Store the trainer instance
 
-        # Initialize experts - Pass self.logger to ExpertTrainer constructor
-        self.experts = nn.ModuleDict()
-        # If using a factory function/cache manager, ensure logger is passed there.
-        # If creating directly (as shown):
+        # Initialize ExpertTrainers and store them
+        self.experts = nn.ModuleDict() # Store models
+        self._expert_trainers = {} # Store trainer instances
         for expert_idx in range(self.config.num_experts):
-             # Pass self.logger to ExpertTrainer
             expert_trainer = ExpertTrainer(
                 expert_idx=expert_idx,
                 config=self.config,
                 device=self.device,
                 rank=self.rank,
                 world_size=self.world_size,
-                router=self.router, # Pass the actual router model instance
-                logger=self.logger # Pass the logger
+                router=self.router,
+                logger=self.logger
             )
-            # Store the underlying FSDP-wrapped expert model
-            self.experts[str(expert_idx)] = expert_trainer.expert
-            # Optionally store the trainer instances if needed later
-            # if not hasattr(self, '_expert_trainers'): self._expert_trainers = {}
-            # self._expert_trainers[expert_idx] = expert_trainer
+            self.experts[str(expert_idx)] = expert_trainer.expert # Store the model
+            self._expert_trainers[expert_idx] = expert_trainer # Store the trainer instance
 
-        self.logger.info("Models initialized.")
-        # Return the actual model modules, not the trainers, unless the coordinator uses trainer methods
-        return (self.router, self.experts)
+        self.logger.info("Models and Trainers initialized.")
+        return (self.router, self.experts) # Return models as before
 
     def _init_data_loaders(self):
         """Initialize distributed data loaders with bucket sampling."""
         self.logger.info("Initializing data loaders...")
 
-        # Logger is already passed to DDMDataset in previous step
+        # Dataset initialization (already passes logger)
         dataset = DDMDataset(vars(self.config), split='train', logger=self.logger)
 
-        # Check if dataset is valid
         if len(dataset) == 0:
             self.logger.error("Dataset is empty! Check data paths and verification logic.")
             raise ValueError("Cannot initialize DataLoader with an empty dataset.")
 
-        # Create distributed sampler (if needed for specific strategies, BucketBatchSampler might handle it)
-        # sampler = torch.utils.data.distributed.DistributedSampler( ... )
-
-        # Create bucket batch sampler - Pass logger if BucketBatchSampler uses it
+        # Bucket Batch Sampler initialization (uses dataset.bucket_assignments internally)
         bucket_sampler = BucketBatchSampler(
             dataset=dataset,
             batch_size=self.config.batch_size,
-            device=self.device, # Bucket sampler might not need device, DataLoader handles data transfer
-            shuffle=True,
-            drop_last=True # Important for consistent batch sizes in distributed training
-            # logger=self.logger # Pass logger only if BucketBatchSampler class is modified to use it
+            shuffle=True, # Usually True for training
+            drop_last=True, # Important for distributed training
+            logger=self.logger # Pass logger
         )
 
-        # Calculate workers based on available CPUs
-        num_workers = getattr(self.config, 'num_workers', 0) # Default to 0 if not set
+        num_workers = getattr(self.config, 'num_workers', 0)
+        pin_memory = getattr(self.config, 'pin_memory', True) and torch.cuda.is_available()
+        persistent_workers = num_workers > 0 # Enable if using workers
+
         if self.rank == 0:
             self.logger.info(f"Using {num_workers} dataloader workers per process.")
-        # persistent_workers = num_workers > 0 # Only enable if using workers
+            self.logger.info(f"Pin memory: {pin_memory}")
+            self.logger.info(f"Persistent workers: {persistent_workers}")
 
-        # Create combined loader
-        # Ensure collate_fn is appropriate - using dataset's static method is good practice
+        # DataLoader initialization - VERIFY this line uses DDMDataset.collate_fn
         train_loader = DataLoader(
             dataset,
-            batch_sampler=bucket_sampler, # Use batch_sampler, not sampler+batch_size
-            collate_fn=DDMDataset.collate_fn, # Use the static collate method
-            pin_memory=getattr(self.config, 'pin_memory', True),
-            # persistent_workers=persistent_workers, # persistent_workers requires num_workers > 0
+            batch_sampler=bucket_sampler,
+            collate_fn=DDMDataset.collate_fn, # Correct usage of the static method
+            pin_memory=pin_memory,
             num_workers=num_workers,
-            # prefetch_factor=2 if num_workers > 0 else None # Optional: tune prefetch
+            persistent_workers=persistent_workers,
+            # prefetch_factor=2 if num_workers > 0 else None # Optional tuning
         )
 
-        # Initialize iterator eagerly to catch issues early
+        # Store the loader itself
+        self.train_loader = train_loader # Store the loader instance
+
+        # Initialize iterator immediately to catch potential issues
         try:
-            self.train_iter = iter(train_loader)
+            self._train_iter = iter(self.train_loader) # Use the stored loader
         except Exception as e:
-            self.logger.error(f"Failed to create train_loader iterator: {e}")
+            self.logger.error(f"Failed to create train_loader iterator: {e}", exc_info=True)
             raise
 
         self.logger.info("Data loaders initialized.")
-        return train_loader, None  # No validation loader in paper
+        # No validation loader implemented based on previous context
+        return self.train_loader, None # Return the loader instance
 
     def _init_parallel_components(self):
         """Initialize critical components without manual synchronization"""
@@ -323,64 +315,162 @@ class DDMTrainingCoordinator:
         return torch.arange(start, end, device=self.device)
 
     def train(self, num_steps: int):
-        """Main training loop with improved step tracking"""
-        self.step = 0
-        progress_bar = tqdm(total=num_steps, 
-                          desc="Training Progress",
-                          disable=not self.rank == 0)
-        
+        """Main training loop with periodic checkpointing."""
+        self.logger.info(f"Starting training for {num_steps} steps...")
+        self.step = getattr(self, 'step', 0) # Resume from loaded step or start at 0
+        self.step_start_time = time.time() # Initialize step timer
+
+        # Initialize progress bar on rank 0
+        progress_bar = tqdm(
+            initial=self.step, # Start progress bar from current step
+            total=num_steps,
+            desc="Training Progress",
+            disable=not self.rank == 0
+        )
+
         while self.step < num_steps:
-            batch = self._get_next_batch()
-            
-            # Unified training step
-            router_loss, expert_losses = self._unified_train_step(batch)
-            
-            # Update progress bar
-            progress_bar.update(1)
-            progress_bar.set_postfix({
-                'router': f"{router_loss:.4f}",
-                'expert': f"{sum(expert_losses.values())/len(expert_losses):.4f}"
-            })
-            
-            # Validation and checkpointing
-            if self.step % self.config.save_interval == 0:
-                self._validate_and_checkpoint()
-            
-            self.step += 1
+            try:
+                batch = self._get_next_batch()
+                if batch is None:
+                    self.logger.warning(f"Skipping step {self.step} due to invalid batch.")
+                    # Ensure iterator is reset if necessary
+                    if not hasattr(self, 'train_iter'): self.train_iter = iter(self.train_loader)
+                    continue # Skip to next iteration
+
+                # Unified training step
+                router_loss, expert_losses = self._unified_train_step(batch)
+
+                # Logging
+                if self.rank == 0: # Only log metrics on rank 0
+                    avg_expert_loss = sum(expert_losses.values()) / len(expert_losses) if expert_losses else 0.0
+                    self._handle_logging(self.step, router_loss, expert_losses) # Pass metrics dict
+                    # Update progress bar description
+                    progress_bar.set_postfix({
+                        'router': f"{router_loss:.4f}",
+                        'expert': f"{avg_expert_loss:.4f}",
+                        'lr': f"{self.router_optimizer.param_groups[0]['lr']:.1e}" # Example LR display
+                    })
+
+                # --- Checkpoint Saving ---
+                # Check if save interval is defined and if it's time to save
+                if hasattr(self.config, 'save_interval') and self.config.save_interval > 0:
+                    # Save at the specified interval (and also at the very last step)
+                    if (self.step + 1) % self.config.save_interval == 0 or (self.step + 1) == num_steps:
+                         self.logger.info(f"Reached step {self.step + 1}, triggering checkpoint save.")
+                         self._save_checkpoint(self.step + 1) # Pass the *completed* step number
+                # --- End Checkpoint Saving ---
+
+                self.step += 1
+                progress_bar.update(1) # Update progress bar after step completion
+                self.step_start_time = time.time() # Reset timer for the next step
+
+            except Exception as e:
+                self.logger.exception(f"Error during training step {self.step}: {e}")
+                # Optionally implement error handling/recovery or re-raise
+                self._handle_training_error(e, self.step) # Use existing error handler
+                raise # Re-raise after logging/handling
+
+        progress_bar.close()
+        self.logger.info("Training loop finished.")
+        self._cleanup_training()
 
     def _unified_train_step(self, batch):
-        """Combined training step with gradient sync"""
-        # Train router
-        router_loss = self._train_router(batch)
-        
-        # Train experts with proper capacity allocation
-        expert_losses = self._train_experts(batch)
-        
-        # Synchronize gradients
-        self._synchronize_gradients()
-        
-        # Update learning rates
-        self._update_learning_rates()
-        
+        """Delegates training steps to router and expert trainers."""
+        # --- Router Training Step ---
+        # Ensure the trainer instance exists and has the train_step method
+        if not hasattr(self._router_trainer, 'train_step'):
+             raise NotImplementedError("RouterTrainer must implement a 'train_step(batch)' method.")
+        # Delegate the step to the RouterTrainer
+        # The train_step method should handle:
+        # - Setting model to train mode
+        # - Moving data to device
+        # - Zeroing gradients
+        # - Forward pass
+        # - Loss calculation
+        # - Backward pass (FSDP handles gradient sync)
+        # - Optimizer step
+        # - Scheduler step (if applicable)
+        router_loss = self._router_trainer.train_step(batch)
+
+
+        # --- Expert Training Step ---
+        expert_losses = {}
+        assigned_experts_indices = batch['expert'].unique().tolist() # Get unique expert indices needed
+
+        # Iterate through the required expert trainers
+        for expert_idx in assigned_experts_indices:
+            if expert_idx not in self._expert_trainers:
+                self.logger.warning(f"Coordinator doesn't have trainer for expert {expert_idx}. Skipping.")
+                continue
+
+            expert_trainer = self._expert_trainers[expert_idx]
+
+            # Ensure the trainer instance has the train_step method
+            if not hasattr(expert_trainer, 'train_step'):
+                raise NotImplementedError(f"ExpertTrainer {expert_idx} must implement a 'train_step(batch)' method.")
+
+            # Filter the batch for the current expert
+            expert_mask = (batch['expert'] == expert_idx)
+            # Create a shallow copy of the batch dict and filter tensors
+            expert_batch = {k: v[expert_mask] for k, v in batch.items() if torch.is_tensor(v)}
+            # Add non-tensor items if needed
+            for k, v in batch.items():
+                if not torch.is_tensor(v) and k not in expert_batch:
+                     # Decide how to handle non-tensor data (e.g., pass metadata if needed)
+                     # expert_batch[k] = v # Example: passing through non-tensor data
+                     pass
+
+
+            if expert_batch['latent'].shape[0] > 0:
+                # Delegate the step to the ExpertTrainer
+                # The train_step method handles its own forward/loss/backward/optim/scheduler
+                loss = expert_trainer.train_step(expert_batch)
+                expert_losses[f'expert_{expert_idx}_loss'] = loss
+            else:
+                 # Log if an expert index appeared but had no samples after filtering
+                 self.logger.debug(f"No samples found for expert {expert_idx} in this batch after filtering.")
+
+
+        # --- Gradient Sync / LR Updates ---
+        # FSDP handles gradient synchronization automatically during backward().
+        # Optimizer steps and LR scheduler steps are now handled *within* the
+        # train_step methods of the individual trainers.
+        # Therefore, these coordinator-level calls are removed.
+        # self._synchronize_gradients() # REMOVED
+        # self._update_learning_rates() # REMOVED
+
         return router_loss, expert_losses
 
     def _get_next_batch(self):
-        """Get next batch with validation and automatic retry"""
-        while True:  # Loop until valid batch
+        """Get next batch with validation and automatic iterator reset."""
+        while True:
             try:
+                # Use the property to get the iterator
                 batch = next(self.train_iter)
-                
-                # Validate batch structure
+                # Validate batch (ensure collate_fn didn't return None)
+                if batch is None:
+                     self.logger.warning("Collate function returned None, skipping batch.")
+                     continue
+                # Further validation
                 if not self._validate_batch(batch):
+                    self.logger.warning("Invalid batch structure or content, skipping.")
                     continue
-                    
                 return batch
-                
-            except (StopIteration, AttributeError):
+            except StopIteration:
+                self.logger.info("Epoch finished. Resetting data loader iterator.")
+                # Reset using the property's setter
                 self.train_iter = iter(self.train_loader)
-            except RuntimeError as e:
-                self.logger.warning(f"Batch loading error: {str(e)}")
-                continue
+            except Exception as e: # Catch broader errors during next()
+                self.logger.error(f"Error getting next batch: {str(e)}", exc_info=True)
+                # Optional: Implement retry logic or raise critical error
+                # For now, reset iterator and continue
+                self.logger.warning("Attempting to reset iterator after batch loading error.")
+                try:
+                    self.train_iter = iter(self.train_loader)
+                except Exception as reset_e:
+                     self.logger.critical(f"Failed to reset data loader after error: {reset_e}", exc_info=True)
+                     raise RuntimeError("Unrecoverable error in data loading.") from reset_e
+                continue # Continue to try getting next batch from reset iterator
 
     def _validate_batch(self, batch):
         """Strict batch validation"""
@@ -406,141 +496,80 @@ class DDMTrainingCoordinator:
         
         return True
 
-    def _train_router(self, batch):
-        """Router training step aligned with shape test"""
-        self.router.train()
-        
-        # Get inputs directly from batch
-        latents = batch['latent'].to(self.device)
-        timesteps = (torch.rand(latents.size(0)) * 1000).to(self.device)
-        text_embeds = batch['clip_embedding'].to(self.device)
-        
-        # Use the stored router optimizer
-        self.router_optimizer.zero_grad()
-
-        with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-            logits = self.router(latents, timesteps, text_embeds)
-            loss = self._router_loss(logits, batch['expert'].to(self.device))
-        
-        # Backward pass and optimizer step
-        loss.backward()
-        # Optional: Gradient clipping
-        if hasattr(self.config, 'router_grad_clip_norm') and self.config.router_grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.router_grad_clip_norm)
-
-        self.router_optimizer.step()
-        
-        return loss.item()
-
-    def _train_experts(self, batch):
-        """Expert training step using corresponding optimizers."""
-        expert_losses = {}
-        assigned_experts = batch['expert'].unique() # Find which experts are needed for this batch
-
-        for expert_idx_tensor in assigned_experts:
-            expert_idx = expert_idx_tensor.item()
-            idx_str = str(expert_idx)
-
-            # Filter batch for this expert
-            expert_mask = (batch['expert'] == expert_idx)
-            expert_batch = {k: v[expert_mask] for k, v in batch.items()}
-
-            if expert_batch['latent'].shape[0] == 0: continue # Skip if no samples for this expert
-
-            # Get the expert model and its optimizer
-            expert_model = self.experts[idx_str]
-            if expert_idx not in self.expert_optimizers:
-                self.logger.error(f"Optimizer for expert {expert_idx} not found!")
-                continue
-            expert_optimizer = self.expert_optimizers[expert_idx]
-
-            expert_model.train()
-            expert_optimizer.zero_grad()
-
-            # Prepare inputs (similar to how ExpertTrainer would do it)
-            latents = expert_batch['latent'].to(self.device)
-            timesteps = (torch.rand(latents.size(0), device=self.device) * 1000).long()
-            text_embeds = expert_batch['clip_embedding'].to(self.device)
-            # Cluster IDs might be needed if ExpertMMDiT uses them internally
-            cluster_ids = expert_batch['expert'].to(self.device)
-
-            with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-                 # Simplified forward pass for loss calculation (adapt based on ExpertMMDiT forward signature)
-                 # This assumes a basic diffusion loss setup; adjust if ExpertTrainer.compute_loss is complex
-                 noise = torch.randn_like(latents)
-                 alphas_cumprod = get_alphas_and_betas(num_timesteps=1000)[1] # Assuming get_alphas_and_betas is accessible
-                 alpha_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
-                 noisy_latents = torch.sqrt(alpha_t) * latents + torch.sqrt(1 - alpha_t) * noise
-
-                 # Assuming ExpertMMDiT forward signature matches this call:
-                 pred_noise = expert_model(
-                     img=noisy_latents,
-                     timesteps=timesteps,
-                     txt=text_embeds,
-                     # Pass other required args like img_ids, txt_ids, y, cluster_ids if needed
-                     # These might need to be loaded in the dataset or derived
-                 )
-                 loss = F.mse_loss(pred_noise, noise) # Example: Simple MSE loss
-
-            loss.backward()
-            # Optional: Gradient clipping for experts
-            if hasattr(self.config, 'expert_grad_clip_norm') and self.config.expert_grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(expert_model.parameters(), self.config.expert_grad_clip_norm)
-
-            expert_optimizer.step()
-            expert_losses[f'expert_{expert_idx}_loss'] = loss.item()
-
-        return expert_losses
-
-    def _synchronize_gradients(self):
-        """Synchronize gradients across devices"""
-        # Synchronize router
-        for param in self.router.parameters():
-            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-            
-        # Synchronize experts
-        for expert in self.experts.values():
-            for param in expert.parameters():
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-
-    def _update_learning_rates(self):
-        """Update learning rates for all models"""
-        self.router_optimizer.step()
-        
-        # Update learning rates for experts
-        for expert in self.experts.values():
-            expert.optimizer.step()
-
     def _handle_logging(self, step: int, router_loss: float, expert_losses: dict):
-        """Centralized logging handling"""
+        """Centralized logging handling for console and WandB."""
         if self.rank != 0:
-            return
+            return # Only log on rank 0
 
-        # Calculate step timing
-        step_time = time.time() - self.step_start_time
-        
-        # Prepare metrics
+        # Calculate step time
+        current_time = time.time()
+        step_time = current_time - self.step_start_time
+        self.step_start_time = current_time # Reset timer for the next step
+
+        # Get learning rate (handle potential missing optimizer or param_groups)
+        lr = 'N/A'
+        if hasattr(self, 'router_optimizer') and self.router_optimizer and self.router_optimizer.param_groups:
+             try:
+                 lr = self.router_optimizer.param_groups[0]['lr']
+             except (IndexError, KeyError):
+                 self.logger.warning("Could not retrieve learning rate from router optimizer.")
+
+        # Prepare metrics dictionary
         log_data = {
-            'router_loss': router_loss,
-            'step_time': step_time,
-            'learning_rate': self.router.optimizer.param_groups[0]['lr'],
-            **expert_losses
+            'train/step': step,
+            'train/router_loss': router_loss,
+            'train/step_time_sec': step_time, # Log step time in seconds
+            'train/learning_rate': lr,
         }
-        
-        # Add memory stats
-        if self.config.log_memory:
-            log_data.update(self._get_memory_stats())
-        
-        # WandB logging
-        if self.wandb_enabled:
-            import wandb
-            wandb.log(log_data, step=step)
-        
-        # Console logging
-        self.logger.info(
-            f"Step {step} | Router Loss: {router_loss:.4f} | "
+
+        # Add individual expert losses with prefix
+        for k, v in expert_losses.items():
+             # Ensure keys are wandb-compatible (e.g., 'train/expert_0_loss')
+             log_data[f'train/{k}'] = v
+
+        # Calculate average expert loss if any experts ran
+        avg_expert_loss = 0.0
+        if expert_losses:
+             avg_expert_loss = sum(expert_losses.values()) / len(expert_losses)
+             log_data['train/avg_expert_loss'] = avg_expert_loss
+        # else: log_data['train/avg_expert_loss'] = 0.0 # Optionally log 0 or NaN
+
+        # --- Console Logging ---
+        lr_str = f"{lr:.1e}" if isinstance(lr, (float, int)) else lr # Format LR if numeric
+        # Construct the log message dynamically to handle missing losses gracefully
+        log_message = (
+            f"Step {step:>6} | Router Loss: {router_loss:.4f} | "
+            f"Avg Expert Loss: {avg_expert_loss:.4f} | LR: {lr_str} | "
             f"Step Time: {step_time:.2f}s"
         )
+        # Optionally add individual expert losses to console log if verbose
+        # if self.verbose and expert_losses:
+        #    expert_loss_str = " | ".join([f"E{k.split('_')[1]}: {v:.3f}" for k, v in expert_losses.items()])
+        #    log_message += f" | {expert_loss_str}"
+        self.logger.info(log_message)
+
+        # --- WandB Logging ---
+        if hasattr(self.config, 'wandb_enabled') and self.config.wandb_enabled:
+            try:
+                import wandb
+                # Log all collected metrics to WandB
+                # The 'step' argument ensures metrics are plotted against the correct training step
+                wandb.log(log_data, step=step)
+            except ImportError:
+                 # Log error once if wandb import fails but config has it enabled
+                 if not hasattr(self, '_wandb_import_error_logged'):
+                     self.logger.error("WandB is enabled in config, but the 'wandb' package could not be imported.")
+                     self._wandb_import_error_logged = True
+            except Exception as e:
+                 # Log other wandb errors
+                 if not hasattr(self, '_wandb_log_error_logged'): # Log generic error once
+                     self.logger.error(f"Error logging to WandB: {e}", exc_info=True)
+                     self._wandb_log_error_logged = True
+
+
+        # --- Memory Logging (Periodic) ---
+        if hasattr(self.config, 'log_memory') and self.config.log_memory and step % 100 == 0: # Check frequency
+             self._log_gpu_memory_usage(f"Step {step}")
 
     def _cleanup_training(self):
         """Post-training cleanup"""
@@ -611,15 +640,47 @@ class DDMTrainingCoordinator:
             torch.save(checkpoint, f"checkpoint.pt")
             self.logger.info(f"Saved checkpoint at step {step}")
 
-    def load_checkpoint(self, checkpoint_dir):
-        """Direct checkpoint loading without distributed validation"""
-        checkpoint = torch.load(checkpoint_dir, map_location=self.device)
-        self.router.load_state_dict(checkpoint['router'])
-        
-        for idx, state in checkpoint['experts'].items():
-            self.experts[str(idx)].load_state_dict(state)
-            
-        return checkpoint.get('step', 0)
+    def load_checkpoint(self, checkpoint_path: str):
+        """Loads the router and expert models state from a checkpoint."""
+        # This method will need to be updated based on how load_ddm_checkpoint is implemented
+        self.logger.info(f"Attempting to load checkpoint from: {checkpoint_path}")
+
+        # Example using a hypothetical load function
+        # from utils.checkpoint import load_ddm_checkpoint
+        # loaded_step = load_ddm_checkpoint(
+        #     checkpoint_path=checkpoint_path,
+        #     router_model=self.router,
+        #     expert_models=self.experts,
+        #     router_optimizer=self.router_optimizer,
+        #     expert_optimizers=self.expert_optimizers,
+        #     logger=self.logger
+        # )
+        # if loaded_step is not None:
+        #     self.step = loaded_step
+        #     self.logger.info(f"Resumed training from step {self.step}")
+        #     return True
+        # else:
+        #     self.logger.warning(f"Failed to load checkpoint from {checkpoint_path}")
+        #     return False
+
+        # Placeholder for the old direct loading (needs update)
+        try:
+             checkpoint = torch.load(checkpoint_path, map_location=self.device)
+             # Load state dicts - needs FSDP handling similar to saving
+             self.logger.warning("Using basic torch.load for checkpoint - FSDP state loading needs implementation in load_ddm_checkpoint.")
+             # FSDP loading logic should be encapsulated in utils.checkpoint.load_ddm_checkpoint
+             # self.router.load_state_dict(checkpoint['router'])
+             # for idx, state in checkpoint['experts'].items():
+             #     self.experts[str(idx)].load_state_dict(state)
+             self.step = checkpoint.get('step', 0)
+             self.logger.info(f"Checkpoint loaded (basic), step set to {self.step}")
+             return True # Indicate success for now
+        except FileNotFoundError:
+             self.logger.error(f"Checkpoint file not found at {checkpoint_path}")
+             return False
+        except Exception as e:
+             self.logger.exception(f"Error loading checkpoint from {checkpoint_path}: {e}")
+             return False
 
     def _init_wandb(self):
         """Initialize Weights & Biases with enhanced error handling and cleanup"""
@@ -731,52 +792,76 @@ class DDMTrainingCoordinator:
         }
         
     def _init_optimizers(self):
-        """Initialize optimizers using the trainer instances."""
-        self.logger.info("Initializing optimizers...")
+        """Initialize optimizers by retrieving them from the trainer instances."""
+        self.logger.info("Retrieving optimizers from trainers...")
 
-        # Get optimizer from the RouterTrainer instance
-        if hasattr(self, '_router_trainer') and hasattr(self._router_trainer, 'optimizer'):
-             self.router_optimizer = self._router_trainer.optimizer
-             self.logger.info("Router optimizer initialized.")
+        # Router optimizer
+        if hasattr(self._router_trainer, 'optimizer'):
+            self.router_optimizer = self._router_trainer.optimizer
+            # Get scheduler if the trainer has one
+            self.router_scheduler = getattr(self._router_trainer, 'lr_scheduler', None)
+            self.logger.info("Router optimizer and scheduler retrieved.")
         else:
-             # Fallback or error if direct initialization is expected
-             self.logger.warning("Could not find optimizer in RouterTrainer instance. Attempting direct init (may differ).")
-             # Direct init might be needed if trainer classes don't manage optimizers
-             self.router_optimizer = torch.optim.AdamW(
-                 self.router.parameters(), # Use self.router (the model)
-                 lr=getattr(self.config, 'router_learning_rate', self.config.learning_rate), # Specific router LR
-                 weight_decay=self.config.weight_decay
-             )
+            self.logger.error("RouterTrainer instance is missing the 'optimizer' attribute!")
+            raise AttributeError("RouterTrainer must have an 'optimizer' attribute.")
 
-        # Initialize optimizers for experts - depends on how expert trainers are stored/accessed
+        # Expert optimizers and schedulers
         self.expert_optimizers = {}
-        if hasattr(self, '_expert_trainers'):
-             for idx, expert_trainer in self._expert_trainers.items():
-                 if hasattr(expert_trainer, 'optimizer'):
-                     self.expert_optimizers[idx] = expert_trainer.optimizer
-                 else:
-                     self.logger.warning(f"Optimizer not found in ExpertTrainer {idx}. Check ExpertTrainer class.")
-             self.logger.info("Expert optimizers initialized from trainers.")
-        else:
-             # Fallback: Initialize directly if trainers aren't stored
-             self.logger.warning("Expert trainers not stored. Initializing expert optimizers directly (may differ).")
-             for idx_str, expert_model in self.experts.items():
-                 # Assumes ExpertTrainer configures optimizer similarly if initialized directly
-                 optimizer = torch.optim.AdamW(
-                     expert_model.parameters(),
-                     lr=self.config.learning_rate, # Use general LR for experts
-                     weight_decay=self.config.weight_decay
-                 )
-                 self.expert_optimizers[int(idx_str)] = optimizer
-             self.logger.info("Expert optimizers initialized directly.")
+        self.expert_schedulers = {}
+        for idx, expert_trainer in self._expert_trainers.items():
+            if hasattr(expert_trainer, 'optimizer'):
+                self.expert_optimizers[idx] = expert_trainer.optimizer
+                self.expert_schedulers[idx] = getattr(expert_trainer, 'lr_scheduler', None)
+            else:
+                 self.logger.error(f"ExpertTrainer {idx} is missing the 'optimizer' attribute!")
+                 raise AttributeError(f"ExpertTrainer {idx} must have an 'optimizer' attribute.")
+        self.logger.info(f"Optimizers and schedulers retrieved for {len(self.expert_optimizers)} experts.")
 
     @property
     def train_iter(self):
-        """Lazy initialization of training iterator"""
-        if not hasattr(self, '_train_iter'):
-            self._train_iter = iter(self.train_loader)
-        return self._train_iter
+        """Provides the training iterator, recreating it if necessary."""
+        try:
+            # Check if the backing iterator exists and is valid (optional advanced check)
+            # For simplicity, just return or recreate
+            if not hasattr(self, '_train_iter'):
+                 self.logger.warning("Recreating train_loader iterator unexpectedly.")
+                 self._train_iter = iter(self.train_loader)
+            return self._train_iter
+        except Exception as e: # Catch potential issues during iteration creation
+            self.logger.error(f"Failed to get or create train_loader iterator: {e}", exc_info=True)
+            raise
 
     @train_iter.setter
     def train_iter(self, value):
         self._train_iter = value
+
+    def _save_checkpoint(self, step: int):
+        """Saves the router and expert models state."""
+        self.logger.info(f"Initiating checkpoint save for step {step}...")
+
+        # Define checkpoint directory and filename
+        checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
+        checkpoint_path = os.path.join(checkpoint_dir, f"ddm_step_{step:08d}.pt")
+
+        # Call the dedicated saving function from utils.checkpoint
+        # Pass models and optimizers if they need to be saved
+        # Note: Saving FSDP optimizer states requires the model instance
+        saved_path = save_ddm_checkpoint(
+            step=step,
+            checkpoint_path=checkpoint_path,
+            router_model=self.router,
+            expert_models=self.experts,
+            router_optimizer=self.router_optimizer,
+            expert_optimizers=self.expert_optimizers, # Pass the dict of expert optimizers
+            config=self.config, # Pass config for context if needed
+            logger=self.logger # Pass logger
+        )
+
+        if saved_path and self.rank == 0:
+            self.logger.info(f"Checkpoint for step {step} saved successfully to {saved_path}")
+        elif self.rank == 0:
+             self.logger.error(f"Checkpoint saving failed for step {step}.")
+
+        # Ensure all processes wait until rank 0 is done saving (handled within save_ddm_checkpoint)
+        synchronize()
+        self.logger.info(f"All ranks synchronized after checkpoint attempt for step {step}.")
