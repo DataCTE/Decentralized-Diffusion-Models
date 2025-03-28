@@ -185,11 +185,11 @@ class ExpertMMDiT(Flux):
         nn.init.normal_(self.capacity_gate[0].weight, std=0.01)  # More stable initialization
         nn.init.constant_(self.capacity_gate[0].bias, 0.0)  # Neutral initial bias
 
-        # Replace final layer to match output dimensions
+        # CORRECTED final layer - output channels should match latent dimensions
         self.final_layer = LastLayer(
             self.params.hidden_size,
             self.params.patch_size,
-            self.params.out_channels  # Should be latent_channels * patch_size^2
+            self.params.latent_channels  # Instead of out_channels
         )
 
     def _validate_params(self, params):
@@ -306,9 +306,10 @@ class ExpertMMDiT(Flux):
         return rearrange(
             self.final_layer(img_features, time_vec),
             "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-            h=img_ids.shape[-2]//patch_size,
-            p1=patch_size,
-            p2=patch_size
+            h=img_ids.shape[-2]//self.params.patch_size,
+            p1=self.params.patch_size,
+            p2=self.params.patch_size,
+            c=self.params.latent_channels  # Explicit channel dimension
         )
 
     def create_embeddings(self, text_input, image_input):
