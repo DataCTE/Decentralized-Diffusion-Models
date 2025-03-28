@@ -13,23 +13,23 @@ logger = logging.getLogger(__name__)
 # Add this at the top under imports
 DEFAULT_CONFIG = {
     # ===== Core Architecture =====
-    'hidden_size': 864,
-    'num_heads': 12,
-    'depth': 22,
-    'mlp_ratio': 3.0,
+    'hidden_size': 512,
+    'num_heads': 8,
+    'depth': 12,
+    'mlp_ratio': 2.0,
     'qkv_bias': True,
     'vec_in_dim': 768,
     'context_in_dim': 768,
     
     # ===== Expert Configuration =====
-    'num_experts': 8,
+    'num_experts': 4,
     'num_clusters': 8,
     'cluster_embed_dim': 512,
-    'expert_capacity_factor': 1.0,
+    'expert_capacity_factor': 0.5,
     
     # ===== Training Parameters ===== 
     'batch_size': 1,
-    'learning_rate': 1e-4,
+    'learning_rate': 2e-4,
     'weight_decay': 0.01,
     'warmup_steps': 1000,
     'use_mixed_precision': True,
@@ -59,9 +59,9 @@ DEFAULT_CONFIG = {
     'clip_embedding_dim': 768,
     
     # ===== Router Configuration =====
-    'router_learning_rate': 1e-4,
-    'router_hidden_size': 384,
-    'router_num_heads': 6,
+    'router_learning_rate': 2e-4,
+    'router_hidden_size': 256,
+    'router_num_heads': 4,
     'router_temperature': 2.0,
     'router_min_temp': 0.5,
     'router_temperature_decay': 0.9997,
@@ -90,7 +90,7 @@ DEFAULT_CONFIG = {
     # Add these new parameters
     'num_steps': 100000,
     'save_interval': 5000,
-    'max_experts_in_memory': 3,
+    'max_experts_in_memory': 2,
     'expert_offload_to_cpu': True,
     'expert_batch_size': 2,
     'distilled_model': None,
@@ -103,8 +103,8 @@ DEFAULT_CONFIG = {
     'scheduler_type': 'cosine',
 
     # ===== Optimization =====
-    'adam_betas': (0.9, 0.999),
-    'eps': 1e-8,
+    'adam_betas': (0.9, 0.98),
+    'eps': 1e-6,
 
     # ===== CLIP Configuration =====
     'clip_model': 'openai/clip-vit-large-patch14',
