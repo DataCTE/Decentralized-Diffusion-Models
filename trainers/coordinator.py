@@ -473,7 +473,7 @@ class DDMTrainingCoordinator:
                 continue # Continue to try getting next batch from reset iterator
 
     def _validate_batch(self, batch):
-        """Strict batch validation"""
+        """Updated validation for CLIP embeddings"""
         if batch is None:
             return False
         
@@ -483,14 +483,15 @@ class DDMTrainingCoordinator:
                 self.logger.warning(f"Missing key {key} in batch")
                 return False
             
-        # Validate tensor shapes
+        # Validate tensor shapes with dimension flexibility
         latent_shape = batch['latent'].shape
         if len(latent_shape) != 4 or latent_shape[1] != self.config.latent_channels:
             self.logger.warning(f"Invalid latent shape {latent_shape}")
             return False
         
+        # Handle both 3D and 4D CLIP embeddings
         clip_shape = batch['clip_embedding'].shape
-        if clip_shape[-1] != self.config.clip_embed_dim:
+        if clip_shape[-1] != self.config.clip_embedding_dim:
             self.logger.warning(f"Invalid CLIP shape {clip_shape}")
             return False
         

@@ -105,20 +105,16 @@ class RouterTrainer:
         self.router.eval()
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Implements paper's router training with proper step tracking and type safety
-        
-        Args:
-            batch: Dictionary containing:
-                - 'latent': Tensor of shape [B, C, H, W]
-                - 'clip_embedding': Tensor of shape [B, seq_len, D]
-                - 'cluster_labels': LongTensor of shape [B]
-            
-        Returns:
-            Computed cross-entropy loss with temperature scaling
-        """
+        """Updated to handle 4D CLIP embeddings"""
         # Validate input types and shapes
         self._validate_batch(batch)
         
+        # Get actual CLIP embedding dimensions
+        clip_emb = batch['clip_embedding']
+        if clip_emb.dim() == 4:
+            # Squeeze singleton dimension if present [B, 1, L, D] -> [B, L, D]
+            clip_emb = clip_emb.squeeze(1)
+            
         # Update step counter and calculate temperature
         self.step += 1  # Maintain internal step counter
         current_step = max(1, self.step)
@@ -134,7 +130,7 @@ class RouterTrainer:
             logits = self.router(
                 self._add_diffusion_noise(batch['latent']),
                 self._generate_timesteps(batch['latent'].size(0)),
-                batch['clip_embedding']
+                clip_emb  # Use processed clip_emb
             )
             
             # Add expert load balancing regularization
@@ -163,8 +159,13 @@ class RouterTrainer:
         if batch['latent'].dim() != 4:
             raise ValueError(f"Latent must be 4D tensor, got {batch['latent'].dim()}D")
         
-        if batch['clip_embedding'].dim() != 3:
-            raise ValueError(f"CLIP embeddings must be 3D tensor, got {batch['clip_embedding'].dim()}D")
+        # Allow 4D CLIP embeddings but ensure last dimension matches
+        clip_dims = batch['clip_embedding'].dim()
+        if clip_dims not in [3, 4]:
+            raise ValueError(f"CLIP embeddings must be 3D/4D tensor, got {clip_dims}D")
+            
+        if batch['clip_embedding'].shape[-1] != self.config.clip_embedding_dim:
+            raise ValueError(f"CLIP embedding dim mismatch. Expected {self.config.clip_embedding_dim}, got {batch['clip_embedding'].shape[-1]}")
 
     def _calculate_temperature(self, current_step: int) -> float:
         """Compute temperature with exponential decay and minimum floor"""
