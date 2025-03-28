@@ -532,15 +532,16 @@ class DDMTrainingCoordinator:
             'train/learning_rate': lr,
         }
 
-        # Process expert metrics according to paper's evaluation guidelines
+        # Initialize all metrics before the expert loop
+        total_expert_loss = 0.0  # Initialize here
         expert_utilization = 0
         total_confidence = 0
         alignment_values = []
-        per_step_confidences = []  # Track individual confidences for visualization
+        per_step_confidences = []
         
         for expert_key, metrics in expert_losses.items():
             # Paper's core metrics (Section 4)
-            total_expert_loss += metrics['total_loss']
+            total_expert_loss += metrics['total_loss']  # Now safely accumulates
             expert_confidence = metrics['router_confidence']
             total_confidence += expert_confidence
             alignment_values.append(metrics['cluster_alignment'])
@@ -559,7 +560,7 @@ class DDMTrainingCoordinator:
             avg_confidence = total_confidence / num_experts
             
             log_data.update({
-                'train/avg_expert_loss': total_expert_loss / num_experts,
+                'train/avg_expert_loss': total_expert_loss / num_experts if num_experts > 0 else 0.0,
                 'train/avg_router_confidence': avg_confidence,
                 'train/utilization_rate': expert_utilization / num_experts,
                 'train/avg_cluster_alignment': avg_alignment,
