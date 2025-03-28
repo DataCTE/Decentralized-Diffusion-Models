@@ -326,27 +326,24 @@ class ExpertTrainer(BaseTrainer):
         return pos_ids
 
     def _get_text_position_ids(self, text_emb):
-        """Simple sequence position IDs for text with improved shape handling"""
-        print(f"[DEBUG Expert {self.expert_idx}] Text embedding shape for position IDs: {text_emb.shape}")
-        
+        """Handle 4D CLIP embeddings with proper squeezing"""
+        # Handle both 3D and 4D CLIP embeddings
         if text_emb.dim() == 4:
-            # Handle [B, S, L, D] → [B, L, D]
-            B, S, L, D = text_emb.shape
-            if S == 1:
-                # If sequence dimension is 1, we can simply remove it
-                print(f"[DEBUG Expert {self.expert_idx}] Reshaping 4D text embedding for position IDs")
+            # Verify sequence dimension is singleton before squeezing
+            if text_emb.size(1) == 1:
                 text_emb = text_emb.squeeze(1)
             else:
-                print(f"[WARNING Expert {self.expert_idx}] Multiple text sequences ({S}), using first")
+                self.logger.warning(f"Unexpected text embedding shape {text_emb.shape}, taking first sequence element")
                 text_emb = text_emb[:, 0]
         
-        # Now process the standard 3D case
+        # Validate final dimensions
+        if text_emb.dim() != 3:
+            raise ValueError(f"Invalid text embedding dimensions after processing: {text_emb.shape}")
+        
+        # Generate position IDs for validated 3D tensor
         B, L, _ = text_emb.shape
         pos_ids = torch.arange(L, device=self.device)[None].repeat(B, 1)
-        pos_ids = pos_ids[:, :, None].repeat(1, 1, 2)  # Add 2D position dim for consistency
-        
-        print(f"[DEBUG Expert {self.expert_idx}] Text position ID shape: {pos_ids.shape}")
-        return pos_ids
+        return pos_ids[:, :, None].repeat(1, 1, 2)  # Add 2D position dim
 
     def _get_conditioning(self, batch_size):
         """Get conditioning vector for expert"""

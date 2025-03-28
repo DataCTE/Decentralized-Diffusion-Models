@@ -170,6 +170,16 @@ class RouterTrainer:
         if batch['clip_embedding'].shape[-1] != self.config.clip_embedding_dim:
             raise ValueError(f"CLIP embedding dim mismatch. Expected {self.config.clip_embedding_dim}, got {batch['clip_embedding'].shape[-1]}")
 
+        # Add strict CLIP embedding validation
+        clip_emb = batch['clip_embedding']
+        if clip_emb.dim() == 4:
+            if clip_emb.shape[1] != 1:
+                raise ValueError(f"Invalid CLIP sequence dim {clip_emb.shape}, expected [B, 1, L, D]")
+            batch['clip_embedding'] = clip_emb.squeeze(1)
+        
+        if batch['clip_embedding'].dim() != 3:
+            raise ValueError(f"CLIP embeddings must be 3D after processing, got {batch['clip_embedding'].dim()}D")
+
     def _calculate_temperature(self, current_step: int) -> float:
         """Compute temperature with exponential decay and minimum floor"""
         return max(
