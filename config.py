@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     'gradient_accumulation_steps': 2,
     'use_scheduler': True,
     'scheduler_type': 'cosine',
+    'expert_loss_weight': 1.0,
     'adam_betas': (0.9, 0.999),
     'eps': 1e-8,
     
