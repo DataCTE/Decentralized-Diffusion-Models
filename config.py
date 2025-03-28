@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
     'expert_capacity_factor': 1.2,
     'max_experts_in_memory': 2,
     'expert_offload_to_cpu': True,
+    'patch_size': 4,
     
     # ===== Router Configuration =====
     'router_learning_rate': 3e-4,

@@ -7,6 +7,7 @@ import os
 import logging
 from typing import Dict
 import torch.nn as nn
+from einops import rearrange
 
 from models.mmdit import ExpertMMDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
@@ -191,8 +192,14 @@ class ExpertTrainer(BaseTrainer):
                 txt=batch['clip_embedding']
             ).argmax(dim=-1)
 
-        # Dynamic sequence reshaping
-        img_seq = latent.view(B, C, H * W).permute(0, 2, 1)  # [B, L, C]
+        # Paper's patch encoding (Section 3.1)
+        patch_size = 4
+        img_seq = rearrange(
+            latent,
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+            p1=patch_size,
+            p2=patch_size
+        )
         
         # Position IDs generation using actual H/W
         pos_ids = self._get_position_ids(latent)  # Ensure this uses H/W
@@ -208,8 +215,15 @@ class ExpertTrainer(BaseTrainer):
                 cluster_ids=batch['cluster_pred']
             )
             
-            # Dynamic loss reshaping
-            pred_flow = pred_flow.permute(0, 2, 1).view(B, C, H, W)
+            # Remove incorrect reshape and use paper's patch decoding
+            pred_flow = rearrange(
+                pred_flow,
+                "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+                h=H//patch_size,
+                w=W//patch_size,
+                p1=patch_size,
+                p2=patch_size
+            )
             loss = self.flow_matcher.compute_loss(
                 pred_flow, 
                 latent,

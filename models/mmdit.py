@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 from dataclasses import dataclass, field
 import math
+from einops import rearrange
 
 
 # Import core modules
@@ -57,6 +58,7 @@ class FluxParams:
     gradient_checkpointing: bool = config.use_gradient_checkpointing
     latent_channels: int = config.latent_channels
     depth_single_blocks: int = config.depth_single_blocks
+    patch_size: int = config.patch_size
 
 
 class Flux(nn.Module):
@@ -285,7 +287,15 @@ class ExpertMMDiT(Flux):
         # Extract image features after processing (critical dimension fix)
         img_features = x[:, txt_stream.size(1):]
         
-        return self.final_layer(img_features, time_vec)
+        # Add paper's patch decoding
+        patch_size = self.params.patch_size
+        return rearrange(
+            self.final_layer(img_features, time_vec),
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=img_ids.shape[-2]//patch_size,
+            p1=patch_size,
+            p2=patch_size
+        )
 
     def create_embeddings(self, text_input, image_input):
         """
