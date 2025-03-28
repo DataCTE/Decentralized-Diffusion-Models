@@ -437,8 +437,13 @@ class DDMTrainingCoordinator:
             }
             
             if expert_batch['latent'].shape[0] > 0:
-                loss = expert_trainer.train_step(expert_batch)
-                expert_losses[f'expert_{expert_idx}'] = loss
+                loss_dict = expert_trainer.train_step(expert_batch)
+                # Paper's recommended loss aggregation (Section 3.3)
+                expert_losses[f'expert_{expert_idx}'] = {
+                    'total_loss': loss_dict['total_loss'],
+                    'router_confidence': loss_dict['router_confidence'],
+                    'cluster_alignment': loss_dict['cluster_alignment']
+                }
         
         return expert_losses
 
@@ -530,36 +535,23 @@ class DDMTrainingCoordinator:
         expert_utilization = 0
         total_confidence = 0
         alignment_values = []
+        total_expert_loss = 0
         
         for expert_key, metrics in expert_losses.items():
-            if not isinstance(metrics, dict):
-                continue
-            
-            # Paper-style metric namespacing
-            expert_id = expert_key.split('_')[1]
-            prefix = f'train/expert_{expert_id}'
-            
-            # Core metrics from paper Section 4
-            log_data.update({
-                f'{prefix}/raw_loss': metrics.get('raw_loss', 0),
-                f'{prefix}/weighted_loss': metrics.get('weighted_loss', 0),
-                f'{prefix}/router_confidence': metrics.get('router_confidence', 0),
-                f'{prefix}/cluster_alignment': metrics.get('cluster_alignment', 0),
-            })
+            # Paper's core metrics (Section 4)
+            total_expert_loss += metrics['total_loss']
+            total_confidence += metrics['router_confidence']
+            alignment_values.append(metrics['cluster_alignment'])
             
             # Utilization tracking (paper's "expert activation rate")
-            conf = metrics.get('router_confidence', 0)
-            total_confidence += conf
             threshold = self.config.expert_metrics.utilization_threshold
-            expert_utilization += (conf > threshold).float().mean().item()
-            
-            # Specialization tracking (paper's "cluster alignment")
-            alignment_values.append(metrics.get('cluster_alignment', 0))
+            expert_utilization += (metrics['router_confidence'] > threshold).float().mean().item()
 
         # Paper-recommended aggregate metrics
         if expert_losses:
             num_experts = len(expert_losses)
             log_data.update({
+                'train/avg_expert_loss': total_expert_loss / num_experts,
                 'train/avg_router_confidence': total_confidence / num_experts,
                 'train/utilization_rate': expert_utilization / num_experts,
                 'train/avg_cluster_alignment': sum(alignment_values) / num_experts,
@@ -568,6 +560,7 @@ class DDMTrainingCoordinator:
         # Console logging remains focused on core metrics
         log_message = (
             f"Step {step:>6} | Router Loss: {router_loss:.4f} | "
+            f"Expert Loss: {log_data.get('train/avg_expert_loss', 0):.4f} | "
             f"Utilization: {log_data.get('train/utilization_rate', 0):.1%} | "
             f"Alignment: {log_data.get('train/avg_cluster_alignment', 0):.2f}"
         )
@@ -577,7 +570,7 @@ class DDMTrainingCoordinator:
         if self.config.wandb_enabled:
             import wandb
             # Paper-style histogram for expert confidence distribution
-            confidences = [m.get('router_confidence', 0) for m in expert_losses.values()]
+            confidences = [m['router_confidence'] for m in expert_losses.values()]
             log_data['train/expert_conf_dist'] = wandb.Histogram(np.array(confidences))
             
             # Time-series metrics matching paper figures
