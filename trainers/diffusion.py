@@ -222,16 +222,24 @@ class DecentralizedFlowMatcher:
         return torch.einsum('bk,kbchw->bchw', router_weights, torch.stack(expert_flows))
     
     def compute_flow_matching_loss(self, pred, target):
-        """Direct dimension matching without resizing"""
-        if pred.shape != target.shape:
-            raise ValueError(f"Shape mismatch: pred {pred.shape} vs target {target.shape}")
+        """Handle dynamic spatial dimensions through resizing"""
+        # Get target dimensions from x0
+        _, _, H_target, W_target = target.shape
+        
+        # Resize prediction to match target spatial dimensions
+        pred_resized = torch.nn.functional.interpolate(
+            pred, 
+            size=(H_target, W_target), 
+            mode='bilinear', 
+            align_corners=False
+        )
         
         if self.loss_type == 'huber':
-            return F.huber_loss(pred, target, delta=0.1, reduction='mean')
+            return F.huber_loss(pred_resized, target, delta=0.1, reduction='mean')
         elif self.loss_type == 'mse':
-            return F.mse_loss(pred, target, reduction='mean')
+            return F.mse_loss(pred_resized, target, reduction='mean')
         elif self.loss_type == 'l1':
-            return F.l1_loss(pred, target, reduction='mean')
+            return F.l1_loss(pred_resized, target, reduction='mean')
         else:
             raise ValueError(f"Invalid loss type: {self.loss_type}")
 

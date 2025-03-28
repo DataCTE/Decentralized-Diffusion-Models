@@ -364,7 +364,12 @@ class ExpertTrainer(BaseTrainer):
     def _get_position_ids(self, x):
         """Generates position IDs for PATCHED latent tensor"""
         _, _, H, W = x.shape
-        patch_size = self.config.patch_size  # Get from config
+        patch_size = self.config.patch_size
+        
+        # Ensure divisible patch dimensions
+        if H % patch_size != 0 or W % patch_size != 0:
+            raise ValueError(f"Input size {H}x{W} must be divisible by patch_size {patch_size}")
+        
         H_patch = H // patch_size
         W_patch = W // patch_size
         
