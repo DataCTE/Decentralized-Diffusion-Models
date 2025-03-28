@@ -65,15 +65,13 @@ class DDMDataset(Dataset):
         self._bucket_assignments = None  # Initialize cache
 
     def _verify_cache_dirs(self):
-        """Verify cache directories with strict filename validation."""
+        """Modified verification without clusters/dims"""
         required_dirs = {
             "latents": self.latent_dir,
             "clip": self.clip_dir,
-            "clusters": self.cluster_dir,
-            "dims": self.dim_dir,
             "buckets": self.bucket_dir
         }
-
+        
         # Pattern to match 'basename_rankN.pt' where N is a digit
         filename_pattern = re.compile(r"^(.*)_rank(\d+)\.pt$")
         
