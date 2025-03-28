@@ -145,8 +145,13 @@ class ExpertTrainer(BaseTrainer):
         noise = torch.randn_like(x0)
         xt = alpha_t * x0 + sigma_t * noise
         
-        # Reshape for transformer input (B, L, C)
-        xt_seq = xt.flatten(2).permute(0, 2, 1)  # [B, H*W, C]
+        # Replace incorrect flattening with proper patching
+        xt_seq = rearrange(
+            xt,
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+            p1=self.config.patch_size,
+            p2=self.config.patch_size
+        )
         
         # Get cluster predictions from router (Section 3.3)
         with torch.no_grad():
@@ -222,9 +227,10 @@ class ExpertTrainer(BaseTrainer):
 
         # Process through expert model
         img_seq = rearrange(
-            xt,  # Use diffused latent for patching
+            xt,
             "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
-            p1=4, p2=4
+            p1=self.config.patch_size,
+            p2=self.config.patch_size
         )
         
         with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
