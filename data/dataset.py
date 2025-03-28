@@ -62,16 +62,13 @@ class DDMDataset(Dataset):
         # Initialize bucket assignments as a property
         self._bucket_assignments = None  # Initialize cache
 
-        # Add cluster data loading
+        # Modified cluster data loading
         self.cluster_file = os.path.join(self.config.feature_cache_path, "clusters", "final_clusters.pt")
         if not os.path.exists(self.cluster_file):
             raise FileNotFoundError(f"Cluster file {self.cluster_file} missing")
         
-        # Load all cluster assignments at initialization
-        self.cluster_assignments = torch.load(self.cluster_file, map_location='cpu')
-        
-        # Remove cluster_dir from initialization
-        self.cluster_dir = None  # Remove cluster directory reference
+        # Load cluster assignments as a dictionary and convert to tensor
+        self._load_cluster_assignments()
 
     def _verify_cache_dirs(self):
         """Modified verification without clusters/dims"""
@@ -161,33 +158,45 @@ class DDMDataset(Dataset):
             self.logger.error("Cache verification failed:\n" + "\n".join(error_lines))
             raise
 
+    def _load_cluster_assignments(self):
+        """Load cluster assignments and align with dataset base names"""
+        # Load the cluster data (assumed to be {base_name: cluster_id} mapping)
+        cluster_data = torch.load(self.cluster_file, map_location='cpu')
+        
+        # Convert to tensor in base_names order
+        assignments = []
+        missing = []
+        for base in self.base_names:
+            if base in cluster_data:
+                assignments.append(cluster_data[base])
+            else:
+                missing.append(base)
+        
+        if missing:
+            self.logger.error(f"Missing cluster assignments for {len(missing)} samples. First missing: {missing[:5]}")
+            raise ValueError(f"Cluster assignments incomplete. Missing {len(missing)} entries")
+        
+        self.cluster_assignments = torch.tensor(assignments, dtype=torch.long)
+        
+        # Final validation
+        if len(self.cluster_assignments) != self.num_samples:
+            raise ValueError(f"Cluster assignments count mismatch. Got {len(self.cluster_assignments)}, expected {self.num_samples}")
+
     def __getitem__(self, idx):
-        """Modified to generate dims from latent shape"""
+        """Fixed item loading with proper cluster assignment"""
         base_name = self.base_names[idx]
         rank_suffix = f"_rank{self.rank}.pt"
 
-        # Construct paths for remaining features
-        paths = {
-            'latent': os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"),
-            'clip_embedding': os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"),
+        # Load latent and clip embedding
+        latent = torch.load(os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
+        clip_embed = torch.load(os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
+
+        return {
+            'latent': latent,
+            'clip_embedding': clip_embed,
+            'expert': self.cluster_assignments[idx],
+            'dims': torch.tensor(latent.shape, dtype=torch.int16)
         }
-
-        try:
-            item = {
-                'latent': torch.load(paths['latent'], map_location='cpu'),
-                'clip_embedding': torch.load(paths['clip_embedding'], map_location='cpu'),
-                'expert': self.cluster_assignments[idx],  # Get from preloaded tensor
-                'dims': torch.tensor(item['latent'].shape, dtype=torch.int16)
-            }
-            
-            return item
-
-        except FileNotFoundError as e:
-            self.logger.error(f"[Rank {self.rank}] Critical file missing: {str(e)}", exc_info=True)
-            raise
-        except Exception as e:
-            self.logger.error(f"[Rank {self.rank}] Error loading data: {str(e)}", exc_info=True)
-            return None
 
     def __len__(self):
         return self.num_samples
