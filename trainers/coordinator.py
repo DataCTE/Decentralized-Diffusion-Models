@@ -15,7 +15,6 @@ from trainers.router import RouterTrainer
 from trainers.expert import ExpertTrainer
 from trainers.sampling import ddm_sample
 from data.dataset import DDMDataset, BucketBatchSampler
-from utils.logging import setup_logger
 from utils.checkpoint import save_coordinator_checkpoint, load_coordinator_checkpoint, save_ddm_checkpoint
 from torch.utils.data import DataLoader 
 import torch.distributed as dist

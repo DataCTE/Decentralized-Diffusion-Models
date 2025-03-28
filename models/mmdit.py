@@ -180,7 +180,8 @@ class ExpertMMDiT(Flux):
             nn.Linear(params.cluster_embed_dim, 1),
             nn.Sigmoid()
         )
-        nn.init.constant_(self.capacity_gate[0].bias, -2.0)  # Initial gate bias
+        nn.init.normal_(self.capacity_gate[0].weight, std=0.01)  # More stable initialization
+        nn.init.constant_(self.capacity_gate[0].bias, 0.0)  # Neutral initial bias
 
     def _validate_params(self, params):
         """Safer parameter validation with cluster config"""
@@ -231,8 +232,10 @@ class ExpertMMDiT(Flux):
 
 
     def _apply_capacity_scaling(self, y: Tensor, cluster_emb: Tensor) -> Tensor:
-        """Implements paper's Equation 7 with gating"""
-        capacity_scale = 1.0 + self.capacity_gate(cluster_emb.mean(1)) 
+        """Implements paper's Equation 7 with dimension fix"""
+        # Process full embeddings through the gate
+        capacity_scale = 1.0 + self.capacity_gate(cluster_emb)  # [B, 1]
+        # Add projected cluster information
         return y * capacity_scale + self.cluster_proj(cluster_emb)
 
     def _fuse_embeddings(self, img, txt, timesteps, y):
