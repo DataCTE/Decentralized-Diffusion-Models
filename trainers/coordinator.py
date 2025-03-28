@@ -209,7 +209,7 @@ class DDMTrainingCoordinator:
                 'vec_in_dim': self.config.vec_in_dim,
                 'context_in_dim': self.config.context_in_dim,
                 'guidance_embed': False,  # Experts never use guidance
-                'gradient_checkpointing': self.config.gradient_checkpointing,
+                'gradient_checkpointing': self.config.use_gradient_checkpointing,
                 'latent_channels': latent_channels,
                 'depth_single_blocks': self.config.depth_single_blocks,
                 'patch_size': patch_size
