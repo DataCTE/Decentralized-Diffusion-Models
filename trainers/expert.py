@@ -183,46 +183,49 @@ class ExpertTrainer(BaseTrainer):
         latent = batch["latent"]
         B, C, H, W = latent.shape  # Now dynamic based on input
         
-        # Router logic remains unchanged
+        # Generate proper diffusion parameters
+        t = torch.rand(B, device=self.device)  # [0, 1) range
+        alpha_t = torch.cos(t * math.pi/2).view(-1, 1, 1, 1)
+        sigma_t = torch.sin(t * math.pi/2).view(-1, 1, 1, 1)
+        noise = torch.randn_like(latent)
+        xt = alpha_t * latent + sigma_t * noise  # Diffused latent
+
+        # Router uses scaled timesteps
         with torch.no_grad():
-            t = torch.rand(B, device=self.device) * 1000
             batch['cluster_pred'] = self.router(
-                img=latent,
-                timesteps=t,
+                img=xt,  # Use diffused latent
+                timesteps=t * 1000,
                 txt=batch['clip_embedding']
             ).argmax(dim=-1)
 
-        # Paper's patch encoding (Section 3.1)
-        patch_size = 4
+        # Process through expert model
         img_seq = rearrange(
-            latent,
+            xt,  # Use diffused latent for patching
             "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
-            p1=patch_size,
-            p2=patch_size
+            p1=4, p2=4
         )
-        
-        # Position IDs generation using actual H/W
-        pos_ids = self._get_position_ids(latent)  # Ensure this uses H/W
         
         with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             pred_flow = self.expert(
                 img=img_seq,
-                img_ids=pos_ids,
+                img_ids=self._get_position_ids(xt),
                 txt=batch["clip_embedding"],
                 txt_ids=self._get_text_position_ids(batch["clip_embedding"]),
-                timesteps=torch.rand(B, device=self.device) * 1000,
+                timesteps=t * 1000,
                 y=self._get_conditioning(B),
                 cluster_ids=batch['cluster_pred']
             )
             
+            # Calculate loss with proper dimensions
             loss = self.flow_matcher.compute_loss(
-                pred_flow,
-                latent,
-                torch.rand(B, device=self.device)
+                pred_flow,  # Model predictions
+                latent,     # Original x0
+                xt,         # Diffused latent
+                t           # Original timesteps
             ) * self.config.expert_loss_weight
 
         # Proper mixed precision handling
-        self.scaler.scale(loss).backward()  # Scale loss and perform backward pass
+        self.scaler.scale(loss).backward()
 
         # Gradient accumulation logic
         if (self.step + 1) % self.config.expert_gradient_accumulation_steps == 0:
