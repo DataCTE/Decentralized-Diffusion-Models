@@ -12,8 +12,9 @@ from collections import defaultdict
 from config import get_config
 import torch.distributed as dist
 from config import get_config
-
-config = get_config("config.py")
+from einops import rearrange
+from typing import Callable, Dict, Tuple
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
@@ -34,42 +35,53 @@ def ddm_sample(
     top_k=1,                     # For top-k selection
     top_p=0.9,                   # For nucleus sampling
     true_clusters=None,          # For oracle evaluation
+    config=None  # Add config parameter
 ):
     """DDM sampling with multiple inference strategies"""
     if device is None:
         device = next(router.parameters()).device
     
-    x = torch.randn(shape, device=device)
-    num_clusters = len(experts)
-    alphas, alpha_bar, _ = get_alphas_and_betas(num_steps, "cosine")
-    alphas = alphas.to(device)
-    alpha_bar = alpha_bar.to(device)
+    # Get critical parameters from config
+    patch_size = config.patch_size
+    vec_in_dim = config.vec_in_dim
+    
+    # Initialize latents with proper dimensions
+    latents = torch.randn(shape, device=device)
+    
+    # Create progress bar
+    progress_bar = tqdm(range(num_steps), disable=not verbose)
+    
+    for step in progress_bar:
+        # Get router predictions with ORIGINAL latents
+        router_logits = router(
+            img=latents,  # Use original 4D latents
+            timesteps=torch.full((latents.shape[0],), step, device=device),
+            txt=text_embeddings
+        )
+        
+        # Prepare expert input with proper patching
+        img_input = rearrange(
+            latents,
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+            p1=config.patch_size,
+            p2=config.patch_size
+        )
+        
+        # Generate position IDs based on actual spatial dimensions
+        H_patch = latents.shape[2] // patch_size
+        W_patch = latents.shape[3] // patch_size
+        pos_h = torch.arange(H_patch, device=device)
+        pos_w = torch.arange(W_patch, device=device)
+        img_ids = torch.stack(torch.meshgrid(pos_h, pos_w, indexing='ij'), -1)
+        img_ids = img_ids.reshape(1, -1, 2).expand(latents.shape[0], -1, -1)
 
-    #print("Shape of alphas:", alphas.shape)
-    #print("Shape of alpha_bar:", alpha_bar.shape)
-
-    batch_size = shape[0]
-    if text_embeddings is not None:
-        text_embeddings = text_embeddings[:batch_size]
-        uncond_embeddings = uncond_embeddings[:batch_size] if uncond_embeddings is not None else None
-
-    for t in tqdm(range(num_steps), disable=not verbose):
-        timestep = torch.full((x.size(0),), t, device=device)
-
-        #print(f"Sampling loop iteration: t = {t}") # Print current timestep iteration
-        #print("Shape of timestep:", timestep.shape) # Print shape of timestep tensor
-        #print("Values of timestep:", timestep) # Print values of timestep tensor
-        #print(f"Timestep value range: min={timestep.min()}, max={timestep.max()}") # Print min/max timestep values
-
-        # Get router predictions
-        router_logits = router(x, timestep, text_embeddings)
         router_weights = F.softmax(router_logits / temperature, dim=-1)
         
         # Paper's inference strategies (Section 3.5)
         if inference_strategy == "full":
             # Full ensemble - use all experts
             selected_weights = router_weights
-            selected_indices = torch.arange(num_clusters, device=device).expand(batch_size, -1)
+            selected_indices = torch.arange(len(experts), device=device).expand(latents.shape[0], -1)
         elif inference_strategy == "top_k":
             # Greedy top-k expert selection
             selected_weights, selected_indices = router_weights.topk(top_k, dim=-1)
@@ -142,22 +154,26 @@ def ddm_sample(
             
             # Extract relevant inputs
             expert = experts[expert_idx]
-            expert_input = x[batch_indices]
+            expert_input = img_input[batch_indices]
 
-            # Reshape latent tensor to sequence format [B, H*W, C]
-            B, C, H, W = expert_input.shape
-            expert_input = expert_input.reshape(B, C, H*W).permute(0, 2, 1)  # New shape: [B, L, C]
+            # Get actual dimensions from original latents
+            H_patch = latents.shape[2] // config.patch_size
+            W_patch = latents.shape[3] // config.patch_size
+            
+            # Reshape latent tensor to sequence format [B, L, C]
+            B, L, C = expert_input.shape  # Correct dimension unpacking
 
-            expert_timesteps = timestep[batch_indices]
+            expert_timesteps = torch.full((B,), step, device=device)
             expert_text = text_embeddings[batch_indices] if text_embeddings is not None else None
             
-            # Generate position IDs using original H/W dimensions
-            img_len = H * W
-            img_ids = torch.stack([
-                torch.arange(H, device=device).repeat_interleave(W),
-                torch.arange(W, device=device).repeat(H)
-            ], dim=-1)
-            img_ids = img_ids.unsqueeze(0).repeat(B, 1, 1)
+            # Generate position IDs using calculated spatial dimensions
+            img_ids = torch.stack(
+                torch.meshgrid(
+                    torch.arange(H_patch, device=device),
+                    torch.arange(W_patch, device=device),
+                    indexing='ij'
+                ), -1
+            ).reshape(1, -1, 2).expand(B, -1, -1)
             
             # Generate text position IDs
             txt_len = expert_text.shape[1] if expert_text is not None else 0
@@ -168,7 +184,7 @@ def ddm_sample(
 
             # Create conditioning vector (y) from text embeddings
             y = expert_text.mean(dim=1) if expert_text is not None else torch.zeros(expert_input.shape[0], 
-                                                                                   config.vec_in_dim, 
+                                                                                   vec_in_dim, 
                                                                                    device=device)
             
             # Get cluster IDs from router selection
@@ -186,12 +202,13 @@ def ddm_sample(
                 cluster_ids=cluster_ids
             )
             
-            # Reshape from [B, L, C] to [B, C, H, W]
-            reshaped_output = expert_output.permute(0, 2, 1).view(B, C, H, W)
+            # Remove unnecessary reshape since output is already 4D
+            reshaped_output = expert_output  # Directly use the model output
+            
             expert_outputs.append(reshaped_output)
         
         # Combine predictions
-        pred = torch.zeros_like(x)
+        pred = torch.zeros_like(latents)
         output_idx = 0
         for idx in set(flattened_indices):
             mask = torch.tensor(
@@ -204,20 +221,20 @@ def ddm_sample(
             output_idx += 1
 
         #print("Shape of combined_pred before ddim_step:", pred.shape)
-        #print("Shape of timestep before ddim_step:", timestep.shape)
+        #print("Shape of timestep before ddim_step:", step.shape)
 
-        # DDIM update step
-        x = ddim_step(
+        # DDIM update step with device-aware tensors
+        latents = ddim_step(
             lambda x_t, t, c: pred,
-            x,
-            timestep,
-            torch.full_like(timestep, t+1) if t < num_steps-1 else None,
-            alphas,
-            alpha_bar,
+            latents,
+            torch.full((latents.shape[0],), step, device=device),  # Already on device
+            torch.full((latents.shape[0],), step+1, device=device) if step < num_steps-1 else None,
+            get_alphas_and_betas(num_steps, "cosine")[0].to(device),  # Add device transfer
+            get_alphas_and_betas(num_steps, "cosine")[1].to(device),  # Add device transfer
             eta=eta
         )
 
-    return x
+    return latents
 
 def distilled_sample(distilled_model, shape, num_steps=50, prompt_embeds=None, 
                     cfg_scale=7.5, device=None, eta=0.0, 

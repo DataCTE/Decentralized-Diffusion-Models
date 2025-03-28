@@ -10,6 +10,7 @@ from trainers.expert import ExpertTrainer
 from utils.logging import setup_logger
 from types import SimpleNamespace
 import torch.distributed as dist
+from einops import rearrange
 
 def test_full_pipeline():
     """End-to-end shape test of DDM pipeline with dummy data using FSDP"""
@@ -38,75 +39,119 @@ def test_full_pipeline():
 
     config = get_config()
     config_dict = {
-        # ===== Core Architecture =====
-        'hidden_size': 512,          # Reduced from 1152
-        'num_heads': 8,              # Reduced from 16
-        'depth': 6,                  # Reduced from 30
-        'mlp_ratio': 2.0,            # Reduced from 4.0
-        'qkv_bias': True,             
-        'position_embed_type': 'rope_2d',  
-        
-        # ===== Expert Configuration =====
-        'num_experts': 2,            # Keep minimal experts
-        'num_clusters': 2,
-        'cluster_embed_dim': 256,    # Reduced from 512
-        'expert_capacity_factor': 1.2,
-        
-        # ===== Training Parameters ===== 
-        'batch_size': 1,
-        'learning_rate': 1e-4,
-        'weight_decay': 0.01,
-        'warmup_steps': 1000,
-        'use_mixed_precision': True,
-        'gradient_accumulation_steps': 2,
-        
-        # ===== Dataset & Latent Config =====
-        'image_size': (256, 256),
-        'latent_channels': 16,  # Critical for VAE compatibility
-        'vae_scaling_factor': 0.18215,  
-        'in_channels': 16,  # Must match latent_channels
-        'out_channels': 16, 
-        
-        # ===== Positional Embeddings =====
-        'axes_dim': [32, 32],        # Reduced from [36,36]
-        'theta': 10000,               
-        
-        # ===== Router Configuration =====
-        'router_hidden_size': 256,   # Reduced from 512
-        'router_num_heads': 8,
-        'router_temperature': 2.0,
-        'router_min_temp': 0.5,
-        'router_temperature_decay': 0.99995,
-        
-        # ===== Diffusion & Loss =====
-        'loss_type': 'huber',         
-        'sigma': 1.0,
-        'sampling_steps': 10,
-        'top_p': 0.9,                 
-        
-        # ===== Optimization =====
-        'adam_betas': (0.9, 0.999),
-        'eps': 1e-8,
-        
-        # ===== Distributed Training =====
-        'gradient_checkpointing': True,
-        
-        # ===== Experimental Flags =====
-        'bypass_cluster_validation': True,
-        'guidance_embed': False,      
-        
-        # Required parameters from latest implementation
-        'vec_in_dim': 768,  
-        'context_in_dim': 768,  
-        'buckets': [(256, 256), (288, 224), (224, 288)], 
-        'clip_embedding_dim': 768, 
-        't5_embedding_dim': 512, 
-        'num_steps': 10,  
-        'balance_lambda': 0.01,  
-        'router_model': 'paper_baseline',  
-        'use_scheduler': True,  
-        'scheduler_type': 'cosine',  
-        'depth_single_blocks': 2,    # Reduced from 5
+    # ===== Model Architecture =====
+    'hidden_size': 256,          # Reduced from 768
+    'num_heads': 8,              # Reduced from 12
+    'depth': 4,                  # Reduced from 12
+    'mlp_ratio': 2.0,
+    'qkv_bias': True,
+    'vec_in_dim': 768,           # Must match CLIP's 768D
+    'context_in_dim': 768,       # Match CLIP embedding dim
+    'position_embed_type': 'rope_2d',
+    'theta': 10000,
+    'axes_dim': [16, 16],        # Reduced from [32,32]
+    
+    # ===== Training Configuration =====
+    'batch_size': 1,
+    'expert_batch_size': 1,
+    'learning_rate': 2e-4,
+    'weight_decay': 0.05,
+    'warmup_steps': 500,
+    'num_steps': 100000,
+    'use_mixed_precision': True,
+    'gradient_accumulation_steps': 1,
+    'use_scheduler': True,
+    'scheduler_type': 'linear',
+    'expert_loss_weight': 1.0,
+    'adam_betas': (0.9, 0.98),
+    'eps': 1e-8,
+    
+    # ===== Expert Configuration =====
+    'num_experts': 2,
+    'num_clusters': 2,
+    'cluster_embed_dim': 768,
+    'cluster_embed': 768,
+    'expert_capacity_factor': 1.2,
+    'max_experts_in_memory': 2,
+    'expert_offload_to_cpu': True,
+    'patch_size': 4,
+    'guidance_embed': False,
+    
+    # ===== Router Configuration =====
+    'router_learning_rate': 3e-4,
+    'router_hidden_size': 192,   # Reduced from 384
+    'router_num_heads': 4,       # Reduced from 6
+    'router_temperature': 1.5,
+    'router_min_temp': 0.5,
+    'router_temperature_decay': 0.9999,
+    'router_model': 'paper_baseline',
+    'balance_lambda': 0.1,
+    
+    # ===== Diffusion Configuration =====
+    'loss_type': 'huber',
+    'sigma': 1.0,
+    'sampling_steps': 10,
+    'top_p': 0.9,
+    
+    # ===== Dataset & Latent Configuration =====
+    'buckets': [
+            (64, 64), (96, 64),      # Smaller test resolutions
+            (64, 96), (128, 64)
+    ],
+    'image_size': 64,
+    'latent_channels': 16,
+    'in_channels': 16,
+    'out_channels': 16,
+    'vae_scaling_factor': 0.18215,
+    'vae_model': 'AuraDiffusion/16ch-vae',
+    
+    # ===== CLIP Configuration =====
+    'clip_model': 'openai/clip-vit-large-patch14',
+    'clip_embedding_dim': 768,
+    
+    # ===== Distributed Training =====
+    'gradient_checkpointing': True,
+    'fsdp_sharding_strategy': "FULL_SHARD",
+    'fsdp_auto_wrap_policy': "LAMBDA",
+    
+    # ===== Logging & Monitoring =====
+    'output_dir': './outputs',
+    'feature_cache_path': './cache',
+    'wandb_enabled': True,
+    'wandb_project': 'decentralized-diffusion',
+    'verbose_training': False,
+    'log_memory': False,
+    
+    # ===== Validation & Sampling =====
+    'enable_validation': False,
+    'validation_interval': 1000,
+    'enable_sampling': True,
+    'sampling_steps': 50,
+    'cfg_scale': 7.5,
+    'save_interval': 5000,
+    
+    # ===== Debugging & Testing =====
+    'bypass_cluster_validation': False,
+    'depth_single_blocks': 5,
+    
+    # ===== Model References =====
+    'distilled_model': None,
+    
+    # ===== Expert Training Configuration =====
+    'expert_learning_rate': 2e-4,
+    'expert_warmup_steps': 500,
+    'expert_scheduler_type': 'linear',
+    'expert_gradient_accumulation_steps': 1,
+    'expert_adam_betas': (0.9, 0.98),
+    'expert_weight_decay': 0.05,
+    'expert_max_grad_norm': 1.0,
+    
+    # ===== Expert Metrics Configuration =====
+    'expert_metrics': {
+        'track_ensemble': True,
+        'utilization_threshold': 0.1,
+        'alignment_window': 1000
+    },
     }
     config = SimpleNamespace(**config_dict)
     
@@ -140,6 +185,10 @@ def test_full_pipeline():
         for i in range(num_dummy_images):
             base_name = f"anime-{i}"
             
+            # Create cluster assignment
+            cluster_id = torch.randint(0, config.num_clusters, (1,))
+            all_cluster_ids.append(cluster_id)  # Store cluster IDs
+            
             # Create latent file with proper dimensions
             torch.save(
                 torch.randn(config.latent_channels, 32, 32),  # [C, H, W]
@@ -150,14 +199,6 @@ def test_full_pipeline():
             torch.save(
                 torch.randn(77, config.clip_embedding_dim),
                 os.path.join(config.feature_cache_path, "clip", f"{base_name}_rank0.pt")
-            )
-            
-            # Create cluster assignment
-            cluster_id = torch.randint(0, config.num_clusters, (1,))
-            all_cluster_ids.append(cluster_id)
-            torch.save(
-                cluster_id,
-                os.path.join(config.feature_cache_path, "clusters", f"{base_name}_rank0.pt")
             )
             
             # Create bucket assignment
@@ -175,7 +216,7 @@ def test_full_pipeline():
             )
 
         # Create final_clusters.pt with proper structure
-        final_clusters = torch.cat(all_cluster_ids)
+        final_clusters = {f"anime-{i}": int(cluster_id.item()) for i, cluster_id in enumerate(all_cluster_ids)}
         torch.save(
             final_clusters,
             os.path.join(config.feature_cache_path, "clusters", "final_clusters.pt")
@@ -186,7 +227,10 @@ def test_full_pipeline():
         
         print(f"\n{'='*40} DATASET INFO {'='*40}")
         print(f"Created {num_dummy_images} dummy samples")
-        print(f"Final cluster distribution: {final_clusters.unique(return_counts=True)}")
+        cluster_ids = list(final_clusters.values())
+        cluster_tensor = torch.tensor(cluster_ids, dtype=torch.long)
+        unique_clusters, counts = torch.unique(cluster_tensor, return_counts=True)
+        print(f"Final cluster distribution:\nClusters: {unique_clusters.tolist()}\nCounts: {counts.tolist()}")
 
         # Initialize models with paper's architecture
         router_trainer = RouterTrainer(config, device, rank, world_size=1)
@@ -252,18 +296,52 @@ def test_full_pipeline():
         print(f"  Latent: {dummy_latent.shape}")
         
         # Test expert forward pass with cluster IDs
-        cluster_ids = torch.randint(0, config.num_clusters, (2,), device=device)
+        expert_input = rearrange(
+            dummy_latent,
+            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+            p1=config.patch_size,
+            p2=config.patch_size
+        )
+        img_ids = torch.stack(
+            torch.meshgrid(
+                torch.arange(8, device=device),
+                torch.arange(8, device=device),
+                indexing='ij'
+            ), -1
+        ).reshape(1, 64, 2).expand(2, -1, -1)
+
         expert_out = expert_trainer.expert(
-            img=torch.randn(2, 32*32, config.latent_channels, device=device),
-            img_ids=torch.randint(0,32,(2,32*32,2), device=device),
+            img=expert_input,
+            img_ids=img_ids,  # Updated position IDs
             txt=dummy_text_embeds,
             txt_ids=torch.randint(0,77,(2,77,2), device=device),
             timesteps=(dummy_t * 1000).float(),
             y=torch.randn(2, config.vec_in_dim, device=device),
-            cluster_ids=cluster_ids
+            cluster_ids=torch.randint(0, config.num_clusters, (2,), device=device)
         )
-        assert expert_out.shape == (2, 32*32, config.latent_channels), \
-            f"Expert output shape mismatch: {expert_out.shape} vs expected (2, 1024, 16)"
+        assert expert_out.shape == (2, config.latent_channels, 32, 32), \
+            f"Expert output shape mismatch: {expert_out.shape} vs expected (2, 16, 32, 32)"
+
+        # Correct dimension check
+        expected_in_channels = config.latent_channels * (config.patch_size ** 2)
+        print(f"\n{'='*40} DIMENSION CHECKS {'='*40}")
+        print(f"Expected input channels: {expected_in_channels}")
+        print(f"Actual input channels: {expert_input.shape[-1]}")
+        print(f"Expected output channels: {config.latent_channels}")
+        print(f"Actual output channels: {expert_out.shape[1]}")
+        
+        assert expert_input.shape[-1] == expected_in_channels, \
+            f"Input dimension mismatch: {expert_input.shape[-1]} vs {expected_in_channels}"
+        
+        assert expert_out.shape[1] == config.latent_channels, \
+            f"Output channel mismatch: {expert_out.shape[1]} vs {config.latent_channels}"
+
+        # Verify final_layer configuration
+        final_layer = expert_trainer.expert.final_layer
+        assert final_layer.patch_size == config.patch_size, \
+            f"Final layer patch_size mismatch: {final_layer.patch_size} vs {config.patch_size}"
+        assert final_layer.out_channels == config.latent_channels, \
+            f"Final layer out_channels mismatch: {final_layer.out_channels} vs {config.latent_channels}"
 
         # Initialize all experts
         experts = {}
@@ -281,13 +359,14 @@ def test_full_pipeline():
         # Test sampling with proper latent dimensions
         print(f"\n{'='*40} SAMPLING {'='*40}")
         samples = ddm_sample(
-            router=lambda x, t, txt: router_trainer.router(x, t, txt),
-            experts=experts,  # Now contains all 4 experts
+            router=lambda img, timesteps, txt: router_trainer.router(img, timesteps, txt),
+            experts=experts,
             shape=(2, config.latent_channels, 32, 32),
             num_steps=config.sampling_steps,
             device=device,
             text_embeddings=dummy_text_embeds,
-            temperature=0.1
+            temperature=0.1,
+            config=config
         )
         assert samples.shape == (2, config.latent_channels, 32, 32), \
             f"Sampling shape mismatch: {samples.shape} vs expected (2, 16, 32, 32)"
@@ -302,6 +381,11 @@ def test_full_pipeline():
         config.num_clusters,  # Was previously using num_experts
         config.cluster_embed_dim
     ).to(device)
+
+    # Remove non-architectural params from model_config_dict
+    del config_dict['batch_size']
+    del config_dict['expert_batch_size']
+    # ... remove other training-specific params
 
 if __name__ == "__main__":
     try:

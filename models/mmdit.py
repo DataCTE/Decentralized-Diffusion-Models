@@ -21,44 +21,35 @@ from models.modules.layers import (
 )
 from models.modules.lora import LinearLora, replace_linear_with_lora
 
-# Import config
-from config import get_config
-
-# Get active config (will load defaults if not initialized elsewhere)
-config = get_config()
-
 
 @dataclass
 class FluxParams:
-    # Core architecture parameters (paper Section 3.1)
+    # All fields now require explicit initialization
     in_channels: int
     out_channels: int
-    hidden_size: int = config.hidden_size
-    num_heads: int = config.num_heads
-    depth: int = config.depth
-    mlp_ratio: float = config.mlp_ratio
-    qkv_bias: bool = config.qkv_bias
-    
-    # Positional embedding config (paper Section 3.3)
-    axes_dim: list[int] = field(default_factory=lambda: config.axes_dim)
-    theta: int = config.theta
-    position_embed_type: str = config.position_embed_type
-    
-    # Expert specialization parameters (paper Section 3.2)
-    num_clusters: int = config.num_clusters
-    cluster_embed_dim: int = config.cluster_embed_dim
-    expert_capacity_factor: float = config.expert_capacity_factor
-    
-    # Conditional guidance (paper Section 3.5)
-    vec_in_dim: int = config.vec_in_dim
-    context_in_dim: int = config.context_in_dim
-    guidance_embed: bool = False
-    
-    # Performance config
-    gradient_checkpointing: bool = config.use_gradient_checkpointing
-    latent_channels: int = config.latent_channels
-    depth_single_blocks: int = config.depth_single_blocks
-    patch_size: int = config.patch_size
+    hidden_size: int
+    num_heads: int
+    depth: int
+    mlp_ratio: float
+    qkv_bias: bool
+    axes_dim: list[int]
+    theta: int
+    position_embed_type: str
+    num_clusters: int
+    cluster_embed_dim: int
+    expert_capacity_factor: float
+    vec_in_dim: int
+    context_in_dim: int
+    guidance_embed: bool
+    gradient_checkpointing: bool
+    latent_channels: int
+    depth_single_blocks: int
+    patch_size: int
+
+    def __post_init__(self):
+        """Post-initialization validation"""
+        if not hasattr(self, 'gradient_checkpointing'):
+            raise ValueError("gradient_checkpointing must be defined")
 
 
 class Flux(nn.Module):
@@ -189,7 +180,7 @@ class ExpertMMDiT(Flux):
         self.final_layer = LastLayer(
             self.params.hidden_size,
             self.params.patch_size,
-            self.params.latent_channels  # Instead of out_channels
+            self.params.latent_channels  # Now matches configured out_channels
         )
 
     def _validate_params(self, params):
@@ -216,15 +207,6 @@ class ExpertMMDiT(Flux):
     ) -> torch.Tensor:
         """Implements paper's expert specialization with validated dimensions"""
         # Validate input dimensions
-        B, L, C = img.shape
-        expected_C = self.params.latent_channels * (self.params.patch_size ** 2)
-        
-        if C != expected_C:
-            raise ValueError(
-                f"Input features have shape {img.shape}, but expected last dimension "
-                f"to be {expected_C} (patch_size²×latent_channels). Check patching configuration."
-            )
-        
         # Cluster conditioning (Equation 5)
         cluster_emb = self.cluster_embed(cluster_ids)
         conditioned_y = self._apply_capacity_scaling(y, cluster_emb)
@@ -316,13 +298,16 @@ class ExpertMMDiT(Flux):
         
         # Add paper's patch decoding
         patch_size = self.params.patch_size
+        h_dim = img_ids[:, :, 0].max() + 1  # Get actual spatial dimensions from position IDs
+        w_dim = img_ids[:, :, 1].max() + 1
         return rearrange(
             self.final_layer(img_features, time_vec),
             "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-            h=img_ids.shape[-2]//self.params.patch_size,
+            h=h_dim,
+            w=w_dim,
             p1=self.params.patch_size,
             p2=self.params.patch_size,
-            c=self.params.latent_channels  # Explicit channel dimension
+            c=self.params.latent_channels
         )
 
     def create_embeddings(self, text_input, image_input):

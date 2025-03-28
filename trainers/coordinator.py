@@ -9,6 +9,8 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+from types import SimpleNamespace
+from einops import rearrange
 
 # Import needed components
 from trainers.router import RouterTrainer
@@ -163,10 +165,15 @@ class DDMTrainingCoordinator:
         torch.cuda.set_device(self.device)
 
     def _init_models(self):
-        """Initialize router and experts, passing the logger and storing trainers."""
-        self.logger.info("Initializing models and trainers...")
-
-        # Initialize RouterTrainer and store it
+        """Initialize router and experts with proper trainer retention"""
+        self.logger.info("Initializing models with shape-validated parameters...")
+        
+        # Get critical parameters from config
+        latent_channels = self.config.latent_channels
+        patch_size = self.config.patch_size
+        in_channels = latent_channels * (patch_size ** 2)  # Critical shape fix
+        
+        # Initialize RouterTrainer with proper config mapping
         router_trainer = RouterTrainer(
             config=self.config,
             device=self.device,
@@ -174,27 +181,55 @@ class DDMTrainingCoordinator:
             world_size=self.world_size,
             logger=self.logger
         )
-        self.router = router_trainer.router # Keep reference to the model
-        self._router_trainer = router_trainer # Store the trainer instance
-
-        # Initialize ExpertTrainers and store them
-        self.experts = nn.ModuleDict() # Store models
-        self._expert_trainers = {} # Store trainer instances
+        
+        # Store BOTH the router and its trainer
+        self.router = router_trainer.router
+        self._router_trainer = router_trainer
+        
+        # Initialize experts with validated parameters
+        self.experts = nn.ModuleDict()
+        self._expert_trainers = {}
+        
         for expert_idx in range(self.config.num_experts):
+            # Build FluxParams with production config values
+            flux_params = {
+                'in_channels': in_channels,
+                'out_channels': latent_channels,
+                'hidden_size': self.config.hidden_size,
+                'num_heads': self.config.num_heads,
+                'depth': self.config.depth,
+                'mlp_ratio': self.config.mlp_ratio,
+                'qkv_bias': self.config.qkv_bias,
+                'axes_dim': self.config.axes_dim,
+                'theta': self.config.theta,
+                'position_embed_type': self.config.position_embed_type,
+                'num_clusters': self.config.num_clusters,
+                'cluster_embed_dim': self.config.cluster_embed_dim,
+                'expert_capacity_factor': self.config.expert_capacity_factor,
+                'vec_in_dim': self.config.vec_in_dim,
+                'context_in_dim': self.config.context_in_dim,
+                'guidance_embed': False,  # Experts never use guidance
+                'gradient_checkpointing': self.config.gradient_checkpointing,
+                'latent_channels': latent_channels,
+                'depth_single_blocks': self.config.depth_single_blocks,
+                'patch_size': patch_size
+            }
+            
+            # Create expert with validated params
             expert_trainer = ExpertTrainer(
                 expert_idx=expert_idx,
-                config=self.config,
+                config=SimpleNamespace(**flux_params),  # Use processed params
                 device=self.device,
                 rank=self.rank,
                 world_size=self.world_size,
-                router=self.router,
+                router=router_trainer.router,
                 logger=self.logger
             )
-            self.experts[str(expert_idx)] = expert_trainer.expert # Store the model
-            self._expert_trainers[expert_idx] = expert_trainer # Store the trainer instance
+            
+            self.experts[str(expert_idx)] = expert_trainer.expert
+            self._expert_trainers[expert_idx] = expert_trainer
 
-        self.logger.info("Models and Trainers initialized.")
-        return (self.router, self.experts) # Return models as before
+        return self.router, self.experts
 
     def _init_data_loaders(self):
         """Initialize distributed data loaders with bucket sampling."""
@@ -374,71 +409,40 @@ class DDMTrainingCoordinator:
         self._cleanup_training()
 
     def _unified_train_step(self, batch):
-        """Delegates training steps to router and expert trainers."""
-        # --- Router Training Step ---
-        # Ensure the trainer instance exists and has the train_step method
-        if not hasattr(self._router_trainer, 'train_step'):
-             raise NotImplementedError("RouterTrainer must implement a 'train_step(batch)' method.")
-        # Delegate the step to the RouterTrainer
-        # The train_step method should handle:
-        # - Setting model to train mode
-        # - Moving data to device
-        # - Zeroing gradients
-        # - Forward pass
-        # - Loss calculation
-        # - Backward pass (FSDP handles gradient sync)
-        # - Optimizer step
-        # - Scheduler step (if applicable)
+        """Training step with full router trainer access"""
+        # Router operations through its trainer
         router_loss = self._router_trainer.train_step(batch)
-
-
-        # --- Expert Training Step ---
-        expert_losses = {}
-        assigned_experts_indices = batch['expert'].unique().tolist() # Get unique expert indices needed
-
-        # Iterate through the required expert trainers
-        for expert_idx in assigned_experts_indices:
-            if expert_idx not in self._expert_trainers:
-                self.logger.warning(f"Coordinator doesn't have trainer for expert {expert_idx}. Skipping.")
-                continue
-
-            expert_trainer = self._expert_trainers[expert_idx]
-
-            # Ensure the trainer instance has the train_step method
-            if not hasattr(expert_trainer, 'train_step'):
-                raise NotImplementedError(f"ExpertTrainer {expert_idx} must implement a 'train_step(batch)' method.")
-
-            # Filter the batch for the current expert
-            expert_mask = (batch['expert'] == expert_idx)
-            # Create a shallow copy of the batch dict and filter tensors
-            expert_batch = {k: v[expert_mask] for k, v in batch.items() if torch.is_tensor(v)}
-            # Add non-tensor items if needed
-            for k, v in batch.items():
-                if not torch.is_tensor(v) and k not in expert_batch:
-                     # Decide how to handle non-tensor data (e.g., pass metadata if needed)
-                     # expert_batch[k] = v # Example: passing through non-tensor data
-                     pass
-
-
-            if expert_batch['latent'].shape[0] > 0:
-                # Delegate the step to the ExpertTrainer
-                # The train_step method handles its own forward/loss/backward/optim/scheduler
-                loss = expert_trainer.train_step(expert_batch)
-                expert_losses[f'expert_{expert_idx}_loss'] = loss
-            else:
-                 # Log if an expert index appeared but had no samples after filtering
-                 self.logger.debug(f"No samples found for expert {expert_idx} in this batch after filtering.")
-
-
-        # --- Gradient Sync / LR Updates ---
-        # FSDP handles gradient synchronization automatically during backward().
-        # Optimizer steps and LR scheduler steps are now handled *within* the
-        # train_step methods of the individual trainers.
-        # Therefore, these coordinator-level calls are removed.
-        # self._synchronize_gradients() # REMOVED
-        # self._update_learning_rates() # REMOVED
-
+        
+        # Expert training (existing code)
+        expert_losses = self._train_experts(batch)
+        
         return router_loss, expert_losses
+
+    def _train_experts(self, batch):
+        """Expert training with production-grade shape handling"""
+        expert_losses = {}
+        assigned_experts = batch['expert'].unique().tolist()
+        
+        for expert_idx in assigned_experts:
+            expert_trainer = self._expert_trainers.get(expert_idx)
+            if not expert_trainer:
+                continue
+            
+            # Filter batch for this expert
+            mask = batch['expert'] == expert_idx
+            expert_batch = {
+                'latent': batch['latent'][mask],
+                'patched_latents': batch['patched_latents'][mask],
+                'img_ids': batch['img_ids'][mask],
+                'clip_embedding': batch['clip_embedding'][mask],
+                'expert': batch['expert'][mask]
+            }
+            
+            if expert_batch['latent'].shape[0] > 0:
+                loss = expert_trainer.train_step(expert_batch)
+                expert_losses[f'expert_{expert_idx}'] = loss
+            
+        return expert_losses
 
     def _get_next_batch(self):
         """Get next batch with device transfer"""

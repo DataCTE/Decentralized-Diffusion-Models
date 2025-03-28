@@ -9,7 +9,7 @@ from typing import Dict
 import torch.nn as nn
 from einops import rearrange
 
-from models.mmdit import ExpertMMDiT
+from models.mmdit import ExpertMMDiT, FluxParams
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from trainers.base import BaseTrainer
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
@@ -47,22 +47,36 @@ class ExpertTrainer(BaseTrainer):
         patch_size = config.patch_size
         if hasattr(config, 'latent_channels'):
             model_config_dict = vars(config).copy()
-            expected_channels = config.latent_channels * (patch_size ** 2)
-            model_config_dict['in_channels'] = expected_channels
-            model_config_dict['out_channels'] = expected_channels
+            model_config_dict['gradient_checkpointing'] = config.gradient_checkpointing
+            model_config_dict['in_channels'] = config.latent_channels * (patch_size ** 2)
+            model_config_dict['out_channels'] = config.latent_channels
             model_config_dict['latent_channels'] = config.latent_channels
             
             # Log the dimension configuration for debugging
-            self.logger.info(f"Expert {expert_idx} configured with: in_channels={expected_channels}, "
+            self.logger.info(f"Expert {expert_idx} configured with: in_channels={model_config_dict['in_channels']}, "
                              f"latent_channels={config.latent_channels}, patch_size={patch_size}")
+            
+            # Add validation when creating model_config_dict
+            required_params = [
+                'num_clusters', 'cluster_embed_dim', 'vec_in_dim',
+                'patch_size', 'latent_channels'
+            ]
+            for param in required_params:
+                if param not in model_config_dict:
+                    raise ValueError(f"Missing required expert parameter: {param}")
         else:
             self.logger.warning(f"Using default in_channels {config.in_channels}")
         
         # Ensure patch_size propagates correctly to model
         model_config_dict['patch_size'] = patch_size
         
-        model_config = SimpleNamespace(**model_config_dict)
-        self.expert = ExpertMMDiT(model_config)
+        # Get list of valid FluxParams fields
+        flux_fields = FluxParams.__annotations__.keys()
+        # Filter config to only include valid fields
+        filtered_config = {k: v for k, v in model_config_dict.items() if k in flux_fields}
+        flux_params = FluxParams(**filtered_config)
+        
+        self.expert = ExpertMMDiT(flux_params)
         
         # After creating the expert:
         self.expert = self.expert.to(device)
