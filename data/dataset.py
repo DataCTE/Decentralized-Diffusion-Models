@@ -163,14 +163,15 @@ class DDMDataset(Dataset):
 
         # Load latent and remove unnecessary sequence dimension
         latent = torch.load(os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
-        latent = latent.squeeze(1)  # Removes dimension 1 if size 1
         
         clip_embed = torch.load(os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
-
-        # Add validation
-        if latent.shape[1] != self.config.latent_channels:
-            raise ValueError(f"Invalid latent channels. Expected {self.config.latent_channels}, got {latent.shape[1]}")
-        
+        latent = latent.squeeze()
+        # Add back channel dimension if squeezed too much (e.g., from 16x64x64 to 16x64x64)
+        if latent.dim() == 2:  # [H, W] -> [1, H, W] (unlikely case)
+            latent = latent.unsqueeze(0)
+        # Validate final shape
+        if latent.shape[0] != self.config.latent_channels:
+            raise ValueError(f"Invalid latent channels. Expected {self.config.latent_channels}, got {latent.shape[0]}")
         return {
             'latent': latent,
             'clip_embedding': clip_embed,
@@ -315,6 +316,7 @@ class DDMDataset(Dataset):
         try:
             # Handle latent dimension mismatch
             latents = [item['latent'] for item in batch]
+            latents = [lat.unsqueeze(0) if lat.dim() == 3 else lat for lat in latents]  # Add batch dim if missing
             
             # Pad latents to matching dimensions if needed
             max_shape = [max(s) for s in zip(*[l.shape for l in latents])]
