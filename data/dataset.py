@@ -83,7 +83,7 @@ class DDMDataset(Dataset):
             dir_progress = tqdm(
                 required_dirs.items(),
                 desc=f"Rank {self.rank} Verifying cache",
-                disable=not is_main_process(self.rank),
+                disable=not is_main_process(),
                 leave=False
             )
             
@@ -143,10 +143,15 @@ class DDMDataset(Dataset):
                 self.logger.info(f"Verified {self.num_samples} samples with complete features")
 
         except Exception as e:
-            self.logger.error("Cache verification failed:\n" + "\n".join([
-                f"- {k}: {v} ({len(all_base_sets[i])} bases)" 
-                for i, (k, v) in enumerate(required_dirs.items())
-            ]))
+            error_lines = []
+            for i, (k, v) in enumerate(required_dirs.items()):
+                if i < len(all_base_sets):
+                    count = len(all_base_sets[i])
+                    error_lines.append(f"- {k}: {v} ({count} bases)")
+                else:
+                    error_lines.append(f"- {k}: {v} (verification failed before processing)")
+            
+            self.logger.error("Cache verification failed:\n" + "\n".join(error_lines))
             raise
 
     def __getitem__(self, idx):
