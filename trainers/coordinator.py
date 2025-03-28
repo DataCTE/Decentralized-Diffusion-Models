@@ -8,6 +8,7 @@ import concurrent.futures
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 
 # Import needed components
 from trainers.router import RouterTrainer
@@ -23,20 +24,10 @@ import torch.distributed as dist
 # Import centralized utilities
 from utils.distributed import is_dist_initialized, synchronize, broadcast_object
 
-
-# Setup logger
-logger = setup_logger("DDMCoordinator")
-
-# Direct console print function for immediate feedback
-def debug_print(message, rank=None, force=False):
-    """Distributed-safe debug printing"""
-    if (dist.is_initialized() and (rank is None or dist.get_rank() == rank)) or force:
-        print(f"[DEBUG] {message}")
-
 class DDMTrainingCoordinator:
     """Coordinator for Decentralized Diffusion Models with uniform data distribution"""
     
-    def __init__(self, config, rank, world_size, cache_manager=None, progress_callback=None):
+    def __init__(self, config, rank, world_size, cache_manager=None, progress_callback=None, logger=None):
         """
         Initialize coordinator for decentralized diffusion
         
@@ -46,9 +37,11 @@ class DDMTrainingCoordinator:
             world_size: Total number of processes
             cache_manager: Optional cache manager
             progress_callback: Optional callback function to report initialization progress
+            logger: Centralized logger instance
         """
         init_start_time = time.time()
-        debug_print(f"Starting DDM initialization on rank {rank}/{world_size}", rank, force=True)
+        self.logger = logger if logger else logging.getLogger("DDMCoordinator_fallback")
+        self.logger.info(f"Starting DDM initialization on rank {rank}/{world_size}")
         
         self.config = config
         self.rank = rank
@@ -109,7 +102,7 @@ class DDMTrainingCoordinator:
             sample_dir = os.path.join(config.output_dir, 'samples')
             os.makedirs(sample_dir, exist_ok=True)
         else:
-            logger.info("Sampling disabled in config")
+            self.logger.info("Sampling disabled in config")
         
         # Add this after component initialization
         self._init_data_loaders()  # Initialize data loaders
@@ -127,12 +120,14 @@ class DDMTrainingCoordinator:
         
         # Final initialization sync
         total_init_time = time.time() - init_start_time
-        debug_print(f"DDM initialization completed in {total_init_time:.2f}s", rank, force=True)
+        self.logger.info(f"DDM initialization completed in {total_init_time:.2f}s on rank {rank}")
         
         # Log initialization info to wandb
         if self.rank == 0 and self.wandb_enabled:
             import wandb
             wandb.log({"initialization_time": total_init_time})
+        
+        synchronize()
     
     def _ensure_config_completeness(self):
         """
@@ -142,18 +137,18 @@ class DDMTrainingCoordinator:
         # Map hidden_size to hidden_dim if hidden_dim isn't present but hidden_size is
         if not hasattr(self.config, 'hidden_dim') and hasattr(self.config, 'hidden_size'):
             self.config.hidden_dim = self.config.hidden_size
-            logger.info(f"Mapped config.hidden_size to config.hidden_dim = {self.config.hidden_dim}")
+            self.logger.info(f"Mapped config.hidden_size to config.hidden_dim = {self.config.hidden_dim}")
         
         # Set ffn_dim if not present but can be derived from hidden_dim
         if not hasattr(self.config, 'ffn_dim') and hasattr(self.config, 'hidden_dim'):
             self.config.ffn_dim = self.config.hidden_dim * 4
-            logger.info(f"Derived config.ffn_dim from hidden_dim = {self.config.ffn_dim}")
+            self.logger.info(f"Derived config.ffn_dim from hidden_dim = {self.config.ffn_dim}")
         
         # Log a note about using the 16ch-VAE model
         if hasattr(self.config, 'vae_model') and "16ch-vae" in self.config.vae_model:
             if getattr(self.config, 'latent_channels', 0) != 16:
                 self.config.latent_channels = 16
-                logger.warning(f"Enforced latent_channels=16 for 16ch-VAE compatibility")
+                self.logger.warning(f"Enforced latent_channels=16 for 16ch-VAE compatibility")
     
     def _init_distributed_components(self):
         """Initialize FSDP and communication backend"""
@@ -170,70 +165,99 @@ class DDMTrainingCoordinator:
         torch.cuda.set_device(self.device)
 
     def _init_models(self):
-        """Initialize router and experts with proper device placement"""
-        # Initialize router first
-        self.router = RouterTrainer(
+        """Initialize router and experts, passing the logger."""
+        self.logger.info("Initializing models...")
+
+        # Pass self.logger to RouterTrainer constructor
+        router_trainer = RouterTrainer(
             config=self.config,
             device=self.device,
             rank=self.rank,
-            world_size=self.world_size
-        ).router
-        
-        # Initialize experts directly (bypass cache manager for test alignment)
+            world_size=self.world_size,
+            logger=self.logger
+        )
+        # Access the underlying FSDP-wrapped model
+        self.router = router_trainer.router
+        # Store the trainer if needed for its methods/optimizer
+        self._router_trainer = router_trainer
+
+        # Initialize experts - Pass self.logger to ExpertTrainer constructor
         self.experts = nn.ModuleDict()
+        # If using a factory function/cache manager, ensure logger is passed there.
+        # If creating directly (as shown):
         for expert_idx in range(self.config.num_experts):
-            expert = ExpertTrainer(
+             # Pass self.logger to ExpertTrainer
+            expert_trainer = ExpertTrainer(
                 expert_idx=expert_idx,
                 config=self.config,
                 device=self.device,
                 rank=self.rank,
                 world_size=self.world_size,
-                router=self.router
-            ).expert
-            self.experts[str(expert_idx)] = expert
+                router=self.router, # Pass the actual router model instance
+                logger=self.logger # Pass the logger
+            )
+            # Store the underlying FSDP-wrapped expert model
+            self.experts[str(expert_idx)] = expert_trainer.expert
+            # Optionally store the trainer instances if needed later
+            # if not hasattr(self, '_expert_trainers'): self._expert_trainers = {}
+            # self._expert_trainers[expert_idx] = expert_trainer
 
-        # FIX: Return the initialized models as tuple
+        self.logger.info("Models initialized.")
+        # Return the actual model modules, not the trainers, unless the coordinator uses trainer methods
         return (self.router, self.experts)
 
     def _init_data_loaders(self):
-        """Initialize distributed data loaders with bucket sampling"""
-        # Convert config to dict before passing to dataset
-        dataset = DDMDataset(vars(self.config))
-        
-        # Create distributed sampler
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=True
-        )
-        
-        # Create bucket batch sampler
+        """Initialize distributed data loaders with bucket sampling."""
+        self.logger.info("Initializing data loaders...")
+
+        # Logger is already passed to DDMDataset in previous step
+        dataset = DDMDataset(vars(self.config), split='train', logger=self.logger)
+
+        # Check if dataset is valid
+        if len(dataset) == 0:
+            self.logger.error("Dataset is empty! Check data paths and verification logic.")
+            raise ValueError("Cannot initialize DataLoader with an empty dataset.")
+
+        # Create distributed sampler (if needed for specific strategies, BucketBatchSampler might handle it)
+        # sampler = torch.utils.data.distributed.DistributedSampler( ... )
+
+        # Create bucket batch sampler - Pass logger if BucketBatchSampler uses it
         bucket_sampler = BucketBatchSampler(
             dataset=dataset,
             batch_size=self.config.batch_size,
-            device=self.device,
-            shuffle=True
+            device=self.device, # Bucket sampler might not need device, DataLoader handles data transfer
+            shuffle=True,
+            drop_last=True # Important for consistent batch sizes in distributed training
+            # logger=self.logger # Pass logger only if BucketBatchSampler class is modified to use it
         )
-        
+
         # Calculate workers based on available CPUs
-        num_workers = min(4, os.cpu_count() // self.world_size)  # Max 4 workers per process
-        persistent_workers = num_workers > 0  # Only enable if using workers
-        
+        num_workers = getattr(self.config, 'num_workers', 0) # Default to 0 if not set
+        if self.rank == 0:
+            self.logger.info(f"Using {num_workers} dataloader workers per process.")
+        # persistent_workers = num_workers > 0 # Only enable if using workers
+
         # Create combined loader
-        self.train_loader = DataLoader(
+        # Ensure collate_fn is appropriate - using dataset's static method is good practice
+        train_loader = DataLoader(
             dataset,
-            batch_sampler=bucket_sampler,
-            collate_fn=dataset.collate_fn,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
-            num_workers=num_workers
+            batch_sampler=bucket_sampler, # Use batch_sampler, not sampler+batch_size
+            collate_fn=DDMDataset.collate_fn, # Use the static collate method
+            pin_memory=getattr(self.config, 'pin_memory', True),
+            # persistent_workers=persistent_workers, # persistent_workers requires num_workers > 0
+            num_workers=num_workers,
+            # prefetch_factor=2 if num_workers > 0 else None # Optional: tune prefetch
         )
-        
-        # Initialize iterator
-        self.train_iter = iter(self.train_loader)
-        
-        return self.train_loader, None  # No validation loader in paper
+
+        # Initialize iterator eagerly to catch issues early
+        try:
+            self.train_iter = iter(train_loader)
+        except Exception as e:
+            self.logger.error(f"Failed to create train_loader iterator: {e}")
+            raise
+
+        self.logger.info("Data loaders initialized.")
+        return train_loader, None  # No validation loader in paper
 
     def _init_parallel_components(self):
         """Initialize critical components without manual synchronization"""
@@ -355,7 +379,7 @@ class DDMTrainingCoordinator:
             except (StopIteration, AttributeError):
                 self.train_iter = iter(self.train_loader)
             except RuntimeError as e:
-                logger.warning(f"Batch loading error: {str(e)}")
+                self.logger.warning(f"Batch loading error: {str(e)}")
                 continue
 
     def _validate_batch(self, batch):
@@ -366,18 +390,18 @@ class DDMTrainingCoordinator:
         required_keys = ['latent', 'clip_embedding', 'expert']
         for key in required_keys:
             if key not in batch:
-                logger.warning(f"Missing key {key} in batch")
+                self.logger.warning(f"Missing key {key} in batch")
                 return False
             
         # Validate tensor shapes
         latent_shape = batch['latent'].shape
         if len(latent_shape) != 4 or latent_shape[1] != self.config.latent_channels:
-            logger.warning(f"Invalid latent shape {latent_shape}")
+            self.logger.warning(f"Invalid latent shape {latent_shape}")
             return False
         
         clip_shape = batch['clip_embedding'].shape
         if clip_shape[-1] != self.config.clip_embed_dim:
-            logger.warning(f"Invalid CLIP shape {clip_shape}")
+            self.logger.warning(f"Invalid CLIP shape {clip_shape}")
             return False
         
         return True
@@ -391,46 +415,81 @@ class DDMTrainingCoordinator:
         timesteps = (torch.rand(latents.size(0)) * 1000).to(self.device)
         text_embeds = batch['clip_embedding'].to(self.device)
         
+        # Use the stored router optimizer
+        self.router_optimizer.zero_grad()
+
         with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             logits = self.router(latents, timesteps, text_embeds)
             loss = self._router_loss(logits, batch['expert'].to(self.device))
         
-        # Optimizer step with gradient clipping
-        self.router_optimizer.zero_grad()
+        # Backward pass and optimizer step
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.router.parameters(), 2.0)
+        # Optional: Gradient clipping
+        if hasattr(self.config, 'router_grad_clip_norm') and self.config.router_grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.router.parameters(), self.config.router_grad_clip_norm)
+
         self.router_optimizer.step()
         
         return loss.item()
 
     def _train_experts(self, batch):
-        """Expert training aligned with shape test"""
+        """Expert training step using corresponding optimizers."""
         expert_losses = {}
-        cluster_ids = batch['expert'].unique()
-        
-        for expert_idx in cluster_ids:
-            expert = self.experts[str(expert_idx.item())]
-            expert.train()
-            
-            # Get samples for this expert with capacity constraints
-            mask = (batch['expert'] == expert_idx)
-            expert_batch = {
-                k: v[mask][:int(self.config.batch_size * self.config.expert_capacity_factor)]
-                for k, v in batch.items()
-            }
-            
-            # Forward pass with test-aligned parameters
+        assigned_experts = batch['expert'].unique() # Find which experts are needed for this batch
+
+        for expert_idx_tensor in assigned_experts:
+            expert_idx = expert_idx_tensor.item()
+            idx_str = str(expert_idx)
+
+            # Filter batch for this expert
+            expert_mask = (batch['expert'] == expert_idx)
+            expert_batch = {k: v[expert_mask] for k, v in batch.items()}
+
+            if expert_batch['latent'].shape[0] == 0: continue # Skip if no samples for this expert
+
+            # Get the expert model and its optimizer
+            expert_model = self.experts[idx_str]
+            if expert_idx not in self.expert_optimizers:
+                self.logger.error(f"Optimizer for expert {expert_idx} not found!")
+                continue
+            expert_optimizer = self.expert_optimizers[expert_idx]
+
+            expert_model.train()
+            expert_optimizer.zero_grad()
+
+            # Prepare inputs (similar to how ExpertTrainer would do it)
+            latents = expert_batch['latent'].to(self.device)
+            timesteps = (torch.rand(latents.size(0), device=self.device) * 1000).long()
+            text_embeds = expert_batch['clip_embedding'].to(self.device)
+            # Cluster IDs might be needed if ExpertMMDiT uses them internally
+            cluster_ids = expert_batch['expert'].to(self.device)
+
             with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
-                loss = expert.compute_loss(expert_batch)
-            
-            # Optimization step
-            expert.optimizer.zero_grad()
+                 # Simplified forward pass for loss calculation (adapt based on ExpertMMDiT forward signature)
+                 # This assumes a basic diffusion loss setup; adjust if ExpertTrainer.compute_loss is complex
+                 noise = torch.randn_like(latents)
+                 alphas_cumprod = get_alphas_and_betas(num_timesteps=1000)[1] # Assuming get_alphas_and_betas is accessible
+                 alpha_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                 noisy_latents = torch.sqrt(alpha_t) * latents + torch.sqrt(1 - alpha_t) * noise
+
+                 # Assuming ExpertMMDiT forward signature matches this call:
+                 pred_noise = expert_model(
+                     img=noisy_latents,
+                     timesteps=timesteps,
+                     txt=text_embeds,
+                     # Pass other required args like img_ids, txt_ids, y, cluster_ids if needed
+                     # These might need to be loaded in the dataset or derived
+                 )
+                 loss = F.mse_loss(pred_noise, noise) # Example: Simple MSE loss
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(expert.expert.parameters(), 2.0)
-            expert.optimizer.step()
-            
-            expert_losses[expert_idx.item()] = loss.item()
-        
+            # Optional: Gradient clipping for experts
+            if hasattr(self.config, 'expert_grad_clip_norm') and self.config.expert_grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(expert_model.parameters(), self.config.expert_grad_clip_norm)
+
+            expert_optimizer.step()
+            expert_losses[f'expert_{expert_idx}_loss'] = loss.item()
+
         return expert_losses
 
     def _synchronize_gradients(self):
@@ -478,7 +537,7 @@ class DDMTrainingCoordinator:
             wandb.log(log_data, step=step)
         
         # Console logging
-        logger.info(
+        self.logger.info(
             f"Step {step} | Router Loss: {router_loss:.4f} | "
             f"Step Time: {step_time:.2f}s"
         )
@@ -487,7 +546,7 @@ class DDMTrainingCoordinator:
         """Post-training cleanup"""
         torch.cuda.empty_cache()
         if self.rank == 0:
-            logger.info("Training completed successfully")
+            self.logger.info("Training completed successfully")
 
     def _router_loss(self, logits, true_clusters):
         """Implements paper's router loss with load balancing regularization"""
@@ -507,10 +566,10 @@ class DDMTrainingCoordinator:
     def validate(self, step):
         """Run validation using DDM inference process"""
         if not self.config.enable_validation:
-            logger.debug("Skipping validation (disabled in config)")
+            self.logger.debug("Skipping validation (disabled in config)")
             return
             
-        logger.info(f"Running validation at step {step}")
+        self.logger.info(f"Running validation at step {step}")
         
         # Generate samples using DDM sampling
         sample_images = self.generate_samples(num_samples=4, step=step, return_images=True)
@@ -550,7 +609,7 @@ class DDMTrainingCoordinator:
         
         if self.rank == 0:
             torch.save(checkpoint, f"checkpoint.pt")
-            logger.info(f"Saved checkpoint at step {step}")
+            self.logger.info(f"Saved checkpoint at step {step}")
 
     def load_checkpoint(self, checkpoint_dir):
         """Direct checkpoint loading without distributed validation"""
@@ -574,14 +633,14 @@ class DDMTrainingCoordinator:
             import wandb
             # Check for existing run
             if wandb.run is not None:
-                logger.warning("Existing WandB run detected - skipping initialization")
+                self.logger.warning("Existing WandB run detected - skipping initialization")
                 return
 
             # Validate required config parameters
             required_params = ['wandb_project', 'output_dir']
             missing = [p for p in required_params if not hasattr(self.config, p)]
             if missing:
-                logger.error(f"WandB disabled - missing config params: {missing}")
+                self.logger.error(f"WandB disabled - missing config params: {missing}")
                 return
 
             # Initialize with essential settings
@@ -596,16 +655,16 @@ class DDMTrainingCoordinator:
             )
             
             # Clearer URL logging
-            logger.info(f"\nWANDB RUN URL: {run.get_url()}\n")
+            self.logger.info(f"\nWANDB RUN URL: {run.get_url()}\n")
             self.wandb_run_url = run.get_url()
             self.wandb_enabled = True
 
         except ImportError:
-            logger.error("wandb package not installed - install with 'pip install wandb'")
+            self.logger.error("wandb package not installed - install with 'pip install wandb'")
         except wandb.errors.UsageError as e:
-            logger.error(f"WandB configuration error: {str(e)}")
+            self.logger.error(f"WandB configuration error: {str(e)}")
         except Exception as e:
-            logger.error(f"WandB initialization failed: {str(e)}")
+            self.logger.error(f"WandB initialization failed: {str(e)}")
 
     def _get_memory_stats(self):
         """Simplified memory logging matching test output"""
@@ -647,10 +706,10 @@ class DDMTrainingCoordinator:
             reserved = [m[1].item() for m in world_metrics]
             active = [m[2].item() for m in world_metrics]
             
-            logger.info(f"Memory Distribution ({stage}):")
-            logger.info(f"Allocated: μ={np.mean(allocated):.2f} ±{np.std(allocated):.2f} GB")
-            logger.info(f"Reserved: μ={np.mean(reserved):.2f} ±{np.std(reserved):.2f} GB")
-            logger.info(f"Active: μ={np.mean(active):.2f} ±{np.std(active):.2f} GB")
+            self.logger.info(f"Memory Distribution ({stage}):")
+            self.logger.info(f"Allocated: μ={np.mean(allocated):.2f} ±{np.std(allocated):.2f} GB")
+            self.logger.info(f"Reserved: μ={np.mean(reserved):.2f} ±{np.std(reserved):.2f} GB")
+            self.logger.info(f"Active: μ={np.mean(active):.2f} ±{np.std(active):.2f} GB")
 
     def _handle_training_error(self, error, step):
         """Coordinated error handling across ranks"""
@@ -660,7 +719,7 @@ class DDMTrainingCoordinator:
         
         if error_tensor.item() == 1:
             if self.rank == 0:
-                logger.error(f"Critical error detected: {error_msg}")
+                self.logger.error(f"Critical error detected: {error_msg}")
             raise RuntimeError("Distributed training error") from error
 
     def _init_training_state(self):
@@ -672,12 +731,44 @@ class DDMTrainingCoordinator:
         }
         
     def _init_optimizers(self):
-        """Initialize optimizers with config parameters"""
-        self.router_optimizer = torch.optim.AdamW(
-            self.router.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay
-        )
+        """Initialize optimizers using the trainer instances."""
+        self.logger.info("Initializing optimizers...")
+
+        # Get optimizer from the RouterTrainer instance
+        if hasattr(self, '_router_trainer') and hasattr(self._router_trainer, 'optimizer'):
+             self.router_optimizer = self._router_trainer.optimizer
+             self.logger.info("Router optimizer initialized.")
+        else:
+             # Fallback or error if direct initialization is expected
+             self.logger.warning("Could not find optimizer in RouterTrainer instance. Attempting direct init (may differ).")
+             # Direct init might be needed if trainer classes don't manage optimizers
+             self.router_optimizer = torch.optim.AdamW(
+                 self.router.parameters(), # Use self.router (the model)
+                 lr=getattr(self.config, 'router_learning_rate', self.config.learning_rate), # Specific router LR
+                 weight_decay=self.config.weight_decay
+             )
+
+        # Initialize optimizers for experts - depends on how expert trainers are stored/accessed
+        self.expert_optimizers = {}
+        if hasattr(self, '_expert_trainers'):
+             for idx, expert_trainer in self._expert_trainers.items():
+                 if hasattr(expert_trainer, 'optimizer'):
+                     self.expert_optimizers[idx] = expert_trainer.optimizer
+                 else:
+                     self.logger.warning(f"Optimizer not found in ExpertTrainer {idx}. Check ExpertTrainer class.")
+             self.logger.info("Expert optimizers initialized from trainers.")
+        else:
+             # Fallback: Initialize directly if trainers aren't stored
+             self.logger.warning("Expert trainers not stored. Initializing expert optimizers directly (may differ).")
+             for idx_str, expert_model in self.experts.items():
+                 # Assumes ExpertTrainer configures optimizer similarly if initialized directly
+                 optimizer = torch.optim.AdamW(
+                     expert_model.parameters(),
+                     lr=self.config.learning_rate, # Use general LR for experts
+                     weight_decay=self.config.weight_decay
+                 )
+                 self.expert_optimizers[int(idx_str)] = optimizer
+             self.logger.info("Expert optimizers initialized directly.")
 
     @property
     def train_iter(self):

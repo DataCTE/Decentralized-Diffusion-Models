@@ -10,28 +10,53 @@ import torch.distributed as dist
 import torch
 import wandb
 
-def setup_logger(name, output_dir=None, log_to_console=True):
-    """Initialize logger with proper handlers"""
+def setup_logger(name, output_dir=None, log_to_console=True, level=logging.INFO, rank=0, world_size=1):
+    """
+    Initialize logger with proper handlers, considering distributed rank.
+    Only rank 0 will have console and file handlers by default.
+    """
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    
-    # Clear existing handlers
+    logger.setLevel(level) # Set base level for the logger
+
+    # Clear existing handlers to prevent duplicates during re-runs or testing
     logger.handlers = []
-    
-    # Console handler
-    if log_to_console:
-        console_handler = logging.StreamHandler()
+
+    # Determine if this rank should handle logging output
+    is_logging_rank = (rank == 0)
+
+    # Prevent propagation to avoid duplicate messages if using root logger elsewhere
+    logger.propagate = False
+
+    # Console handler (only for the designated logging rank)
+    if log_to_console and is_logging_rank:
+        console_handler = logging.StreamHandler(sys.stdout) # Explicitly use stdout
+        # Set formatter for clearer logs (optional)
+        formatter = logging.Formatter(f'%(asctime)s - Rank {rank} - %(name)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(formatter)
+        # Set the level for the handler (e.g., INFO for console)
         console_handler.setLevel(logging.INFO)
         logger.addHandler(console_handler)
-    
-    # File handler
-    if output_dir:
+
+    # File handler (only for the designated logging rank)
+    if output_dir and is_logging_rank:
         os.makedirs(output_dir, exist_ok=True)
-        log_file = os.path.join(output_dir, f"{name}.log")
-        file_handler = logging.FileHandler(log_file)
+        log_file = os.path.join(output_dir, f"rank_{rank}_{name}.log") # Include rank in filename
+        file_handler = logging.FileHandler(log_file, mode='a') # Append mode
+        # Set formatter (optional, can be more detailed for file)
+        file_formatter = logging.Formatter(f'%(asctime)s - Rank {rank} - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        # Set the level for the file handler (e.g., DEBUG for file)
         file_handler.setLevel(logging.DEBUG)
         logger.addHandler(file_handler)
-    
+
+    # For non-logging ranks, add a NullHandler to prevent "No handler found" warnings
+    if not is_logging_rank:
+        null_handler = logging.NullHandler()
+        logger.addHandler(null_handler)
+        # Optionally set a higher level to completely silence non-logging ranks
+        # logger.setLevel(logging.CRITICAL + 1)
+
+
     return logger
 
 def setup_distributed_logger(name=None, level=logging.INFO, log_file=None, rank=0):
@@ -333,5 +358,9 @@ def log_training_end(logger, start_time, rank=0):
     logger.info(f"Total training time: {int(hours)}h {int(minutes)}m {int(seconds)}s")
     logger.info("=" * 80)
 
-# Create a default global logger that can be imported - NOW AT THE END OF THE FILE
-logger = setup_logger("DDM") 
+# Remove the global logger instance creation
+# logger = setup_logger("DDM") # <--- REMOVE THIS LINE
+
+# ... (rest of the functions like init_wandb, log_metrics, etc. remain the same) ...
+# Note: Functions like log_training_start already accept a logger instance, which aligns with the new approach.
+# Functions using wandb directly are fine as wandb handles rank internally. 

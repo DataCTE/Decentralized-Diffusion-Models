@@ -23,7 +23,7 @@ from utils.distributed import is_main_process, get_rank, get_world_size
 from utils.logging import setup_distributed_logger
 
 # Setup logging
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 
 
 def chunks(lst, n):
@@ -47,13 +47,15 @@ def simple_collate(batch):
 class DDMDataset(Dataset):
     """Distributed-optimized dataset with on-demand loading"""
     
-    def __init__(self, config_dict, split='train'):
+    def __init__(self, config_dict, split='train', logger=None):
         # Convert config dict to SimpleNamespace
         self.config = SimpleNamespace(**config_dict)
         self.feature_dir = self.config.feature_cache_path
         self.rank = get_rank()
         self.world_size = get_world_size()
         self.device = torch.device('cpu')
+        # Store the passed logger
+        self.logger = logger if logger else logging.getLogger("DDMDataset_fallback")
         
         # Cache directories
         self.latent_dir = os.path.join(self.config.feature_cache_path, "latents")
@@ -70,22 +72,24 @@ class DDMDataset(Dataset):
         # self.num_samples = len(self.latent_files)
         # self.base_names = [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
         
-        logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples (lazy loading enabled)")
+        # Use self.logger for logging
+        self.logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples (lazy loading enabled)")
         
         # Initialize bucket assignments as a property
         self._bucket_assignments = None  # Initialize cache
 
     def _verify_cache_dirs(self):
         """Verify cache directories and find valid pairs efficiently with progress."""
+        # Use self.logger
         if self.rank == 0:
-            logger.info(f"Verifying cache directories: {self.clip_dir}, {self.latent_dir}")
+            self.logger.info(f"Verifying cache directories: {self.clip_dir}, {self.latent_dir}")
 
         # Use os.listdir for faster directory reading
         try:
             clip_filenames = os.listdir(self.clip_dir)
             latent_filenames = os.listdir(self.latent_dir)
         except FileNotFoundError as e:
-            logger.error(f"Cache directory not found: {e}")
+            self.logger.error(f"Cache directory not found: {e}")
             raise
 
         # Filter for .pt files and extract base names efficiently with tqdm progress
@@ -110,7 +114,7 @@ class DDMDataset(Dataset):
                 f"No matching '*.pt' files found between {self.clip_dir} and {self.latent_dir}. "
                 f"Ensure files follow the 'name_rank<N>.pt' format."
             )
-            logger.error(error_msg)
+            self.logger.error(error_msg)
             # Ensure all processes are aware of the critical failure
             if dist.is_initialized():
                  dist.barrier() # Sync processes before potential divergence
@@ -122,7 +126,7 @@ class DDMDataset(Dataset):
 
         # Log completion only on rank 0
         if self.rank == 0:
-            logger.info(f"Verified {self.num_samples} valid sample base names")
+            self.logger.info(f"Verified {self.num_samples} valid sample base names")
         
         # Synchronize after verification to ensure all ranks have the list or failed
         if dist.is_initialized():
@@ -144,11 +148,11 @@ class DDMDataset(Dataset):
             }
         except FileNotFoundError as e:
             # Log file not found errors more informatively
-            logger.warning(f"[Rank {self.rank}] Missing file for base_name '{base_name}' at index {idx}: {str(e)}. Returning None.")
+            self.logger.warning(f"[Rank {self.rank}] Missing file for base_name '{base_name}' at index {idx}: {str(e)}. Returning None.")
             # Depending on collation, returning None might require careful handling later
             return None # Or handle differently if None breaks collation
         except Exception as e: # Catch other potential loading errors (like corrupt files)
-             logger.error(f"[Rank {self.rank}] Error loading data for base_name '{base_name}' at index {idx}: {str(e)}")
+             self.logger.error(f"[Rank {self.rank}] Error loading data for base_name '{base_name}' at index {idx}: {str(e)}")
              # Decide on error handling: skip sample (return None), or raise error?
              return None # Returning None is often safer for dataloading
 
@@ -183,7 +187,7 @@ class DDMDataset(Dataset):
     def _compute_cluster_statistics(self):
         """Compute and cache cluster statistics"""
         if self.cluster_assignments is None:
-            logger.warning("No cluster assignments found - using uniform distribution")
+            self.logger.warning("No cluster assignments found - using uniform distribution")
             self.cluster_counts = torch.ones(self.config.num_experts, dtype=torch.long, device=self.device)
             return
 
@@ -206,7 +210,8 @@ class DDMDataset(Dataset):
         # Log distribution
         total = self.cluster_counts.sum().item()
         for cluster, count in enumerate(self.cluster_counts.tolist()):
-            logger.info(f"Cluster {cluster}: {count} samples ({100 * count/total:.2f}%)")
+            if self.rank == 0:
+                self.logger.info(f"Cluster {cluster}: {count} samples ({100 * count/total:.2f}%)")
 
     def get_cluster_sizes(self):
         """Return number of samples per cluster"""
