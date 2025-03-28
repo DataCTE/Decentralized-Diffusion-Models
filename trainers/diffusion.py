@@ -273,16 +273,16 @@ class DecentralizedFlowMatcher:
         """
         Compute flow matching loss with better error handling and shape compatibility
         """
-        print(f"[DEBUG FlowMatcher] compute_loss called")
-        print(f"[DEBUG FlowMatcher] predictions shape: {predictions.shape}")
-        print(f"[DEBUG FlowMatcher] x0 shape: {x0.shape}")
-        print(f"[DEBUG FlowMatcher] t shape: {t.shape}")
+        #print(f"[DEBUG FlowMatcher] compute_loss called")
+        #print(f"[DEBUG FlowMatcher] predictions shape: {predictions.shape}")
+        #print(f"[DEBUG FlowMatcher] x0 shape: {x0.shape}")
+        #print(f"[DEBUG FlowMatcher] t shape: {t.shape}")
         
         try:
             # Ensure x0 and predictions have compatible shapes
             if x0.dim() == 5 and predictions.dim() == 4:
                 # Reshape x0 from [B, S, C, H, W] to [B, C, H, W]
-                print(f"[DEBUG FlowMatcher] Reshaping x0 from 5D to 4D")
+                #print(f"[DEBUG FlowMatcher] Reshaping x0 from 5D to 4D")
                 if x0.shape[1] == 1:  # If sequence length is 1
                     x0 = x0.squeeze(1)
                 else:
@@ -290,17 +290,18 @@ class DecentralizedFlowMatcher:
             
             # Calculate target flow
             target = self.compute_flow_matching_target(x0, predictions, t)
-            print(f"[DEBUG FlowMatcher] target shape: {target.shape}")
+            #print(f"[DEBUG FlowMatcher] target shape: {target.shape}")
             
             # Compute loss
             raw_loss = self.compute_flow_matching_loss(predictions, target)
-            print(f"[DEBUG FlowMatcher] raw_loss type: {type(raw_loss)}")
+            #print(f"[DEBUG FlowMatcher] raw_loss type: {type(raw_loss)}")
             
             # Ensure we return only one value
             if isinstance(raw_loss, tuple):
-                print(f"[DEBUG FlowMatcher] raw_loss is a tuple with {len(raw_loss)} elements")
+                #print(f"[DEBUG FlowMatcher] raw_loss is a tuple with {len(raw_loss)} elements")
                 for i, item in enumerate(raw_loss):
-                    print(f"[DEBUG FlowMatcher] raw_loss[{i}] type: {type(item)}, value: {item}")
+                    #print(f"[DEBUG FlowMatcher] raw_loss[{i}] type: {type(item)}, value: {item}")
+                    pass  # Add pass statement to fix indentation error
                 return raw_loss[0]
             else:
                 return raw_loss
