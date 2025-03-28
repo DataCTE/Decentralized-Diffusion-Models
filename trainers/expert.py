@@ -216,18 +216,25 @@ class ExpertTrainer(BaseTrainer):
                 torch.rand(B, device=self.device)
             ) * self.config.expert_loss_weight
 
-        # Use expert-specific gradient accumulation
-        if self.step % self.config.expert_gradient_accumulation_steps == 0:
+        # Proper mixed precision handling
+        self.scaler.scale(loss).backward()  # Scale loss and perform backward pass
+
+        # Gradient accumulation logic
+        if (self.step + 1) % self.config.expert_gradient_accumulation_steps == 0:
+            # Unscale gradients before clipping
+            self.scaler.unscale_(self.optimizer)
+            
+            # Gradient clipping
+            if self.config.expert_max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.expert.parameters(),
+                    self.config.expert_max_grad_norm
+                )
+            
+            # Update parameters and scaler
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()
-
-        # Add gradient clipping
-        if self.config.expert_max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.expert.parameters(),
-                self.config.expert_max_grad_norm
-            )
         
         self.step += 1  # Increment step counter after optimization
         
