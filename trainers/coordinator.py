@@ -574,7 +574,7 @@ class DDMTrainingCoordinator:
         if self.config.wandb_enabled:
             import wandb
             # Paper-style histogram for expert confidence distribution
-            confidences = [m['router_confidence'] for m in expert_losses.values()]
+            confidences = [m['router_confidence'].cpu() for m in expert_losses.values()]
             log_data['train/expert_conf_dist'] = wandb.Histogram(np.array(confidences))
             
             # Time-series metrics matching paper figures
