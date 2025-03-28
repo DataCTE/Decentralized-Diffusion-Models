@@ -81,7 +81,7 @@ DEFAULT_CONFIG = {
     # ===== Positional Embeddings =====
     'position_embed_type': 'rope_2d',
     'theta': 10000,
-    'axes_dim': [36, 36],
+    'axes_dim': [32, 32],
     
     # ===== Debug/Test Flags =====
     'bypass_cluster_validation': False,
