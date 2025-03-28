@@ -47,7 +47,7 @@ class ExpertTrainer(BaseTrainer):
         patch_size = config.patch_size
         if hasattr(config, 'latent_channels'):
             model_config_dict = vars(config).copy()
-            model_config_dict['gradient_checkpointing'] = config.gradient_checkpointing
+            model_config_dict['use_gradient_checkpointing'] = config.use_gradient_checkpointing
             model_config_dict['in_channels'] = config.latent_channels * (patch_size ** 2)
             model_config_dict['out_channels'] = config.latent_channels
             model_config_dict['latent_channels'] = config.latent_channels
