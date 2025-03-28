@@ -544,7 +544,11 @@ class DDMTrainingCoordinator:
             alignment_values.append(metrics['cluster_alignment'])
             
             # Utilization tracking (paper's "expert activation rate")
-            threshold = self.config.expert_metrics.utilization_threshold
+            threshold = (
+                self.config.expert_metrics.utilization_threshold 
+                if hasattr(self.config.expert_metrics, 'utilization_threshold')
+                else self.config.expert_metrics.get('utilization_threshold', 0.1)  # Default from paper
+            )
             expert_utilization += (metrics['router_confidence'] > threshold).float().mean().item()
 
         # Paper-recommended aggregate metrics
