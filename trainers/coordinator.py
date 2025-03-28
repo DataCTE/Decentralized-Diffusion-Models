@@ -432,7 +432,6 @@ class DDMTrainingCoordinator:
             mask = batch['expert'] == expert_idx
             expert_batch = {
                 'latent': batch['latent'][mask],
-                'patched_latents': batch['patched_latents'][mask],
                 'img_ids': batch['img_ids'][mask],
                 'clip_embedding': batch['clip_embedding'][mask],
                 'expert': batch['expert'][mask]
@@ -441,7 +440,7 @@ class DDMTrainingCoordinator:
             if expert_batch['latent'].shape[0] > 0:
                 loss = expert_trainer.train_step(expert_batch)
                 expert_losses[f'expert_{expert_idx}'] = loss
-            
+        
         return expert_losses
 
     def _get_next_batch(self):
