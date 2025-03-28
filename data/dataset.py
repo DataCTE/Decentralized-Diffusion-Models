@@ -10,7 +10,7 @@ import logging
 import time  
 from tqdm.auto import tqdm
 import torch.distributed as dist # Assuming dist is initialized elsewhere or handle initialization
-
+from types import SimpleNamespace
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, get_world_size
 from utils.logging import setup_distributed_logger
