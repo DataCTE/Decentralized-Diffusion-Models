@@ -104,13 +104,17 @@ class ExpertTrainer(BaseTrainer):
         # Precompute diffusion schedule as in paper appendix
         self.alphas, self.alpha_bar, _ = get_alphas_and_betas()
         
-        # Update warmup and scheduler to use expert-specific values
-        self.warmup_steps = config.expert_warmup_steps
+        # Paper's warmup schedule with step validation
+        self.warmup_steps = max(1, config.expert_warmup_steps)  # Ensure at least 1 step
         self.total_steps = config.num_steps
         
+        # Modified scheduler initialization with step offset
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: min(step / self.warmup_steps, 1.0)
+            lr_lambda=lambda step: min(
+                (step + 1) / self.warmup_steps,  # Add +1 to avoid 0/div
+                1.0
+            )
         )
 
         # Add step counter initialization
@@ -250,27 +254,17 @@ class ExpertTrainer(BaseTrainer):
         # Proper mixed precision handling
         self.scaler.scale(loss).backward()
 
-        # Gradient accumulation logic
+        # Paper's recommended gradient handling
         if (self.step + 1) % self.config.expert_gradient_accumulation_steps == 0:
-            # Unscale gradients before clipping
-            self.scaler.unscale_(self.optimizer)
-            
-            # Gradient clipping
-            if self.config.expert_max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.expert.parameters(),
-                    self.config.expert_max_grad_norm
-                )
-            
-            # Update parameters and scaler
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()
             
-            # Update scheduler ONLY on optimizer steps (paper's recommendation)
-            self.lr_scheduler.step()
+            # Update scheduler with validated step count
+            current_scheduler_step = max(0, self.step // self.config.expert_gradient_accumulation_steps)
+            self.lr_scheduler.step(current_scheduler_step)
         
-        self.step += 1  # Increment step counter after optimization
+        self.step += 1
         
         # Modified return with metrics
         metrics = self.compute_loss(batch)
