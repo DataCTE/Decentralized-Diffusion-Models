@@ -95,7 +95,6 @@ DEFAULT_CONFIG = {
     'expert_batch_size': 2,
     'distilled_model': None,
     'vae_model': 'AuraDiffusion/16ch-vae',
-    'clip_model': 'openai/clip-vit-large-patch14',
     'verbose_training': False,
     'log_memory': False,
     'balance_lambda': 0.01,
@@ -106,6 +105,10 @@ DEFAULT_CONFIG = {
     # ===== Optimization =====
     'adam_betas': (0.9, 0.999),
     'eps': 1e-8,
+
+    # ===== CLIP Configuration =====
+    'clip_model': 'openai/clip-vit-large-patch14',
+    'clip_embed_dim': 768,
 }
 
 def dict_to_namespace(d):
