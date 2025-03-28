@@ -166,9 +166,8 @@ class DDMDataset(Dataset):
         
         clip_embed = torch.load(os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
         latent = latent.squeeze()
-        # Add back channel dimension if squeezed too much (e.g., from 16x64x64 to 16x64x64)
-        if latent.dim() == 2:  # [H, W] -> [1, H, W] (unlikely case)
-            latent = latent.unsqueeze(0)
+        if latent.dim() != 3:
+            raise ValueError(f"Invalid latent dimensions {latent.shape} after squeezing. Expected 3D [C, H, W]")
         # Validate final shape
         if latent.shape[0] != self.config.latent_channels:
             raise ValueError(f"Invalid latent channels. Expected {self.config.latent_channels}, got {latent.shape[0]}")
@@ -316,17 +315,22 @@ class DDMDataset(Dataset):
         try:
             # Handle latent dimension mismatch
             latents = [item['latent'] for item in batch]
-            latents = [lat.unsqueeze(0) if lat.dim() == 3 else lat for lat in latents]  # Add batch dim if missing
             
-            # Pad latents to matching dimensions if needed
-            max_shape = [max(s) for s in zip(*[l.shape for l in latents])]
+            # Get max dimensions across all samples (C, H, W)
+            max_shape = tuple(max(s) for s in zip(*[lat.shape for lat in latents]))
+            
+            # Pad each latent to max dimensions
             padded_latents = []
-            for l in latents:
-                pad = [(0, max_dim - l.shape[i]) for i, max_dim in enumerate(max_shape)]
-                padded_latents.append(torch.nn.functional.pad(l, [p for p in reversed(pad) if p[1] > 0]))
-            
+            for lat in latents:
+                # Calculate padding for each dimension (C, H, W)
+                pad = [(0, max_dim - dim) for dim, max_dim in zip(lat.shape, max_shape)]
+                # Reverse padding order for F.pad (W, H, C)
+                pad = tuple(p for p in reversed(pad) for _ in (0, 1))
+                padded = torch.nn.functional.pad(lat, pad)
+                padded_latents.append(padded)
+                
             return {
-                'latent': torch.stack(padded_latents),
+                'latent': torch.stack(padded_latents),  # [B, C, H, W]
                 'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
                 'expert': torch.stack([item['expert'] for item in batch]),
                 'bucket': torch.stack([item['bucket'] for item in batch])

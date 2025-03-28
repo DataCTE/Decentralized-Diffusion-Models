@@ -145,27 +145,31 @@ class ExpertTrainer(BaseTrainer):
         return self.flow_matcher.compute_loss(pred_flow, x0, t)
 
     def train_step(self, batch):
-        """Implements paper's capacity-aware training (Section 3.4)"""
-        # Apply expert capacity factor
+        """Capacity-aware training with dynamic shape handling"""
+        # Capacity enforcement remains unchanged
         expert_capacity = int(self.config.batch_size * self.config.expert_capacity_factor)
         if len(batch['latent']) > expert_capacity:
-            # Randomly select subset of samples
             indices = torch.randperm(len(batch['latent']))[:expert_capacity]
             batch = {k: v[indices] for k, v in batch.items()}
+
+        # Get actual latent dimensions
+        latent = batch["latent"]
+        B, C, H, W = latent.shape  # Now dynamic based on input
         
-        # Paper's router freezing during expert training (Section 3.3)
+        # Router logic remains unchanged
         with torch.no_grad():
-            # Generate timestep-conditioned cluster predictions
-            t = torch.rand(len(batch["latent"]), device=self.device) * 1000
+            t = torch.rand(B, device=self.device) * 1000
             batch['cluster_pred'] = self.router(
-                img=batch['latent'],
+                img=latent,
                 timesteps=t,
                 txt=batch['clip_embedding']
             ).argmax(dim=-1)
 
-        # Original training logic with capacity enforcement
-        img_seq = batch["latent"].view(-1, self.config.latent_channels, 32*32).permute(0, 2, 1)
-        pos_ids = self._get_position_ids(batch["latent"])
+        # Dynamic sequence reshaping
+        img_seq = latent.view(B, C, H * W).permute(0, 2, 1)  # [B, L, C]
+        
+        # Position IDs generation using actual H/W
+        pos_ids = self._get_position_ids(latent)  # Ensure this uses H/W
         
         with torch.autocast(device_type='cuda', enabled=self.config.use_mixed_precision):
             pred_flow = self.expert(
@@ -173,18 +177,19 @@ class ExpertTrainer(BaseTrainer):
                 img_ids=pos_ids,
                 txt=batch["clip_embedding"],
                 txt_ids=self._get_text_position_ids(batch["clip_embedding"]),
-                timesteps=torch.rand(len(batch["latent"]), device=self.device) * 1000,
-                y=self._get_conditioning(len(batch["latent"])),
+                timesteps=torch.rand(B, device=self.device) * 1000,
+                y=self._get_conditioning(B),
                 cluster_ids=batch['cluster_pred']
             )
             
-            # Paper's modified loss weighting (Equation 7)
+            # Dynamic loss reshaping
+            pred_flow = pred_flow.permute(0, 2, 1).view(B, C, H, W)
             loss = self.flow_matcher.compute_loss(
-                pred_flow.permute(0, 2, 1).view(-1, 4, 32, 32), 
-                batch["latent"],
-                torch.rand(len(batch["latent"]), device=self.device)
+                pred_flow, 
+                latent,
+                torch.rand(B, device=self.device)
             ) * self.config.expert_loss_weight
-        
+
         # Original optimization steps
         self.scaler.scale(loss).backward()
         if self.step % self.config.gradient_accumulation_steps == 0:
@@ -304,20 +309,17 @@ class ExpertTrainer(BaseTrainer):
                 self.logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 
 
     def _get_position_ids(self, x):
-        # Get spatial dimensions
-        if x.dim() == 4:
-            _, _, H, W = x.shape
-        else:  # Handle sequence format
-            H = W = int(math.sqrt(x.shape[1]))
-        
-        # Generate grid with matching dtype and device
+        """Generates position IDs from 4D latent tensor"""
+        _, _, H, W = x.shape
         device = x.device
         dtype = x.dtype
+        
+        # Generate grid for actual H/W dimensions
         pos_h = torch.arange(H, device=device, dtype=dtype)
         pos_w = torch.arange(W, device=device, dtype=dtype)
         grid_h, grid_w = torch.meshgrid(pos_h, pos_w, indexing='ij')
         
-        # Stack and flatten to [B, H*W, 2]
+        # Stack and flatten spatial positions
         pos_ids = torch.stack([grid_h, grid_w], dim=-1).flatten(0, 1)[None]  # [1, L, 2]
         pos_ids = pos_ids.expand(x.shape[0], -1, -1)  # [B, L, 2]
         
