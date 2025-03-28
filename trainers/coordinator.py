@@ -441,8 +441,9 @@ class DDMTrainingCoordinator:
                 # Paper's recommended loss aggregation (Section 3.3)
                 expert_losses[f'expert_{expert_idx}'] = {
                     'total_loss': loss_dict['total_loss'],
-                    'router_confidence': loss_dict['router_confidence'],
-                    'cluster_alignment': loss_dict['cluster_alignment']
+                    'router_confidence': loss_dict.get('router_confidence', 0.0),
+                    'cluster_alignment': loss_dict.get('cluster_alignment', 0.0),
+                    'per_sample_confidence': loss_dict.get('per_sample_confidence', torch.tensor(0.0))
                 }
         
         return expert_losses
@@ -544,9 +545,10 @@ class DDMTrainingCoordinator:
             alignment_values.append(metrics['cluster_alignment'])
             
             # Utilization tracking (paper's "expert activation rate")
-            threshold = getattr(self.config, 'expert_utilization_threshold', 0.1)  # Use getattr for namespace
-            # Track per-sample utilization
-            utilization_mask = metrics['per_sample_confidence'] > threshold
+            threshold = getattr(self.config, 'expert_utilization_threshold', 0.1)
+            # Safely get per_sample_confidence with fallback
+            confidences = metrics.get('per_sample_confidence', torch.tensor([0.0])) 
+            utilization_mask = confidences > threshold
             expert_utilization += utilization_mask.float().mean().item()
 
         # Paper-recommended aggregate metrics
