@@ -298,8 +298,8 @@ class ExpertMMDiT(Flux):
         
         # Add paper's patch decoding
         patch_size = self.params.patch_size
-        h_dim = img_ids[:, :, 0].max() + 1  # Get actual spatial dimensions from position IDs
-        w_dim = img_ids[:, :, 1].max() + 1
+        h_dim = int(img_ids[:, :, 0].max().item()) + 1  # Convert to int
+        w_dim = int(img_ids[:, :, 1].max().item()) + 1  # Convert to int
         return rearrange(
             self.final_layer(img_features, time_vec),
             "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
