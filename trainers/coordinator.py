@@ -376,7 +376,7 @@ class DDMTrainingCoordinator:
 
                 # Logging
                 if self.rank == 0: # Only log metrics on rank 0
-                    avg_expert_loss = sum(expert_losses.values()) / len(expert_losses) if expert_losses else 0.0
+                    avg_expert_loss = sum(metrics['total_loss'] for metrics in expert_losses.values()) / len(expert_losses) if expert_losses else 0.0
                     self._handle_logging(self.step, router_loss, expert_losses) # Pass metrics dict
                     # Update progress bar description
                     progress_bar.set_postfix({
