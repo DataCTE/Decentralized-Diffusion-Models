@@ -50,8 +50,12 @@ class ExpertTrainer(BaseTrainer):
             model_config_dict = vars(config).copy()
             model_config_dict['in_channels'] = config.latent_channels * (patch_size ** 2)
             model_config_dict['out_channels'] = config.latent_channels * (patch_size ** 2)
+            model_config_dict['latent_channels'] = config.latent_channels
         else:
             self.logger.warning(f"Using default in_channels {config.in_channels}")
+        
+        # Ensure patch_size propagates correctly to model
+        model_config_dict['patch_size'] = patch_size
         
         model_config = SimpleNamespace(**model_config_dict)
         self.expert = ExpertMMDiT(model_config)
