@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Add this at the top under imports
 DEFAULT_CONFIG = {
-    # ===== Core Architecture =====
+    # ===== Model Architecture =====
     'hidden_size': 768,
     'num_heads': 12,
     'depth': 12,
@@ -20,44 +20,31 @@ DEFAULT_CONFIG = {
     'qkv_bias': True,
     'vec_in_dim': 768,
     'context_in_dim': 768,
+    'position_embed_type': 'rope_2d',
+    'theta': 10000,
+    'axes_dim': [32, 32],
+    
+    # ===== Training Configuration =====
+    'batch_size': 1,
+    'expert_batch_size': 1,
+    'learning_rate': 1e-4,
+    'weight_decay': 0.01,
+    'warmup_steps': 1000,
+    'num_steps': 100000,
+    'use_mixed_precision': True,
+    'gradient_accumulation_steps': 2,
+    'use_scheduler': True,
+    'scheduler_type': 'cosine',
+    'adam_betas': (0.9, 0.999),
+    'eps': 1e-8,
     
     # ===== Expert Configuration =====
     'num_experts': 8,
     'num_clusters': 8,
     'cluster_embed_dim': 512,
     'expert_capacity_factor': 1.0,
-    'expert_batch_size': 1,
-    
-    # ===== Training Parameters ===== 
-    'batch_size': 1,
-    'learning_rate': 1e-4,
-    'weight_decay': 0.01,
-    'warmup_steps': 1000,
-    'use_mixed_precision': True,
-    'gradient_accumulation_steps': 2,
-
-    # ===== Diffusion & Loss =====
-    'loss_type': 'huber',         
-    'sigma': 1.0,
-    'sampling_steps': 1000,
-    'top_p': 0.9, 
-    
-    # ===== Distributed Training =====
-    'use_gradient_checkpointing': True,
-    'fsdp_sharding_strategy': "FULL_SHARD",
-    'fsdp_auto_wrap_policy': "LAMBDA",
-    
-    # ===== Dataset & Bucketing =====
-    'buckets': [
-        (512, 512), (576, 448), 
-        (448, 576), (640, 384),
-        (384, 640)
-    ],
-    'latent_channels': 16,
-    'vae_scaling_factor': 0.18215,
-    'in_channels': 16,
-    'out_channels': 16,
-    'clip_embedding_dim': 768,
+    'max_experts_in_memory': 2,
+    'expert_offload_to_cpu': True,
     
     # ===== Router Configuration =====
     'router_learning_rate': 1e-4,
@@ -66,50 +53,58 @@ DEFAULT_CONFIG = {
     'router_temperature': 2.0,
     'router_min_temp': 0.5,
     'router_temperature_decay': 0.9997,
+    'router_model': 'paper_baseline',
+    'balance_lambda': 0.01,
     
-    # ===== Sampling & Validation =====
-    'sampling_steps': 50,
-    'cfg_scale': 7.5,
-    'enable_validation': False,
-    'validation_interval': 1000,
-    'enable_sampling': True,
-    # ===== Paths & Logging =====
+    # ===== Diffusion Configuration =====
+    'loss_type': 'huber',
+    'sigma': 1.0,
+    'sampling_steps': 1000,
+    'top_p': 0.9,
+    
+    # ===== Dataset & Latent Configuration =====
+    'buckets': [
+        (512, 512), (576, 448), 
+        (448, 576), (640, 384),
+        (384, 640)
+    ],
+    'latent_channels': 16,
+    'in_channels': 16,
+    'out_channels': 16,
+    'vae_scaling_factor': 0.18215,
+    'vae_model': 'AuraDiffusion/16ch-vae',
+    
+    # ===== CLIP Configuration =====
+    'clip_model': 'openai/clip-vit-large-patch14',
+    'clip_embedding_dim': 768,
+    
+    # ===== Distributed Training =====
+    'use_gradient_checkpointing': True,
+    'fsdp_sharding_strategy': "FULL_SHARD",
+    'fsdp_auto_wrap_policy': "LAMBDA",
+    
+    # ===== Logging & Monitoring =====
     'output_dir': './outputs',
     'feature_cache_path': './cache',
     'wandb_enabled': True,
     'wandb_project': 'decentralized-diffusion',
-    
-    # ===== Positional Embeddings =====
-    'position_embed_type': 'rope_2d',
-    'theta': 10000,
-    'axes_dim': [64, 64],
-    
-    # ===== Debug/Test Flags =====
-    'bypass_cluster_validation': False,
-    'depth_single_blocks': 5,  # Config-controlled value
-    
-    # Add these new parameters
-    'num_steps': 100000,
-    'save_interval': 5000,
-    'max_experts_in_memory': 2,
-    'expert_offload_to_cpu': True,
-
-    'distilled_model': None,
-    'vae_model': 'AuraDiffusion/16ch-vae',
     'verbose_training': False,
     'log_memory': False,
-    'balance_lambda': 0.01,
-    'router_model': 'paper_baseline',
-    'use_scheduler': True,
-    'scheduler_type': 'cosine',
-
-    # ===== Optimization =====
-    'adam_betas': (0.9, 0.999),
-    'eps': 1e-8,
-
-    # ===== CLIP Configuration =====
-    'clip_model': 'openai/clip-vit-large-patch14',
-    'clip_embed_dim': 768,
+    
+    # ===== Validation & Sampling =====
+    'enable_validation': False,
+    'validation_interval': 1000,
+    'enable_sampling': True,
+    'sampling_steps': 50,
+    'cfg_scale': 7.5,
+    'save_interval': 5000,
+    
+    # ===== Debugging & Testing =====
+    'bypass_cluster_validation': False,
+    'depth_single_blocks': 5,
+    
+    # ===== Model References =====
+    'distilled_model': None
 }
 
 def dict_to_namespace(d):
