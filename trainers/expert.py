@@ -62,12 +62,12 @@ class ExpertTrainer(BaseTrainer):
         
         # Don't wrap with FSDP here - let cache manager handle it
         
-        # Use standard optimizer initially - will be reconfigured when FSDP is applied
+        # Use expert-specific optimizer parameters
         self.optimizer = AdamW8bit(
             self.expert.parameters(),
-            lr=config.learning_rate,
-            betas=config.adam_betas,
-            weight_decay=config.weight_decay
+            lr=config.expert_learning_rate,  # Changed from general learning_rate
+            betas=config.expert_adam_betas,
+            weight_decay=config.expert_weight_decay
         )
         
         # Paper-defined components
@@ -81,13 +81,13 @@ class ExpertTrainer(BaseTrainer):
         # Precompute diffusion schedule as in paper appendix
         self.alphas, self.alpha_bar, _ = get_alphas_and_betas()
         
-        # Learning rate scheduler
-        warmup_steps = int(0.05 * config.num_steps)
+        # Update warmup and scheduler to use expert-specific values
+        self.warmup_steps = config.expert_warmup_steps
+        self.total_steps = config.num_steps
+        
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: min(step/warmup_steps, 1.0) 
-            if step < warmup_steps
-            else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (config.num_steps - warmup_steps)))
+            lr_lambda=lambda step: min(step / self.warmup_steps, 1.0)
         )
 
         # Add step counter initialization
@@ -102,14 +102,14 @@ class ExpertTrainer(BaseTrainer):
                 nn.init.xavier_uniform_(p, gain=1/math.sqrt(config.num_experts))
         nn.init.constant_(self.expert.cluster_embed.weight, 0.01)
 
-    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Implements paper's per-expert loss (Section 3.2, Equation 6)
         
         Args:
             batch: Contains 'latent' (B, C, H, W) and 'clip_embedding' (B, L, D)
             
         Returns:
-            Scalar loss value
+            Dictionary with 'raw_loss', 'weighted_loss', 'router_confidence', and 'cluster_alignment'
         """
         # Paper's cosine schedule handling
         x0 = batch["latent"]
@@ -133,6 +133,15 @@ class ExpertTrainer(BaseTrainer):
                 txt=batch['clip_embedding']
             ).argmax(dim=-1)
         
+        # Get router confidence scores for ALL experts (paper Eq.4)
+        with torch.no_grad():
+            router_logits = self.router(
+                img=xt,
+                timesteps=t * 1000,
+                txt=batch['clip_embedding']
+            )
+            router_probs = torch.softmax(router_logits, dim=-1)
+        
         # Forward pass with cluster conditioning (Equation 5)
         pred_flow = self.expert(
             img=xt_seq,
@@ -144,8 +153,22 @@ class ExpertTrainer(BaseTrainer):
             cluster_ids=cluster_ids
         )
         
-        # Flow matching loss (Equation 6)
-        return self.flow_matcher.compute_loss(pred_flow, x0, t)
+        # Original per-expert loss
+        raw_loss = self.flow_matcher.compute_loss(pred_flow, x0, t)
+        
+        # New ensemble-weighted loss (paper Section 3.3)
+        expert_weight = router_probs[:, self.expert_idx]
+        weighted_loss = raw_loss * expert_weight.mean()
+        
+        # Track specialization metrics
+        cluster_match = (cluster_ids == self.expert_idx).float().mean()
+        
+        return {
+            'raw_loss': raw_loss,
+            'weighted_loss': weighted_loss,
+            'router_confidence': expert_weight.mean(),
+            'cluster_alignment': cluster_match
+        }
 
     def train_step(self, batch):
         """Capacity-aware training with dynamic shape handling"""
@@ -193,16 +216,31 @@ class ExpertTrainer(BaseTrainer):
                 torch.rand(B, device=self.device)
             ) * self.config.expert_loss_weight
 
-        # Original optimization steps
-        self.scaler.scale(loss).backward()
-        if self.step % self.config.gradient_accumulation_steps == 0:
+        # Use expert-specific gradient accumulation
+        if self.step % self.config.expert_gradient_accumulation_steps == 0:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()
+
+        # Add gradient clipping
+        if self.config.expert_max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.expert.parameters(),
+                self.config.expert_max_grad_norm
+            )
         
         self.step += 1  # Increment step counter after optimization
         
-        return loss.item()
+        # Update scheduler every step regardless of gradient accumulation
+        self.lr_scheduler.step()
+        
+        # Modified return with metrics
+        metrics = self.compute_loss(batch)
+        return {
+            'total_loss': loss.item(),
+            'raw_loss': loss.item() / self.config.expert_loss_weight,
+            **metrics  # From compute_loss()
+        }
     
     def save_checkpoint(self, save_dir, step):
         """Save a checkpoint for the expert model using consolidated checkpoint utility"""
@@ -275,19 +313,16 @@ class ExpertTrainer(BaseTrainer):
         # Reset optimizer state
         self.optimizer = AdamW8bit(
             self.expert.parameters(),
-            lr=self.config.learning_rate,
-            betas=self.config.adam_betas,
-            weight_decay=self.config.weight_decay
+            lr=self.config.expert_learning_rate,
+            betas=self.config.expert_adam_betas,
+            weight_decay=self.config.expert_weight_decay
         )
         
         # Reset scheduler
-        warmup_steps = int(0.05 * self.config.num_steps)
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: min(step/warmup_steps, 1.0) 
-            if step < warmup_steps
-            else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (self.config.num_steps - warmup_steps)))
-        ) 
+            lr_lambda=lambda step: min(step/self.warmup_steps, 1.0)
+        )
 
     def isolate_optimizer_state(self):
         """Prevent contamination of optimizer state across experts"""

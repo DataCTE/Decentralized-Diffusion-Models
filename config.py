@@ -27,35 +27,35 @@ DEFAULT_CONFIG = {
     # ===== Training Configuration =====
     'batch_size': 1,
     'expert_batch_size': 1,
-    'learning_rate': 1e-4,
-    'weight_decay': 0.01,
-    'warmup_steps': 1000,
+    'learning_rate': 2e-4,
+    'weight_decay': 0.05,
+    'warmup_steps': 500,
     'num_steps': 100000,
     'use_mixed_precision': True,
-    'gradient_accumulation_steps': 2,
+    'gradient_accumulation_steps': 1,
     'use_scheduler': True,
-    'scheduler_type': 'cosine',
+    'scheduler_type': 'linear',
     'expert_loss_weight': 1.0,
-    'adam_betas': (0.9, 0.999),
+    'adam_betas': (0.9, 0.98),
     'eps': 1e-8,
     
     # ===== Expert Configuration =====
     'num_experts': 8,
     'num_clusters': 8,
     'cluster_embed_dim': 512,
-    'expert_capacity_factor': 1.1,
+    'expert_capacity_factor': 1.2,
     'max_experts_in_memory': 2,
     'expert_offload_to_cpu': True,
     
     # ===== Router Configuration =====
-    'router_learning_rate': 1e-4,
+    'router_learning_rate': 3e-4,
     'router_hidden_size': 384,
     'router_num_heads': 6,
-    'router_temperature': 2.0,
+    'router_temperature': 1.5,
     'router_min_temp': 0.5,
-    'router_temperature_decay': 0.9997,
+    'router_temperature_decay': 0.9999,
     'router_model': 'paper_baseline',
-    'balance_lambda': 0.01,
+    'balance_lambda': 0.1,
     
     # ===== Diffusion Configuration =====
     'loss_type': 'huber',
@@ -105,7 +105,23 @@ DEFAULT_CONFIG = {
     'depth_single_blocks': 5,
     
     # ===== Model References =====
-    'distilled_model': None
+    'distilled_model': None,
+    
+    # ===== Expert Training Configuration =====
+    'expert_learning_rate': 2e-4,
+    'expert_warmup_steps': 500,
+    'expert_scheduler_type': 'linear',
+    'expert_gradient_accumulation_steps': 1,
+    'expert_adam_betas': (0.9, 0.98),
+    'expert_weight_decay': 0.05,
+    'expert_max_grad_norm': 1.0,
+    
+    # ===== Expert Metrics Configuration =====
+    'expert_metrics': {
+        'track_ensemble': True,
+        'utilization_threshold': 0.1,
+        'alignment_window': 1000
+    },
 }
 
 def dict_to_namespace(d):

@@ -172,8 +172,15 @@ class ExpertMMDiT(Flux):
         )
         # Initialize with paper's recommended scheme
         nn.init.normal_(self.cluster_embed.weight, std=0.02)
-        nn.init.normal_(self.cluster_proj.weight, std=0.02)
+        nn.init.kaiming_normal_(self.cluster_proj.weight, mode='fan_out', nonlinearity='linear')
         nn.init.zeros_(self.cluster_proj.bias)
+
+        # Paper's expert capacity gating (Equation 7)
+        self.capacity_gate = nn.Sequential(
+            nn.Linear(params.cluster_embed_dim, 1),
+            nn.Sigmoid()
+        )
+        nn.init.constant_(self.capacity_gate[0].bias, -2.0)  # Initial gate bias
 
     def _validate_params(self, params):
         """Safer parameter validation with cluster config"""
@@ -224,11 +231,9 @@ class ExpertMMDiT(Flux):
 
 
     def _apply_capacity_scaling(self, y: Tensor, cluster_emb: Tensor) -> Tensor:
-        """Paper's Equation 7 implementation"""
-        capacity_scale = 1.0 + self.params.expert_capacity_factor * torch.sigmoid(
-            cluster_emb.mean(dim=-1)  # [B, D] -> [B]
-        )
-        return y * capacity_scale[:, None] + self.cluster_proj(cluster_emb)
+        """Implements paper's Equation 7 with gating"""
+        capacity_scale = 1.0 + self.capacity_gate(cluster_emb.mean(1)) 
+        return y * capacity_scale + self.cluster_proj(cluster_emb)
 
     def _fuse_embeddings(self, img, txt, timesteps, y):
         """Fuse embeddings with mixed precision safety"""

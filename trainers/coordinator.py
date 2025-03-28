@@ -502,7 +502,7 @@ class DDMTrainingCoordinator:
     def _handle_logging(self, step: int, router_loss: float, expert_losses: dict):
         """Centralized logging handling for console and WandB."""
         if self.rank != 0:
-            return # Only log on rank 0
+            return
 
         # Calculate step time
         current_time = time.time()
@@ -521,58 +521,74 @@ class DDMTrainingCoordinator:
         log_data = {
             'train/step': step,
             'train/router_loss': router_loss,
-            'train/step_time_sec': step_time, # Log step time in seconds
+            'train/step_time_sec': step_time,
             'train/learning_rate': lr,
         }
 
-        # Add individual expert losses with prefix
-        for k, v in expert_losses.items():
-             # Ensure keys are wandb-compatible (e.g., 'train/expert_0_loss')
-             log_data[f'train/{k}'] = v
+        # Process expert metrics according to paper's evaluation guidelines
+        expert_utilization = 0
+        total_confidence = 0
+        alignment_values = []
+        
+        for expert_key, metrics in expert_losses.items():
+            if not isinstance(metrics, dict):
+                continue
+            
+            # Paper-style metric namespacing
+            expert_id = expert_key.split('_')[1]
+            prefix = f'train/expert_{expert_id}'
+            
+            # Core metrics from paper Section 4
+            log_data.update({
+                f'{prefix}/raw_loss': metrics.get('raw_loss', 0),
+                f'{prefix}/weighted_loss': metrics.get('weighted_loss', 0),
+                f'{prefix}/router_confidence': metrics.get('router_confidence', 0),
+                f'{prefix}/cluster_alignment': metrics.get('cluster_alignment', 0),
+            })
+            
+            # Utilization tracking (paper's "expert activation rate")
+            conf = metrics.get('router_confidence', 0)
+            total_confidence += conf
+            threshold = self.config.expert_metrics.utilization_threshold
+            expert_utilization += (conf > threshold).float().mean().item()
+            
+            # Specialization tracking (paper's "cluster alignment")
+            alignment_values.append(metrics.get('cluster_alignment', 0))
 
-        # Calculate average expert loss if any experts ran
-        avg_expert_loss = 0.0
+        # Paper-recommended aggregate metrics
         if expert_losses:
-             avg_expert_loss = sum(expert_losses.values()) / len(expert_losses)
-             log_data['train/avg_expert_loss'] = avg_expert_loss
-        # else: log_data['train/avg_expert_loss'] = 0.0 # Optionally log 0 or NaN
+            num_experts = len(expert_losses)
+            log_data.update({
+                'train/avg_router_confidence': total_confidence / num_experts,
+                'train/utilization_rate': expert_utilization / num_experts,
+                'train/avg_cluster_alignment': sum(alignment_values) / num_experts,
+            })
 
-        # --- Console Logging ---
-        lr_str = f"{lr:.1e}" if isinstance(lr, (float, int)) else lr # Format LR if numeric
-        # Construct the log message dynamically to handle missing losses gracefully
+        # Console logging remains focused on core metrics
         log_message = (
             f"Step {step:>6} | Router Loss: {router_loss:.4f} | "
-            f"Avg Expert Loss: {avg_expert_loss:.4f} | LR: {lr_str} | "
-            f"Step Time: {step_time:.2f}s"
+            f"Utilization: {log_data.get('train/utilization_rate', 0):.1%} | "
+            f"Alignment: {log_data.get('train/avg_cluster_alignment', 0):.2f}"
         )
-        # Optionally add individual expert losses to console log if verbose
-        # if self.verbose and expert_losses:
-        #    expert_loss_str = " | ".join([f"E{k.split('_')[1]}: {v:.3f}" for k, v in expert_losses.items()])
-        #    log_message += f" | {expert_loss_str}"
         self.logger.info(log_message)
 
-        # --- WandB Logging ---
-        if hasattr(self.config, 'wandb_enabled') and self.config.wandb_enabled:
-            try:
-                import wandb
-                # Log all collected metrics to WandB
-                # The 'step' argument ensures metrics are plotted against the correct training step
-                wandb.log(log_data, step=step)
-            except ImportError:
-                 # Log error once if wandb import fails but config has it enabled
-                 if not hasattr(self, '_wandb_import_error_logged'):
-                     self.logger.error("WandB is enabled in config, but the 'wandb' package could not be imported.")
-                     self._wandb_import_error_logged = True
-            except Exception as e:
-                 # Log other wandb errors
-                 if not hasattr(self, '_wandb_log_error_logged'): # Log generic error once
-                     self.logger.error(f"Error logging to WandB: {e}", exc_info=True)
-                     self._wandb_log_error_logged = True
-
-
-        # --- Memory Logging (Periodic) ---
-        if hasattr(self.config, 'log_memory') and self.config.log_memory and step % 100 == 0: # Check frequency
-             self._log_gpu_memory_usage(f"Step {step}")
+        # WandB logging with paper-aligned visualizations
+        if self.config.wandb_enabled:
+            import wandb
+            # Paper-style histogram for expert confidence distribution
+            confidences = [m.get('router_confidence', 0) for m in expert_losses.values()]
+            log_data['train/expert_conf_dist'] = wandb.Histogram(np.array(confidences))
+            
+            # Time-series metrics matching paper figures
+            wandb.log({
+                **log_data,
+                'charts/alignment_vs_confidence': wandb.plot.line_series(
+                    xs=[step]*len(alignment_values),
+                    ys=[alignment_values, confidences],
+                    keys=['Cluster Alignment', 'Router Confidence'],
+                    title="Specialization Dynamics"
+                )
+            }, step=step)
 
     def _cleanup_training(self):
         """Post-training cleanup"""
