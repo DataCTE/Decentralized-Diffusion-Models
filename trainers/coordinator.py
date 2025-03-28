@@ -218,7 +218,7 @@ class DDMTrainingCoordinator:
             # Create expert with validated params
             expert_trainer = ExpertTrainer(
                 expert_idx=expert_idx,
-                config=SimpleNamespace(**flux_params),  # Use processed params
+                config=self.config,  # Pass the full config instead of flux_params
                 device=self.device,
                 rank=self.rank,
                 world_size=self.world_size,
