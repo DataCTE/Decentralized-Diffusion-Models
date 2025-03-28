@@ -153,43 +153,36 @@ class DDMDataset(Dataset):
             raise
 
     def __getitem__(self, idx):
-        """Minimal check variant for research efficiency"""
+        """Modified to generate dims from latent shape"""
         base_name = self.base_names[idx]
         rank_suffix = f"_rank{self.rank}.pt"
 
-        # Construct all paths first
+        # Construct paths for remaining features
         paths = {
             'latent': os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"),
             'clip_embedding': os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"),
             'expert': os.path.join(self.cluster_dir, f"{base_name}{rank_suffix}"),
-            'dims': os.path.join(self.dim_dir, f"{base_name}{rank_suffix}"),
-            # Include bucket path for completeness, though not directly returned here
-            # 'bucket': os.path.join(self.bucket_dir, f"{base_name}{rank_suffix}")
         }
 
         try:
-            # Optional: Add an explicit check here if paranoia is high,
-            # but _verify_cache_dirs should handle it.
-            # for feature, path in paths.items():
-            #     if not os.path.exists(path):
-            #         raise FileNotFoundError(f"Verified base name '{base_name}' but file missing at {path}")
-
-            return {
+            item = {
                 'latent': torch.load(paths['latent'], map_location='cpu'),
                 'clip_embedding': torch.load(paths['clip_embedding'], map_location='cpu'),
                 'expert': torch.load(paths['expert'], map_location='cpu'),
-                'dims': torch.load(paths['dims'], map_location='cpu'),
-                # Bucket data is loaded separately via the bucket_assignments property
             }
+            
+            # Generate dims from latent shape [C, H, W]
+            latent_shape = item['latent'].shape
+            item['dims'] = torch.tensor(latent_shape, dtype=torch.int16)
+            
+            return item
+
         except FileNotFoundError as e:
-            # This should ideally not happen now, but log if it does
-            self.logger.error(f"[Rank {self.rank}] CRITICAL: File missing for verified base_name '{base_name}' at index {idx}: {str(e)}. Check cache integrity.", exc_info=True)
-            # Decide how to handle this - raising might be better than returning None now
-            raise e # Re-raise the critical error
+            self.logger.error(f"[Rank {self.rank}] Critical file missing: {str(e)}", exc_info=True)
+            raise
         except Exception as e:
-             self.logger.error(f"[Rank {self.rank}] Error loading data for base_name '{base_name}' at index {idx}: {str(e)}", exc_info=True)
-             # Decide on error handling: skip sample (return None), or raise error?
-             return None # Returning None might still be necessary for corrupt files, handle in collate_fn
+            self.logger.error(f"[Rank {self.rank}] Error loading data: {str(e)}", exc_info=True)
+            return None
 
     def __len__(self):
         return self.num_samples
@@ -323,30 +316,20 @@ class DDMDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """
-        Collate function that handles potential None values in the batch
-        (e.g., due to loading errors other than FileNotFoundError).
-        """
-        # Filter out None items first
+        """Updated collate function without dims stacking"""
         batch = [item for item in batch if item is not None]
         if not batch:
-            return None # Return None if the whole batch was invalid
+            return None
 
         try:
-            # Proceed with stacking the valid items
             return {
                 'latent': torch.stack([item['latent'] for item in batch]),
                 'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
-                # Bucket info is implicitly handled by BucketBatchSampler forming the batch
-                'expert': torch.stack([item['expert'] for item in batch]),
-                'dims': torch.stack([item['dims'] for item in batch])
+                'expert': torch.stack([item['expert'] for item in batch])
             }
         except Exception as e:
-            logging.error(f"Collation error after filtering Nones: {str(e)}", exc_info=True)
-            # You might want to log the shapes here for debugging
-            # for i, item in enumerate(batch):
-            #    logging.error(f"Item {i} shapes: latent={item['latent'].shape}, clip={item['clip_embedding'].shape}, ...")
-            return None # Return None if collation fails even after filtering
+            logging.error(f"Collation error: {str(e)}", exc_info=True)
+            return None
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple BatchSamplers to ensure each batch has consistent dimensions"""
