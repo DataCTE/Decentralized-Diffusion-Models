@@ -266,11 +266,11 @@ class ExpertTrainer(BaseTrainer):
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()
+            
+            # Update scheduler ONLY on optimizer steps (paper's recommendation)
+            self.lr_scheduler.step()
         
         self.step += 1  # Increment step counter after optimization
-        
-        # Update scheduler every step regardless of gradient accumulation
-        self.lr_scheduler.step()
         
         # Modified return with metrics
         metrics = self.compute_loss(batch)
