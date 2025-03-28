@@ -185,6 +185,13 @@ class ExpertMMDiT(Flux):
         nn.init.normal_(self.capacity_gate[0].weight, std=0.01)  # More stable initialization
         nn.init.constant_(self.capacity_gate[0].bias, 0.0)  # Neutral initial bias
 
+        # Replace final layer to match output dimensions
+        self.final_layer = LastLayer(
+            self.params.hidden_size,
+            self.params.patch_size,
+            self.params.out_channels  # Should be latent_channels * patch_size^2
+        )
+
     def _validate_params(self, params):
         """Safer parameter validation with cluster config"""
         if not hasattr(params, 'cluster_embed_dim'):

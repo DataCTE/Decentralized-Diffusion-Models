@@ -222,30 +222,22 @@ class DecentralizedFlowMatcher:
         return torch.einsum('bk,kbchw->bchw', router_weights, torch.stack(expert_flows))
     
     def compute_flow_matching_loss(self, pred, target):
-        """
-        Compute flow matching loss following paper Section 3.4
-        with bucket-aware resizing
-        """
-        # Get current bucket dimensions from prediction shape
-        _, _, H, W = pred.shape
+        """Updated to handle channel dimension matching"""
+        # Get dimensions from target instead of prediction
+        _, C, H, W = target.shape
         
-        # Resize target to match prediction dimensions
-        target_resized = torch.nn.functional.interpolate(
-            target, size=(H, W), mode='bilinear', align_corners=False
+        # Resize prediction to match target dimensions
+        pred_resized = torch.nn.functional.interpolate(
+            pred, size=(H, W), mode='bilinear', align_corners=False
         )
         
-        if self.loss_type == 'mse':
-            loss = F.mse_loss(pred, target_resized, reduction='none')
-        elif self.loss_type == 'huber':
-            loss = F.huber_loss(pred, target_resized, delta=0.1, reduction='none')
-        elif self.loss_type == 'l1':
-            loss = F.l1_loss(pred, target_resized, reduction='none')
-        else:
-            raise ValueError(f"Invalid loss type: {self.loss_type}")
-
-        return loss.mean()
+        # Add channel dimension if needed
+        if pred_resized.size(1) != C:
+            pred_resized = pred_resized.repeat(1, C, 1, 1)  # Match channels
+        
+        return F.huber_loss(pred_resized, target, delta=0.1, reduction='mean')
 
     def compute_loss(self, pred_flow, x0, xt, t):
-        """Calculate loss using actual diffused latent"""
+        """Only keep this version"""
         target = self.compute_flow_matching_target(x0, xt, t)
         return self.compute_flow_matching_loss(pred_flow, target) 

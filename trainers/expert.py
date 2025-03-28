@@ -44,19 +44,17 @@ class ExpertTrainer(BaseTrainer):
         self.expert_idx = expert_idx
         self.world_size = world_size
         
-        # --- FIX: Calculate correct input dimensions for patched latent ---
+        # Calculate patched dimensions correctly
+        patch_size = config.patch_size
         if hasattr(config, 'latent_channels'):
-            # Calculate patched input dimension: latent_channels * (patch_size^2)
-            model_config_dict = vars(config).copy() # Create a mutable copy
-            model_config_dict['in_channels'] = config.latent_channels * (config.patch_size ** 2)
+            model_config_dict = vars(config).copy()
+            model_config_dict['in_channels'] = config.latent_channels * (patch_size ** 2)
+            model_config_dict['out_channels'] = config.latent_channels * (patch_size ** 2)
         else:
-            self.logger.warning(f"Expert {expert_idx}: config.latent_channels not found, using config.in_channels ({config.in_channels}) for model.")
-        # Use a SimpleNamespace or a dedicated dataclass if ExpertMMDiT expects one
+            self.logger.warning(f"Using default in_channels {config.in_channels}")
+        
         model_config = SimpleNamespace(**model_config_dict)
-        # --- END FIX ---
-
-        # Initialize base model first using the corrected config
-        self.expert = ExpertMMDiT(model_config) # Pass the modified config
+        self.expert = ExpertMMDiT(model_config)
         
         # After creating the expert:
         self.expert = self.expert.to(device)
