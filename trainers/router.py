@@ -86,9 +86,7 @@ class RouterTrainer:
         
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: min(step/self.warmup_steps, 1.0) 
-            if step < self.warmup_steps 
-            else 0.5*(1 + math.cos(math.pi*(step - self.warmup_steps)/self.total_steps))
+            lr_lambda=lambda step: min((step + 1)/self.warmup_steps, 1.0)
         )
 
         # Initialize step counter
