@@ -16,6 +16,7 @@ from torch.serialization import safe_globals
 from numpy._core.multiarray import _reconstruct
 from types import SimpleNamespace
 from multiprocessing import Pool
+import torch.distributed as dist # Assuming dist is initialized elsewhere or handle initialization
 
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, get_world_size
@@ -61,47 +62,71 @@ class DDMDataset(Dataset):
         self.dim_dir = os.path.join(self.config.feature_cache_path, "dims")
         self.bucket_dir = os.path.join(self.config.feature_cache_path, "buckets")
         
-        # Verify directories exist
+        # Verify directories exist and find valid base names
         self._verify_cache_dirs()
         
-        # Load all preprocessed files for this rank
-        self.latent_files = sorted(glob.glob(os.path.join(self.latent_dir, f"*_rank{self.rank}.pt")))
-        self.num_samples = len(self.latent_files)
+        # No need to glob for latent_files here anymore if __getitem__ uses base_names
+        # self.latent_files = sorted(glob.glob(os.path.join(self.latent_dir, f"*_rank{self.rank}.pt")))
+        # self.num_samples = len(self.latent_files)
+        # self.base_names = [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
         
-        # Extract base names without rank suffix for loading other features
-        self.base_names = [Path(f).stem.rsplit('_rank', 1)[0] for f in self.latent_files]
-        
-        # Remove all preloading logic
         logger.info(f"[Rank {self.rank}] Initialized dataset with {self.num_samples} samples (lazy loading enabled)")
         
         # Initialize bucket assignments as a property
         self._bucket_assignments = None  # Initialize cache
 
     def _verify_cache_dirs(self):
-        """Research-grade validation using parallel file checking"""
-        # Get all file paths using parallel glob
-        with Pool() as pool:
-            clip_files = set(pool.map(str, Path(self.clip_dir).glob("anime-*_rank*.pt")))
-            latent_files = set(pool.map(str, Path(self.latent_dir).glob("anime-*_rank*.pt")))
+        """Verify cache directories and find valid pairs efficiently with progress."""
+        if self.rank == 0:
+            logger.info(f"Verifying cache directories: {self.clip_dir}, {self.latent_dir}")
 
-        # Extract base names without rank/extension
-        clip_bases = {f.split("/")[-1].split("_rank")[0] for f in clip_files}
-        latent_bases = {f.split("/")[-1].split("_rank")[0] for f in latent_files}
+        # Use os.listdir for faster directory reading
+        try:
+            clip_filenames = os.listdir(self.clip_dir)
+            latent_filenames = os.listdir(self.latent_dir)
+        except FileNotFoundError as e:
+            logger.error(f"Cache directory not found: {e}")
+            raise
+
+        # Filter for .pt files and extract base names efficiently with tqdm progress
+        clip_bases = set()
+        # Wrap the loop with tqdm, disable if not rank 0
+        for f in tqdm(clip_filenames, desc="Processing clip files ", unit="file", disable=(self.rank != 0)):
+             if f.endswith('.pt') and '_rank' in f:
+                 clip_bases.add(f.split('_rank')[0])
+
+        latent_bases = set()
+        # Wrap the loop with tqdm, disable if not rank 0
+        for f in tqdm(latent_filenames, desc="Processing latent files", unit="file", disable=(self.rank != 0)):
+             if f.endswith('.pt') and '_rank' in f:
+                 latent_bases.add(f.split('_rank')[0])
 
         # Find valid pairs using set intersection
         valid_bases = clip_bases & latent_bases
-        
-        # Sort to ensure deterministic ordering
-        self.base_names = sorted(valid_bases)
+
+        if not valid_bases:
+            # Log error on all ranks, but raise may only be needed on rank 0 depending on setup
+            error_msg = (
+                f"No matching '*.pt' files found between {self.clip_dir} and {self.latent_dir}. "
+                f"Ensure files follow the 'name_rank<N>.pt' format."
+            )
+            logger.error(error_msg)
+            # Ensure all processes are aware of the critical failure
+            if dist.is_initialized():
+                 dist.barrier() # Sync processes before potential divergence
+            raise FileNotFoundError(error_msg)
+
+        # Sort to ensure deterministic ordering across ranks
+        self.base_names = sorted(list(valid_bases))
         self.num_samples = len(self.base_names)
+
+        # Log completion only on rank 0
+        if self.rank == 0:
+            logger.info(f"Verified {self.num_samples} valid sample base names")
         
-        # Create full file paths using first available rank
-        self.latent_files = [
-            f for base in self.base_names
-            for f in glob.glob(os.path.join(self.latent_dir, f"{base}_rank*.pt"))
-        ]
-        
-        logger.info(f"Verified {self.num_samples} valid sample pairs")
+        # Synchronize after verification to ensure all ranks have the list or failed
+        if dist.is_initialized():
+            dist.barrier()
 
     def __getitem__(self, idx):
         """Minimal check variant for research efficiency"""
@@ -109,15 +134,23 @@ class DDMDataset(Dataset):
         rank_suffix = f"_rank{self.rank}.pt"
         
         try:
+            # Ensure cluster_dir and dim_dir exist before trying to load
+            # (Could add checks here if they might be missing for some items)
             return {
-                'latent': torch.load(f"{self.latent_dir}/{base_name}{rank_suffix}", map_location='cpu'),
-                'clip_embedding': torch.load(f"{self.clip_dir}/{base_name}{rank_suffix}", map_location='cpu'),
-                'expert': torch.load(f"{self.cluster_dir}/{base_name}{rank_suffix}", map_location='cpu'),
-                'dims': torch.load(f"{self.dim_dir}/{base_name}{rank_suffix}", map_location='cpu')
+                'latent': torch.load(os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"), map_location='cpu'),
+                'clip_embedding': torch.load(os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"), map_location='cpu'),
+                'expert': torch.load(os.path.join(self.cluster_dir, f"{base_name}{rank_suffix}"), map_location='cpu'),
+                'dims': torch.load(os.path.join(self.dim_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
             }
         except FileNotFoundError as e:
-            logger.debug(f"Missing file for {base_name}: {str(e)}")
-            return None
+            # Log file not found errors more informatively
+            logger.warning(f"[Rank {self.rank}] Missing file for base_name '{base_name}' at index {idx}: {str(e)}. Returning None.")
+            # Depending on collation, returning None might require careful handling later
+            return None # Or handle differently if None breaks collation
+        except Exception as e: # Catch other potential loading errors (like corrupt files)
+             logger.error(f"[Rank {self.rank}] Error loading data for base_name '{base_name}' at index {idx}: {str(e)}")
+             # Decide on error handling: skip sample (return None), or raise error?
+             return None # Returning None is often safer for dataloading
 
     def __len__(self):
         return self.num_samples

@@ -2,12 +2,9 @@
 
 import os
 import torch
-import datetime
 import time
-import contextlib
 from tqdm.auto import tqdm
 import concurrent.futures
-from collections import defaultdict
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,10 +22,6 @@ import torch.distributed as dist
 
 # Import centralized utilities
 from utils.distributed import is_dist_initialized, synchronize, broadcast_object
-
-
-# Import FSDP directly to fix the "FSDP is not defined" error
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 
 # Setup logger
