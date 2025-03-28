@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
     'num_experts': 8,
     'num_clusters': 8,
     'cluster_embed_dim': 512,
-    'expert_capacity_factor': 1.0,
+    'expert_capacity_factor': 1.1,
     'max_experts_in_memory': 2,
     'expert_offload_to_cpu': True,
     

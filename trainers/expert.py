@@ -90,6 +90,9 @@ class ExpertTrainer(BaseTrainer):
             else 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / (config.num_steps - warmup_steps)))
         )
 
+        # Add step counter initialization
+        self.step = 0  # Track training steps for gradient accumulation
+        
         # Initialize scaler once in __init__
         self.scaler = torch.amp.GradScaler(enabled=config.use_mixed_precision)
 
@@ -196,6 +199,8 @@ class ExpertTrainer(BaseTrainer):
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()
+        
+        self.step += 1  # Increment step counter after optimization
         
         return loss.item()
     
