@@ -544,7 +544,7 @@ class DDMTrainingCoordinator:
             alignment_values.append(metrics['cluster_alignment'])
             
             # Utilization tracking (paper's "expert activation rate")
-            threshold = self.config.expert_metrics.utilization_threshold
+            threshold = self.config.get('expert_utilization_threshold', 0.1)  # Paper-recommended default
             # Track per-sample utilization
             utilization_mask = metrics['per_sample_confidence'] > threshold
             expert_utilization += utilization_mask.float().mean().item()
