@@ -109,6 +109,9 @@ class RouterTrainer:
         # Validate input types and shapes
         self._validate_batch(batch)
         
+        # Move expert labels to device
+        batch['expert'] = batch['expert'].to(self.device, non_blocking=True)
+        
         # Get actual CLIP embedding dimensions
         clip_emb = batch['clip_embedding']
         if clip_emb.dim() == 4:

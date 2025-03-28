@@ -442,18 +442,20 @@ class DDMTrainingCoordinator:
         return router_loss, expert_losses
 
     def _get_next_batch(self):
-        """Get next batch with validation and automatic iterator reset."""
+        """Get next batch with device transfer"""
         while True:
             try:
-                # Use the property to get the iterator
                 batch = next(self.train_iter)
-                # Validate batch (ensure collate_fn didn't return None)
-                if batch is None:
-                     self.logger.warning("Collate function returned None, skipping batch.")
-                     continue
-                # Further validation
+                if batch is None: continue
+                
+                # Move all tensors to training device
+                batch = {
+                    k: v.to(self.device, non_blocking=True) 
+                    if torch.is_tensor(v) else v 
+                    for k, v in batch.items()
+                }
+                
                 if not self._validate_batch(batch):
-                    self.logger.warning("Invalid batch structure or content, skipping.")
                     continue
                 return batch
             except StopIteration:

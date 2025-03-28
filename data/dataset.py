@@ -544,12 +544,13 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         # Configure loader with GPU optimizations
         loader_config_start = time.time()
         try:
-            data_loader = DataLoader(
+            train_loader = DataLoader(
                 dataset,
                 batch_sampler=batch_sampler,
-                num_workers=0,
-                pin_memory=True,
-                collate_fn=DDMDataset.collate_fn # Use static collate_fn
+                collate_fn=DDMDataset.collate_fn,
+                pin_memory=True,  # Ensure this is set
+                num_workers=config.num_workers,
+                persistent_workers=config.num_workers > 0
             )
             print(f"[Rank {rank}] DataLoader created successfully")
         except Exception as e:
@@ -563,7 +564,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
         try:
             print(f"[Rank {rank}] Warming up loader...")
             for _ in range(1):
-                batch = next(iter(data_loader))
+                batch = next(iter(train_loader))
                 print(f"[Rank {rank}] Warmup batch shapes:")
                 for k, v in batch.items():
                     print(f"  {k}: {v.shape if hasattr(v, 'shape') else type(v)}")
@@ -576,7 +577,7 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
                 print(f"Problematic index: {e.args[1]}")
             print("Skipping warmup, continuing with training...")
 
-        expert_loaders[expert_idx] = data_loader
+        expert_loaders[expert_idx] = train_loader
         loader_pbar.update(1)
 
     loader_pbar.close()
