@@ -258,7 +258,7 @@ class ExpertMMDiT(Flux):
         return img_emb, txt_emb
 
     def _transformer_forward(self, img_emb, txt_emb, img_ids, txt_ids, timesteps):
-        """Core transformer processing with position embeddings"""
+        """Core transformer processing with corrected position embeddings"""
         t_emb = timestep_embedding(timesteps.float(), 256)
         time_vec = self.time_in(t_emb)
         
@@ -273,9 +273,16 @@ class ExpertMMDiT(Flux):
                 self.pe_embedder(torch.cat([txt_ids, img_ids], dim=1))
             )
 
+        # Generate fresh position IDs for combined sequence
+        combined_ids = torch.cat([
+            txt_ids[:, :txt_stream.size(1)],  # Actual text sequence length
+            img_ids[:, :img_stream.size(1)]   # Actual image sequence length
+        ], dim=1)
+        
+        pe = self.pe_embedder(combined_ids)
+        
         # Concatenate streams and process through single blocks
         x = torch.cat([txt_stream, img_stream], dim=1)
-        pe = self.pe_embedder(torch.cat([txt_ids, img_ids], dim=1))
         
         for block in self.single_blocks:
             x = block(
