@@ -51,8 +51,6 @@ class DDMDataset(Dataset):
         # Cache directories
         self.latent_dir = os.path.join(self.config.feature_cache_path, "latents")
         self.clip_dir = os.path.join(self.config.feature_cache_path, "clip")
-        self.cluster_dir = os.path.join(self.config.feature_cache_path, "clusters")
-        self.dim_dir = os.path.join(self.config.feature_cache_path, "dims")
         self.bucket_dir = os.path.join(self.config.feature_cache_path, "buckets")
         
         # Verify directories exist and find valid base names
@@ -63,6 +61,17 @@ class DDMDataset(Dataset):
         
         # Initialize bucket assignments as a property
         self._bucket_assignments = None  # Initialize cache
+
+        # Add cluster data loading
+        self.cluster_file = os.path.join(self.config.feature_cache_path, "final_clusters.pt")
+        if not os.path.exists(self.cluster_file):
+            raise FileNotFoundError(f"Cluster file {self.cluster_file} missing")
+        
+        # Load all cluster assignments at initialization
+        self.cluster_assignments = torch.load(self.cluster_file, map_location='cpu')
+        
+        # Remove cluster_dir from initialization
+        self.cluster_dir = None  # Remove cluster directory reference
 
     def _verify_cache_dirs(self):
         """Modified verification without clusters/dims"""
@@ -161,19 +170,15 @@ class DDMDataset(Dataset):
         paths = {
             'latent': os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"),
             'clip_embedding': os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"),
-            'expert': os.path.join(self.cluster_dir, f"{base_name}{rank_suffix}"),
         }
 
         try:
             item = {
                 'latent': torch.load(paths['latent'], map_location='cpu'),
                 'clip_embedding': torch.load(paths['clip_embedding'], map_location='cpu'),
-                'expert': torch.load(paths['expert'], map_location='cpu'),
+                'expert': self.cluster_assignments[idx],  # Get from preloaded tensor
+                'dims': torch.tensor(item['latent'].shape, dtype=torch.int16)
             }
-            
-            # Generate dims from latent shape [C, H, W]
-            latent_shape = item['latent'].shape
-            item['dims'] = torch.tensor(latent_shape, dtype=torch.int16)
             
             return item
 
