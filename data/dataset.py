@@ -146,6 +146,16 @@ class DDMDataset(Dataset):
             if self.rank == 0:
                 self.logger.info(f"Verified {self.num_samples} samples with complete features")
 
+            # Add distributed consistency check
+            if dist.is_initialized():
+                world_size = dist.get_world_size()
+                all_rank_bases = [None] * world_size
+                dist.all_gather_object(all_rank_bases, self.base_names)
+                
+                # Verify all ranks have the same base names
+                if not all(b == self.base_names for b in all_rank_bases):
+                    raise RuntimeError("Mismatched base names across ranks")
+
         except Exception as e:
             error_lines = []
             for i, (k, v) in enumerate(required_dirs.items()):
@@ -195,6 +205,7 @@ class DDMDataset(Dataset):
             'latent': latent,
             'clip_embedding': clip_embed,
             'expert': self.cluster_assignments[idx],
+            'bucket': self.bucket_assignments[idx],
             'dims': torch.tensor(latent.shape, dtype=torch.int16)
         }
 
@@ -242,7 +253,7 @@ class DDMDataset(Dataset):
         return self._bucket_assignments
 
     def _load_bucket_assignments(self) -> torch.Tensor:
-        """Load bucket assignments for all verified samples from cache files."""
+        """Load bucket assignments with memory mapping"""
         assignments = []
         missing_files = []
         # Use tqdm for loading assignments, only display on rank 0
@@ -252,13 +263,10 @@ class DDMDataset(Dataset):
             # Construct the expected path for the current rank
             path = os.path.join(self.bucket_dir, f"{base_name}_rank{self.rank}.pt")
             try:
-                # Load directly to CPU, assumes assignment is a single tensor/value
-                assignment_tensor = torch.load(path, map_location='cpu')
-                # Ensure it's a scalar or has the expected format (e.g., single element tensor)
-                if not isinstance(assignment_tensor, torch.Tensor):
-                     assignment_tensor = torch.tensor(assignment_tensor) # Convert if not tensor
-                # Ensure it's treated as a bucket index (long)
-                assignments.append(assignment_tensor.long().squeeze()) # Use squeeze to remove extra dims if any
+                # Replace torch.load with memory-mapped load
+                assignment_tensor = torch.load(path, map_location='cpu', mmap=True)
+                # Use int16 instead of long (max 32767 buckets supported)
+                assignments.append(assignment_tensor.to(torch.int16).squeeze())
             except FileNotFoundError:
                  # This error should NOT happen if _verify_cache_dirs worked correctly
                  self.logger.error(f"CRITICAL: Bucket file missing for verified base name '{base_name}' at {path}. Cache verification failed or file deleted during run.")
