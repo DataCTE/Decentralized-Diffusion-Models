@@ -370,14 +370,18 @@ class ExpertTrainer(BaseTrainer):
                 self.logger.info(f"Isolated optimizer state for expert {self.expert_idx}") 
 
     def _get_position_ids(self, x):
-        """Generates position IDs from 4D latent tensor"""
+        """Generates position IDs for PATCHED latent tensor"""
         _, _, H, W = x.shape
+        patch_size = self.config.patch_size  # Get from config
+        H_patch = H // patch_size
+        W_patch = W // patch_size
+        
         device = x.device
         dtype = x.dtype
         
-        # Generate grid for actual H/W dimensions
-        pos_h = torch.arange(H, device=device, dtype=dtype)
-        pos_w = torch.arange(W, device=device, dtype=dtype)
+        # Generate grid for PATCHED dimensions
+        pos_h = torch.arange(H_patch, device=device, dtype=dtype)
+        pos_w = torch.arange(W_patch, device=device, dtype=dtype)
         grid_h, grid_w = torch.meshgrid(pos_h, pos_w, indexing='ij')
         
         # Stack and flatten spatial positions
