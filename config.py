@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 # Add this at the top under imports
 DEFAULT_CONFIG = {
     # ===== Core Architecture =====
-    'hidden_size': 512,
-    'num_heads': 8,
+    'hidden_size': 768,
+    'num_heads': 12,
     'depth': 12,
     'mlp_ratio': 2.0,
     'qkv_bias': True,
@@ -22,18 +22,19 @@ DEFAULT_CONFIG = {
     'context_in_dim': 768,
     
     # ===== Expert Configuration =====
-    'num_experts': 4,
+    'num_experts': 8,
     'num_clusters': 8,
     'cluster_embed_dim': 512,
-    'expert_capacity_factor': 0.5,
+    'expert_capacity_factor': 1.0,
+    'expert_batch_size': 1,
     
     # ===== Training Parameters ===== 
     'batch_size': 1,
-    'learning_rate': 2e-4,
+    'learning_rate': 1e-4,
     'weight_decay': 0.01,
     'warmup_steps': 1000,
     'use_mixed_precision': True,
-    'gradient_accumulation_steps': 4,
+    'gradient_accumulation_steps': 2,
 
     # ===== Diffusion & Loss =====
     'loss_type': 'huber',         
@@ -59,9 +60,9 @@ DEFAULT_CONFIG = {
     'clip_embedding_dim': 768,
     
     # ===== Router Configuration =====
-    'router_learning_rate': 2e-4,
-    'router_hidden_size': 256,
-    'router_num_heads': 4,
+    'router_learning_rate': 1e-4,
+    'router_hidden_size': 384,
+    'router_num_heads': 6,
     'router_temperature': 2.0,
     'router_min_temp': 0.5,
     'router_temperature_decay': 0.9997,
@@ -81,7 +82,7 @@ DEFAULT_CONFIG = {
     # ===== Positional Embeddings =====
     'position_embed_type': 'rope_2d',
     'theta': 10000,
-    'axes_dim': [32, 32],
+    'axes_dim': [64, 64],
     
     # ===== Debug/Test Flags =====
     'bypass_cluster_validation': False,
@@ -92,7 +93,7 @@ DEFAULT_CONFIG = {
     'save_interval': 5000,
     'max_experts_in_memory': 2,
     'expert_offload_to_cpu': True,
-    'expert_batch_size': 2,
+
     'distilled_model': None,
     'vae_model': 'AuraDiffusion/16ch-vae',
     'verbose_training': False,
@@ -103,8 +104,8 @@ DEFAULT_CONFIG = {
     'scheduler_type': 'cosine',
 
     # ===== Optimization =====
-    'adam_betas': (0.9, 0.98),
-    'eps': 1e-6,
+    'adam_betas': (0.9, 0.999),
+    'eps': 1e-8,
 
     # ===== CLIP Configuration =====
     'clip_model': 'openai/clip-vit-large-patch14',
@@ -242,4 +243,3 @@ def save_config(config, path):
                     f.write(f'{key} = {value}\n')
     
     logger.info(f"Saved configuration to {path}")
-
