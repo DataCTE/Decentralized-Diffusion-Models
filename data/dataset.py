@@ -71,19 +71,16 @@ class DDMDataset(Dataset):
         self._load_cluster_assignments()
 
     def _verify_cache_dirs(self):
-        """Modified verification without clusters/dims"""
+        """Modified verification without buckets"""
         required_dirs = {
             "latents": self.latent_dir,
-            "clip": self.clip_dir,
-            "buckets": self.bucket_dir
+            "clip": self.clip_dir
         }
         
-        # Pattern to match 'basename_rankN.pt' where N is a digit
         filename_pattern = re.compile(r"^(.*)_rank(\d+)\.pt$")
         
         all_base_sets = []
         try:
-            # Add progress bar for directory verification
             dir_progress = tqdm(
                 required_dirs.items(),
                 desc=f"Rank {self.rank} Verifying cache",
@@ -99,15 +96,11 @@ class DDMDataset(Dataset):
                 valid_files = []
                 base_names = set()
                 
-                # Update progress bar description
-                dir_progress.set_postfix({"current": feature_type, "status": "scanning"})
-                
-                # Use regex to validate filenames
                 for f in os.listdir(dir_path):
                     match = filename_pattern.match(f)
                     if match:
                         base_name, rank = match.groups()
-                        if rank == str(self.rank):  # Only consider files for current rank
+                        if rank == str(self.rank):
                             base_names.add(base_name)
                             valid_files.append(f)
                 
@@ -120,25 +113,10 @@ class DDMDataset(Dataset):
                     "files": len(valid_files),
                     "bases": len(base_names)
                 })
-                
-                if self.rank == 0:
-                    self.logger.info(f"{feature_type.upper()} | Valid files: {len(valid_files)} | Unique bases: {len(base_names)}")
 
-            # Find intersection of base names
+            # Find intersection of latent/clip base names only
             valid_bases = set.intersection(*[set(s) for s in all_base_sets])
-            dir_progress.set_postfix({"status": f"found {len(valid_bases)} common bases"})
             
-            if not valid_bases:
-                # Detailed error reporting
-                missing_in = []
-                for i, (feature, path) in enumerate(required_dirs.items()):
-                    if not all_base_sets[i]:
-                        missing_in.append(f"{feature} ({path})")
-                        
-                error_msg = "No common base names found. Missing/invalid files in:\n" + "\n".join(missing_in)
-                self.logger.error(error_msg)
-                raise FileNotFoundError(error_msg)
-
             # Sort to ensure deterministic ordering
             self.base_names = sorted(valid_bases)
             self.num_samples = len(self.base_names)
@@ -146,24 +124,10 @@ class DDMDataset(Dataset):
             if self.rank == 0:
                 self.logger.info(f"Verified {self.num_samples} samples with complete features")
 
-            # Add distributed consistency check
-            if dist.is_initialized():
-                world_size = dist.get_world_size()
-                all_rank_bases = [None] * world_size
-                dist.all_gather_object(all_rank_bases, self.base_names)
-                
-                # Verify all ranks have the same base names
-                if not all(b == self.base_names for b in all_rank_bases):
-                    raise RuntimeError("Mismatched base names across ranks")
-
         except Exception as e:
             error_lines = []
             for i, (k, v) in enumerate(required_dirs.items()):
-                if i < len(all_base_sets):
-                    count = len(all_base_sets[i])
-                    error_lines.append(f"- {k}: {v} ({count} bases)")
-                else:
-                    error_lines.append(f"- {k}: {v} (verification failed before processing)")
+                error_lines.append(f"- {k}: {v} ({len(all_base_sets[i]) if i<len(all_base_sets) else 0} bases)")
             
             self.logger.error("Cache verification failed:\n" + "\n".join(error_lines))
             raise
