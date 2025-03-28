@@ -536,17 +536,18 @@ class DDMTrainingCoordinator:
         expert_utilization = 0
         total_confidence = 0
         alignment_values = []
-        total_expert_loss = 0
+        per_step_confidences = []  # Track individual confidences for visualization
         
         for expert_key, metrics in expert_losses.items():
             # Paper's core metrics (Section 4)
             total_expert_loss += metrics['total_loss']
-            total_confidence += metrics['router_confidence']
+            expert_confidence = metrics['router_confidence']
+            total_confidence += expert_confidence
             alignment_values.append(metrics['cluster_alignment'])
+            per_step_confidences.extend(metrics['per_sample_confidence'].cpu().tolist())
             
-            # Utilization tracking (paper's "expert activation rate")
+            # Utilization tracking
             threshold = getattr(self.config, 'expert_utilization_threshold', 0.1)
-            # Safely get per_sample_confidence with fallback
             confidences = metrics.get('per_sample_confidence', torch.tensor([0.0])) 
             utilization_mask = confidences > threshold
             expert_utilization += utilization_mask.float().mean().item()
@@ -554,37 +555,37 @@ class DDMTrainingCoordinator:
         # Paper-recommended aggregate metrics
         if expert_losses:
             num_experts = len(expert_losses)
+            avg_alignment = sum(alignment_values) / num_experts
+            avg_confidence = total_confidence / num_experts
+            
             log_data.update({
                 'train/avg_expert_loss': total_expert_loss / num_experts,
-                'train/avg_router_confidence': total_confidence / num_experts,
+                'train/avg_router_confidence': avg_confidence,
                 'train/utilization_rate': expert_utilization / num_experts,
-                'train/avg_cluster_alignment': sum(alignment_values) / num_experts,
+                'train/avg_cluster_alignment': avg_alignment,
             })
-
-        # Console logging remains focused on core metrics
-        #log_message = (
-        #    f"Step {step:>6} | Router Loss: {router_loss:.4f} | "
-        #    f"Expert Loss: {log_data.get('train/avg_expert_loss', 0):.4f} | "
-        #    f"Utilization: {log_data.get('train/utilization_rate', 0):.1%} | "
-        #    f"Alignment: {log_data.get('train/avg_cluster_alignment', 0):.2f}"
-        #)
-        #self.logger.info(log_message)
 
         # WandB logging with paper-aligned visualizations
         if self.config.wandb_enabled:
             import wandb
-            # Paper-style histogram for expert confidence distribution
-            confidences = [m['router_confidence'].cpu() for m in expert_losses.values()]
-            log_data['train/expert_conf_dist'] = wandb.Histogram(np.array(confidences))
             
-            # Time-series metrics matching paper figures
+            # Create proper time series for specialization dynamics
+            alignment_confidence_table = wandb.Table(
+                columns=["Step", "Alignment", "Confidence"],
+                data=[[step, avg_alignment, avg_confidence]]
+            )
+            
+            # Add histogram for expert confidence distribution
+            conf_hist = wandb.Histogram(np.array(per_step_confidences))
+            
             wandb.log({
                 **log_data,
-                'charts/alignment_vs_confidence': wandb.plot.line_series(
-                    xs=[step]*len(alignment_values),
-                    ys=[alignment_values, confidences],
-                    keys=['Cluster Alignment', 'Router Confidence'],
-                    title="Specialization Dynamics"
+                'train/expert_conf_dist': conf_hist,
+                'specialization_dynamics': wandb.plot.line(
+                    alignment_confidence_table,
+                    x="Step",
+                    y=["Alignment", "Confidence"],
+                    title="Specialization Dynamics: Alignment vs Confidence"
                 )
             }, step=step)
 
