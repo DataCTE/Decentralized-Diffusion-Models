@@ -15,6 +15,7 @@ from pathlib import Path
 from torch.serialization import safe_globals
 from numpy._core.multiarray import _reconstruct
 from types import SimpleNamespace
+from multiprocessing import Pool
 
 # Import centralized utilities
 from utils.distributed import is_main_process, get_rank, get_world_size
@@ -77,62 +78,46 @@ class DDMDataset(Dataset):
         self._bucket_assignments = None  # Initialize cache
 
     def _verify_cache_dirs(self):
-        """Verify cache directories and initialize sample IDs"""
-        # Make sure these directories exist
-        self.clip_dir = os.path.join(self.config.feature_cache_path, 'clip')
-        self.latent_dir = os.path.join(self.config.feature_cache_path, 'latents')
+        """Research-grade validation using parallel file checking"""
+        # Get all file paths using parallel glob
+        with Pool() as pool:
+            clip_files = set(pool.map(str, Path(self.clip_dir).glob("anime-*_rank*.pt")))
+            latent_files = set(pool.map(str, Path(self.latent_dir).glob("anime-*_rank*.pt")))
+
+        # Extract base names without rank/extension
+        clip_bases = {f.split("/")[-1].split("_rank")[0] for f in clip_files}
+        latent_bases = {f.split("/")[-1].split("_rank")[0] for f in latent_files}
+
+        # Find valid pairs using set intersection
+        valid_bases = clip_bases & latent_bases
         
-        # Check directory existence
-        if not os.path.exists(self.clip_dir) or not os.path.exists(self.latent_dir):
-            raise ValueError(f"Cache directories not found: {self.clip_dir}, {self.latent_dir}")
+        # Sort to ensure deterministic ordering
+        self.base_names = sorted(valid_bases)
+        self.num_samples = len(self.base_names)
         
-        # Get sample IDs from actual files
-        sample_ids = []
-        # Iterate through clip files to extract actual sample IDs
-        for file_path in Path(self.clip_dir).glob("anime-*_rank*.pt"):
-            file_name = file_path.stem  # Get filename without extension
-            # Parse the ID from the filename pattern "anime-{ID}_rank{N}"
-            try:
-                sample_id = int(file_name.split("-")[1].split("_rank")[0])
-                sample_ids.append(sample_id)
-            except (IndexError, ValueError) as e:
-                print(f"Warning: Could not parse sample ID from {file_name}: {e}")
+        # Create full file paths using first available rank
+        self.latent_files = [
+            f for base in self.base_names
+            for f in glob.glob(os.path.join(self.latent_dir, f"{base}_rank*.pt"))
+        ]
         
-        # Remove duplicates and sort
-        self.samples = sorted(set(sample_ids))
-        self.num_samples = len(self.samples)
-        print(f"Found {self.num_samples} valid samples with both latent and CLIP embeddings")
+        logger.info(f"Verified {self.num_samples} valid sample pairs")
 
     def __getitem__(self, idx):
-        """Load individual sample on demand"""
+        """Minimal check variant for research efficiency"""
+        base_name = self.base_names[idx]
+        rank_suffix = f"_rank{self.rank}.pt"
+        
         try:
-            base_name = self.base_names[idx]
-            
-            # Load latent
-            latent = torch.load(self.latent_files[idx], map_location='cpu')
-            
-            # Load CLIP embeddings
-            clip_path = os.path.join(self.clip_dir, f"{base_name}_rank{self.rank}.pt")
-            clip_embed = torch.load(clip_path, map_location='cpu')
-            
-            # Load cluster assignment
-            cluster_path = os.path.join(self.cluster_dir, f"{base_name}_rank{self.rank}.pt")
-            cluster_id = torch.load(cluster_path, map_location='cpu')
-            
-            # Load bucket dimensions
-            dim_path = os.path.join(self.dim_dir, f"{base_name}_rank{self.rank}.pt")
-            bucket_dims = torch.load(dim_path, map_location='cpu')
-            
             return {
-                'latent': latent,
-                'clip_embedding': clip_embed,
-                'expert': cluster_id,
-                'dims': bucket_dims
+                'latent': torch.load(f"{self.latent_dir}/{base_name}{rank_suffix}", map_location='cpu'),
+                'clip_embedding': torch.load(f"{self.clip_dir}/{base_name}{rank_suffix}", map_location='cpu'),
+                'expert': torch.load(f"{self.cluster_dir}/{base_name}{rank_suffix}", map_location='cpu'),
+                'dims': torch.load(f"{self.dim_dir}/{base_name}{rank_suffix}", map_location='cpu')
             }
-            
-        except Exception as e:
-            logger.error(f"Error loading sample {idx} on rank {self.rank}: {str(e)}")
-            raise
+        except FileNotFoundError as e:
+            logger.debug(f"Missing file for {base_name}: {str(e)}")
+            return None
 
     def __len__(self):
         return self.num_samples

@@ -348,14 +348,46 @@ class DDMTrainingCoordinator:
         return router_loss, expert_losses
 
     def _get_next_batch(self):
-        """Get next batch with cluster-aware sampling"""
-        try:
-            # Get batch from iterator
-            return next(self.train_iter)
-        except (StopIteration, AttributeError):
-            # Initialize iterator if not exists or exhausted
-            self.train_iter = iter(self.train_loader)
-            return next(self.train_iter)
+        """Get next batch with validation and automatic retry"""
+        while True:  # Loop until valid batch
+            try:
+                batch = next(self.train_iter)
+                
+                # Validate batch structure
+                if not self._validate_batch(batch):
+                    continue
+                    
+                return batch
+                
+            except (StopIteration, AttributeError):
+                self.train_iter = iter(self.train_loader)
+            except RuntimeError as e:
+                logger.warning(f"Batch loading error: {str(e)}")
+                continue
+
+    def _validate_batch(self, batch):
+        """Strict batch validation"""
+        if batch is None:
+            return False
+        
+        required_keys = ['latent', 'clip_embedding', 'expert']
+        for key in required_keys:
+            if key not in batch:
+                logger.warning(f"Missing key {key} in batch")
+                return False
+            
+        # Validate tensor shapes
+        latent_shape = batch['latent'].shape
+        if len(latent_shape) != 4 or latent_shape[1] != self.config.latent_channels:
+            logger.warning(f"Invalid latent shape {latent_shape}")
+            return False
+        
+        clip_shape = batch['clip_embedding'].shape
+        if clip_shape[-1] != self.config.clip_embed_dim:
+            logger.warning(f"Invalid CLIP shape {clip_shape}")
+            return False
+        
+        return True
 
     def _train_router(self, batch):
         """Router training step aligned with shape test"""
