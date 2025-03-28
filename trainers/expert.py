@@ -13,6 +13,7 @@ from models.mmdit import ExpertMMDiT
 from trainers.diffusion import DecentralizedFlowMatcher, get_alphas_and_betas
 from trainers.base import BaseTrainer
 from utils.checkpoint import save_model_checkpoint, load_model_checkpoint
+from types import SimpleNamespace
 
 
 
@@ -43,14 +44,13 @@ class ExpertTrainer(BaseTrainer):
         self.expert_idx = expert_idx
         self.world_size = world_size
         
-        # --- FIX: Ensure model config uses latent_channels for in_channels ---
-        from types import SimpleNamespace
-        model_config_dict = vars(config).copy() # Create a mutable copy
+        # --- FIX: Calculate correct input dimensions for patched latent ---
         if hasattr(config, 'latent_channels'):
-             model_config_dict['in_channels'] = config.latent_channels
-             #logger.info(f"Expert {expert_idx}: Setting model in_channels to latent_channels ({config.latent_channels})")
+            # Calculate patched input dimension: latent_channels * (patch_size^2)
+            model_config_dict = vars(config).copy() # Create a mutable copy
+            model_config_dict['in_channels'] = config.latent_channels * (config.patch_size ** 2)
         else:
-             self.logger.warning(f"Expert {expert_idx}: config.latent_channels not found, using config.in_channels ({config.in_channels}) for model.")
+            self.logger.warning(f"Expert {expert_idx}: config.latent_channels not found, using config.in_channels ({config.in_channels}) for model.")
         # Use a SimpleNamespace or a dedicated dataclass if ExpertMMDiT expects one
         model_config = SimpleNamespace(**model_config_dict)
         # --- END FIX ---
