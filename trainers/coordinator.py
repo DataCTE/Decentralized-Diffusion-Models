@@ -560,13 +560,13 @@ class DDMTrainingCoordinator:
             })
 
         # Console logging remains focused on core metrics
-        log_message = (
-            f"Step {step:>6} | Router Loss: {router_loss:.4f} | "
-            f"Expert Loss: {log_data.get('train/avg_expert_loss', 0):.4f} | "
-            f"Utilization: {log_data.get('train/utilization_rate', 0):.1%} | "
-            f"Alignment: {log_data.get('train/avg_cluster_alignment', 0):.2f}"
-        )
-        self.logger.info(log_message)
+        #log_message = (
+        #    f"Step {step:>6} | Router Loss: {router_loss:.4f} | "
+        #    f"Expert Loss: {log_data.get('train/avg_expert_loss', 0):.4f} | "
+        #    f"Utilization: {log_data.get('train/utilization_rate', 0):.1%} | "
+        #    f"Alignment: {log_data.get('train/avg_cluster_alignment', 0):.2f}"
+        #)
+        #self.logger.info(log_message)
 
         # WandB logging with paper-aligned visualizations
         if self.config.wandb_enabled:
