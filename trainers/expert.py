@@ -215,17 +215,8 @@ class ExpertTrainer(BaseTrainer):
                 cluster_ids=batch['cluster_pred']
             )
             
-            # Remove incorrect reshape and use paper's patch decoding
-            pred_flow = rearrange(
-                pred_flow,
-                "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
-                h=H//patch_size,
-                w=W//patch_size,
-                p1=patch_size,
-                p2=patch_size
-            )
             loss = self.flow_matcher.compute_loss(
-                pred_flow, 
+                pred_flow,
                 latent,
                 torch.rand(B, device=self.device)
             ) * self.config.expert_loss_weight
