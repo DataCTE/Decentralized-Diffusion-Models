@@ -324,9 +324,16 @@ class DDMDataset(Dataset):
             for lat in latents:
                 # Calculate padding for each dimension (C, H, W)
                 pad = [(0, max_dim - dim) for dim, max_dim in zip(lat.shape, max_shape)]
-                # Reverse padding order for F.pad (W, H, C)
-                pad = tuple(p for p in reversed(pad) for _ in (0, 1))
-                padded = torch.nn.functional.pad(lat, pad)
+                
+                # Convert to flat tuple in reverse order (W, H, C)
+                # torch.nn.functional.pad expects padding order from last dimension to first
+                pad_tuple = tuple(
+                    item 
+                    for dimension in reversed(pad)  # Process W first, then H, then C
+                    for item in dimension  # Flatten (left, right) pairs
+                )
+                
+                padded = torch.nn.functional.pad(lat, pad_tuple)
                 padded_latents.append(padded)
                 
             return {
