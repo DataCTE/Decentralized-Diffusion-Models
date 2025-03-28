@@ -507,7 +507,7 @@ class DDMTrainingCoordinator:
         return True
 
     def _handle_logging(self, step: int, router_loss: float, expert_losses: dict):
-        """Centralized logging handling for console and WandB."""
+        """Centralized logging handling with proper axis configuration"""
         if self.rank != 0:
             return
 
@@ -570,24 +570,21 @@ class DDMTrainingCoordinator:
         if self.config.wandb_enabled:
             import wandb
             
-            # Create proper time series for specialization dynamics
+            # Create specialized table for dynamics plot
             alignment_confidence_table = wandb.Table(
-                columns=["Step", "Alignment", "Confidence"],
+                columns=["train/step", "Alignment", "Confidence"],
                 data=[[step, avg_alignment, avg_confidence]]
             )
             
-            # Add histogram for expert confidence distribution
-            conf_hist = wandb.Histogram(np.array(per_step_confidences))
-            
             wandb.log({
                 **log_data,
-                'train/expert_conf_dist': conf_hist,
-                'specialization_dynamics': wandb.plot.line(
+                'specialization/dynamics': wandb.plot.line(
                     alignment_confidence_table,
-                    x="Step",
+                    x="train/step",
                     y=["Alignment", "Confidence"],
-                    title="Specialization Dynamics: Alignment vs Confidence"
-                )
+                    title="Specialization Dynamics"
+                ),
+                'train/expert_conf_dist': wandb.Histogram(np.array(per_step_confidences))
             }, step=step)
 
     def _cleanup_training(self):
@@ -702,7 +699,7 @@ class DDMTrainingCoordinator:
              return False
 
     def _init_wandb(self):
-        """Initialize Weights & Biases with enhanced error handling and cleanup"""
+        """Initialize Weights & Biases with proper metric configuration"""
         self.wandb_enabled = False
         
         # Only attempt on rank 0 with config enabled
@@ -738,6 +735,11 @@ class DDMTrainingCoordinator:
             self.logger.info(f"\nWANDB RUN URL: {run.get_url()}\n")
             self.wandb_run_url = run.get_url()
             self.wandb_enabled = True
+
+            # Define custom step metrics and their associations
+            wandb.define_metric("train/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+            wandb.define_metric("specialization/*", step_metric="train/step")
 
         except ImportError:
             self.logger.error("wandb package not installed - install with 'pip install wandb'")
