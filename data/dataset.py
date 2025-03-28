@@ -197,10 +197,16 @@ class DDMDataset(Dataset):
         base_name = self.base_names[idx]
         rank_suffix = f"_rank{self.rank}.pt"
 
-        # Load latent and clip embedding
+        # Load latent and remove unnecessary sequence dimension
         latent = torch.load(os.path.join(self.latent_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
+        latent = latent.squeeze(1)  # Removes dimension 1 if size 1
+        
         clip_embed = torch.load(os.path.join(self.clip_dir, f"{base_name}{rank_suffix}"), map_location='cpu')
 
+        # Add validation
+        if latent.shape[1] != self.config.latent_channels:
+            raise ValueError(f"Invalid latent channels. Expected {self.config.latent_channels}, got {latent.shape[1]}")
+        
         return {
             'latent': latent,
             'clip_embedding': clip_embed,
@@ -338,16 +344,26 @@ class DDMDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Updated collate function without dims stacking"""
         batch = [item for item in batch if item is not None]
         if not batch:
             return None
 
         try:
+            # Handle latent dimension mismatch
+            latents = [item['latent'] for item in batch]
+            
+            # Pad latents to matching dimensions if needed
+            max_shape = [max(s) for s in zip(*[l.shape for l in latents])]
+            padded_latents = []
+            for l in latents:
+                pad = [(0, max_dim - l.shape[i]) for i, max_dim in enumerate(max_shape)]
+                padded_latents.append(torch.nn.functional.pad(l, [p for p in reversed(pad) if p[1] > 0]))
+            
             return {
-                'latent': torch.stack([item['latent'] for item in batch]),
+                'latent': torch.stack(padded_latents),
                 'clip_embedding': torch.stack([item['clip_embedding'] for item in batch]),
-                'expert': torch.stack([item['expert'] for item in batch])
+                'expert': torch.stack([item['expert'] for item in batch]),
+                'bucket': torch.stack([item['bucket'] for item in batch])
             }
         except Exception as e:
             logging.error(f"Collation error: {str(e)}", exc_info=True)

@@ -685,7 +685,7 @@ def main():
                                 
                                 # Save the feature
                                 save_path = save_dir/f"{base_name}_rank{rank}.pt"
-                                torch.save(feature_data, save_path)
+                                torch.save(feature_data.squeeze(1), save_path)  # Remove sequence dimension during saving
                                 
                                 # Occasional logging
                                 if rank == 0 and random.random() < 0.001:
