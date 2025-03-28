@@ -576,6 +576,12 @@ class DDMTrainingCoordinator:
                 data=[[step, avg_alignment, avg_confidence]]
             )
             
+            # Create histogram table with proper format
+            hist_table = wandb.Table(
+                data=[[conf] for conf in per_step_confidences],  # Wrap in list-of-lists
+                columns=["confidence"]
+            )
+            
             wandb.log({
                 **log_data,
                 'specialization/dynamics': wandb.plot.line(
@@ -584,7 +590,11 @@ class DDMTrainingCoordinator:
                     y=["Alignment", "Confidence"],
                     title="Specialization Dynamics"
                 ),
-                'train/expert_conf_dist': wandb.Histogram(np.array(per_step_confidences))
+                'train/expert_conf_hist': wandb.plot.histogram(
+                    hist_table,
+                    "confidence",
+                    title="Expert Confidence Distribution"
+                )
             }, step=step)
 
     def _cleanup_training(self):
