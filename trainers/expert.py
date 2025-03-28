@@ -154,8 +154,8 @@ class ExpertTrainer(BaseTrainer):
             cluster_ids=cluster_ids
         )
         
-        # Original per-expert loss
-        raw_loss = self.flow_matcher.compute_loss(pred_flow, x0, t)
+        # Pass actual diffused latent (xt) to flow matcher
+        raw_loss = self.flow_matcher.compute_loss(pred_flow, x0, xt, t)
         
         # New ensemble-weighted loss (paper Section 3.3)
         expert_weight = router_probs[:, self.expert_idx]

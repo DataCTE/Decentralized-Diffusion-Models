@@ -209,27 +209,11 @@ class DecentralizedFlowMatcher:
         
     def compute_flow_matching_target(self, x0, xt, t):
         """Implements paper Eq.1 with numerical stability"""
-        # Time conditioning parameters
-        alpha_t = torch.cos(t * math.pi/2)
-        sigma_t = torch.sin(t * math.pi/2)
+        # Expand timestep tensors to match input dimensions
+        alpha_t = torch.cos(t * math.pi/2).view(-1, 1, 1, 1)
+        sigma_t = torch.sin(t * math.pi/2).view(-1, 1, 1, 1)
         
-        # Reshape for broadcasting
-        alpha_t = alpha_t.view(-1, 1, 1, 1)
-        sigma_t = sigma_t.view(-1, 1, 1, 1)
-        
-        # Target flow calculation
-        target = (x0 - alpha_t * xt) / (sigma_t ** 2 + 1e-7)
-        
-        # Handle near-zero sigma_t cases
-        mask = t < 1e-3
-        mask_reshaped = mask.view(-1, 1, 1, 1)
-        near_zero_sigma_t_value = 1e-7  # Use a constant value instead of t_masked_reshaped
-
-        value_if_true = torch.zeros_like(target) # Initialize with zeros
-        value_if_true = torch.where(~mask_reshaped, value_if_true, (x0 - xt) / near_zero_sigma_t_value) # Apply division only where mask is True
-        target = torch.where(mask_reshaped, value_if_true, target) # Use the conditionally created value_if_true
-        
-        return target
+        return (x0 - alpha_t * xt) / (sigma_t ** 2 + 1e-7)
 
     def compute_ensemble_flow(self, router_outputs, expert_flows):
         """Non-clustered expert combination from paper Eq. 4"""
@@ -261,13 +245,13 @@ class DecentralizedFlowMatcher:
 
         return loss.mean()
 
-    def compute_loss(self, pred_flow, x0, t):
-        # Paper's exact flow matching loss calculation
-        alpha_t = torch.cos(t * math.pi/2)[:,None,None,None]
-        sigma_t = torch.sin(t * math.pi/2)[:,None,None,None]
+    def compute_loss(self, pred_flow, x0, xt, t):
+        """Updated to use actual diffused latent"""
+        # Calculate target using ground truth diffused latent
+        target = self.compute_flow_matching_target(x0, xt, t)
         
-        target_flow = (x0 - alpha_t * pred_flow) / (sigma_t**2 + 1e-7)
-        return F.mse_loss(pred_flow, target_flow)
+        # Compare model predictions to the target
+        return self.compute_flow_matching_loss(pred_flow, target)
 
     def compute_loss(self, predictions, x0, t):
         """
