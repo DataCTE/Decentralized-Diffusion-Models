@@ -432,7 +432,6 @@ class DDMTrainingCoordinator:
             mask = batch['expert'] == expert_idx
             expert_batch = {
                 'latent': batch['latent'][mask],
-                'img_ids': batch['img_ids'][mask],
                 'clip_embedding': batch['clip_embedding'][mask],
                 'expert': batch['expert'][mask]
             }
