@@ -398,7 +398,8 @@ class ExpertTrainer(BaseTrainer):
         W_patch = W // patch_size
         
         device = x.device
-        dtype = x.dtype
+        # Force position IDs to be integers
+        dtype = torch.long  # Changed from x.dtype to ensure integer positions
         
         # Generate grid for PATCHED dimensions
         pos_h = torch.arange(H_patch, device=device, dtype=dtype)
