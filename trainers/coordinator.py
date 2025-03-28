@@ -11,6 +11,9 @@ import torch.nn.functional as F
 import logging
 from types import SimpleNamespace
 from einops import rearrange
+import queue
+import threading
+import wandb
 
 # Import needed components
 from trainers.router import RouterTrainer
@@ -128,6 +131,17 @@ class DDMTrainingCoordinator:
             wandb.log({"initialization_time": total_init_time})
         
         synchronize()
+        
+        # Add async components with monitoring
+        self.log_queue = queue.Queue(maxsize=100)
+        self._log_drop_count = 0
+        self._last_logged_step = -1
+        self._log_thread = threading.Thread(
+            target=self._async_log_worker, 
+            daemon=True,
+            name="WandBLogger"
+        )
+        self._log_thread.start()
     
     def _ensure_config_completeness(self):
         """
@@ -507,98 +521,38 @@ class DDMTrainingCoordinator:
         return True
 
     def _handle_logging(self, step: int, router_loss: float, expert_losses: dict):
-        """Centralized logging handling with proper axis configuration"""
+        """Ultra-lightweight main thread logging"""
         if self.rank != 0:
             return
-
-        # Calculate step time
-        current_time = time.time()
-        step_time = current_time - self.step_start_time
-        self.step_start_time = current_time # Reset timer for the next step
-
-        # Get learning rate (handle potential missing optimizer or param_groups)
-        lr = 'N/A'
-        if hasattr(self, 'router_optimizer') and self.router_optimizer and self.router_optimizer.param_groups:
-             try:
-                 lr = self.router_optimizer.param_groups[0]['lr']
-             except (IndexError, KeyError):
-                 self.logger.warning("Could not retrieve learning rate from router optimizer.")
-
-        # Prepare metrics dictionary
-        log_data = {
+        
+        # Prepare raw metrics (no visualizations)
+        log_payload = {
             'train/step': step,
             'train/router_loss': router_loss,
-            'train/step_time_sec': step_time,
-            'train/learning_rate': lr,
+            'train/step_time_sec': time.time() - self.step_start_time,
+            'train/learning_rate': self.router_optimizer.param_groups[0]['lr'] if hasattr(self, 'router_optimizer') and self.router_optimizer else 'N/A',
+            '_raw_alignment': sum(metrics['cluster_alignment'] for metrics in expert_losses.values()) / len(expert_losses) if expert_losses else 0.0,
+            '_raw_confidence': sum(metrics['router_confidence'] for metrics in expert_losses.values()) / len(expert_losses) if expert_losses else 0.0,
+            '_raw_confidences': [conf.item() for conf in expert_losses.values() if torch.is_tensor(conf)]
         }
-
-        # Initialize all metrics before the expert loop
-        total_expert_loss = 0.0  # Initialize here
-        expert_utilization = 0
-        total_confidence = 0
-        alignment_values = []
-        per_step_confidences = []
         
-        for expert_key, metrics in expert_losses.items():
-            # Paper's core metrics (Section 4)
-            total_expert_loss += metrics['total_loss']  # Now safely accumulates
-            expert_confidence = metrics['router_confidence']
-            total_confidence += expert_confidence
-            alignment_values.append(metrics['cluster_alignment'])
-            per_step_confidences.extend(metrics['per_sample_confidence'].cpu().tolist())
-            
-            # Utilization tracking
-            threshold = getattr(self.config, 'expert_utilization_threshold', 0.1)
-            confidences = metrics.get('per_sample_confidence', torch.tensor([0.0])) 
-            utilization_mask = confidences > threshold
-            expert_utilization += utilization_mask.float().mean().item()
-
-        # Paper-recommended aggregate metrics
-        if expert_losses:
-            num_experts = len(expert_losses)
-            avg_alignment = sum(alignment_values) / num_experts
-            avg_confidence = total_confidence / num_experts
-            
-            log_data.update({
-                'train/avg_expert_loss': total_expert_loss / num_experts if num_experts > 0 else 0.0,
-                'train/avg_router_confidence': avg_confidence,
-                'train/utilization_rate': expert_utilization / num_experts,
-                'train/avg_cluster_alignment': avg_alignment,
-            })
-
-        # WandB logging with paper-aligned visualizations
-        if self.config.wandb_enabled:
-            import wandb
-            
-            # Create specialized table for dynamics plot
-            alignment_confidence_table = wandb.Table(
-                columns=["train/step", "Alignment", "Confidence"],
-                data=[[step, avg_alignment, avg_confidence]]
-            )
-            
-            # Create histogram table with proper format
-            hist_table = wandb.Table(
-                data=[[conf] for conf in per_step_confidences],  # Wrap in list-of-lists
-                columns=["confidence"]
-            )
-            
-            wandb.log({
-                **log_data,
-                'specialization/dynamics': wandb.plot.line(
-                    alignment_confidence_table,
-                    x="train/step",
-                    y=["Alignment", "Confidence"],
-                    title="Specialization Dynamics"
-                ),
-                'train/expert_conf_hist': wandb.plot.histogram(
-                    hist_table,
-                    "confidence",
-                    title="Expert Confidence Distribution"
-                )
-            }, step=step)
-
+        # Non-blocking queue put with pressure monitoring
+        try:
+            self.log_queue.put((log_payload, step), block=False)
+        except queue.Full:
+            self._log_drop_count += 1
+            if self._log_drop_count % 100 == 0:
+                self.logger.warning(f"Dropped {self._log_drop_count} logs (queue full)")
+                
     def _cleanup_training(self):
-        """Post-training cleanup"""
+        """Guaranteed graceful shutdown"""
+        if self.rank == 0:
+            self.logger.info("Finalizing logs...")
+            self.log_queue.join()
+            self.log_queue.put(None)
+            self._log_thread.join(timeout=10)
+            if self._log_thread.is_alive():
+                self.logger.error("Logging thread failed to exit!")
         torch.cuda.empty_cache()
         if self.rank == 0:
             self.logger.info("Training completed successfully")
@@ -896,3 +850,58 @@ class DDMTrainingCoordinator:
         # Ensure all processes wait until rank 0 is done saving (handled within save_ddm_checkpoint)
         synchronize()
         self.logger.info(f"All ranks synchronized after checkpoint attempt for step {step}.")
+
+    def _async_log_worker(self):
+        """Production-grade logging worker with:
+        - Ordered step processing
+        - Memory-bounded queue
+        - Error recovery
+        - Performance monitoring
+        """
+        while True:
+            try:
+                item = self.log_queue.get(timeout=5)
+                if item is None:
+                    self.logger.info("Logging worker received shutdown signal")
+                    break
+                
+                log_data, step = item
+                
+                # Strict ordering enforcement
+                if step <= self._last_logged_step:
+                    self.logger.debug(f"Skipping stale log step {step} (current {self._last_logged_step})")
+                    continue
+                
+                # Defer compute-heavy operations to logger thread
+                alignment_table = wandb.Table(
+                    columns=["train/step", "Alignment", "Confidence"],
+                    data=[[step, log_data.pop('_raw_alignment'), log_data.pop('_raw_confidence')]]
+                )
+                hist_table = wandb.Table(
+                    data=[[conf] for conf in log_data.pop('_raw_confidences')],
+                    columns=["confidence"]
+                )
+                
+                log_data.update({
+                    'specialization/dynamics': wandb.plot.line(
+                        alignment_table,
+                        x="train/step",
+                        y=["Alignment", "Confidence"],
+                        title="Specialization Dynamics"
+                    ),
+                    'train/expert_conf_hist': wandb.plot.histogram(
+                        hist_table,
+                        "confidence",
+                        title="Expert Confidence Distribution"
+                    )
+                })
+                
+                wandb.log(log_data, step=step)
+                self._last_logged_step = step
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.logger.error(f"Logging failed for step {step}: {str(e)}", exc_info=True)
+            finally:
+                self.log_queue.task_done()
