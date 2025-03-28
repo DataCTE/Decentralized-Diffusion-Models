@@ -63,7 +63,7 @@ class DDMDataset(Dataset):
         self._bucket_assignments = None  # Initialize cache
 
         # Add cluster data loading
-        self.cluster_file = os.path.join(self.config.feature_cache_path, "final_clusters.pt")
+        self.cluster_file = os.path.join(self.config.feature_cache_path, "clusters", "final_clusters.pt")
         if not os.path.exists(self.cluster_file):
             raise FileNotFoundError(f"Cluster file {self.cluster_file} missing")
         
