@@ -5,7 +5,7 @@ import logging
 import threading
 from collections import OrderedDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from trainers.expert import wrap_model_with_fsdp, configure_optimizer_for_fsdp
+from utils.fsdp import wrap_model_with_fsdp, configure_optimizer_for_fsdp
 import torch.distributed as dist
 from bitsandbytes.optim import AdamW8bit
 
