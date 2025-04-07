@@ -16,3 +16,4 @@ toml
 faiss-gpu-cu12
 scikit-learn
 scipy
+diffusers
