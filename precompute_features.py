@@ -65,35 +65,39 @@ def setup_distributed():
 
 # --- Dataset for Precomputation ---
 class PrecomputeDataset(Dataset):
-    """Basic dataset to load images and captions."""
+    """Basic dataset to load images and captions from paired files."""
     def __init__(self, config):
         self.root_dir = Path(config.data.dataset_path)
         self.image_files = []
-        self.captions = {} # Maps image filename (without ext) to caption
+        self.caption_files = {} # Maps image path to caption file path
 
-        logger.info(f"Scanning dataset at {self.root_dir}...")
-        # Example: Assume images are in root_dir and captions in root_dir/captions.txt
-        # Adjust this logic based on your actual dataset structure
-        caption_file = self.root_dir / "captions.txt" # Example caption file path
-        try:
-            with open(caption_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    parts = line.strip().split('\t', 1) # Example: image_name.jpg\tCaption text
-                    if len(parts) == 2:
-                        img_name_no_ext = os.path.splitext(parts[0])[0]
-                        self.captions[img_name_no_ext] = parts[1]
-        except FileNotFoundError:
-            logger.warning(f"Caption file not found at {caption_file}. Text features (CLIP/T5) cannot be generated.")
-            self.captions = {}
+        logger.info(f"Scanning dataset at {self.root_dir} for paired image/text files...")
 
         valid_extensions = ('.jpg', '.jpeg', '.png', '.webp')
+        found_images = 0
+        found_captions = 0
+
+        # Iterate through all files in the root directory
         for entry in os.scandir(self.root_dir):
-            if entry.is_file() and entry.name.lower().endswith(valid_extensions):
-                 self.image_files.append(entry.path)
+             if entry.is_file() and entry.name.lower().endswith(valid_extensions):
+                  image_path = entry.path
+                  self.image_files.append(image_path)
+                  found_images += 1
+                  # Look for corresponding .txt file
+                  base_name = os.path.splitext(entry.name)[0]
+                  caption_path = self.root_dir / f"{base_name}.txt"
+                  if caption_path.exists():
+                       self.caption_files[image_path] = str(caption_path) # Store path
+                       found_captions += 1
+                  # else: # No corresponding caption file found for this image
+                  #     self.caption_files[image_path] = None # Or handle differently
 
         logger.info(f"Found {len(self.image_files)} images.")
-        if not self.captions:
-            logger.warning("No captions loaded. CLIP/T5 features will be skipped or use empty strings.")
+        if found_captions < len(self.image_files):
+             logger.warning(f"Found corresponding .txt caption files for {found_captions}/{len(self.image_files)} images.")
+        if not self.caption_files:
+             logger.warning("No paired .txt caption files found. CLIP/T5 features will use empty strings.")
+
 
         # Basic image transform: resize and convert to tensor
         # VAEWrapper expects [-1, 1] range, encoders expect specific formats
@@ -111,7 +115,7 @@ class PrecomputeDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_files[idx]
         img_filename = os.path.basename(img_path)
-        img_name_no_ext = os.path.splitext(img_filename)[0]
+        # img_name_no_ext = os.path.splitext(img_filename)[0] # No longer needed directly
 
         try:
             # Load image as PIL
@@ -122,8 +126,15 @@ class PrecomputeDataset(Dataset):
             logger.error(f"Error loading image {img_path}: {e}. Returning None.")
             img = None # Signal error
 
-        # Get caption, default to empty string if missing or no caption file
-        caption = self.captions.get(img_name_no_ext, "")
+        # Get caption from corresponding .txt file, default to empty string if missing
+        caption = ""
+        caption_path = self.caption_files.get(img_path)
+        if caption_path:
+             try:
+                  with open(caption_path, 'r', encoding='utf-8') as f:
+                       caption = f.read().strip()
+             except Exception as e:
+                  logger.error(f"Error reading caption file {caption_path}: {e}")
 
         # Return raw PIL image, caption, and original path/ID
         return {'image': img, 'caption': caption, 'id': img_filename}
