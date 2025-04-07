@@ -98,9 +98,9 @@ class VAEWrapper:
         x = x.to(self.device, dtype=torch.float32)
         
         # VAE operates in float32
-        latents = self.vae.encode(x).latent_dist.sample()
+        latents = self.vae.encode(x).latent
         
-        # Scale latents *after* sampling
+        # Scale latents *after* sampling/retrieval
         if self.scaling_factor is None:
              raise ValueError("VAE scaling_factor is not set.")
         scaled_latents = latents * self.scaling_factor
