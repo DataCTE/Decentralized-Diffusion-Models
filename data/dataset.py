@@ -13,6 +13,7 @@ from utils.logging import setup_distributed_logger # Correct import
 import math
 from pathlib import Path # Add Path import
 import re
+from typing import Optional
 
 
 def chunks(lst, n):
@@ -613,13 +614,15 @@ class BucketBatchSampler(Sampler):
     """
     Yields batches of indices, ensuring each batch comes from the same bucket.
     Handles distributed training by ensuring each rank gets unique batches.
+    Can optionally filter indices for a specific target expert ID.
     """
-    def __init__(self, dataset: DDMDataset, batch_size: int, shuffle=True, drop_last=True, logger=None):
+    def __init__(self, dataset: DDMDataset, batch_size: int, shuffle=True, drop_last=True, logger=None, target_expert_id: Optional[int] = None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.logger = logger if logger else logging.getLogger(__name__)
+        self.target_expert_id = target_expert_id
 
         # Distributed training setup
         self.rank = 0
@@ -630,7 +633,7 @@ class BucketBatchSampler(Sampler):
 
         # Get bucket assignments (this triggers loading if not already done)
         try:
-            assignments = self.dataset.bucket_assignments
+            bucket_assignments = self.dataset.bucket_assignments
         except FileNotFoundError:
             self.logger.error("Bucket assignments not found. Cannot use BucketBatchSampler.")
             raise
@@ -638,38 +641,77 @@ class BucketBatchSampler(Sampler):
             self.logger.error(f"Error loading bucket assignments: {e}")
             raise
 
-        self.num_buckets = assignments.max().item() + 1
+        self.num_buckets = bucket_assignments.max().item() + 1
         self.logger.info(f"Sampler Rank {self.rank}: Found {self.num_buckets} buckets.")
 
         # Group indices by bucket
         self.indices_by_bucket = defaultdict(list)
-        for idx, bucket_id in enumerate(assignments.tolist()):
+        for idx, bucket_id in enumerate(bucket_assignments.tolist()):
              self.indices_by_bucket[bucket_id].append(idx)
 
-        # Prepare batches for each bucket
+        # Filter indices by target_expert_id if provided
+        if self.target_expert_id is not None:
+             self.logger.info(f"Sampler Rank {self.rank}: Filtering indices for target expert ID: {self.target_expert_id}")
+             try:
+                  cluster_assignments = self.dataset.cluster_assignments # Load cluster assignments
+                  filtered_indices_by_bucket = defaultdict(list)
+                  original_count = 0
+                  filtered_count = 0
+                  for bucket_id, indices in self.indices_by_bucket.items():
+                       original_count += len(indices)
+                       # Ensure cluster_assignments covers all indices
+                       max_idx_in_bucket = max(indices) if indices else -1
+                       if max_idx_in_bucket >= len(cluster_assignments):
+                            self.logger.error(f"Index {max_idx_in_bucket} in bucket {bucket_id} is out of bounds for cluster assignments (size: {len(cluster_assignments)}). Cannot filter.")
+                            # Decide how to handle: skip bucket, raise error? Let's skip for now.
+                            continue # Skip this bucket if indices are invalid
+
+                       # Filter indices based on cluster assignment
+                       expert_indices = [
+                            idx for idx in indices if cluster_assignments[idx].item() == self.target_expert_id
+                       ]
+                       filtered_indices_by_bucket[bucket_id] = expert_indices
+                       filtered_count += len(expert_indices)
+                  self.indices_by_bucket = filtered_indices_by_bucket # Overwrite with filtered indices
+                  self.logger.info(f"Sampler Rank {self.rank}: Filtering complete. Kept {filtered_count}/{original_count} samples for expert {self.target_expert_id}.")
+             except FileNotFoundError:
+                  self.logger.error("Cluster assignments not found. Cannot filter for expert.")
+                  raise
+             except Exception as e:
+                  self.logger.error(f"Error loading or filtering cluster assignments: {e}")
+                  raise
+
+        # Prepare batches for each bucket using the (potentially filtered) indices
         self.batches_by_bucket = defaultdict(list)
         self.num_batches = 0
+        total_samples_this_rank = 0 # Track samples assigned to this rank
         for bucket_id in range(self.num_buckets):
-            indices = self.indices_by_bucket[bucket_id]
+            indices = self.indices_by_bucket[bucket_id] # Now uses filtered indices if applicable
+            if not indices: # Skip empty buckets (especially after filtering)
+                 continue
+
             if self.shuffle:
                 random.shuffle(indices) # Shuffle within bucket
 
             bucket_batches = list(chunks(indices, self.batch_size))
 
             # Handle drop_last for the bucket
-            if self.drop_last and len(indices) % self.batch_size != 0:
+            if self.drop_last and len(indices) % self.batch_size != 0 and len(bucket_batches) > 0:
                 bucket_batches = bucket_batches[:-1]
 
             # Distribute batches across ranks
-            # Each rank processes roughly 1/world_size of the batches per bucket
             num_bucket_batches = len(bucket_batches)
             batches_for_this_rank = bucket_batches[self.rank : num_bucket_batches : self.world_size]
 
             self.batches_by_bucket[bucket_id] = batches_for_this_rank
             self.num_batches += len(batches_for_this_rank)
+            samples_in_batches_this_rank = sum(len(b) for b in batches_for_this_rank)
+            total_samples_this_rank += samples_in_batches_this_rank
 
+            # Adjusted Logging
             if self.rank == 0: # Log bucket info from rank 0
-                 self.logger.info(f"Bucket {bucket_id}: {len(indices)} samples -> {num_bucket_batches} total batches -> {len(batches_for_this_rank)} batches for rank 0.")
+                 log_expert_id = f" (Expert {self.target_expert_id})" if self.target_expert_id is not None else ""
+                 self.logger.info(f"Bucket {bucket_id}{log_expert_id}: {len(indices)} samples -> {num_bucket_batches} total batches -> {len(batches_for_this_rank)} batches ({samples_in_batches_this_rank} samples) for rank 0.")
 
         # Create the final list of all batches for this rank for the epoch
         self.epoch_batches = []
@@ -680,46 +722,47 @@ class BucketBatchSampler(Sampler):
         if self.shuffle:
             random.shuffle(self.epoch_batches)
 
-        self.logger.info(f"Sampler Rank {self.rank}: Total batches for this rank per epoch: {self.num_batches}")
-
+        self.logger.info(f"Sampler Rank {self.rank}: Total batches: {self.num_batches}. Total samples assigned: {total_samples_this_rank}.")
+        # Sanity check: if num_batches is 0 but total_samples > 0, batch_size might be too large or drop_last issue.
+        if self.num_batches == 0 and total_samples_this_rank > 0:
+             self.logger.warning(f"Sampler Rank {self.rank}: No batches generated, but {total_samples_this_rank} samples were assigned. Check batch_size ({self.batch_size}) vs samples per bucket and drop_last setting.")
+        elif self.num_batches == 0 and total_samples_this_rank == 0:
+             self.logger.warning(f"Sampler Rank {self.rank}: No batches generated and no samples assigned. This rank might not have data for this expert or dataset is empty.")
 
     def __iter__(self):
-        # If shuffling epoch-to-epoch is desired, re-shuffle here
-        if self.shuffle:
-            # Regenerate self.epoch_batches by reshuffling within buckets and then across buckets
-            self.epoch_batches = []
-            for bucket_id in range(self.num_buckets):
-                indices = self.indices_by_bucket[bucket_id]
+        # Re-generates batches for the epoch, shuffling within buckets if self.shuffle is True
+        # Uses self.indices_by_bucket which might have been filtered in __init__
+        self.epoch_batches = []
+        for bucket_id in range(self.num_buckets):
+            indices = self.indices_by_bucket[bucket_id] # Use potentially filtered indices
+            if not indices: continue # Skip empty bucket
+
+            if self.shuffle:
                 random.shuffle(indices) # Reshuffle indices within bucket
-                bucket_batches = list(chunks(indices, self.batch_size))
-                if self.drop_last and len(indices) % self.batch_size != 0:
-                    bucket_batches = bucket_batches[:-1]
-                batches_for_this_rank = bucket_batches[self.rank : len(bucket_batches) : self.world_size]
-                self.epoch_batches.extend(batches_for_this_rank)
-            # Reshuffle the order of all batches for this rank
+            bucket_batches = list(chunks(indices, self.batch_size))
+            if self.drop_last and len(indices) % self.batch_size != 0 and len(bucket_batches) > 0:
+                bucket_batches = bucket_batches[:-1]
+
+            # Distribute batches across ranks for this epoch
+            num_bucket_batches = len(bucket_batches)
+            batches_for_this_rank = bucket_batches[self.rank : num_bucket_batches : self.world_size]
+            self.epoch_batches.extend(batches_for_this_rank)
+
+        # Reshuffle the order of all batches for this rank
+        if self.shuffle:
             random.shuffle(self.epoch_batches)
 
-        return iter(self.epoch_batches)
+        # Log if the iterator is empty for this rank
+        if not self.epoch_batches and self.rank == 0: # Only log warning once from rank 0
+             self.logger.warning(f"Sampler Rank {self.rank} __iter__: No batches to yield for this epoch.")
+        elif not self.epoch_batches and self.target_expert_id is not None:
+             self.logger.warning(f"Sampler Rank {self.rank} __iter__: No batches to yield for expert {self.target_expert_id} on this rank.")
 
+        return iter(self.epoch_batches)
 
     def __len__(self):
         # Total number of batches yielded by this rank per epoch
         return self.num_batches
-
-    def _load_bucket_assignments(self) -> torch.Tensor:
-        # ... existing code ...
-        try:
-            assignments = self.dataset.bucket_assignments
-        except FileNotFoundError:
-            self.logger.error("Bucket assignments not found. Cannot use BucketBatchSampler.")
-            raise
-        except Exception as e:
-            self.logger.error(f"Error loading bucket assignments: {e}")
-            raise # Correct indentation for raise
-
-        self.num_buckets = assignments.max().item() + 1
-        self.logger.info(f"Sampler Rank {self.rank}: Found {self.num_buckets} buckets.")
-        # ... rest of the method ...
 
 def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     """
@@ -803,7 +846,8 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
             # device=device, # device not used by sampler
             shuffle=True,
             drop_last=True,
-            logger=dataset.logger # Pass dataset's logger
+            logger=dataset.logger, # Pass dataset's logger
+            target_expert_id=expert_idx
         )
 
         # Configure loader with GPU optimizations

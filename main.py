@@ -187,41 +187,53 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
     print(f"Rank {rank}: DDMDataset initialized with {len(dataset)} samples.")
 
 
-    # --- Modify Sampler for DDP ---
-    # Use DistributedSampler to wrap the dataset indices OR adapt BucketBatchSampler
-    # Using DistributedSampler is simpler if bucketing isn't strictly required per batch *during DDP*
-    # If bucketing IS required per batch with DDP, BucketBatchSampler needs adaptation (shown below)
+    # --- Modify Sampler for DDP and Expert Filtering --- START EDIT ---
     print(f"Rank {rank}: Initializing Sampler (Distributed={is_distributed})...")
-    if is_distributed:
-         # Option B: Adapt BucketBatchSampler for DDP (keeps buckets per batch)
+
+    # Determine target_expert_id based on model type
+    target_expert_id_for_sampler = None
+    if cfg.train.model_type == "expert":
+        target_expert_id_for_sampler = getattr(cfg.train, 'expert_id', None)
+        if target_expert_id_for_sampler is None:
+             # This case should be caught by earlier validation, but double-check
+             raise ValueError("Expert training selected but 'expert_id' is missing in config.")
+        print(f"Rank {rank}: Configuring sampler to filter for expert ID: {target_expert_id_for_sampler}")
+
+    # Initialize BucketBatchSampler with potential expert filtering
+    try:
          batch_sampler = BucketBatchSampler(
-              dataset=dataset, 
-              batch_size=cfg.train.batch_size, 
-              shuffle=True, 
+              dataset=dataset,
+              batch_size=cfg.train.batch_size,
+              shuffle=True,
               drop_last=True,
-              logger=dataset.logger # Pass logger
+              logger=dataset.logger, # Pass logger from dataset
+              target_expert_id=target_expert_id_for_sampler # Pass the expert ID or None
          )
-    else:
-         # Non-distributed: use BucketBatchSampler directly
-         batch_sampler = BucketBatchSampler(
-              dataset=dataset, 
-              batch_size=cfg.train.batch_size, 
-              shuffle=True, 
-              drop_last=True,
-              logger=dataset.logger # Pass logger
-         )
+    except Exception as e:
+         # Catch potential errors during sampler init (e.g., missing cluster assignments)
+         print(f"Rank {rank}: ERROR initializing BucketBatchSampler: {e}")
+         raise # Re-raise the error to stop execution
+
+    # --- Modify Sampler for DDP and Expert Filtering --- END EDIT ---
 
 
     print(f"Rank {rank}: Initializing DataLoader...")
     # Ensure collate_fn is correctly referenced if it's a static method
     dataloader = DataLoader(
         dataset,
-        batch_sampler=batch_sampler, # Use the (potentially DDP-aware) BucketBatchSampler
+        batch_sampler=batch_sampler, # Use the configured BucketBatchSampler
         num_workers=getattr(cfg.train, 'num_workers', 4), # Get num_workers safely
         pin_memory=True, # Important for performance
         collate_fn=DDMDataset.collate_fn # Use the static collate function
     )
-    print(f"Rank {rank}: DataLoader initialized with {len(dataloader)} batches for this rank.")
+    # Add a check for dataloader length, especially after filtering
+    loader_len = len(dataloader)
+    print(f"Rank {rank}: DataLoader initialized with {loader_len} batches for this rank.")
+    if loader_len == 0 and cfg.train.model_type == "expert":
+         print(f"Rank {rank}: WARNING - DataLoader is empty for expert {target_expert_id_for_sampler}. This rank might have no data for this expert, or filtering removed all samples.")
+         # Consider if training should proceed or stop if a rank has no data
+    elif loader_len == 0:
+         print(f"Rank {rank}: WARNING - DataLoader is empty. Check dataset and sampler configuration.")
 
     # --- 4. Initialize Model ---
     model = None
