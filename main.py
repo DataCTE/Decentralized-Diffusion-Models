@@ -85,6 +85,26 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
     if not hasattr(cfg.train, 'output_dir'): raise ValueError("Config missing output_dir in [train] section.")
     cfg.train.checkpoint_dir = os.path.join(cfg.train.output_dir, "checkpoints")
 
+    # --- Validate presence of essential [train] config values ---
+    if not hasattr(cfg, 'train'):
+        raise ValueError("Configuration file missing [train] section.")
+
+    required_train_keys = [
+        'output_dir', 'model_type', 'batch_size', 'num_train_steps',
+        'gradient_accumulation_steps',
+        'learning_rate', 'adam_beta1', 'adam_beta2', 'adam_weight_decay', 'adam_epsilon', # <-- Added optimizer keys
+        'lr_scheduler_type',
+        'log_frequency', 'checkpoint_frequency', 'num_diffusion_timesteps',
+        'beta_start', 'beta_end', 'distributed', 'use_mixed_precision'
+        # Add other absolutely essential keys if needed
+    ]
+    missing_keys = [key for key in required_train_keys if not hasattr(cfg.train, key)]
+    if missing_keys:
+        raise ValueError(f"Missing required keys in [train] section of config: {missing_keys}")
+
+    # Specific check for expert_id if type is expert
+    if cfg.train.model_type == "expert" and not hasattr(cfg.train, 'expert_id'):
+         raise ValueError("Missing required key 'expert_id' in [train] section when model_type is 'expert'.")
 
     # --- 2. Setup Environment ---
     rank, world_size, local_rank, device = setup_distributed()
@@ -291,12 +311,13 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         print(f"Rank {rank}: Model wrapped with DDP.")
 
     # --- 5. Initialize Optimizer and Scheduler ---
+    print(f"Rank {rank}: Initializing Optimizer and Scheduler...") # Added print
     optimizer = AdamW(
         model.parameters(),
-        lr=getattr(cfg.train, 'learning_rate', 1e-4),
-        betas=(getattr(cfg.train, 'adam_beta1', 0.9), getattr(cfg.train, 'adam_beta2', 0.999)),
-        weight_decay=getattr(cfg.train, 'adam_weight_decay', 1e-2),
-        eps=getattr(cfg.train, 'adam_epsilon', 1e-8),
+        lr=cfg.train.learning_rate,              # <-- Direct access
+        betas=(cfg.train.adam_beta1, cfg.train.adam_beta2), # <-- Direct access
+        weight_decay=cfg.train.adam_weight_decay, # <-- Direct access
+        eps=cfg.train.adam_epsilon,               # <-- Direct access
     )
 
     # Ensure gradient accumulation steps >= 1
@@ -308,6 +329,7 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         num_warmup_steps=getattr(cfg.train, 'lr_warmup_steps', 0) * grad_accum_steps, # Keep default for optional warmup
         num_training_steps=cfg.train.num_train_steps * grad_accum_steps, # Read directly
     )
+    print(f"Rank {rank}: Optimizer and Scheduler initialized.") # Added print
 
     # --- 6. Initialize Trainer ---
     print(f"Rank {rank}: Initializing {trainer_class.__name__}...")
