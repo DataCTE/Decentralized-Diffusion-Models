@@ -29,6 +29,7 @@ import fire
 import logging
 from data.clustering import DDMClustering
 from utils import dict_to_sns
+import json
 
 # Import local modules (assuming correct paths relative to project root)
 from data.vae import VAEWrapper
@@ -65,49 +66,109 @@ def setup_distributed():
 
 # --- Dataset for Precomputation ---
 class PrecomputeDataset(Dataset):
-    """Basic dataset to load images and captions from paired files."""
+    """
+    Basic dataset to load images and captions.
+    Uses a manifest file for fast loading on large datasets.
+    """
+    MANIFEST_FILENAME = "dataset_manifest.json" # Define manifest filename
+
     def __init__(self, config):
         self.root_dir = Path(config.data.dataset_path)
+        self.manifest_path = self.root_dir / self.MANIFEST_FILENAME
         self.image_files = []
         self.caption_files = {} # Maps image path to caption file path
 
-        logger.info(f"Scanning dataset at {self.root_dir} for paired image/text files...")
+        # --- Manifest Loading/Creation ---
+        if self.manifest_path.exists():
+            logger.info(f"Loading dataset manifest from: {self.manifest_path}")
+            try:
+                with open(self.manifest_path, 'r') as f:
+                    manifest_data = json.load(f)
+                # Populate from manifest
+                for item in manifest_data:
+                    img_path = item.get("image_path")
+                    cap_path = item.get("caption_path")
+                    if img_path: # Basic check
+                        self.image_files.append(img_path)
+                        if cap_path:
+                             # Ensure paths loaded from JSON are absolute or relative to root
+                             # Assuming paths in manifest are stored correctly (e.g., relative to root_dir)
+                             # If they are absolute, use them directly. If relative, resolve them.
+                             # Example: if stored relative: self.caption_files[img_path] = str(self.root_dir / cap_path)
+                             # Assuming they are stored as absolute or directly usable paths for simplicity here:
+                             self.caption_files[img_path] = cap_path
+                logger.info(f"Loaded {len(self.image_files)} image paths from manifest.")
+                if len(self.image_files) == 0:
+                     logger.warning("Manifest loaded, but contains no image paths. Consider deleting it to rescan.")
 
+            except Exception as e:
+                logger.error(f"Error loading manifest file {self.manifest_path}: {e}. Will attempt to rescan.")
+                self._scan_and_create_manifest() # Fallback to scanning if load fails
+        else:
+            logger.info(f"Manifest file not found at {self.manifest_path}. Scanning directory to create it...")
+            self._scan_and_create_manifest()
+
+
+        # --- Image Transforms (optional, consider moving to FeatureGenerator if needed) ---
+        # img_size = getattr(config.data, 'precompute_image_size', 512)
+        # self.transform = transforms.Compose([
+        #     transforms.Resize(img_size, interpolation=transforms.InterpolationMode.LANCZOS),
+        #     transforms.CenterCrop(img_size)
+        # ])
+
+    def _scan_and_create_manifest(self):
+        """Scans the dataset directory, builds the file list, and saves the manifest."""
+        logger.info(f"Scanning dataset directory: {self.root_dir}...")
+        manifest_data = []
         valid_extensions = ('.jpg', '.jpeg', '.png', '.webp')
         found_images = 0
         found_captions = 0
 
-        # Iterate through all files in the root directory
-        for entry in os.scandir(self.root_dir):
+        # Use os.scandir for potentially better performance than glob on some systems
+        # Wrap with tqdm for progress visibility during the initial slow scan
+        iterator = tqdm(os.scandir(self.root_dir), desc="Scanning Dataset")
+        for entry in iterator:
              if entry.is_file() and entry.name.lower().endswith(valid_extensions):
-                  image_path = entry.path
-                  self.image_files.append(image_path)
+                  image_path_str = entry.path # Get the full path string
                   found_images += 1
+
                   # Look for corresponding .txt file
                   base_name = os.path.splitext(entry.name)[0]
                   caption_path = self.root_dir / f"{base_name}.txt"
-                  if caption_path.exists():
-                       self.caption_files[image_path] = str(caption_path) # Store path
+                  caption_path_str = str(caption_path) if caption_path.exists() else None
+
+                  if caption_path_str:
                        found_captions += 1
-                  # else: # No corresponding caption file found for this image
-                  #     self.caption_files[image_path] = None # Or handle differently
 
-        logger.info(f"Found {len(self.image_files)} images.")
-        if found_captions < len(self.image_files):
-             logger.warning(f"Found corresponding .txt caption files for {found_captions}/{len(self.image_files)} images.")
-        if not self.caption_files:
-             logger.warning("No paired .txt caption files found. CLIP/T5 features will use empty strings.")
+                  # Add to manifest structure
+                  manifest_data.append({
+                       "image_path": image_path_str,
+                       "caption_path": caption_path_str
+                  })
+                  # Also populate the instance attributes directly during scan
+                  self.image_files.append(image_path_str)
+                  if caption_path_str:
+                      self.caption_files[image_path_str] = caption_path_str
 
+        logger.info(f"Scan complete. Found {found_images} images.")
+        if found_captions < found_images:
+             logger.warning(f"Found corresponding .txt caption files for {found_captions}/{found_images} images.")
+        if not found_captions:
+             logger.warning("No paired .txt caption files found.")
 
-        # Basic image transform: resize and convert to tensor
-        # VAEWrapper expects [-1, 1] range, encoders expect specific formats
-        # We load PIL images and let each extractor handle its required transform
-        img_size = getattr(config.data, 'precompute_image_size', 512) # Add a config option if needed
-        self.transform = transforms.Compose([
-            transforms.Resize(img_size, interpolation=transforms.InterpolationMode.LANCZOS),
-            transforms.CenterCrop(img_size)
-        ])
+        # Save the manifest
+        if not self.image_files:
+             logger.warning("No images found during scan. Manifest file will not be created.")
+             return
 
+        try:
+            logger.info(f"Saving dataset manifest to: {self.manifest_path}")
+            with open(self.manifest_path, 'w') as f:
+                json.dump(manifest_data, f, indent=2) # Use indent for readability
+            logger.info("Manifest file saved successfully.")
+        except Exception as e:
+            logger.error(f"Error saving manifest file {self.manifest_path}: {e}")
+            # Proceed without manifest if saving fails, but log error
 
     def __len__(self):
         return len(self.image_files)
@@ -115,18 +176,14 @@ class PrecomputeDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.image_files[idx]
         img_filename = os.path.basename(img_path)
-        # img_name_no_ext = os.path.splitext(img_filename)[0] # No longer needed directly
 
         try:
-            # Load image as PIL
             img = Image.open(img_path).convert('RGB')
-            # Apply transform here if decided it's needed before feature extraction
-            # img = self.transform(img)
         except Exception as e:
-            logger.error(f"Error loading image {img_path}: {e}. Returning None.")
+            # Log specific error and path for easier debugging
+            logger.error(f"Error loading image {img_path} (index {idx}): {e}. Returning None.")
             img = None # Signal error
 
-        # Get caption from corresponding .txt file, default to empty string if missing
         caption = ""
         caption_path = self.caption_files.get(img_path)
         if caption_path:
@@ -134,9 +191,9 @@ class PrecomputeDataset(Dataset):
                   with open(caption_path, 'r', encoding='utf-8') as f:
                        caption = f.read().strip()
              except Exception as e:
-                  logger.error(f"Error reading caption file {caption_path}: {e}")
+                  logger.error(f"Error reading caption file {caption_path} for image {img_path}: {e}")
+                  # Keep caption as "" if reading fails
 
-        # Return raw PIL image, caption, and original path/ID
         return {'image': img, 'caption': caption, 'id': img_filename}
 
 # --- Feature Generator ---
