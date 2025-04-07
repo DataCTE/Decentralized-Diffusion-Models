@@ -304,8 +304,12 @@ class FeatureGenerator:
     def _extract_batch_vae(self, images_pil: list):
         """Encodes a batch of PIL images into latents."""
         if not self.vae: return None
-        # VAEWrapper expects [-1, 1] normalized tensors.
+        # Define target size (consistent input for VAE)
+        vae_input_size = self.config.model.router_input_size * self.config.data.vae_downsample_factor # e.g., 32 * 32 = 1024
+
+        # VAEWrapper expects [-1, 1] normalized tensors. Resize added.
         preprocess = transforms.Compose([
+            transforms.Resize((vae_input_size, vae_input_size), interpolation=transforms.InterpolationMode.LANCZOS), # Added Resize
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]) # Normalize to [-1, 1]
         ])
@@ -313,34 +317,52 @@ class FeatureGenerator:
             # Filter out None images before preprocessing
             valid_images = [img for img in images_pil if img is not None]
             if not valid_images: return None # Skip if no valid images in batch
-            img_tensors = torch.stack([preprocess(img) for img in valid_images]).to(self.device)
+
+            # Preprocess only valid images
+            img_tensors_list = []
+            for img in valid_images:
+                 try:
+                      img_tensors_list.append(preprocess(img))
+                 except Exception as preprocess_e:
+                      # Log error if a specific image fails preprocessing (e.g., corrupt image data after loading)
+                      logger.error(f"Error preprocessing one image in batch: {preprocess_e}. Skipping this image.")
+                      img_tensors_list.append(None) # Add a placeholder
+
+            # Filter out None tensors resulting from preprocessing errors
+            valid_img_tensors = [t for t in img_tensors_list if t is not None]
+            if not valid_img_tensors:
+                 logger.warning("No images in batch could be preprocessed successfully.")
+                 return None # If all preprocessing failed
+
+            # Stack only the successfully preprocessed tensors
+            img_tensors = torch.stack(valid_img_tensors).to(self.device)
 
             with torch.no_grad():
                 # Precision handled within VAEWrapper encode
                 latents = self.vae.encode(img_tensors)
 
-            # Need to handle batches where some images failed to load
-            # Create a full-size placeholder and fill valid latents
-            full_latents = None
-            if len(valid_images) < len(images_pil):
-                 # Determine latent shape from the first valid latent
-                 if latents.shape[0] > 0:
-                      latent_c, latent_h, latent_w = latents.shape[1:]
-                      full_latents = torch.zeros(len(images_pil), latent_c, latent_h, latent_w, dtype=latents.dtype)
-                      valid_indices_iter = iter(range(len(valid_images)))
-                      for i in range(len(images_pil)):
-                           if images_pil[i] is not None:
-                                valid_idx = next(valid_indices_iter)
-                                full_latents[i] = latents[valid_idx]
-                      # else: latents remain zeros (placeholder for failed image)
-                 else: # All images failed to preprocess/encode? Return None
-                      return None
-            else: # All images were valid
-                 full_latents = latents
+            # --- Handle batches where some images failed loading OR preprocessing ---
+            # Create a full-size placeholder based on the first valid latent's shape
+            latent_c, latent_h, latent_w = latents.shape[1:]
+            full_latents = torch.zeros(len(images_pil), latent_c, latent_h, latent_w, dtype=latents.dtype, device='cpu') # Create on CPU directly
 
-            return full_latents.cpu() # Return on CPU
+            valid_latent_idx = 0
+            valid_tensor_indices_iter = iter(range(len(valid_img_tensors))) # Iterator for successfully processed tensors
+
+            for i in range(len(images_pil)):
+                # Check if original PIL image was valid AND preprocessing succeeded
+                if images_pil[i] is not None and img_tensors_list[valid_latent_idx] is not None:
+                    processed_idx = next(valid_tensor_indices_iter)
+                    full_latents[i] = latents[processed_idx].cpu()
+                # Increment index corresponding to the original images_pil list
+                if images_pil[i] is not None:
+                    valid_latent_idx += 1
+
+            return full_latents # Return on CPU
+
         except Exception as e:
-            logger.error(f"[Rank {self.rank}] Error in VAE batch encoding: {e}")
+            # Broader catch for unexpected errors during the process
+            logger.error(f"[Rank {self.rank}] Error in VAE batch encoding: {e}", exc_info=True) # Log traceback
             # Return None to indicate batch failure
             return None
 

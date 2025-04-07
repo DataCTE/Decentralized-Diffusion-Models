@@ -5,75 +5,55 @@ from transformers import T5EncoderModel, T5Tokenizer, AutoTokenizer, AutoConfig
 from transformers.utils import logging as hf_logging
 import logging
 import os
+import torch.nn as nn # Added for type hinting
+from types import SimpleNamespace # Added for type hinting
 
 logger = logging.getLogger(__name__)
 hf_logging.set_verbosity_error() # Suppress HuggingFace warnings unless error
 
-class T5TextEncoder:
+class T5TextEncoder(nn.Module):
     """Text encoder using T5 for text conditioning in diffusion models"""
-    def __init__(self, device, config):
+    def __init__(self, device: torch.device, config: SimpleNamespace):
+        super().__init__()
         self.device = device
         self.config = config # Store the whole config
-        # Use float32 by default, only use float16 if explicitly enabled AND cuda available
-        self.precision = torch.float16 if getattr(config, 'use_mixed_precision', False) and torch.cuda.is_available() else torch.float32
-        self.t5_model_name_or_path = getattr(config, 't5_model_name', 'google/flan-t5-xl') # Use configured name or default
+        self.model_name = config.t5_model_name
+        self.max_length = config.t5_max_token_length
+        self.precision = torch.float16 if config.use_mixed_precision else torch.float32
 
-        # Handle model loading paths
-        if not os.path.exists(self.t5_model_name_or_path) and "/" in self.t5_model_name_or_path:
-            logger.info(f"Loading T5 from HuggingFace: {self.t5_model_name_or_path}")
-        else:
-            logger.info(f"Loading T5 from local path: {self.t5_model_name_or_path}")
-
+        logger.info(f"Loading T5 from HuggingFace: {self.model_name}")
         try:
-            # Load T5 config first
-            t5_config = AutoConfig.from_pretrained(self.t5_model_name_or_path)
-
-            # Use device_map='auto' for better memory management or specify device
-            # Note: device_map might conflict with manual .to(device) later if not careful
-            load_device = 'auto' if torch.cuda.device_count() > 1 else self.device
-            # Load in float32, then potentially cast
+            # Explicitly set device_map to the target device
             self.model = T5EncoderModel.from_pretrained(
-                self.t5_model_name_or_path,
-                config=t5_config,
-                device_map=load_device,
-                # torch_dtype=self.precision, # Apply precision later
-                low_cpu_mem_usage=True, # Useful for large models
+                self.model_name,
+                torch_dtype=self.precision,
+                low_cpu_mem_usage=True, # Recommended for large models
+                device_map=self.device # <--- Force model parts to this device
             )
+            self.model.eval() # Set to evaluation mode
+            for param in self.model.parameters():
+                param.requires_grad = False # Freeze parameters
 
-            # Move to target device if device_map didn't handle it fully
-            if load_device != self.device and not isinstance(load_device, dict):
-                 self.model.to(self.device)
-
-            # Apply precision
-            if self.precision == torch.float16:
-                self.model.half()
-
-            self.model.eval()
-
-            # Load tokenizer - try specialized T5 tokenizer and AutoTokenizer
+            # Load tokenizer
             try:
-                self.tokenizer = T5Tokenizer.from_pretrained(self.t5_model_name_or_path)
-                logger.info("Loaded specialized T5 tokenizer")
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             except Exception:
                 logger.info("Falling back to AutoTokenizer for T5")
-                self.tokenizer = AutoTokenizer.from_pretrained(self.t5_model_name_or_path)
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
-            # Set to evaluation mode and freeze parameters
-            for param in self.model.parameters():
-                param.requires_grad_(False)
+            # Manually ensure model is on the correct device AGAIN after loading,
+            # although device_map should handle it. This is belt-and-suspenders.
+            self.model.to(self.device)
 
             logger.info(f"T5 text encoder loaded successfully in {self.precision} precision.")
 
-            # Store max token length from config or default
-            self.max_length = getattr(config, 't5_max_token_length', 128) # Use specific config name or default
             # Set tokenizer max length if possible
             if hasattr(self.tokenizer, 'model_max_length'):
                  self.tokenizer.model_max_length = self.max_length
 
-
         except Exception as e:
-            logger.error(f"Error loading T5 ({self.t5_model_name_or_path}): {str(e)}")
-            raise RuntimeError(f"Failed to load T5: {str(e)}")
+            logger.error(f"Failed to load T5 model '{self.model_name}': {e}")
+            raise RuntimeError(f"Failed to load T5: {e}")
 
     @torch.no_grad()
     def encode(self, text):
