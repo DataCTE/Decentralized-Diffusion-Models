@@ -32,6 +32,7 @@ expert_guidance_embed = false # Example Flux guidance embed (usually False for b
 [data]
 dataset_path = "/home/alex/workspace/datasets/danbooru2025/" # Root directory of the dataset
 feature_cache_path = "/home/alex/workspace/datasets/danbooru2025/cache" # Where VAE latents, CLIP embeddings etc. are stored
+precompute_batch_size = 16 # <--- Add or adjust this line
 
 # --- Feature Extractor Models ---
 # VAE settings - UPDATED FOR DC-AE f32c32-mix

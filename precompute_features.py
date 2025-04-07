@@ -720,7 +720,7 @@ def main(config_path: str = "config.toml",
 
     if distributed:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False) # No shuffle for precompute
-        precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 128)
+        precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 16)
         dataloader = DataLoader(
             dataset,
             batch_size=precompute_batch_size, # Use dedicated precompute batch size
@@ -731,7 +731,7 @@ def main(config_path: str = "config.toml",
             collate_fn=precompute_collate_fn # Use the custom collate function
         )
     else:
-        precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 128)
+        precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 16)
         dataloader = DataLoader(
             dataset,
             batch_size=precompute_batch_size, # Use dedicated precompute batch size
