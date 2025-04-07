@@ -1,0 +1,84 @@
+# Main Configuration Sections
+[model]
+# Common DDM parameters
+num_clusters = 8 # K: Number of experts/clusters (Should match the final number of partitions after clustering)
+
+# Router Parameters (adjust based on models/router.py)
+router_input_size = 32 # Latent H/W (e.g., 1024px image / vae_downsample_factor 32 = 32) - ADJUST IF IMAGE SIZE CHANGES
+router_patch_size = 2
+router_in_channels = 32 # Should match data.latent_channels
+router_hidden_size = 768
+router_depth = 12
+router_num_heads = 12
+router_mlp_ratio = 4.0
+# router_cond_dim = 768 # Optional: e.g., CLIP pooler output dim (uncomment and set if used)
+
+# Expert Parameters (using Flux/MMDiT structure)
+# These should match FluxParams fields or MMDiT.__init__ kwargs
+expert_in_channels = 128 # Example: latent_channels * patch_size^2 = 32 * 2 * 2 = 128. Verify!
+expert_out_channels = 128 # Example: Verify!
+expert_vec_in_dim = 768 # Example: Dimension of vector 'y' (CLIP pooler)
+expert_context_in_dim = 4096 # Example: Dimension of text context (T5)
+expert_hidden_size = 1792 # Example Flux hidden size
+expert_mlp_ratio = 4.0 # Example Flux MLP ratio
+expert_num_heads = 16 # Example Flux num heads
+expert_depth = 28 # Example Flux depth (double stream blocks)
+expert_depth_single_blocks = 4 # Example Flux depth (single stream blocks)
+expert_axes_dim = [4, 4, 10] # Example Flux axes_dim (check consistency)
+expert_theta = 10000 # Example Flux theta
+expert_qkv_bias = true # Example Flux qkv_bias
+expert_guidance_embed = false # Example Flux guidance embed (usually False for base models)
+
+[data]
+dataset_path = "/path/to/your/dataset" # Root directory of the dataset
+feature_cache_path = "/path/to/feature/cache" # Where VAE latents, CLIP embeddings etc. are stored
+
+# --- Feature Extractor Models ---
+# VAE settings - UPDATED FOR DC-AE f32c32-mix
+vae_model = "mit-han-lab/dc-ae-f32c32-mix-1.0-diffusers" # Set the chosen model
+vae_downsample_factor = 32                          # MUST MATCH model (f32)
+vae_scaling_factor = 0.4552                         # Correct value for f32c32-mix-1.0
+vae_decode_batch_size = 8                           # Optional: Batch size for VAE decoding
+latent_channels = 32                                # MUST MATCH model (c32)
+# Conditioning models (used for precomputation and potentially inference)
+clip_model_name = "openai/clip-vit-large-patch14" # Specify CLIP model used
+t5_model_name = "google/flan-t5-xl"             # Specify T5 model used
+
+# --- Clustering Settings (Informational - Assumes precomputed) ---
+# clustering_model = "dinov2-vitl14" # Model used for clustering (e.g., DINOv2)
+# num_coarse_clusters = 8  # Optional: If using two-stage clustering (matches model.num_clusters)
+# num_fine_clusters = 512  # Optional: If using two-stage clustering
+
+# --- Bucketing Settings (Used by DDMDataset/BucketBatchSampler if enabled) ---
+# Example values for SDXL-like resolutions
+bucket_scale = 8
+bucket_thresholds = { square = [0.9, 1.1], portrait = [0.5, 0.9], landscape = [1.1, 2.0] } # Example thresholds
+# Example buckets (width, height) - adjust based on dataset aspect ratios
+buckets = [
+  [640, 1536], [768, 1344], [832, 1216], [896, 1152], [1024, 1024],
+  [1152, 896], [1216, 832], [1344, 768], [1536, 640]
+]
+
+[train]
+model_type = "expert" # 'expert' or 'router'
+expert_id = 0 # Required if model_type is 'expert', ignored otherwise
+output_dir = "output"
+# checkpoint_dir is derived from output_dir in the script
+seed = 42
+batch_size = 64 # Adjust batch size based on memory usage with new VAE/latent size
+num_train_steps = 100000 # Total training steps
+gradient_accumulation_steps = 1
+max_grad_norm = 1.0 # Optional: Max gradient norm for clipping (e.g., 1.0)
+learning_rate = 1e-4
+adam_beta1 = 0.9
+adam_beta2 = 0.999
+adam_weight_decay = 1e-2
+adam_epsilon = 1e-8
+lr_scheduler_type = "constant" # e.g., "linear", "cosine", "constant"
+lr_warmup_steps = 500
+log_frequency = 100
+checkpoint_frequency = 10000
+num_workers = 4 # Dataloader workers
+use_mixed_precision = true # Enable AMP (Note: VAEWrapper forces float32 for VAE ops)
+distributed = true # Enable distributed training
+num_diffusion_timesteps = 1000 # T

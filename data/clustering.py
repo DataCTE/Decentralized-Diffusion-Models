@@ -3,6 +3,7 @@ import faiss
 from tqdm import tqdm
 import os
 from sklearn.cluster import AgglomerativeClustering
+import numpy as np
 
 class DDMClustering:
     """Implements paper's two-stage clustering from Appendix B and Section 4.1"""
@@ -14,31 +15,27 @@ class DDMClustering:
         self.default_feature_path = "/home/alex/workspace/Decentralized-Diffusion-Models/features"
 
     def cluster(self, features):
-        """Paper's two-stage clustering (Appendix B)"""
-        # Stage 1: Fine-grained k-means
-        kmeans = faiss.Kmeans(
-            features.shape[1], 
-            self.num_fine,
-            niter=100,
-            verbose=False,
-            spherical=True,
-            gpu=True
-        )
-        kmeans.train(features)
+        # Stage 1: Coarse k-means
+        kmeans_coarse = faiss.Kmeans(features.shape[1], self.num_coarse,
+                                   niter=20, spherical=True, gpu=True)
+        kmeans_coarse.train(features)
+        coarse_labels = kmeans_coarse.index.search(features, 1)[1].squeeze()
         
-        # Stage 2: Hierarchical merging
-        agg = AgglomerativeClustering(
-            n_clusters=self.num_coarse,
-            linkage='average',
-            metric='cosine'
-        )
-        agg.fit(kmeans.centroids)
+        # Stage 2: Per-cluster fine clustering
+        fine_centroids = []
+        for i in range(self.num_coarse):
+            cluster_feats = features[coarse_labels == i]
+            kmeans_fine = faiss.Kmeans(cluster_feats.shape[1], self.num_fine,
+                                     niter=50, spherical=True, gpu=True)
+            kmeans_fine.train(cluster_feats)
+            fine_centroids.append(kmeans_fine.centroids)
         
-        # Assign original points to coarse clusters
-        _, fine_labels = kmeans.index.search(features, 1)
-        coarse_labels = agg.labels_[fine_labels.flatten()]
-        
-        return coarse_labels
+        # Combine centroids and create final assignments
+        all_centroids = np.vstack(fine_centroids)
+        index = faiss.IndexFlatIP(all_centroids.shape[1])
+        index.add(all_centroids)
+        _, final_labels = index.search(features, 1)
+        return final_labels.squeeze()
 
     def cluster(self, features_list=None, feature_path=None):
         if features_list is None:

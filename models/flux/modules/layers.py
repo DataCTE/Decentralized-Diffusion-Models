@@ -4,9 +4,8 @@ from dataclasses import dataclass
 import torch
 from einops import rearrange
 from torch import Tensor, nn
-from torch.nn import functional as F
 
-from models.modules.math import attention, rope
+from flux.math import attention, rope
 
 
 class EmbedND(nn.Module):
@@ -243,8 +242,6 @@ class SingleStreamBlock(nn.Module):
 class LastLayer(nn.Module):
     def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
         super().__init__()
-        self.patch_size = patch_size
-        self.out_channels = out_channels
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))

@@ -1,703 +1,289 @@
-"""Inference for Decentralized Diffusion Models"""
-
-import os
 import torch
-import torch.distributed as dist
-import datetime
-import json
-import logging # Import standard logging
-import tqdm
-from queue import Queue
-from threading import Thread
-
-# Import necessary components from the project
-# from config import DDMConfig # Assuming DDMConfig might be replaced by get_config
-from config import get_config
-from models.mmdit import ExpertMMDiT # Keep ExpertMMDiT import
-from models.router import RouterModel
-from data.vae import VAEWrapper
-from data.clip import CLIPTextEncoder # Keep if used for encoding prompts
-from utils.visualization import tensor_to_pil
-from utils.distributed import is_main_process, get_rank, get_world_size, setup_distributed, is_dist_initialized
-from utils.logging import setup_logger, log_images # Keep setup_logger, log_images
+import fire
+import toml
+import os
+import numpy as np
+from PIL import Image
 from types import SimpleNamespace
-from trainers.sampling import ddm_sample, distilled_sample
-from utils.checkpoint import load_model_checkpoint # Assuming a generic loader exists
-from utils.expert_cache import ExpertCacheManager # Assuming cache manager is used
-from models.mmdit import FluxParams # Import if needed by ExpertMMDiT
+from typing import List, Optional
+import glob
 
-# Define the global logger, initialized to None
-logger = None
+# Project imports (adjust paths if necessary)
+from models.router import RouterModel
+from models.expert import ExpertModel
+from sampling.ddm_sampler import DDMSampler
+from data.vae import VAEWrapper # Assuming VAEWrapper for decoding latents
+# Import necessary conditioning modules (e.g., CLIP) - adapt based on actual implementation
+from data.clip import CLIPTextEncoder # Example, adjust if using flux's HFEmbedder directly
+# Helper to load config
+from utils import dict_to_sns, load_model_checkpoint, tensor_to_pil, find_latest_checkpoint
 
-def log_worker(queue):
-    """Background worker thread for logging generated images"""
-    # This function runs in a separate thread. Direct logging using the global logger
-    # might be problematic. Using print for internal errors is safer here,
-    # or implement a thread-safe logging queue if needed.
-    while True:
-        item = queue.get()
-        if item is None:  # Sentinel to stop the thread
-            break
-        try:
-            log_to_wandb_async(item)
-        except Exception as e:
-            print(f"Error in logging worker: {str(e)}") # Keep print for thread safety
-        finally:
-            queue.task_done()
-
-def log_to_wandb_async(data):
-    """Logs data to WandB asynchronously (called by worker)."""
-    # This function also runs in the worker thread.
+# Helper functions (potentially move to a utils file later)
+def load_model_checkpoint(model: torch.nn.Module, filepath: str, device: torch.device):
+    """Loads state dict from a checkpoint, handling potential 'module.' prefix."""
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Checkpoint file not found at {filepath}")
     try:
-        import wandb
-        if wandb.run:
-            # Assuming log_images or wandb.log is thread-safe enough for this use case.
-            # If issues arise, consider passing data back to the main thread for logging.
-            # Example: log wandb.Image directly if data contains PIL images
-            step = data.get('step', None)
-            log_payload = {k: v for k, v in data.items() if k not in ['step']} # Prepare data for wandb.log
-            wandb.log(log_payload, step=step)
-        # else:
-        #    print("WandB run not active, cannot log data.")
-    except ImportError:
-        # print("WandB not installed, cannot log data.")
-        pass
-    except Exception as e:
-        print(f"Error during WandB logging: {str(e)}") # Keep print for thread safety
-
-# Modify setup_environment to initialize the *global* logger
-def setup_environment(config):
-    """Setup logging, directories, distributed env, and environment variables"""
-    global logger # Declare intention to modify the global logger
-
-    rank = 0
-    world_size = 1
-    log_file = None
-
-    # Attempt distributed setup first if configured or multiple GPUs detected
-    use_distributed = getattr(config, 'distributed_inference', torch.cuda.device_count() > 1)
-    if use_distributed:
-        try:
-            # setup_distributed should return rank and world_size
-            rank, world_size = setup_distributed()
-        except Exception as e:
-            # Log error using a temporary basic logger before the main one is set up
-            logging.basicConfig(level=logging.INFO)
-            logging.error(f"Failed to setup distributed environment: {e}", exc_info=True)
-            # Decide whether to raise or fallback to single process
-            raise RuntimeError("Distributed setup failed") from e
-    else:
-        # Ensure CUDA device is set even in non-distributed mode if available
-        if torch.cuda.is_available():
-            torch.cuda.set_device(0)
-
-
-    # Setup logger AFTER determining rank and world_size
-    if is_main_process(rank): # Use rank directly
-        # Only create log files and directories on main process
-        log_dir = getattr(config, 'log_dir', os.path.join(config.output_dir, 'logs'))
-        os.makedirs(log_dir, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_file = os.path.join(log_dir, f"inference-{timestamp}-rank{rank}.log")
-
-        # Also create sample directory here
-        sample_dir = getattr(config, 'sample_dir', os.path.join(config.output_dir, 'samples'))
-        os.makedirs(sample_dir, exist_ok=True)
-
-    # Use the centralized setup_logger function to initialize the global logger
-    logger = setup_logger(
-        name="DDMInference", # Consistent logger name
-        output_dir=config.output_dir, # Pass output_dir for potential file logging path
-        log_to_console=True, # Keep console logging for inference
-        level=logging.DEBUG if getattr(config, 'verbose_logging', False) else logging.INFO, # Control level via config
-        rank=rank,
-        world_size=world_size
-        # log_file=log_file # setup_logger can handle file path creation based on output_dir and rank
-    )
-
-    logger.info(f"Environment setup complete. Rank: {rank}, World Size: {world_size}")
-    if is_main_process(rank):
-        logger.info(f"Logging to console and potentially to file in {config.output_dir}/logs")
-        sample_dir = getattr(config, 'sample_dir', os.path.join(config.output_dir, 'samples'))
-        logger.info(f"Saving samples to: {sample_dir}")
-
-
-    # Initialize wandb if configured (only on main process)
-    log_queue = None
-    if is_main_process(rank) and getattr(config, 'wandb_enabled', False):
-        try:
-            import wandb
-            # Check if already initialized (e.g., in testing scenarios)
-            if wandb.run is None:
-                run_name = getattr(config, 'wandb_run_name', f"ddm-inference-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}")
-                wandb.init(
-                    project=getattr(config, 'wandb_project', "decentralized-diffusion-inference"),
-                    config=vars(config), # Log the config
-                    name=run_name,
-                    dir=getattr(config, 'wandb_dir', config.output_dir), # Set wandb dir
-                    settings=wandb.Settings(start_method="thread") # Use thread start method
-                )
-                logger.info(f"Initialized WandB logging: {run_name} (URL: {wandb.run.get_url()})")
-            else:
-                 logger.warning("WandB run already initialized.")
-
-            # Start background logging thread
-            log_queue = Queue()
-            log_thread = Thread(target=log_worker, args=(log_queue,), daemon=True)
-            log_thread.start()
-            logger.info("Started background WandB logging thread.")
-        except ImportError:
-             logger.error("WandB is enabled in config, but 'wandb' package is not installed. Disabling WandB logging.")
-             config.wandb_enabled = False # Ensure it's disabled if import fails
-        except Exception as e:
-             logger.error(f"Failed to initialize WandB: {e}", exc_info=True)
-             config.wandb_enabled = False
-
-    # Return rank, world_size, device, and log_queue
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    return rank, world_size, device, log_queue
-
-
-# Ensure load_models uses the global logger
-def load_models(config, device, checkpoint_dir, cache_manager=None):
-    """Loads the router, experts (via cache/builder), VAE, and CLIP."""
-    global logger # Access the global logger
-
-    logger.info(f"Loading models. Checkpoint dir: {checkpoint_dir}")
-
-    # --- Find latest checkpoint (common logic for router/experts) ---
-    # This assumes checkpoints are saved with a pattern like ddm_step_XXXX.pt
-    # If router and experts are saved separately, adjust finding logic.
-    latest_checkpoint_path = None
-    step = 0
-    if os.path.isdir(checkpoint_dir):
-        try:
-            checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith(".pt") and f.startswith("ddm_step_")]
-            if checkpoints:
-                checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-                latest_checkpoint_path = os.path.join(checkpoint_dir, checkpoints[-1])
-                step = int(checkpoints[-1].split('_')[-1].split('.')[0])
-                logger.info(f"Found latest DDM checkpoint: {latest_checkpoint_path} (Step: {step})")
-            else:
-                 logger.warning(f"No DDM checkpoints (ddm_step_*.pt) found in {checkpoint_dir}. Models might not be loaded.")
-        except Exception as e:
-             logger.error(f"Error finding latest checkpoint in {checkpoint_dir}: {e}", exc_info=True)
-             # Decide if this is critical
-             # raise RuntimeError("Failed to find valid checkpoint.") from e
-    else:
-        logger.error(f"Checkpoint directory not found: {checkpoint_dir}")
-        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
-
-
-    # --- Load VAE ---
-    try:
-        logger.info("Loading VAE...")
-        vae = VAEWrapper(device, config)
-        _ = vae.vae # Trigger lazy loading
-        logger.info("VAE loaded successfully.")
-    except Exception as e:
-        logger.exception("Failed to load VAE.")
-        raise RuntimeError("VAE loading failed, cannot proceed.") from e
-
-    # --- Load CLIP ---
-    try:
-        logger.info("Loading CLIP...")
-        # Assuming CLIPTextEncoder takes device and config
-        clip = CLIPTextEncoder(device, config)
-        logger.info("CLIP loaded successfully.")
-    except Exception as e:
-        logger.exception("Failed to load CLIP.")
-        raise RuntimeError("CLIP loading failed, cannot proceed.") from e
-
-
-    # --- Load Router ---
-    # Initialize router (FSDP wrapping happens inside wrap_model_with_fsdp if needed)
-    logger.info("Initializing Router model...")
-    router_model = RouterModel(config) # No .to(device) yet if using FSDP loading
-
-    # Use centralized checkpoint loading function
-    if latest_checkpoint_path:
-        logger.info(f"Loading Router state from {latest_checkpoint_path}...")
-        try:
-            # Assuming load_model_checkpoint handles FSDP state loading correctly
-            router_metadata = load_model_checkpoint(
-                model=router_model,
-                path=latest_checkpoint_path,
-                model_key='router_model_state', # Key in the checkpoint file
-                device=device, # Target device
-                is_fsdp=getattr(config, 'use_fsdp', False), # Check if FSDP was used
-                rank=get_rank(),
-                world_size=get_world_size()
-            )
-            if router_metadata:
-                logger.info(f"Router loaded successfully (Step: {router_metadata.get('step', 'N/A')}).")
-            else:
-                 logger.warning(f"Router state not found or failed to load from {latest_checkpoint_path}.")
-        except Exception as e:
-             logger.error(f"Error loading router state from checkpoint: {e}", exc_info=True)
-             # Decide if loading failure is critical
-    else:
-        logger.warning("No checkpoint found, router weights are uninitialized.")
-
-
-    # --- Setup Expert Loading ---
-    # We don't load all experts at once. Instead, create builders or use cache manager.
-    expert_models = {} # Dictionary to hold models or builders
-
-    def create_expert_loader(expert_idx):
-        """Factory function to load a single expert model on demand."""
-        global logger # Access global logger
-        logger.info(f"Factory: Creating/Loading Expert {expert_idx}...")
-        # Initialize the expert model structure
-        # Important: Ensure FluxParams or similar config is correctly passed if needed
-        expert_cfg_ns = SimpleNamespace(**vars(config)) # Create namespace if needed
-        expert_cfg_ns.in_channels = config.latent_channels # Ensure correct channels
-
-        # Use FluxParams dataclass if ExpertMMDiT expects it
-        try:
-             flux_params = FluxParams(**vars(expert_cfg_ns)) # Adapt based on FluxParams definition
-             base_expert = ExpertMMDiT(flux_params)
-        except TypeError as te:
-             logger.error(f"TypeError initializing ExpertMMDiT {expert_idx}. Check config/FluxParams: {te}")
-             # Fallback or re-raise
-             base_expert = ExpertMMDiT(expert_cfg_ns) # Try with namespace if dataclass fails
-
-        # Load state dict from the main checkpoint file if found
-        if latest_checkpoint_path:
-            logger.debug(f"Factory: Loading Expert {expert_idx} state from {latest_checkpoint_path}...")
-            try:
-                expert_metadata = load_model_checkpoint(
-                    model=base_expert,
-                    path=latest_checkpoint_path,
-                    model_key=f'expert_models_state.{expert_idx}', # Key for this specific expert
-                    device=device, # Load directly to target device
-                    is_fsdp=getattr(config, 'use_fsdp', False),
-                    rank=get_rank(),
-                    world_size=get_world_size()
-                )
-                if expert_metadata:
-                     logger.debug(f"Factory: Expert {expert_idx} loaded successfully.")
-                else:
-                     logger.warning(f"Factory: Expert {expert_idx} state not found or failed to load from checkpoint.")
-            except Exception as e:
-                 logger.error(f"Factory: Error loading expert {expert_idx} state: {e}", exc_info=True)
-                 # Model remains uninitialized if loading fails
+        checkpoint = torch.load(filepath, map_location=device)
+        # Determine the actual state dict
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint.get('model', checkpoint)))
+            if not isinstance(state_dict, dict): state_dict = checkpoint # Assume checkpoint is the state_dict
+        elif isinstance(checkpoint, torch.nn.Module):
+            state_dict = checkpoint.state_dict()
         else:
-             logger.warning(f"Factory: No checkpoint for Expert {expert_idx}, weights uninitialized.")
+             raise TypeError(f"Unsupported checkpoint format at {filepath}.")
 
-        # FSDP Wrapping should happen *outside* the factory if using cache manager,
-        # or here if loading directly without cache manager but using FSDP.
-        # Let's assume cache manager handles FSDP wrapping for now.
-        return base_expert.to(device).eval() # Ensure eval mode and correct device
+        # Handle 'module.' prefix
+        adjusted_state_dict = {}
+        for k, v in state_dict.items():
+            name = k[len("module."):] if k.startswith("module.") else k
+            adjusted_state_dict[name] = v
 
-    # Populate the expert_models dictionary with loader functions
-    for i in range(config.num_experts):
-        expert_models[i] = create_expert_loader # Store the factory function
-
-    logger.info(f"Setup complete for loading {config.num_experts} experts on demand.")
-
-    return router_model.to(device).eval(), expert_models, vae, clip # Ensure router is on device and eval mode
-
-# Ensure load_distilled_model uses the global logger
-def load_distilled_model(config, device, checkpoint_path):
-    """Load distilled model if available"""
-    global logger
-    # ... (rest of the function remains the same, using logger) ...
-
-# Ensure load_prompts uses the global logger
-def load_prompts(prompts_file=None):
-    """Load text prompts for inference"""
-    global logger
-    # ... (rest of the function remains the same, using logger) ...
-
-# Ensure save_images uses the global logger AND returns paths
-def save_images(images, output_dir, prefix="sample"):
-    """Save generated images to disk and return their paths."""
-    global logger
-    saved_paths = [] # List to store paths of saved images
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        for i, image in enumerate(images):
-            # Use 8-digit padding for step consistency if prefix includes step
-            image_filename = f"{prefix}_{i:04d}.png"
-            image_path = os.path.join(output_dir, image_filename)
-            image.save(image_path)
-            saved_paths.append(image_path) # Store the path
-
-        if saved_paths: # Log only if images were actually saved
-             logger.info(f"Saved {len(saved_paths)} images to {output_dir}")
-        else:
-             logger.warning(f"No images were provided to save_images for dir: {output_dir}")
-
+        missing_keys, unexpected_keys = model.load_state_dict(adjusted_state_dict, strict=False)
+        if missing_keys: print(f"Warning: Missing keys when loading {model.__class__.__name__}: {missing_keys}")
+        if unexpected_keys: print(f"Warning: Unexpected keys when loading {model.__class__.__name__}: {unexpected_keys}")
+        print(f"Successfully loaded weights for {model.__class__.__name__} from {filepath}")
     except Exception as e:
-         logger.error(f"Error saving images to {output_dir}: {e}", exc_info=True)
-         # Depending on severity, you might want to re-raise or just return empty list
+        print(f"Error loading checkpoint for {model.__class__.__name__} from {filepath}: {e}")
+        raise e
 
-    return saved_paths # Return the list of paths
+def tensor_to_pil(tensor):
+    """Converts a B C H W tensor in range [-1, 1] to a list of PIL Images."""
+    # Ensure tensor is on CPU and denormalized
+    tensor = tensor.detach().cpu()
+    tensor = (tensor + 1.0) / 2.0 # Denormalize from [-1, 1] to [0, 1]
+    tensor = tensor.clamp(0, 1)
+    # Convert to HWC uint8 format
+    images_np = (tensor.permute(0, 2, 3, 1) * 255).numpy().astype(np.uint8)
+    pil_images = [Image.fromarray(img) for img in images_np]
+    return pil_images
 
-# Ensure get_expert_for_inference uses the global logger (if it needs logging)
-def get_expert_for_inference(expert_idx, expert_models, cache_manager=None):
-    """Get expert model for inference, using cache manager if available"""
-    global logger # Access global logger if needed for logging inside this func
-
-    if cache_manager is None:
-        # Direct access: expert_models dictionary holds builders or pre-loaded models
-        if expert_idx not in expert_models:
-            logger.error(f"Expert index {expert_idx} not found in expert_models dictionary.")
-            return None
-        expert_source = expert_models[expert_idx]
-        if callable(expert_source) and not isinstance(expert_source, torch.nn.Module):
-            # It's a builder function, call it to get the model
-            logger.debug(f"Building expert {expert_idx} directly (no cache).")
-            try:
-                return expert_source(expert_idx) # Call the factory
-            except Exception as e:
-                logger.error(f"Error building expert {expert_idx} directly: {e}", exc_info=True)
-                return None
-        else:
-            # Assume it's already a loaded model
-            return expert_source
-    else:
-        # Use cache manager to retrieve/build expert
-        if expert_idx not in expert_models:
-             logger.error(f"Expert index {expert_idx} not found in expert_models dictionary (required for cache manager).")
-             return None
-
-        builder = expert_models[expert_idx] # Get the builder function
-        if not callable(builder):
-             logger.error(f"Source for expert {expert_idx} is not a callable builder function (required for cache manager).")
-             return None # Cache manager needs the builder function
-
-        # Cache manager handles calling the builder, FSDP wrapping (if configured), device placement etc.
-        try:
-            # Pass the builder function for the specific expert index
-            return cache_manager.get_expert(expert_idx, lambda idx=expert_idx: builder(idx))
-        except Exception as e:
-             logger.error(f"Error getting expert {expert_idx} via cache manager: {e}", exc_info=True)
-             return None
-
-
-# --- run_inference_pipeline ---
-# This function should REMAIN UNCHANGED as per the request.
-# It will use the global 'logger' initialized by setup_environment.
-def run_inference_pipeline(
-    config,
-    device,
-    checkpoint_dir,
-    output_dir,
-    prompts_file=None,
-    images_file=None,
-    batch_size=4,
-    num_steps=50,
-    cache_manager=None
+def run_inference(
+    config_path: str = "config.toml",
+    prompt: str = "a photo of an astronaut riding a horse on the moon",
+    output_path: str = "output/generated_image.png",
+    num_steps: int = 50,
+    strategy: str = "top-1", # 'top-1' or 'full'
+    seed: int = 1234,
+    batch_size: int = 1, # Generate one image by default
+    image_height: int = 1024, # Default image size might need adjustment for DC-AE factors
+    image_width: int = 1024,
+    # Add options for specific checkpoint paths if needed, otherwise use default derived paths
+    router_checkpoint: Optional[str] = None,
+    expert_checkpoint_pattern: Optional[str] = None, # e.g., "output/checkpoints/expert_{}/expert_*_final.pt"
+    find_latest_experts: bool = False # Flag to auto-find latest expert checkpoints
 ):
-    """Run inference pipeline for Decentralized Diffusion Models"""
-    global logger # Indicate usage of global logger
+    """
+    Runs inference using the trained DDM ensemble.
 
-    # Add config validation
-    if not getattr(config, 'enable_sampling', True): # Default to True if not set
-        logger.error("Sampling disabled in config (enable_sampling=False), aborting inference")
+    Args:
+        config_path: Path to the TOML configuration file.
+        prompt: Text prompt for generation.
+        output_path: Path to save the generated image.
+        num_steps: Number of diffusion steps for sampling.
+        strategy: Sampling strategy ('top-1' or 'full').
+        seed: Random seed for noise generation.
+        batch_size: Number of images to generate.
+        image_height: Desired output image height.
+        image_width: Desired output image width.
+        router_checkpoint: Optional path to a specific router checkpoint.
+        expert_checkpoint_pattern: Optional pattern for expert checkpoints (use {} for expert_id).
+        find_latest_experts: If True, automatically finds the latest checkpoint in each expert's dir.
+                             Overrides expert_checkpoint_pattern if both are provided.
+    """
+    # --- 1. Load Configuration ---
+    print(f"Loading configuration from: {config_path}")
+    try:
+        config_dict = toml.load(config_path)
+        cfg = dict_to_sns(config_dict)
+        # Ensure checkpoint_dir is derived (needed for default paths)
+        cfg.train.checkpoint_dir = os.path.join(cfg.train.output_dir, "checkpoints")
+    except Exception as e:
+        print(f"Error loading configuration: {e}")
         return
 
-    # Load models (uses global logger internally)
-    # Pass cache_manager if provided
-    router_model, expert_models_or_builders, vae, clip = load_models(config, device, checkpoint_dir, cache_manager)
-
-    # Add expert count check
-    num_experts_available = len(expert_models_or_builders)
-    if num_experts_available == 0:
-        logger.error("No experts found or loaded for inference.")
-        return
-    elif num_experts_available != config.num_experts:
-         logger.warning(f"Mismatch between configured num_experts ({config.num_experts}) and available experts ({num_experts_available}).")
-
-
-    # Add device synchronization (good practice before heavy compute)
+    # --- 2. Setup Environment ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.synchronize(device=device)
+        torch.cuda.manual_seed_all(seed)
+    print(f"Using device: {device}")
 
-    # Load distilled model if available (uses global logger internally)
-    distilled_model = None
-    distilled_path = os.path.join(checkpoint_dir, "distilled_model_best.pt") # Assuming standard name
-    if os.path.exists(distilled_path):
-        distilled_model = load_distilled_model(config, device, distilled_path)
+    # --- 3. Load Models ---
+    # Load Router
+    router_cond_dim = getattr(cfg.model, 'router_cond_dim', None)
+    router = RouterModel(
+        num_clusters=cfg.model.num_clusters,
+        input_size=cfg.model.router_input_size,
+        patch_size=cfg.model.router_patch_size,
+        in_channels=cfg.model.router_in_channels,
+        hidden_size=cfg.model.router_hidden_size,
+        depth=cfg.model.router_depth,
+        num_heads=cfg.model.router_num_heads,
+        mlp_ratio=cfg.model.router_mlp_ratio,
+        cond_dim=router_cond_dim,
+    ).to(device)
+    router_ckpt_path = router_checkpoint or find_latest_checkpoint(os.path.join(cfg.train.checkpoint_dir, "router"))
+    if not router_ckpt_path or not os.path.exists(router_ckpt_path):
+         print(f"Error: Router checkpoint not found at expected path: {router_ckpt_path}")
+         return
+    load_model_checkpoint(router, router_ckpt_path, device)
+    router.eval()
 
-    # Load prompts (uses global logger internally)
-    prompts = load_prompts(prompts_file)
-    if not prompts:
-         logger.error("No prompts available for inference.")
-         return # Exit if no prompts
+    # Load Experts
+    experts: List[ExpertModel] = []
+    for i in range(cfg.model.num_clusters):
+        print(f"Loading Expert {i}...")
+        expert_mmdit_config = {
+            'in_channels': cfg.model.expert_in_channels, 'out_channels': cfg.model.expert_out_channels,
+            'vec_in_dim': cfg.model.expert_vec_in_dim, 'context_in_dim': cfg.model.expert_context_in_dim,
+            'hidden_size': cfg.model.expert_hidden_size, 'mlp_ratio': cfg.model.expert_mlp_ratio,
+            'num_heads': cfg.model.expert_num_heads, 'depth': cfg.model.expert_depth,
+            'depth_single_blocks': cfg.model.expert_depth_single_blocks, 'axes_dim': cfg.model.expert_axes_dim,
+            'theta': cfg.model.expert_theta, 'qkv_bias': cfg.model.expert_qkv_bias,
+            'guidance_embed': cfg.model.expert_guidance_embed,
+        }
+        expert = ExpertModel(mmdit_config=expert_mmdit_config).to(device)
 
-    # Create output directory (already handled in setup_environment if rank 0)
-    # os.makedirs(output_dir, exist_ok=True) # Redundant if setup_environment ran
+        # Determine expert checkpoint path
+        expert_ckpt_path = None
+        expert_dir = os.path.join(cfg.train.checkpoint_dir, f"expert_{i}")
+        if find_latest_experts:
+             expert_ckpt_path = find_latest_checkpoint(expert_dir)
+        elif expert_checkpoint_pattern:
+             # Try matching the pattern if provided
+             pattern_path = expert_checkpoint_pattern.format(i, i) # Assuming two placeholders
+             # Use glob to find matching files based on pattern within the expert dir
+             matches = glob.glob(os.path.join(expert_dir, os.path.basename(pattern_path)))
+             if matches:
+                  expert_ckpt_path = max(matches, key=os.path.getmtime) # Get latest match
+             else: # Fallback to direct pattern path if glob fails (e.g., absolute path given)
+                  if os.path.exists(pattern_path):
+                       expert_ckpt_path = pattern_path
 
-    # --- Inference Loop ---
-    # Use rank from distributed setup for progress bar disabling
-    rank = get_rank()
-    inference_pbar = tqdm(
-        range(0, len(prompts), batch_size),
-        desc="Generating Samples",
-        disable=not is_main_process(rank) # Disable if not rank 0
+        else: # Default: look for 'expert_{i}_final.pt'
+             default_path = os.path.join(expert_dir, f"expert_{i}_final.pt")
+             if os.path.exists(default_path):
+                  expert_ckpt_path = default_path
+             else: # If final doesn't exist, try finding latest anyway
+                  expert_ckpt_path = find_latest_checkpoint(expert_dir)
+
+        if not expert_ckpt_path or not os.path.exists(expert_ckpt_path):
+             print(f"Error: Checkpoint for Expert {i} not found.")
+             # Decide whether to error out or continue without this expert
+             # For now, let's error out if any expert is missing
+             return
+             # continue # Or skip this expert
+
+        load_model_checkpoint(expert, expert_ckpt_path, device)
+        expert.eval()
+        experts.append(expert)
+
+    # Check if the number of loaded experts matches configuration
+    if len(experts) != cfg.model.num_clusters:
+         print(f"Error: Loaded {len(experts)} experts, but config specifies {cfg.model.num_clusters}. Check checkpoint paths.")
+         return
+
+    # --- 4. Initialize Sampler ---
+    sampler = DDMSampler(
+        router=router,
+        experts=experts,
+        device=device,
+        num_diffusion_timesteps=cfg.train.num_diffusion_timesteps
     )
 
-    all_generated_image_paths = [] # Collect paths if images_file is specified
+    # --- 5. Initialize VAE and Conditioning Modules ---
+    # VAE for decoding
+    # Create VAE config namespace from main cfg
+    vae_config_dict = {k: v for k, v in cfg.data.items() if k.startswith('vae_')}
+    vae_config_dict['use_mixed_precision'] = cfg.train.use_mixed_precision
+    # Add latent_channels to vae_config if not already present under 'vae_' prefix
+    if 'latent_channels' not in vae_config_dict:
+         vae_config_dict['latent_channels'] = cfg.data.latent_channels
+    vae_config = SimpleNamespace(**vae_config_dict)
+    vae_wrapper = VAEWrapper(device, vae_config) # VAEWrapper now handles downsample factor internally
 
-    for batch_start_idx in inference_pbar:
-        batch_end_idx = min(batch_start_idx + batch_size, len(prompts))
-        batch_prompts = prompts[batch_start_idx:batch_end_idx]
-        actual_batch_size = len(batch_prompts)
+    # Conditioning (e.g., CLIP) - Adapt based on your setup
+    # Example using the separate CLIPTextEncoder from data/clip.py
+    clip_config = SimpleNamespace(
+        clip_model_name=getattr(cfg.data, 'clip_model_name', 'openai/clip-vit-large-patch14') # Example default
+    )
+    clip_encoder = CLIPTextEncoder(device, clip_config)
+    # If using Flux HFEmbedder:
+    # from models.flux.modules.conditioner import HFEmbedder
+    # clip_encoder = HFEmbedder(version="openai/clip-vit-large-patch14", max_length=77).to(device).eval()
+    # t5_encoder = HFEmbedder(version="google/flan-t5-xl", max_length=cfg.model.expert_context_in_dim).to(device).eval() # Assuming T5 needed for expert
 
-        if actual_batch_size == 0:
-            continue
+    # --- 6. Prepare Inputs ---
+    # Generate initial noise using the VAE wrapper's method
+    latent_height, latent_width = vae_wrapper.get_latent_shape(image_height, image_width)
+    # Use latent_channels from the config (now potentially updated by VAEWrapper init)
+    noise_shape = (batch_size, cfg.data.latent_channels, latent_height, latent_width)
+    xt = torch.randn(noise_shape, device=device)
 
-        batch_num = batch_start_idx // batch_size + 1
-        logger.info(f"Processing Batch {batch_num}: {actual_batch_size} prompts...")
+    # Prepare conditioning dictionary
+    conditioning = {}
+    prompts = [prompt] * batch_size
+    with torch.no_grad():
+        # Assuming 'y' is the CLIP pooler output used by both router (if configured) and expert
+        clip_embeddings = clip_encoder.encode_pooled(prompts) # Method might vary based on encoder implementation
+        conditioning['y'] = clip_embeddings.to(device)
 
-        # Encode prompts with CLIP
-        try:
-            # Assuming clip.encode returns a tensor ready for use
-            text_embeddings = clip.encode(batch_prompts).to(device)
-            # Create unconditional embeddings for classifier-free guidance
-            uncond_embeddings = clip.encode([""] * actual_batch_size).to(device)
-            logger.debug(f"Batch {batch_num}: Text embeddings shape: {text_embeddings.shape}")
-        except Exception as e:
-            logger.error(f"Error encoding prompts for batch {batch_num}: {e}", exc_info=True)
-            continue # Skip batch if encoding fails
+        # If experts require more (like text sequence from T5, img_ids), prepare them here
+        # Example for Flux-based experts:
+        # t5_embeddings = t5_encoder(prompts) # Get sequence embeddings
+        # conditioning['txt'] = t5_embeddings.to(device)
+        # # Create txt_ids (dummy or based on actual sequence length)
+        # conditioning['txt_ids'] = torch.zeros(batch_size, t5_embeddings.shape[1], 3, device=device)
+        # # img_ids would typically be created based on latent shape similar to sampling_flux.py
+        # img_h, img_w = latent_height // 2, latent_width // 2 # Check if Flux expects this reduction
+        # img_ids = torch.zeros(img_h, img_w, 3)
+        # img_ids[..., 1] = img_ids[..., 1] + torch.arange(img_h)[:, None]
+        # img_ids[..., 2] = img_ids[..., 2] + torch.arange(img_w)[None, :]
+        # conditioning['img_ids'] = torch.zeros(batch_size, img_h * img_w, 3, device=device)
 
-        # Define latent shape based on VAE and config
-        # Ensure config has image_size or buckets defined
-        h_pixels, w_pixels = config.image_size if hasattr(config, 'image_size') else config.buckets[0]
-        latent_h, latent_w = h_pixels // 8, w_pixels // 8
-        latent_shape = (actual_batch_size, config.latent_channels, latent_h, latent_w)
-        logger.debug(f"Batch {batch_num}: Latent shape: {latent_shape}")
+    print(f"Target Image Size: {image_height}x{image_width}")
+    print(f"VAE Downsample Factor: {vae_wrapper.downsample_factor}")
+    print(f"Generated noise shape (latent): {xt.shape}")
+    print(f"Conditioning keys: {list(conditioning.keys())}")
 
+    # --- 7. Run Sampling ---
+    print(f"Starting DDM sampling with {num_steps} steps, strategy='{strategy}'...")
+    sampled_latents = sampler.sample(
+        initial_noise=xt,
+        num_steps=num_steps,
+        conditioning=conditioning,
+        strategy=strategy,
+        show_progress=True
+    )
+    print("Sampling finished.")
 
-        try:
-            latents = None
-            # First try using distilled model if available
-            if distilled_model is not None:
-                logger.info(f"Batch {batch_num}: Using distilled model for sampling...")
-                distilled_model.eval() # Ensure eval mode
-                latents = distilled_sample(
-                    distilled_model=distilled_model,
-                    shape=latent_shape,
-                    num_steps=num_steps,
-                    prompt_embeds=text_embeddings, # Pass correct embedding key
-                    cfg_scale=config.cfg_scale,
-                    device=device
-                    # Add other distilled_sample params as needed
-                )
-            else:
-                # If no distilled model, use DDM sampling
-                logger.info(f"Batch {batch_num}: Using DDM sampling...")
+    # --- 8. Decode Latents ---
+    print("Decoding latents using VAE...")
+    with torch.no_grad():
+        # Precision handled inside decode method now
+        sampled_pixels = vae_wrapper.decode(sampled_latents)
+    print("Decoding finished.")
 
-                # Router and experts should be in eval mode
-                router_model.eval()
-                # Note: Expert eval mode might be handled by cache manager or get_expert_for_inference
+    # --- 9. Save Image(s) ---
+    pil_images = tensor_to_pil(sampled_pixels)
 
-                # Get sampling parameters from config
-                inference_strategy = getattr(config, 'inference_strategy', 'top_k')
-                # Ensure top_k doesn't exceed available experts
-                top_k = min(getattr(config, 'top_k', 1), num_experts_available)
-                top_p = getattr(config, 'top_p', 0.9)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
-                # We pass the dictionary of expert loaders/models to ddm_sample.
-                # ddm_sample will need to call get_expert_for_inference internally.
-                latents = ddm_sample(
-                    router=router_model,
-                    # Pass the dictionary containing builders or potentially cached models
-                    experts=expert_models_or_builders,
-                    shape=latent_shape,
-                    num_steps=num_steps,
-                    device=device,
-                    cfg_scale=config.cfg_scale,
-                    text_embeddings=text_embeddings,
-                    uncond_embeddings=uncond_embeddings,
-                    inference_strategy=inference_strategy,
-                    top_k=top_k,
-                    top_p=top_p,
-                    cache_manager=cache_manager, # Pass cache_manager to ddm_sample
-                    verbose=(rank==0), # Only verbose on rank 0
-                    # Ensure ddm_sample handles calling get_expert_for_inference
-                )
+    if batch_size == 1:
+        pil_images[0].save(output_path)
+        print(f"Saved generated image to: {output_path}")
+    else:
+        base, ext = os.path.splitext(output_path)
+        for i, img in enumerate(pil_images):
+            img_path = f"{base}_{i:03d}{ext}"
+            img.save(img_path)
+        print(f"Saved {batch_size} generated images to: {base}_*{ext}")
 
-            if latents is None:
-                 logger.error(f"Batch {batch_num}: Sampling failed to produce latents.")
-                 continue
-
-            logger.info(f"Batch {batch_num}: Sampling complete. Decoding latents...")
-            # Decode latents to images
-            images_tensor = vae.decode(latents.to(vae.precision)) # Ensure correct dtype for VAE
-            images_pil = tensor_to_pil(images_tensor) # Convert tensor [B, C, H, W] range [-1, 1] to list of PIL
-            logger.info(f"Batch {batch_num}: Decoding complete ({len(images_pil)} images).")
-
-            # Save images and prompts (only on rank 0)
-            if is_main_process(rank):
-                batch_output_dir = os.path.join(output_dir, f"batch_{batch_num:04d}")
-                logger.info(f"Batch {batch_num}: Saving images to {batch_output_dir}...")
-                # Call save_images and collect the returned paths
-                saved_paths = save_images(images_pil, batch_output_dir, prefix=f"sample_batch_{batch_num}")
-                if saved_paths: # Check if saving was successful
-                    all_generated_image_paths.extend(saved_paths)
-                    logger.info(f"Batch {batch_num}: Successfully saved {len(saved_paths)} images.")
-                else:
-                    logger.error(f"Batch {batch_num}: Failed to save images.")
-
-                # Save corresponding prompts for the batch
-                try:
-                    with open(os.path.join(batch_output_dir, "prompts.json"), 'w') as f:
-                        # Save as a list or dictionary
-                        prompts_data = {idx: prompt for idx, prompt in enumerate(batch_prompts)}
-                        json.dump(prompts_data, f, indent=2)
-                except Exception as json_e:
-                    logger.error(f"Failed to save prompts for batch {batch_num}: {json_e}")
-
-                # Log images to WandB via queue if enabled
-                # Make sure log_queue exists (created in setup_environment)
-                if config.wandb_enabled and 'log_queue' in locals() and log_queue is not None:
-                    wandb_data = {
-                         # Log PIL images directly
-                         f"inference/batch_{batch_num}_sample_{j}": wandb.Image(img, caption=batch_prompts[j])
-                         for j, img in enumerate(images_pil)
-                    }
-                    log_queue.put({"step": batch_num, **wandb_data}) # Add step info for wandb logging
-
-
-        except Exception as e:
-            logger.exception(f"Error processing batch {batch_num}: {e}") # Log full traceback
-            continue # Continue to the next batch
-
-    inference_pbar.close()
-    logger.info("Inference loop finished.")
-
-    # Write image paths to file if requested (Rank 0 only)
-    if is_main_process(rank) and images_file:
-        logger.info(f"Saving list of generated image paths to {images_file}...")
-        try:
-            output_dir_for_paths = os.path.dirname(images_file)
-            if output_dir_for_paths:
-                 os.makedirs(output_dir_for_paths, exist_ok=True)
-            with open(images_file, 'w') as f:
-                for path in all_generated_image_paths:
-                    f.write(path + '\n')
-            logger.info(f"Image paths saved successfully.")
-        except Exception as e:
-            logger.error(f"Error writing image paths to {images_file}: {e}")
-
-
-
-# --- main function ---
-def main():
-    global logger # Access global logger
-
-    # Load configuration
-    try:
-        config = get_config("config.py") # Assumes config.py and get_config work
-        # Add attributes if they are missing from config but needed by inference
-        if not hasattr(config, 'output_dir'): config.output_dir = './inference_output'
-        if not hasattr(config, 'distributed_inference'): config.distributed_inference = torch.cuda.device_count() > 1
-        if not hasattr(config, 'verbose_logging'): config.verbose_logging = False
-        if not hasattr(config, 'wandb_enabled'): config.wandb_enabled = False
-        if not hasattr(config, 'enable_sampling'): config.enable_sampling = True # Inference needs sampling
-
-    except FileNotFoundError:
-        print("ERROR: config.py not found. Please create a configuration file.")
-        return 1 # Indicate error
-    except Exception as e:
-        print(f"ERROR: Failed to load configuration: {e}")
-        return 1
-
-    rank = 0
-    world_size = 1
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    log_queue = None
-
-
-    try:
-        # Setup environment (handles distributed setup and initializes global logger)
-        rank, world_size, device, log_queue = setup_environment(config) # log_queue might be None
-
-        # --- Initialize Cache Manager (Optional) ---
-        cache_manager = None
-        if getattr(config, 'use_expert_cache', False): # Check if caching is enabled
-            logger.info("Initializing Expert Cache Manager...")
-            try:
-                cache_manager = ExpertCacheManager(
-                    config=config,
-                    device=device,
-                    # max_experts, cpu_offload taken from config inside ExpertCacheManager
-                    logger=logger # Pass the initialized logger
-                )
-            except Exception as e:
-                 logger.error(f"Failed to initialize ExpertCacheManager: {e}", exc_info=True)
-                 # Decide if this is fatal or continue without cache
-                 logger.warning("Continuing without expert caching.")
-
-
-        # --- Run Inference ---
-        # Checkpoint directory logic
-        checkpoint_dir = getattr(config, 'checkpoint_dir', os.path.join(config.output_dir, 'checkpoints'))
-        if not os.path.isdir(checkpoint_dir):
-            logger.error(f"Checkpoint directory not found: {checkpoint_dir}")
-            raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
-
-        output_dir = getattr(config, 'sample_dir', os.path.join(config.output_dir, 'inference_output'))
-
-        run_inference_pipeline(
-            config=config,
-            device=device,
-            checkpoint_dir=checkpoint_dir,
-            output_dir=output_dir,
-            prompts_file=getattr(config, 'inference_prompts_file', None),
-            images_file=getattr(config, 'inference_output_paths_file', None),
-            batch_size=getattr(config, 'inference_batch_size', 4),
-            num_steps=config.sampling_steps,
-            cache_manager=cache_manager # Pass cache manager
-        )
-
-        if is_main_process(rank):
-            logger.info(f"Inference finished. Outputs saved to: {output_dir}")
-
-    except Exception as e:
-        # Log exception using the logger if it was initialized, otherwise print
-        if logger:
-            logger.exception(f"An error occurred during inference: {e}")
-        else:
-            print(f"ERROR during inference: {e}")
-            import traceback
-            traceback.print_exc()
-        # Potentially exit with error code
-        # sys.exit(1)
-
-    finally:
-        # --- Cleanup ---
-        # Wait for logging thread - Check if log_queue was created AND is not None
-        # Check if rank is main process and wandb was enabled *during setup*
-        # The `log_queue is not None` check prevents NameError
-        if is_main_process(rank) and getattr(config, 'wandb_enabled', False) and log_queue is not None:
-            logger.info("Waiting for background logging to complete...")
-            log_queue.put(None) # Send sentinel
-            # Optional: Wait for queue processing if tasks are tracked
-            # log_queue.join()
-            # Optional: Wait for thread exit (depends on daemon setting and if join is needed)
-            # log_thread.join() # log_thread is local to setup_environment, cannot join here directly
-                                # Consider returning log_thread from setup_environment if joining is essential
-
-        # Finish WandB run
-        if is_main_process(rank) and getattr(config, 'wandb_enabled', False):
-            try:
-                import wandb
-                if wandb.run:
-                    wandb.finish()
-                    logger.info("WandB run finished.")
-            except Exception as e:
-                 logger.error(f"Error finishing WandB run: {e}")
-
-        # Cleanup distributed environment
-        if is_dist_initialized():
-            logger.info(f"Rank {rank}: Destroying process group.")
-            dist.destroy_process_group()
 
 if __name__ == "__main__":
-    # Consider adding argparse here for command-line overrides
-    main() 
+    fire.Fire(run_inference)

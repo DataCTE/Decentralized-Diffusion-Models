@@ -9,16 +9,7 @@ from safetensors.torch import load_file as load_sft
 from torch import nn
 from transformers import AutoModelForDepthEstimation, AutoProcessor, SiglipImageProcessor, SiglipVisionModel
 
-def print_load_warning(missing: list[str], unexpected: list[str]) -> None:
-    if len(missing) > 0 and len(unexpected) > 0:
-        print(f"Got {len(missing)} missing keys:\n\t" + "\n\t".join(missing))
-        print("\n" + "-" * 79 + "\n")
-        print(f"Got {len(unexpected)} unexpected keys:\n\t" + "\n\t".join(unexpected))
-    elif len(missing) > 0:
-        print(f"Got {len(missing)} missing keys:\n\t" + "\n\t".join(missing))
-    elif len(unexpected) > 0:
-        print(f"Got {len(unexpected)} unexpected keys:\n\t" + "\n\t".join(unexpected))
-
+from flux.util import print_load_warning
 
 
 class DepthImageEncoder:

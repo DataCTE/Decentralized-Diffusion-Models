@@ -35,15 +35,3 @@ class HFEmbedder(nn.Module):
             output_hidden_states=False,
         )
         return outputs[self.output_key]
-
-
-class CLIPEmbedder(HFEmbedder):
-    def __init__(self, version: str = "openai/clip-vit-large-patch14", max_length: int = 77, **hf_kwargs):
-        assert version.startswith("openai"), "CLIPEmbedder requires an OpenAI CLIP model"
-        super().__init__(version=version, max_length=max_length, **hf_kwargs)
-
-
-class T5Embedder(HFEmbedder):
-    def __init__(self, version: str = "google/t5-v1_1-base", max_length: int = 128, **hf_kwargs):
-        assert not version.startswith("openai"), "T5Embedder requires a T5 model"
-        super().__init__(version=version, max_length=max_length, **hf_kwargs)
