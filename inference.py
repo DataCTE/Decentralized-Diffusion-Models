@@ -18,47 +18,6 @@ from data.clip import CLIPTextEncoder # Example, adjust if using flux's HFEmbedd
 # Helper to load config
 from utils import dict_to_sns, load_model_checkpoint, tensor_to_pil, find_latest_checkpoint
 
-# Helper functions (potentially move to a utils file later)
-def load_model_checkpoint(model: torch.nn.Module, filepath: str, device: torch.device):
-    """Loads state dict from a checkpoint, handling potential 'module.' prefix."""
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Checkpoint file not found at {filepath}")
-    try:
-        checkpoint = torch.load(filepath, map_location=device)
-        # Determine the actual state dict
-        if isinstance(checkpoint, dict):
-            state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint.get('model', checkpoint)))
-            if not isinstance(state_dict, dict): state_dict = checkpoint # Assume checkpoint is the state_dict
-        elif isinstance(checkpoint, torch.nn.Module):
-            state_dict = checkpoint.state_dict()
-        else:
-             raise TypeError(f"Unsupported checkpoint format at {filepath}.")
-
-        # Handle 'module.' prefix
-        adjusted_state_dict = {}
-        for k, v in state_dict.items():
-            name = k[len("module."):] if k.startswith("module.") else k
-            adjusted_state_dict[name] = v
-
-        missing_keys, unexpected_keys = model.load_state_dict(adjusted_state_dict, strict=False)
-        if missing_keys: print(f"Warning: Missing keys when loading {model.__class__.__name__}: {missing_keys}")
-        if unexpected_keys: print(f"Warning: Unexpected keys when loading {model.__class__.__name__}: {unexpected_keys}")
-        print(f"Successfully loaded weights for {model.__class__.__name__} from {filepath}")
-    except Exception as e:
-        print(f"Error loading checkpoint for {model.__class__.__name__} from {filepath}: {e}")
-        raise e
-
-def tensor_to_pil(tensor):
-    """Converts a B C H W tensor in range [-1, 1] to a list of PIL Images."""
-    # Ensure tensor is on CPU and denormalized
-    tensor = tensor.detach().cpu()
-    tensor = (tensor + 1.0) / 2.0 # Denormalize from [-1, 1] to [0, 1]
-    tensor = tensor.clamp(0, 1)
-    # Convert to HWC uint8 format
-    images_np = (tensor.permute(0, 2, 3, 1) * 255).numpy().astype(np.uint8)
-    pil_images = [Image.fromarray(img) for img in images_np]
-    return pil_images
-
 def run_inference(
     config_path: str = "config.toml",
     prompt: str = "a photo of an astronaut riding a horse on the moon",

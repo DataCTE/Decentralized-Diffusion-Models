@@ -28,6 +28,7 @@ from types import SimpleNamespace
 import fire
 import logging
 from data.clustering import DDMClustering
+from utils import dict_to_sns
 
 # Import local modules (assuming correct paths relative to project root)
 from data.vae import VAEWrapper
@@ -37,18 +38,6 @@ from data.t5 import T5TextEncoder
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# --- ADD dict_to_sns function definition here ---
-# Helper to recursively convert dict to SimpleNamespace
-def dict_to_sns(d):
-    if isinstance(d, dict):
-        for key, value in d.items():
-            d[key] = dict_to_sns(value)
-        return SimpleNamespace(**d)
-    elif isinstance(d, list):
-        return [dict_to_sns(item) for item in d]
-    return d
-# --- End of dict_to_sns function definition ---
 
 # --- ADD setup_distributed function definition here ---
 def setup_distributed():
@@ -602,7 +591,7 @@ def main(config_path: str = "config.toml",
     # --- Load Config ---
     try:
         config_dict = toml.load(config_path)
-        cfg = dict_to_sns(config_dict) # Now calls the local definition
+        cfg = dict_to_sns(config_dict) # Uses the imported function
         logger.info("Configuration loaded successfully.")
     except Exception as e:
         logger.error(f"Error loading configuration from {config_path}: {e}")

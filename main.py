@@ -53,16 +53,6 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# Helper to recursively convert dict to SimpleNamespace
-def dict_to_sns(d):
-    if isinstance(d, dict):
-        for key, value in d.items():
-            d[key] = dict_to_sns(value)
-        return SimpleNamespace(**d)
-    elif isinstance(d, list):
-        return [dict_to_sns(item) for item in d]
-    return d
-
 def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
     """
     Main training function.
