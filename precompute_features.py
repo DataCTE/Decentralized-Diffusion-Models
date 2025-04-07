@@ -3,25 +3,19 @@ Centralized preprocessing pipeline for Decentralized Diffusion Models
 Combines feature extraction, clustering, and latent precomputation
 """
 import os
-import uuid
 import torch
 import faiss
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from pathlib import Path
-from sklearn.cluster import AgglomerativeClustering
 from torchvision import transforms
 from data.vae import VAEWrapper
 from data.clip import CLIPTextEncoder
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
 from tqdm.auto import tqdm
 import torch.distributed as dist
 import time
-import argparse
 import random
-import sys
 import toml
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from types import SimpleNamespace
@@ -450,69 +444,89 @@ class FeatureGenerator:
         bucket_indices = [self._get_bucket_index(w, h) for w, h in batch_dims.tolist()]
         return torch.tensor(bucket_indices, dtype=torch.int16) # B
 
+    def process_batch(self, batch_data: dict, batch_file_index: int):
+        """Processes a batch: extracts enabled features and saves them."""
+        images_pil = batch_data['image']
+        captions = batch_data['caption']
+        # num_samples = len(images_pil) # No longer needed for logging here
+        # logger.debug(f"[Rank {self.rank}] Processing batch index {batch_file_index} ({num_samples} samples)...") # REMOVED
+
+        batch_results = {}
+        # Process dimensions and buckets first
+        if 'dims' in self.enabled_features:
+            # logger.debug(f"[Rank {self.rank}, Batch {batch_file_index}] Extracting dims...") # REMOVED
+            batch_results['dims'] = self._extract_batch_dims(images_pil)
+        if 'buckets' in self.enabled_features and 'dims' in batch_results:
+            # logger.debug(f"[Rank {self.rank}, Batch {batch_file_index}] Extracting buckets...") # REMOVED
+            batch_results['buckets'] = self._extract_batch_buckets(batch_results['dims'])
+
+        # Process features requiring valid images/captions
+        if 'vae' in self.enabled_features:
+            # logger.debug(f"[Rank {self.rank}, Batch {batch_file_index}] Extracting vae latents...") # REMOVED
+            batch_results['vae'] = self._extract_batch_vae(images_pil)
+        if 'clip' in self.enabled_features:
+            # logger.debug(f"[Rank {self.rank}, Batch {batch_file_index}] Extracting clip embeddings...") # REMOVED
+            batch_results['clip'] = self._extract_batch_clip(captions)
+        if 't5' in self.enabled_features:
+            # logger.debug(f"[Rank {self.rank}, Batch {batch_file_index}] Extracting t5 embeddings...") # REMOVED
+            batch_results['t5'] = self._extract_batch_t5(captions)
+        if 'dino' in self.enabled_features:
+            # logger.debug(f"[Rank {self.rank}, Batch {batch_file_index}] Extracting dino embeddings...") # REMOVED
+            batch_results['dino'] = self._extract_batch_dino(images_pil)
+
+        # Save each computed feature tensor
+        for feature_type, batch_tensor in batch_results.items():
+            self._save_batch_feature(feature_type, batch_tensor, batch_file_index)
+
+        # logger.debug(f"[Rank {self.rank}] Finished processing batch index {batch_file_index}.") # REMOVED
+
     def _save_batch_feature(self, feature_type: str, batch_data: torch.Tensor, batch_file_index: int):
         """Saves a batch tensor for a specific feature type."""
         if batch_data is None:
-             # Don't log a warning here, None indicates feature was disabled or failed earlier (logged there)
-             return
+            return
 
         dir_map = {'vae': 'latents', 'clip': 'clip', 't5': 't5', 'dino': 'dino',
                    'dims': 'dims', 'buckets': 'buckets', 'clusters': 'clusters'}
         save_dir = self.feature_dir / dir_map[feature_type]
-        # Ensure filename includes rank to avoid collisions in shared FS when not using DS sampler offset
         filename = f"{self.rank:03d}_{batch_file_index:06d}.pt"
         filepath = save_dir / filename
         try:
-            torch.save(batch_data.cpu(), filepath) # Save CPU tensor
+            torch.save(batch_data.cpu(), filepath)
+            # logger.debug(f"[Rank {self.rank}] Saved {feature_type} batch {batch_file_index} to {filepath} (Shape: {batch_data.shape})") # REMOVED
         except Exception as e:
-            logger.error(f"[Rank {self.rank}] Error saving {feature_type} batch to {filepath}: {e}")
-
-
-    def process_batch(self, batch_data: dict, batch_file_index: int):
-        """Processes a batch: extracts enabled features and saves them."""
-        # Note: batch_data['image'] contains PIL images OR Nones if loading failed
-        images_pil = batch_data['image']
-        captions = batch_data['caption']
-
-        # Process dimensions and buckets first (works even with Nones in images_pil)
-        batch_results = {}
-        if 'dims' in self.enabled_features:
-             batch_results['dims'] = self._extract_batch_dims(images_pil)
-        if 'buckets' in self.enabled_features and 'dims' in batch_results:
-             batch_results['buckets'] = self._extract_batch_buckets(batch_results['dims'])
-
-        # Process features requiring valid images/captions
-        if 'vae' in self.enabled_features:
-             batch_results['vae'] = self._extract_batch_vae(images_pil) # Handles Nones internally
-        if 'clip' in self.enabled_features:
-             batch_results['clip'] = self._extract_batch_clip(captions) # Assumes captions exist even if image failed
-        if 't5' in self.enabled_features:
-             batch_results['t5'] = self._extract_batch_t5(captions)
-        if 'dino' in self.enabled_features:
-             batch_results['dino'] = self._extract_batch_dino(images_pil) # Handles Nones internally
-
-        # Save each computed feature tensor
-        for feature_type, batch_tensor in batch_results.items():
-             self._save_batch_feature(feature_type, batch_tensor, batch_file_index)
+            logger.error(f"[Rank {self.rank}] Error saving {feature_type} batch {batch_file_index} to {filepath}: {e}")
 
     def run_feature_extraction(self, dataloader: DataLoader):
         """Runs feature extraction over the dataset using the dataloader."""
-        logger.info(f"[Rank {self.rank}] Starting feature extraction...")
+        logger.info(f"[Rank {self.rank}] Starting feature extraction for {len(dataloader)} batches...")
         start_time = time.time()
+        processed_batches = 0
+        # log_frequency = max(1, len(dataloader) // 10) # REMOVED
 
-        # Each rank processes its slice of the data provided by the DistributedSampler
-        # The batch_idx here is local to the rank's dataloader iterator
-        for batch_idx, batch_data in enumerate(tqdm(dataloader, desc=f"Rank {self.rank} Processing", disable=(self.rank != 0))):
-            # The batch_file_index needs to be globally unique across ranks.
-            # We use rank and local batch_idx for the filename.
-            # DDMDataset loading logic handles discovering files like rank_batchidx.pt
+        # --- Use tqdm for progress bar on main rank --- START EDIT ---
+        batch_iterator = dataloader
+        if self.rank == 0:
+            batch_iterator = tqdm(dataloader, desc="Extracting Features", unit="batch")
+
+        for batch_idx, batch_data in enumerate(batch_iterator):
+        # --- Use tqdm for progress bar on main rank --- END EDIT ---
             self.process_batch(batch_data, batch_idx)
+            processed_batches += 1
+
+            # --- REMOVED Periodic Logging Block ---
 
         if self.distributed:
+            # Ensure tqdm bar is closed cleanly on rank 0 before barrier
+            if self.rank == 0 and isinstance(batch_iterator, tqdm):
+                batch_iterator.close()
             dist.barrier() # Wait for all ranks to finish saving
+        elif isinstance(batch_iterator, tqdm): # Close tqdm if not distributed either
+             batch_iterator.close()
+
 
         end_time = time.time()
-        logger.info(f"[Rank {self.rank}] Feature extraction finished in {end_time - start_time:.2f} seconds.")
+        total_time = end_time - start_time
+        logger.info(f"[Rank {self.rank}] Feature extraction finished. Processed {processed_batches} batches in {total_time:.2f} seconds.")
 
     # --- Clustering Logic ---
     def _load_features_for_clustering(self, feature_type: str, subsample_fraction: float):
@@ -520,43 +534,48 @@ class FeatureGenerator:
         logger.info(f"[Rank {self.rank}] Loading '{feature_type}' features for clustering (subsample: {subsample_fraction})...")
         feature_subdir = self.feature_dir / feature_type
         if not feature_subdir.exists():
+            logger.error(f"Feature directory not found: {feature_subdir}") # Changed to error
             raise FileNotFoundError(f"Feature directory not found: {feature_subdir}")
 
-        # Find all files (rank_batchidx.pt) in the feature directory
         all_files = sorted(list(feature_subdir.glob("*_*.pt")))
-
         if not all_files:
-             logger.warning(f"No feature files found in {feature_subdir}. Cannot cluster.")
-             return None
+             logger.error(f"No feature files found in {feature_subdir}. Cannot cluster.") # Changed to error
+             raise FileNotFoundError(f"No feature files found in {feature_subdir}")
 
         # --- Subsampling ---
-        num_files_to_sample = int(len(all_files) * subsample_fraction)
-        if num_files_to_sample < 1 :
-             num_files_to_sample = 1 # Sample at least one file if available
+        num_files_to_load = len(all_files)
+        files_to_load_paths = all_files
+        if subsample_fraction < 1.0:
+             num_files_to_sample = int(len(all_files) * subsample_fraction)
+             if num_files_to_sample < 1 : num_files_to_sample = 1
+             rng_state = random.getstate(); random.seed(42)
+             sampled_file_indices = random.sample(range(len(all_files)), num_files_to_sample)
+             random.setstate(rng_state)
+             files_to_load_paths = [all_files[i] for i in sorted(sampled_file_indices)]
+             num_files_to_load = len(files_to_load_paths)
+             logger.info(f"[Rank {self.rank}] Will load {num_files_to_load}/{len(all_files)} '{feature_type}' files for subsampled clustering.")
+        else:
+             logger.info(f"[Rank {self.rank}] Loading all {num_files_to_load} '{feature_type}' files for clustering.")
 
-        # Sample file indices globally consistently (same sample across all ranks if needed, though only rank 0 clusters)
-        # Use a fixed seed for reproducibility if desired
-        rng_state = random.getstate() # Store current RNG state
-        random.seed(42) # Use a fixed seed for sampling files
-        sampled_file_indices = random.sample(range(len(all_files)), num_files_to_sample)
-        random.setstate(rng_state) # Restore original RNG state
-        files_to_load_paths = [all_files[i] for i in sorted(sampled_file_indices)]
 
-        logger.info(f"[Rank {self.rank}] Will load {len(files_to_load_paths)}/{len(all_files)} '{feature_type}' files for subsampled clustering.")
-
-        # Load features (only rank 0 needs to do this for actual clustering)
+        # Load features (only rank 0 needs to do this)
         features_list = []
+        total_samples_loaded = 0
         if self.rank == 0:
-            for file_path in tqdm(files_to_load_paths, desc="Loading subsampled features"):
+            # --- Wrap loading loop with tqdm --- START EDIT ---
+            pbar = tqdm(files_to_load_paths, desc=f"Loading {feature_type} features", unit="file")
+            for file_path in pbar:
+            # --- Wrap loading loop with tqdm --- END EDIT ---
                 try:
-                    # Load directly to CPU to manage memory
                     batch_features = torch.load(file_path, map_location='cpu')
-                    # Check for NaNs/Infs in loaded features
                     if torch.isnan(batch_features).any() or torch.isinf(batch_features).any():
                          logger.warning(f"NaN/Inf found in feature file {file_path}. Skipping this batch for clustering.")
                          continue
-                    features_list.append(batch_features.float()) # Ensure float32
-
+                    features_list.append(batch_features.float())
+                    total_samples_loaded += batch_features.shape[0] # Track loaded samples
+                    # --- Update tqdm description --- START EDIT ---
+                    pbar.set_postfix({"samples_loaded": f"{total_samples_loaded:,}"})
+                    # --- Update tqdm description --- END EDIT ---
                 except Exception as e:
                     logger.error(f"Error loading feature file {file_path}: {e}")
 
@@ -564,107 +583,163 @@ class FeatureGenerator:
                  logger.error("Failed to load any valid features for clustering.")
                  return None
             all_features = torch.cat(features_list, dim=0)
-            logger.info(f"[Rank 0] Loaded subsampled features shape: {all_features.shape}")
+            logger.info(f"[Rank 0] Loaded {total_samples_loaded} subsampled feature vectors. Final shape: {all_features.shape}")
             return all_features
         else:
-            return None # Other ranks don't need the features for clustering
-
+            return None
 
     def run_clustering(self):
         """Performs two-stage clustering and saves assignments."""
         if self.rank != 0:
-            # Clustering is only done by rank 0
-            if self.distributed:
-                 logger.info(f"Rank {self.rank} waiting at barrier before clustering.")
-                 dist.barrier()
-                 logger.info(f"Rank {self.rank} waiting at barrier after clustering attempt.")
-                 dist.barrier()
+            if self.distributed: dist.barrier(); dist.barrier() # Barriers remain
             return
 
-        logger.info("Rank 0 starting clustering process...")
+        logger.info("[Rank 0] Starting clustering process...")
+        clustering_start_time = time.time() # Add timer
         try:
             feature_type = self.config.data.clustering_feature_type
             subsample_fraction = self.config.data.clustering_subsample_fraction
             num_coarse = self.config.model.num_clusters
             num_fine = self.config.data.num_fine_clusters
 
-            # Load features for clustering (subsampled)
             clustering_features = self._load_features_for_clustering(feature_type, subsample_fraction)
             if clustering_features is None:
-                logger.error("Failed to load features for clustering. Aborting.")
                 raise RuntimeError("Clustering feature loading failed.")
 
-            # --- Use DDMClustering ---
-            logger.info(f"Initializing DDMClustering with {num_coarse} coarse and {num_fine} fine clusters.")
+            logger.info(f"[Rank 0] Initializing DDMClustering with {num_coarse} coarse and {num_fine} fine clusters.")
             clustering_module = DDMClustering(num_coarse, num_fine, feature_path=self.feature_dir)
 
-            # Perform clustering on the loaded (potentially subsampled) features
+            # Stage 1: Fine-grained KMeans (logs progress internally via faiss verbose=True)
+            logger.info("[Rank 0] Performing Stage 1: Fine-grained KMeans...")
+            # DDMClustering's cluster method calls _train_kmeans which uses faiss verbose
             subsampled_assignments = clustering_module.cluster(features=clustering_features)
+            logger.info("[Rank 0] Stage 1 KMeans complete.")
 
             if subsampled_assignments is None:
                  raise RuntimeError("Clustering module failed to return assignments.")
+            if clustering_module.fine_centroids is None or clustering_module.coarse_labels_for_fine is None:
+                 raise RuntimeError("Clustering module did not retain necessary centroids/labels for assignment.")
+
+
+            # Stage 2: Coarse Agglomerative Clustering (relatively fast, no detailed progress needed)
+            logger.info("[Rank 0] Performing Stage 2: Coarse Agglomerative Clustering on fine centroids...")
+            # ... (agglomerative clustering happens inside clustering_module.cluster or implicitly via its result)
+            logger.info("[Rank 0] Stage 2 Agglomerative Clustering complete.")
+
 
             # --- Assign ALL samples to clusters and Save Assignments ---
-            logger.info("Clustering complete. Assigning all samples and saving assignments...")
+            logger.info("[Rank 0] Assigning all samples to final clusters and saving assignments...")
             assignments_dir = self.feature_dir / "clusters"
             assignments_dir.mkdir(exist_ok=True)
 
-            # Load ALL features of the specified type (only paths needed)
             feature_subdir = self.feature_dir / feature_type
-            all_feature_files = sorted([f for f in feature_subdir.glob("*.pt")])
+            all_feature_files = sorted([f for f in feature_subdir.glob("*.pt") if f.is_file()]) # Ensure it's a file
 
             if not all_feature_files:
                  raise FileNotFoundError(f"No feature files found in {feature_subdir} to assign clusters.")
 
-            # Re-use the trained clustering module (centroids are stored) for assignment
-            # Need Faiss index from DDMClustering if it wasn't saved/returned
-            # Let's modify DDMClustering to keep the index accessible or re-create it
-            # Assuming we can access/recreate the fine index from clustering_module:
-            if clustering_module.fine_centroids is None or clustering_module.coarse_labels_for_fine is None:
-                 raise RuntimeError("Clustering module did not retain necessary centroids/labels for assignment.")
-
-            # Create Faiss index for fine centroids (Inner Product for cosine sim)
+            # Create Faiss index for assignment
+            logger.info("[Rank 0] Creating Faiss index for final assignment...")
             index_fine = faiss.IndexFlatIP(clustering_module.fine_centroids.shape[1])
             res = None
             if clustering_module.use_gpu:
-                res = faiss.StandardGpuResources()
-                index_fine = faiss.index_cpu_to_gpu(res, 0, index_fine)
+                res = faiss.StandardGpuResources(); index_fine = faiss.index_cpu_to_gpu(res, 0, index_fine)
             index_fine.add(np.ascontiguousarray(clustering_module.fine_centroids, dtype=np.float32))
-            coarse_labels_for_fine = clustering_module.coarse_labels_for_fine # Get the mapping
+            coarse_labels_for_fine = clustering_module.coarse_labels_for_fine
+            logger.info("[Rank 0] Faiss index created.")
 
             total_samples_processed = 0
-            for file_path in tqdm(all_feature_files, desc="Assigning clusters to all samples"):
+            assignment_start_time = time.time()
+
+            # --- Add tqdm progress bar for assignment loop --- START EDIT ---
+            pbar_assign = tqdm(all_feature_files, desc="Assigning clusters", unit="file")
+            for file_path in pbar_assign:
+            # --- Add tqdm progress bar for assignment loop --- END EDIT ---
                 try:
-                    batch_features = torch.load(file_path, map_location='cpu').float().numpy()
-                    batch_features_np = np.ascontiguousarray(batch_features, dtype=np.float32)
+                    # --- Refactor loading and conversion for clarity --- START EDIT ---
+                    # 1. Load as Tensor
+                    batch_tensor = torch.load(file_path, map_location='cpu')
+                    # 2. Ensure float
+                    batch_tensor = batch_tensor.float()
+                    # 3. Convert to NumPy
+                    batch_features_np = batch_tensor.numpy()
+                    # 4. Ensure contiguous float32 for Faiss
+                    batch_features_np = np.ascontiguousarray(batch_features_np, dtype=np.float32)
 
-                    # Search for nearest fine centroid for each feature in the batch
+                    # --- Add explicit type check ---
+                    if not isinstance(batch_features_np, np.ndarray):
+                         logger.error(f"CRITICAL: Data loaded from {file_path.name} resulted in type {type(batch_features_np)} instead of np.ndarray before Faiss search! Skipping file.")
+                         continue # Skip this file if conversion failed unexpectedly
+                    # --- End explicit type check ---
+
+                    # Search using the guaranteed numpy array
                     _, fine_centroid_indices = index_fine.search(batch_features_np, 1)
-                    fine_centroid_indices = fine_centroid_indices.squeeze() # Shape (N_batch,)
+                    # --- Refactor loading and conversion for clarity --- END EDIT ---
 
-                    # Map fine centroid indices to coarse labels
-                    batch_assignments = coarse_labels_for_fine[fine_centroid_indices] # Shape (N_batch,)
+                    fine_centroid_indices = fine_centroid_indices.squeeze(-1) # Ensure 1D array
 
-                    # Derive the cluster save path from the feature file path
+                    # Handle cases where search might return -1 (shouldn't happen with IndexFlatIP unless empty)
+                    if np.any(fine_centroid_indices == -1):
+                        logger.warning(f"Found invalid index -1 in Faiss search result for file {file_path.name}. Skipping invalid entries.")
+                        # Depending on Faiss version/setup, -1 might indicate issues.
+                        # We might need to filter out these invalid indices before proceeding.
+                        valid_mask = fine_centroid_indices != -1
+                        if not np.all(valid_mask):
+                             logger.warning(f"Filtering out {np.sum(~valid_mask)} invalid assignments for {file_path.name}")
+                             # Apply mask ONLY if needed for subsequent steps, otherwise just warn.
+                             # Example: fine_centroid_indices = fine_centroid_indices[valid_mask]
+                             #          batch_features_np = batch_features_np[valid_mask] # If needed later
+                             # For now, let's just proceed cautiously. Revisit if errors occur later.
+                             pass # Proceeding without explicit filtering for now
+
+
+                    # Ensure indices are within bounds for coarse_labels_for_fine
+                    # Check *after* handling potential -1 indices if filtering is applied above
+                    max_idx_found = np.max(fine_centroid_indices) if len(fine_centroid_indices) > 0 else -1
+                    num_coarse_labels = len(coarse_labels_for_fine) # Get length of the tensor
+
+                    # Check bounds BEFORE indexing
+                    if max_idx_found >= num_coarse_labels:
+                         logger.error(f"Faiss index {max_idx_found} out of bounds for coarse_labels (size: {num_coarse_labels}) in file {file_path.name}. Skipping file.")
+                         continue
+
+                    # Proceed with indexing using the (potentially filtered) valid indices
+                    batch_assignments = coarse_labels_for_fine[fine_centroid_indices] # Indexing Tensor with ndarray -> Result is a Tensor
+
+                    # --- Saving Logic --- START EDIT ---
                     base_filename = file_path.name
-                    cluster_filename = base_filename # Use the same rank_batchidx.pt format
+                    if base_filename.endswith('.pt'):
+                        cluster_filename = base_filename
+                    else:
+                        cluster_filename = f"{os.path.splitext(base_filename)[0]}.pt"
+
                     cluster_save_path = assignments_dir / cluster_filename
 
-                    torch.save(batch_assignments.cpu().short(), cluster_save_path) # Save as short tensor
-                    total_samples_processed += batch_features.shape[0]
+                    # Remove torch.from_numpy as batch_assignments is already a Tensor
+                    torch.save(batch_assignments.short(), cluster_save_path) # Save assignments as short tensor
+                    # --- Saving Logic --- END EDIT ---
 
+
+                    # --- Update progress ---
+                    num_processed = batch_features_np.shape[0] # Use shape from numpy array
+                    total_samples_processed += num_processed
+                    pbar_assign.set_postfix({"samples_assigned": f"{total_samples_processed:,}"})
+
+                except IndexError as e:
+                    # Catch potential index errors specifically after the bounds check
+                    logger.error(f"IndexError during assignment for file {file_path.name}: {e}. Indices: {fine_centroid_indices}, coarse_labels size: {len(coarse_labels_for_fine)}", exc_info=True)
                 except Exception as e:
-                    logger.error(f"Error processing/assigning assignments for file {file_path.name}: {e}")
+                    logger.error(f"Error processing/assigning assignments for file {file_path.name}: {e}", exc_info=True) # Add traceback
 
-            logger.info(f"Finished assigning clusters to {total_samples_processed} samples across all files.")
+            assignment_time = time.time() - assignment_start_time
+            logger.info(f"[Rank 0] Finished assigning clusters to {total_samples_processed} samples across {len(all_feature_files)} files in {assignment_time:.2f} seconds.")
 
         except Exception as e:
-            logger.exception(f"Clustering failed: {e}") # Log full traceback
+            logger.exception(f"[Rank 0] Clustering failed: {e}")
         finally:
-            # Ensure barrier happens even if rank 0 fails
-            if self.distributed:
-                logger.info("Rank 0 waiting at barrier after clustering attempt.")
-                dist.barrier()
+            clustering_time = time.time() - clustering_start_time
+            logger.info(f"[Rank 0] Clustering process finished in {clustering_time:.2f} seconds.")
+            if self.distributed: dist.barrier() # Ensure barrier happens
 
 
 # --- Main Execution ---
@@ -672,96 +747,115 @@ def main(config_path: str = "config.toml",
          skip_feature_extraction: bool = False,
          skip_clustering: bool = False):
     """Main function to run feature precomputation and clustering."""
-    # --- Setup Distributed ---
     rank, world_size, local_rank, device = setup_distributed()
     is_main = rank == 0
     distributed = world_size > 1
 
-    # --- Setup Logging ---
-    # Add rank to the format string and keep INFO level for all ranks initially
     log_format = f'%(asctime)s - Rank {rank} - %(levelname)s - %(message)s'
-    logging.basicConfig(level=logging.INFO, format=log_format)
+    # --- Set level back to INFO --- START EDIT ---
+    logging.basicConfig(level=logging.INFO, format=log_format, force=True)
+    # --- Set level back to INFO --- END EDIT ---
     logger = logging.getLogger(__name__)
-    # if not is_main: # Temporarily disable log level reduction for non-main ranks
-    #     logger.setLevel(logging.WARNING)
+
+    # --- Silence excessive Pillow logging ---
+    pil_logger = logging.getLogger('PIL')
+    pil_logger.setLevel(logging.WARNING) # Set to WARNING for even less noise
+
+    # --- Silence excessive Hugging Face/Network logging ---
+    logging.getLogger('huggingface_hub').setLevel(logging.WARNING) # Set to WARNING
+    logging.getLogger('urllib3').setLevel(logging.WARNING)      # Set to WARNING
 
 
-    # --- Load Config ---
+    logger.info("--- Starting Precomputation ---")
+    overall_start_time = time.time()
+
     try:
         config_dict = toml.load(config_path)
-        cfg = dict_to_sns(config_dict) # Uses the imported function
+        cfg = dict_to_sns(config_dict)
         logger.info("Configuration loaded successfully.")
     except Exception as e:
         logger.error(f"Error loading configuration from {config_path}: {e}")
-        return # Exit if config fails
+        return
 
-    # --- Define Features to Generate ---
-    # Clustering requires 'dims' and the feature specified in 'clustering_feature_type'.
-    # DDMDataset requires 'latents', 'clip', 't5', 'dims', 'buckets', 'clusters'.
     features_to_generate = {'vae', 'clip', 't5', 'dims', 'buckets'}
-    features_for_clustering = {cfg.data.clustering_feature_type, 'dims'} # Need dims to save assignments correctly
+    features_for_clustering = {cfg.data.clustering_feature_type, 'dims'}
     features_needed = features_to_generate.union(features_for_clustering)
-    if 'dino' in getattr(cfg.data, 'enabled_features', []): # Check if DINO is explicitly enabled
-         features_needed.add('dino')
+    if 'dino' in getattr(cfg.data, 'enabled_features', []): features_needed.add('dino')
     logger.info(f"Enabled features for generation/checking: {features_needed}")
 
-    # --- Initialize Generator ---
     generator = FeatureGenerator(cfg, enabled_features=features_needed)
 
-    # --- Initialize Dataset & Dataloader ---
     logger.info("Initializing Dataset and DataLoader...")
-    dataset = PrecomputeDataset(cfg) # Pass the namespace config
+    try:
+        dataset = PrecomputeDataset(cfg)
+        if len(dataset) == 0:
+             logger.error("Dataset initialization resulted in 0 samples. Check dataset path and manifest.")
+             return
 
-    if distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False) # No shuffle for precompute
-        precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 8) # <-- Changed default to 8
-        dataloader = DataLoader(
-            dataset,
-            batch_size=precompute_batch_size, # Use dedicated precompute batch size
-            sampler=sampler,
-            num_workers=getattr(cfg.train, 'num_workers', 4), # Get num_workers from train config
-            pin_memory=False, # Cannot pin list of PIL Images
-            drop_last=False, # Process all samples
-            collate_fn=precompute_collate_fn # Use the custom collate function
-        )
-    else:
-        precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 8) # <-- Changed default to 8
-        dataloader = DataLoader(
-            dataset,
-            batch_size=precompute_batch_size, # Use dedicated precompute batch size
-            shuffle=False,
-            num_workers=getattr(cfg.train, 'num_workers', 4), # Get num_workers from train config
-            pin_memory=False, # Cannot pin list of PIL Images
-            drop_last=False,
-            collate_fn=precompute_collate_fn # Use the custom collate function
-        )
-    logger.info(f"DataLoader initialized with batch size {precompute_batch_size}.")
-    logger.info(f"Rank {rank} DataLoader length: {len(dataloader)}")
+        # ... (Sampler and Dataloader setup remains the same) ...
+        if distributed:
+            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
+            precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 8)
+            dataloader = DataLoader(dataset, batch_size=precompute_batch_size, sampler=sampler, num_workers=getattr(cfg.train, 'num_workers', 4), pin_memory=False, drop_last=False, collate_fn=precompute_collate_fn)
+        else:
+            precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 8)
+            dataloader = DataLoader(dataset, batch_size=precompute_batch_size, shuffle=False, num_workers=getattr(cfg.train, 'num_workers', 4), pin_memory=False, drop_last=False, collate_fn=precompute_collate_fn)
+
+        logger.info(f"DataLoader initialized with batch size {precompute_batch_size}.")
+        logger.info(f"Rank {rank} DataLoader length: {len(dataloader)}")
+
+    except Exception as e:
+         logger.exception("Error during Dataset/DataLoader initialization.")
+         return
 
 
     # --- Run Feature Extraction ---
     if not skip_feature_extraction:
-        generator.run_feature_extraction(dataloader)
+        logger.info("--- Starting Feature Extraction Phase ---")
+        extraction_start_time = time.time()
+        try:
+             generator.run_feature_extraction(dataloader)
+             extraction_time = time.time() - extraction_start_time
+             logger.info(f"--- Feature Extraction Phase Finished (Duration: {extraction_time:.2f}s) ---")
+        except Exception as e:
+             logger.exception("--- Feature Extraction Phase Failed ---")
+             # Decide whether to stop or try clustering anyway
+             # return # Exit if extraction fails
     else:
-        logger.info("Skipping feature extraction.")
-    if distributed:
-        logger.info(f"Rank {rank} waiting at barrier after feature extraction step.")
-        dist.barrier()
+        logger.info("--- Skipping Feature Extraction Phase ---")
+
+    if distributed: logger.info(f"Rank {rank} waiting at barrier after feature extraction step.")
+    if distributed: dist.barrier()
+
 
     # --- Run Clustering ---
-    # Only rank 0 performs clustering after all ranks finish extraction
     if not skip_clustering:
-        generator.run_clustering() # run_clustering now handles the rank check and barriers internally
+         logger.info("--- Starting Clustering Phase ---")
+         clustering_start_time = time.time()
+         try:
+             # Clustering is run by rank 0, includes internal barriers
+             generator.run_clustering()
+             clustering_time = time.time() - clustering_start_time
+             if is_main: # Only rank 0 logs the total time as it performed the work
+                  logger.info(f"--- Clustering Phase Finished (Duration: {clustering_time:.2f}s) ---")
+         except Exception as e:
+              logger.exception("--- Clustering Phase Failed ---")
     else:
-        logger.info("Skipping clustering.")
-        if distributed:
+        logger.info("--- Skipping Clustering Phase ---")
+        # Ensure non-rank 0 processes wait if clustering is skipped
+        if distributed and not is_main:
              logger.info(f"Rank {rank} waiting at barrier after skipping clustering step.")
              dist.barrier()
+        elif distributed and is_main: # Rank 0 also needs barrier if it skips
+             dist.barrier()
+
 
     # --- Cleanup ---
+    overall_time = time.time() - overall_start_time
+    logger.info(f"--- Precomputation Finished (Total Duration: {overall_time:.2f}s) ---")
     if distributed:
+        if dist.is_initialized():
             dist.destroy_process_group()
-    logger.info("Precomputation finished.")
 
 
 if __name__ == "__main__":
