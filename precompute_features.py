@@ -28,7 +28,6 @@ from types import SimpleNamespace
 import fire
 import logging
 from data.clustering import DDMClustering
-from utils.distributed import setup_distributed
 
 # Import local modules (assuming correct paths relative to project root)
 from data.vae import VAEWrapper
@@ -39,6 +38,30 @@ from utils import dict_to_sns # Assuming dict_to_sns is in utils
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# --- ADD setup_distributed function definition here ---
+def setup_distributed():
+    """Initializes torch.distributed"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        print(f"Initializing distributed training: RANK={rank}, WORLD_SIZE={world_size}, LOCAL_RANK={local_rank}")
+        # Ensure backend is explicitly set if needed, nccl is common for NVIDIA GPUs
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        if torch.cuda.is_available():
+             torch.cuda.set_device(local_rank)
+             device = torch.device(f"cuda:{local_rank}")
+        else:
+             device = torch.device("cpu") # Fallback for CPU-only distributed (less common)
+        return rank, world_size, local_rank, device
+    else:
+        print("Not running in distributed mode.")
+        # Setup for single GPU/CPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return 0, 1, 0, device # rank, world_size, local_rank, device
+# --- End of setup_distributed function definition ---
 
 # --- Dataset for Precomputation ---
 class PrecomputeDataset(Dataset):
