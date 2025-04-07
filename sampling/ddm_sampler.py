@@ -163,7 +163,7 @@ class DDMSampler:
                               single_expert_kwargs[k] = v
                               
                      pred_noise[b_idx:b_idx+1] = self.experts[expert_idx](**single_expert_kwargs)
-                # TODO: Explore batched gather if possible for efficiency
+                # Batched gather is complex; loop retained as functional implementation.
 
             elif strategy == 'full':
                 # Weighted average of all expert predictions

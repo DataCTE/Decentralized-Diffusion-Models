@@ -30,8 +30,8 @@ expert_qkv_bias = true # Example Flux qkv_bias
 expert_guidance_embed = false # Example Flux guidance embed (usually False for base models)
 
 [data]
-dataset_path = "/path/to/your/dataset" # Root directory of the dataset
-feature_cache_path = "/path/to/feature/cache" # Where VAE latents, CLIP embeddings etc. are stored
+dataset_path = "/home/alex/workspace/datasets/danbooru2025/" # Root directory of the dataset
+feature_cache_path = "/home/alex/workspace/datasets/danbooru2025/cache" # Where VAE latents, CLIP embeddings etc. are stored
 
 # --- Feature Extractor Models ---
 # VAE settings - UPDATED FOR DC-AE f32c32-mix
@@ -43,11 +43,15 @@ latent_channels = 32                                # MUST MATCH model (c32)
 # Conditioning models (used for precomputation and potentially inference)
 clip_model_name = "openai/clip-vit-large-patch14" # Specify CLIP model used
 t5_model_name = "google/flan-t5-xl"             # Specify T5 model used
+# Tokenizer settings
+clip_max_token_length = 77                          # Max sequence length for CLIP tokenizer
+t5_max_token_length = 128                           # Max sequence length for T5 tokenizer
 
-# --- Clustering Settings (Informational - Assumes precomputed) ---
-# clustering_model = "dinov2-vitl14" # Model used for clustering (e.g., DINOv2)
-# num_coarse_clusters = 8  # Optional: If using two-stage clustering (matches model.num_clusters)
-# num_fine_clusters = 512  # Optional: If using two-stage clustering
+# --- Clustering Settings ---
+clustering_feature_type = "clip"                    # Feature type to use for clustering ('clip', 'dino', 'vae')
+clustering_subsample_fraction = 0.1                 # Fraction of features to use for training cluster centroids (e.g., 0.1 for 10%)
+# num_coarse_clusters = 8  # Defined in [model] section as num_clusters
+num_fine_clusters = 512                             # Number of fine clusters for two-stage clustering
 
 # --- Bucketing Settings (Used by DDMDataset/BucketBatchSampler if enabled) ---
 # Example values for SDXL-like resolutions

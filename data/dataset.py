@@ -18,6 +18,7 @@ import re  # Add regex module
 import glob
 import json
 import math
+from pathlib import Path # Add Path import
 
 
 def chunks(lst, n):
@@ -41,365 +42,443 @@ def simple_collate(batch):
 class DDMDataset(Dataset):
     """
     Dataset for Decentralized Diffusion Models.
-    Loads precomputed features (latents, conditions, cluster assignments)
-    from a specified cache directory.
+    Loads precomputed features (latents, text embeddings, cluster assignments, etc.)
+    from a cache directory structured by feature type. Handles bucketing.
     """
+    # Map feature types to directory names and expected file extensions
+    FEATURE_INFO = {
+        'latents': {'dir': 'latents', 'ext': '.pt'},
+        'clip':    {'dir': 'clip', 'ext': '.pt'},
+        't5':      {'dir': 't5', 'ext': '.pt'},
+        'dino':    {'dir': 'dino', 'ext': '.pt'},
+        'dims':    {'dir': 'dims', 'ext': '.pt'},
+        'buckets': {'dir': 'buckets', 'ext': '.pt'},
+        'clusters':{'dir': 'clusters', 'ext': '.cluster.pt'} # Use distinct extension if needed
+    }
+    # Features that are mandatory for the dataset to function
+    MANDATORY_FEATURES = {'latents', 'clip', 't5', 'dims', 'buckets', 'clusters'}
+    
     def __init__(self, config_dict, split='train', logger=None):
-        self.config = SimpleNamespace(**config_dict) # Convert dict to namespace
-        self.split = split # Currently unused, assuming one large dataset
+        """
+        Initializes the dataset.
+
+        Args:
+            config_dict (dict): Configuration dictionary containing data parameters like
+                                'feature_cache_path', 'latent_channels', 'num_experts',
+                                bucket settings, etc.
+            split (str): Data split ('train', 'val', etc.). Currently unused, assumes train.
+            logger (logging.Logger, optional): Logger instance. Defaults to None.
+        """
+        self.config = dict_to_sns(config_dict) # Convert dict to SimpleNamespace
+        self.feature_cache_path = Path(self.config.feature_cache_path)
+        self.split = split
         self.logger = logger if logger else logging.getLogger(__name__)
 
-        self.feature_cache_path = self.config.feature_cache_path
-        self.num_experts = self.config.num_experts
+        # Validate mandatory config keys
+        if not self.feature_cache_path.exists():
+            raise FileNotFoundError(f"Feature cache path does not exist: {self.feature_cache_path}")
 
-        # --- File Discovery and Metadata Loading ---
-        self._file_map = {} # Maps global index to (file_idx, index_within_file)
-        self._file_paths = {} # Stores paths for different feature types
-        self._file_lengths = [] # Stores number of items per file part
-        self.total_samples = 0
+        # Check for mandatory feature directories (only check, files discovered later)
+        for feat in self.MANDATORY_FEATURES:
+            info = self.FEATURE_INFO.get(feat)
+            if not info or not (self.feature_cache_path / info['dir']).exists():
+                 self.logger.warning(f"Mandatory feature directory '{info['dir'] if info else feat}' not found in {self.feature_cache_path}. Dataset loading might fail.")
+                 # Could raise an error here if strictly required
 
-        self._discover_files()
+        # Discover feature files and determine dataset size
+        self.file_list, self.cumulative_sizes, self.total_samples = self._discover_files()
         if self.total_samples == 0:
-            raise FileNotFoundError(f"No data files found or metadata invalid in {self.feature_cache_path}")
+            raise ValueError(f"No data samples found in feature cache: {self.feature_cache_path}")
+        self.logger.info(f"Discovered {len(self.file_list)} batch files, total samples: {self.total_samples}")
 
-        self.logger.info(f"Found {self.total_samples} total samples across {len(self._file_lengths)} file parts.")
+        # Load bucket assignments (essential for BucketBatchSampler)
+        self._bucket_assignments = self._load_bucket_assignments()
 
-        # --- Lazy Load Placeholders ---
-        self._loaded_files = {} # Cache for currently loaded file parts {feature_type: {file_idx: tensor}}
-        self._current_file_idx = { 'latent': -1, 'clip': -1, 'cluster': -1, 't5': -1 } # Track loaded file index per feature
+        # Precompute cluster statistics if needed (optional)
+        self._cluster_stats = None
+        # self._compute_cluster_statistics() # Uncomment if needed
 
-        # --- Bucket Assignments (Loaded on demand) ---
-        self._bucket_assignments = None # Tensor of bucket indices for all samples
+        # Feature cache (in-memory) - Use with caution for large datasets
+        self.feature_cache = {} # Cache loaded batch files {('feature_type', file_idx): tensor}
+
 
     def _discover_files(self):
-        """Discovers feature files and loads metadata."""
-        metadata_path = os.path.join(self.feature_cache_path, "metadata.json")
-        latent_dir = os.path.join(self.feature_cache_path, "latents")
-        clip_dir = os.path.join(self.feature_cache_path, "clip")
-        cluster_dir = os.path.join(self.feature_cache_path, "clusters")
-        t5_dir = os.path.join(self.feature_cache_path, "t5") # Add T5 directory
+        """
+        Discovers precomputed feature files (rank_batchidx.pt) and calculates dataset size.
 
-        if not os.path.exists(latent_dir):
-            raise FileNotFoundError(f"Latent directory not found: {latent_dir}")
+        Assumes all feature types have corresponding files for each batch index across ranks.
+        Uses 'dims' feature as the reference for determining batch structure and size.
+        """
+        dims_dir = self.feature_cache_path / self.FEATURE_INFO['dims']['dir']
+        if not dims_dir.exists():
+            raise FileNotFoundError(f"Mandatory 'dims' feature directory not found at {dims_dir}")
 
-        # Find latent files to establish the base structure
-        latent_files = sorted(glob.glob(os.path.join(latent_dir, "*.pt")))
-        if not latent_files:
-            raise FileNotFoundError(f"No latent files (.pt) found in {latent_dir}")
+        # Find all dims files: rank_batchidx.pt
+        dims_files = sorted(list(dims_dir.glob("*_*.pt"))) # Glob for rank_batchidx structure
+        if not dims_files:
+            self.logger.error(f"No dimension files ('*_*.pt') found in {dims_dir}")
+            return [], {}, 0
 
-        self._file_paths['latent'] = latent_files
-        num_files = len(latent_files)
+        # Group files by batch index
+        file_groups = {} # {batch_idx: [path_rank0, path_rank1, ...]}
+        batch_sizes = {} # {batch_idx: num_samples}
 
-        # Try loading metadata if it exists
-        if os.path.exists(metadata_path):
+        self.logger.info(f"Discovering files based on {len(dims_files)} dims files in {dims_dir}...")
+
+        total_samples = 0
+        processed_batch_indices = set()
+
+        for file_path in dims_files:
             try:
-                with open(metadata_path, 'r') as f:
-                    metadata = json.load(f)
-                self.total_samples = metadata['total_samples']
-                self._file_lengths = metadata['file_lengths']
-                if len(self._file_lengths) != num_files:
-                     self.logger.warning("Metadata file count mismatch. Re-calculating file lengths.")
-                     self._file_lengths = [] # Force recalculation below
+                filename = file_path.name
+                parts = filename.split('_')
+                if len(parts) != 2 or not parts[0].isdigit() or not parts[1].endswith('.pt'):
+                     self.logger.warning(f"Skipping unexpected filename format: {filename} in {dims_dir}")
+                     continue
+
+                # rank_str = parts[0] # Rank is part of the filename now
+                batch_idx_str = parts[1].replace('.pt', '')
+                batch_idx = int(batch_idx_str)
+
+                if batch_idx not in processed_batch_indices:
+                    # This is the first time we see this batch_idx, load it to get size
+                    try:
+                        dims_tensor = torch.load(file_path, map_location='cpu')
+                        num_samples = dims_tensor.shape[0]
+                        batch_sizes[batch_idx] = num_samples
+                        total_samples += num_samples
+                        processed_batch_indices.add(batch_idx)
+                        file_groups[batch_idx] = [file_path] # Initialize group
+                    except Exception as e:
+                        self.logger.error(f"Failed to load dims file {file_path} to get size: {e}")
+                        continue # Skip this batch if dims file fails
                 else:
-                     self.logger.info("Loaded file structure from metadata.json")
+                    # We've already processed this batch_idx (from another rank's file)
+                    if batch_idx in file_groups:
+                         file_groups[batch_idx].append(file_path)
+                    else:
+                         # This case shouldn't happen if logic is correct, but log if it does
+                         self.logger.warning(f"Found file for already processed batch_idx {batch_idx} but group not initialized: {file_path}")
 
+            except ValueError:
+                self.logger.warning(f"Could not parse batch index from filename: {filename}")
             except Exception as e:
-                self.logger.warning(f"Could not load or parse metadata.json: {e}. Will infer structure.")
-                self.total_samples = 0
-                self._file_lengths = []
+                self.logger.error(f"Error processing file {file_path}: {e}")
 
-        # Infer structure if metadata failed or wasn't present
-        if not self._file_lengths:
-            self.logger.info("Inferring file structure by loading latent file headers...")
-            running_total = 0
-            for i, f_path in enumerate(latent_files):
-                try:
-                     # Quick load just to get shape (less memory intensive)
-                     # Note: This still reads the file header. Faster alternatives might exist.
-                     tensor_info = torch.load(f_path, map_location='cpu', weights_only=True if hasattr(torch, 'weights_only') else False) # weights_only if >=1.13
-                     # If weights_only isn't available or fails, load the whole tensor to get len
-                     if not hasattr(tensor_info, '__len__'):
-                           tensor_info = torch.load(f_path, map_location='cpu')
-                     
-                     length = len(tensor_info)
-                     self._file_lengths.append(length)
-                     running_total += length
-                except Exception as e:
-                     raise IOError(f"Failed to read header/length of latent file {f_path}: {e}")
-            self.total_samples = running_total
-            # Optionally save the inferred metadata here if desired
+        # --- Verification ---
+        # Check if all mandatory features exist for the discovered batch indices
+        required_features = self.MANDATORY_FEATURES # Use the defined set
+        verified_batch_indices = sorted(list(processed_batch_indices))
+        final_file_list = [] # List of tuples: (batch_idx, num_samples)
+        final_total_samples = 0
 
-        # Map global index to file index and index within file
-        current_offset = 0
-        for file_idx, length in enumerate(self._file_lengths):
-            for i in range(length):
-                self._file_map[current_offset + i] = (file_idx, i)
-            current_offset += length
+        self.logger.info(f"Verifying presence of mandatory features for {len(verified_batch_indices)} discovered batch indices...")
+        for batch_idx in verified_batch_indices:
+            batch_complete = True
+            for feature_type in required_features:
+                info = self.FEATURE_INFO[feature_type]
+                expected_filename_pattern = f"*_{batch_idx:06d}{info['ext']}" # Assumes 6-digit padding
+                feature_dir = self.feature_cache_path / info['dir']
+                # Check if at least one rank's file exists for this batch_idx and feature
+                matches = list(feature_dir.glob(expected_filename_pattern))
+                if not matches:
+                    self.logger.warning(f"Missing mandatory feature '{feature_type}' for batch index {batch_idx} (Pattern: {feature_dir / expected_filename_pattern}). Skipping batch.")
+                    batch_complete = False
+                    break # Stop checking features for this batch
 
-        # Verify and map other feature files (CLIP, Cluster, T5)
-        for feature_type, feature_dir in [('clip', clip_dir), ('cluster', cluster_dir), ('t5', t5_dir)]:
-             if os.path.exists(feature_dir):
-                  pattern = "*.cluster.pt" if feature_type == 'cluster' else "*.pt"
-                  feature_files = sorted(glob.glob(os.path.join(feature_dir, pattern)))
-                  if len(feature_files) == num_files:
-                       self._file_paths[feature_type] = feature_files
-                       self.logger.info(f"Found matching {feature_type} files.")
-                  else:
-                       self.logger.warning(f"Mismatch in number of {feature_type} files ({len(feature_files)}) vs latent files ({num_files}). {feature_type.capitalize()} features might be unavailable.")
-                       self._file_paths[feature_type] = []
-             else:
-                  self.logger.warning(f"{feature_type.capitalize()} directory not found: {feature_dir}. Features unavailable.")
-                  self._file_paths[feature_type] = []
+            if batch_complete:
+                num_samples = batch_sizes[batch_idx]
+                final_file_list.append((batch_idx, num_samples))
+                final_total_samples += num_samples
+            else:
+                 # Decrement total samples if batch was skipped
+                 original_size = batch_sizes.get(batch_idx, 0)
+                 # This adjustment might be complex if total_samples wasn't built correctly above
+                 # Safer to recalculate total_samples based on final_file_list
+                 pass # Recalculate below
+
+        # Recalculate total samples accurately based on verified batches
+        final_total_samples = sum(num_samples for _, num_samples in final_file_list)
+
+        # Calculate cumulative sizes for index mapping
+        cumulative_sizes = {}
+        current_pos = 0
+        for batch_idx, num_samples in final_file_list:
+            cumulative_sizes[batch_idx] = current_pos
+            current_pos += num_samples
+
+        if not final_file_list:
+             self.logger.error("No complete batches found after verifying mandatory features.")
+
+        return final_file_list, cumulative_sizes, final_total_samples
+
+
+    def _get_file_path(self, feature_type: str, batch_idx: int):
+         """
+         Gets the path(s) for a given feature type and batch index.
+         It returns the first available file found across potential ranks.
+         """
+         info = self.FEATURE_INFO[feature_type]
+         feature_dir = self.feature_cache_path / info['dir']
+         # Use the precise extension defined in FEATURE_INFO
+         filename_pattern = f"*_{batch_idx:06d}{info['ext']}" # Assumes 6 digits padding from precompute
+         
+         potential_files = sorted(list(feature_dir.glob(filename_pattern)))
+         
+         if not potential_files:
+              # self.logger.warning(f"No file found for feature '{feature_type}', batch {batch_idx} with pattern {filename_pattern}")
+              return None # Indicate file not found
+              
+         # Return the first found file path (e.g., rank 0's if available)
+         return potential_files[0]
 
 
     def _load_feature_file(self, feature_type: str, file_idx: int):
-        """Loads a specific feature file into the cache if not already loaded."""
-        if file_idx == self._current_file_idx.get(feature_type, -1):
-            return # Already loaded
+        """
+        Loads data for a specific feature type and original batch file index.
+        Uses an in-memory cache.
+        """
+        cache_key = (feature_type, file_idx)
+        if cache_key in self.feature_cache:
+            return self.feature_cache[cache_key]
 
-        if feature_type not in self._file_paths or not self._file_paths[feature_type]:
-            # Feature type is not available
-            self._loaded_files[feature_type] = {file_idx: None} # Mark as unavailable
-            self._current_file_idx[feature_type] = file_idx
-            return
+        file_path = self._get_file_path(feature_type, file_idx)
+        if file_path is None:
+             self.logger.error(f"Failed to find file path for feature '{feature_type}', batch index {file_idx}. Cannot load.")
+             # Return None or raise error depending on how critical this feature is
+             # If mandatory features are checked in discover, this might indicate a deeper issue
+             return None
 
         try:
-            filepath = self._file_paths[feature_type][file_idx]
-            # Clear previous file cache for this feature type to save memory
-            if feature_type in self._loaded_files:
-                 self._loaded_files[feature_type].clear()
-
-            # Load the new file (move to CPU to avoid holding GPU memory)
-            loaded_tensor = torch.load(filepath, map_location='cpu')
-            self._loaded_files[feature_type] = {file_idx: loaded_tensor}
-            self._current_file_idx[feature_type] = file_idx
-            # self.logger.debug(f"Loaded {feature_type} file index {file_idx}")
-        except IndexError:
-            self.logger.error(f"File index {file_idx} out of range for {feature_type}")
-            self._loaded_files[feature_type] = {file_idx: None} # Mark as unavailable
+            data = torch.load(file_path, map_location='cpu') # Load to CPU
+            self.feature_cache[cache_key] = data # Store in cache
+            return data
         except Exception as e:
-            self.logger.error(f"Failed to load {feature_type} file {filepath}: {e}")
-            self._loaded_files[feature_type] = {file_idx: None} # Mark as unavailable
+            self.logger.error(f"Error loading feature file {file_path}: {e}")
+            # Decide how to handle load errors (return None, placeholder, raise)
+            return None # Return None to indicate loading failure
 
+    def _find_batch_for_sample(self, idx):
+        """Find the batch_idx and index within that batch for a global sample index."""
+        target_batch_idx = -1
+        index_in_batch = -1
+
+        # Iterate through discovered batches to find where idx falls
+        for batch_idx, num_samples in self.file_list:
+             batch_start_offset = self.cumulative_sizes[batch_idx]
+             if batch_start_offset <= idx < batch_start_offset + num_samples:
+                  target_batch_idx = batch_idx
+                  index_in_batch = idx - batch_start_offset
+                  break # Found the correct batch
+
+        if target_batch_idx == -1:
+            raise IndexError(f"Sample index {idx} out of range (total samples: {self.total_samples})")
+
+        return target_batch_idx, index_in_batch
 
     def __getitem__(self, idx):
         """
-        Loads and returns data for a given global index.
-        Handles lazy loading of file parts.
+        Retrieves precomputed features for a single data sample.
+
+        Args:
+            idx (int): The global index of the sample to retrieve.
+
+        Returns:
+            dict: A dictionary containing the requested features for the sample.
+                  Keys are feature types (e.g., 'latents', 'clip'), values are tensors.
+                  Returns None for features that failed to load.
         """
-        if not 0 <= idx < self.total_samples:
-            raise IndexError(f"Index {idx} out of range for dataset size {self.total_samples}")
+        if not (0 <= idx < self.total_samples):
+             raise IndexError(f"Index {idx} out of bounds for dataset with size {self.total_samples}")
 
-        file_idx, index_in_file = self._file_map[idx]
+        # 1. Find which batch file this index belongs to
+        batch_idx, index_in_batch = self._find_batch_for_sample(idx)
 
-        # Prepare the item dictionary
-        item = {'index': idx} # Include original index
-
-        # Load required features (Latent is mandatory)
-        for feature_type in ['latent', 'clip', 'cluster', 't5']:
-             self._load_feature_file(feature_type, file_idx)
-             
-             loaded_data = self._loaded_files.get(feature_type, {}).get(file_idx, None)
-
-             if loaded_data is not None:
-                 try:
-                     # Note: .clone() is important if multiple workers might access the same cache
-                     item[feature_type] = loaded_data[index_in_file].clone()
-                 except IndexError:
-                     self.logger.error(f"Index {index_in_file} out of range within {feature_type} file {file_idx} (size {len(loaded_data)}).")
-                     item[feature_type] = None # Or handle error appropriately
-                 except Exception as e:
-                     self.logger.error(f"Error accessing index {index_in_file} in loaded {feature_type} file {file_idx}: {e}")
-                     item[feature_type] = None
+        # 2. Load all necessary feature files for this batch_idx (use cache)
+        # Define all features potentially needed by trainers/models
+        all_feature_types = list(self.FEATURE_INFO.keys())
+        batch_data_cache = {}
+        for feature_type in all_feature_types:
+             # Check if directory exists before trying to load (optimization)
+             info = self.FEATURE_INFO[feature_type]
+             feature_dir = self.feature_cache_path / info['dir']
+             if feature_dir.exists():
+                 batch_data_cache[feature_type] = self._load_feature_file(feature_type, batch_idx)
              else:
-                  # Feature file wasn't loaded or available
-                  item[feature_type] = None
-                  if feature_type == 'latent': # Latent is critical
-                       raise RuntimeError(f"Failed to load mandatory latent feature for index {idx} (file {file_idx})")
-                  elif feature_type == 'cluster': # Cluster is critical for RouterTrainer
-                       # Raise error only if router is being trained? Or always require clusters?
-                       # Let's warn for now, trainer can raise error if needed.
-                       self.logger.warning(f"Cluster assignment not available for index {idx} (file {file_idx})")
+                 # Don't try to load if dir doesn't exist
+                 batch_data_cache[feature_type] = None
 
 
-        # Rename keys and generate IDs
-        final_item = {}
-        # Note: We clone tensors fetched from cache to avoid modification issues if using multiple workers
-        if item.get('latent') is not None:
-             final_item['image'] = item['latent'].clone() # Use 'image' for latent tensor
-        if item.get('clip') is not None:
-             final_item['y'] = item['clip'].clone() # Use 'y' for CLIP condition
-        if item.get('cluster') is not None:
-             # Ensure cluster_idx is a scalar tensor if loaded as single element tensor
-             cluster_idx_tensor = item['cluster'].clone()
-             final_item['cluster_idx'] = cluster_idx_tensor.item() if cluster_idx_tensor.numel() == 1 else cluster_idx_tensor
-        if item.get('t5') is not None:
-             final_item['txt'] = item['t5'].clone() # Use 'txt' for T5 condition
-
-        # --- Generate img_ids and txt_ids (Crucial for Flux/ExpertModel) ---
-        if final_item.get('image') is not None:
-            # Based on models/flux/sampling_flux.py: prepare()
-            # Assumes latent is [C, H, W]
-            _, latent_h, latent_w = final_item['image'].shape
-            # Flux expects image input reshaped and IDs based on halved dimensions before reshaping
-            img_h, img_w = math.ceil(latent_h / 2), math.ceil(latent_w / 2) # Match sampling_flux unpack H/W calculation? Needs verification with Flux model structure. Or simply use H//2, W//2 if exact patch division is guaranteed.
-            
-            # Create img_ids tensor [H * W, 3]
-            img_ids_shape = (img_h * img_w, 3)
-            img_ids = torch.zeros(img_ids_shape, dtype=torch.float32) # Match dtype potentially expected by flux.math.rope
-            
-            # Create coordinate grid
-            rows = torch.arange(img_h, dtype=torch.float32)
-            cols = torch.arange(img_w, dtype=torch.float32)
-            grid_h, grid_w = torch.meshgrid(rows, cols, indexing='ij') # Use 'ij' indexing
-            
-            # Populate img_ids: [id_type=1, row, col] (id_type might be different, check Flux usage)
-            img_ids[:, 0] = 1.0 # Assuming 1 signifies image token type, adjust if needed
-            img_ids[:, 1] = grid_h.flatten()
-            img_ids[:, 2] = grid_w.flatten()
-            final_item['img_ids'] = img_ids
-
-        if final_item.get('txt') is not None:
-             # Flux sampling_flux.py uses zeros for txt_ids: [id_type=0, 0, 0]
-             # Assumes txt is [L, D] where L is sequence length
-             txt_len = final_item['txt'].shape[0]
-             txt_ids_shape = (txt_len, 3)
-             txt_ids = torch.zeros(txt_ids_shape, dtype=torch.float32) # Match dtype
-             # txt_ids[:, 0] = 0.0 # Assuming 0 signifies text token type
-             final_item['txt_ids'] = txt_ids
+        # 3. Extract the specific sample's data from the loaded batch tensors
+        sample_data = {}
+        load_successful = True
+        for feature_type, batch_tensor in batch_data_cache.items():
+             if batch_tensor is not None:
+                 try:
+                      sample_data[feature_type] = batch_tensor[index_in_batch]
+                 except IndexError:
+                      self.logger.error(f"IndexError accessing {feature_type} data: index_in_batch={index_in_batch}, batch_tensor shape={batch_tensor.shape}, batch_idx={batch_idx}")
+                      sample_data[feature_type] = None # Mark as failed
+                      if feature_type in self.MANDATORY_FEATURES:
+                           load_successful = False
+                 except Exception as e:
+                      self.logger.error(f"Error extracting sample {idx} (batch {batch_idx}, index {index_in_batch}) for feature {feature_type}: {e}")
+                      sample_data[feature_type] = None
+                      if feature_type in self.MANDATORY_FEATURES:
+                           load_successful = False
+             else:
+                 # Feature file failed to load or dir didn't exist
+                 sample_data[feature_type] = None
+                 # Check if this was a mandatory feature that failed
+                 if feature_type in self.MANDATORY_FEATURES and (self.feature_cache_path / self.FEATURE_INFO[feature_type]['dir']).exists():
+                     # If dir exists but load failed for mandatory feature
+                     load_successful = False
 
 
-        # Filter out None values unless None is valid input (e.g., optional condition)
-        # Ensure mandatory keys are present
-        if 'image' not in final_item:
-            raise RuntimeError(f"Mandatory 'image' (latent) feature missing for index {idx}")
-        if 'cluster_idx' not in final_item:
-             # Cluster index is needed for router training, maybe optional for expert?
-             # Let's keep the warning from before for now.
-             self.logger.warning(f"Cluster assignment ('cluster_idx') not available for index {idx}")
+        # Add index and potentially other metadata if needed
+        sample_data['index'] = idx
+
+        # --- Generate img_ids and txt_ids ---
+        # Based on sampling_flux.py logic
+        latents = sample_data.get('latents')
+        t5_embeddings = sample_data.get('t5')
+
+        if latents is not None:
+            # Assuming latents are [C, H, W]
+            # Flux expects patches of 2x2, so effective grid size is H/2 x W/2
+            latent_h, latent_w = latents.shape[-2], latents.shape[-1]
+            grid_h, grid_w = math.ceil(latent_h / 2), math.ceil(latent_w / 2) # Use ceil for robustness
+            num_img_patches = grid_h * grid_w
+
+            # Create coordinate grid (y, x, 0) - matches flux.math.rope input format potentially
+            img_ids = torch.zeros(grid_h, grid_w, 3, dtype=torch.float32)
+            img_ids[..., 0] = torch.arange(grid_h, dtype=torch.float32)[:, None] # y-coordinates
+            img_ids[..., 1] = torch.arange(grid_w, dtype=torch.float32)[None, :] # x-coordinates
+            # Third dimension is often kept 0 for images in RoPE implementations
+            sample_data['img_ids'] = img_ids.view(num_img_patches, 3) # Reshape to [N_patches, 3]
+        else:
+            # Handle missing latents - create dummy or raise error
+            self.logger.warning(f"Latents missing for sample {idx}, creating dummy img_ids.")
+            sample_data['img_ids'] = torch.zeros(1, 3, dtype=torch.float32) # Minimal placeholder
+            if 'latents' in self.MANDATORY_FEATURES: load_successful = False
 
 
-        # Return only necessary items for the trainer
-        # Filter based on expected keys for the models/trainers
-        # This filtering might be better handled in _get_batch_data if different trainers need different subsets
-        return final_item
+        if t5_embeddings is not None:
+            # Assuming t5_embeddings are [SeqLen, Dim]
+            num_txt_tokens = t5_embeddings.shape[0]
+            # Flux uses zeros for text IDs, RoPE applied differently? Check Flux model.
+            # Creating sequence indices (0, 1, 2...) might be more standard for text RoPE.
+            txt_ids = torch.zeros(num_txt_tokens, 3, dtype=torch.float32)
+            txt_ids[..., 0] = torch.arange(num_txt_tokens, dtype=torch.float32) # Sequence position
+            sample_data['txt_ids'] = txt_ids
+        else:
+             # Handle missing T5 - create dummy or raise error
+            self.logger.warning(f"T5 embeddings missing for sample {idx}, creating dummy txt_ids.")
+            sample_data['txt_ids'] = torch.zeros(1, 3, dtype=torch.float32) # Minimal placeholder
+            if 't5' in self.MANDATORY_FEATURES: load_successful = False
 
+
+        # Handle mandatory feature load failures
+        if not load_successful:
+             self.logger.error(f"Failed to load one or more mandatory features for sample index {idx}. Returning None or partial data.")
+             # Option 1: Return None to signal the collate_fn to skip this sample
+             # return None
+             # Option 2: Return partial data (might cause issues downstream)
+             # return sample_data
+             # Option 3: Raise an exception
+             raise RuntimeError(f"Failed to load mandatory features for sample index {idx}. Check logs.")
+
+        return sample_data
 
     def __len__(self):
         return self.total_samples
 
     @property
     def bucket_assignments(self) -> torch.Tensor:
-        """Loads and returns the bucket assignments for all samples."""
+        """Returns the loaded bucket assignments."""
         if self._bucket_assignments is None:
-            self.logger.info("Loading bucket assignments...")
-            self._bucket_assignments = self._load_bucket_assignments()
+            self.logger.error("Bucket assignments accessed before loading.")
+            # Handle appropriately: raise error or return default
+            raise ValueError("Bucket assignments not loaded.")
         return self._bucket_assignments
 
     def _load_bucket_assignments(self) -> torch.Tensor:
-        """Loads bucket assignments from cached files."""
-        bucket_dir = os.path.join(self.feature_cache_path, "buckets")
-        if not os.path.exists(bucket_dir):
-             raise FileNotFoundError(f"Bucket assignment directory not found: {bucket_dir}")
+        """Loads bucket assignments for the entire dataset."""
+        assignments_dir = self.feature_cache_path / self.FEATURE_INFO['buckets']['dir']
+        if not assignments_dir.exists():
+            raise FileNotFoundError(f"Bucket assignments directory not found: {assignments_dir}")
 
-        bucket_files = sorted(glob.glob(os.path.join(bucket_dir, "*.pt")))
-        if len(bucket_files) != len(self._file_paths['latent']):
-             raise FileNotFoundError("Mismatch between number of bucket files and latent files.")
-
+        # Load assignments from all rank_*_*.pt files and concatenate
         all_assignments = []
-        total_loaded = 0
-        for i, f_path in enumerate(bucket_files):
-            try:
-                assignments = torch.load(f_path, map_location='cpu')
-                if len(assignments) != self._file_lengths[i]:
-                     raise ValueError(f"Length mismatch in bucket file {f_path}: expected {self._file_lengths[i]}, got {len(assignments)}")
-                all_assignments.append(assignments)
-                total_loaded += len(assignments)
-            except Exception as e:
-                raise IOError(f"Failed to load bucket file {f_path}: {e}")
+        # Use self.file_list which contains verified batch indices and sizes
+        self.logger.info(f"Loading bucket assignments for {len(self.file_list)} verified batches...")
+        for batch_idx, num_samples in tqdm(self.file_list, desc="Loading bucket assignments"):
+            file_path = self._get_file_path('buckets', batch_idx) # Use helper to find the file
+            if file_path:
+                try:
+                    batch_assignments = torch.load(file_path, map_location='cpu')
+                    if batch_assignments.shape[0] != num_samples:
+                         self.logger.warning(f"Bucket assignment count mismatch for batch {batch_idx}. Expected {num_samples}, got {batch_assignments.shape[0]}. File: {file_path}")
+                         # Handle mismatch: skip, truncate, error? For now, use loaded count.
+                    all_assignments.append(batch_assignments)
+                except Exception as e:
+                    self.logger.error(f"Error loading bucket assignment file {file_path}: {e}")
+                    # Handle error: skip batch, raise error? Requires consistent handling.
+                    raise RuntimeError(f"Failed to load bucket assignments for batch {batch_idx}")
+            else:
+                self.logger.error(f"Could not find bucket assignment file for batch {batch_idx}. Cannot proceed.")
+                raise FileNotFoundError(f"Missing bucket assignment file for batch {batch_idx}")
 
-        if total_loaded != self.total_samples:
-             raise ValueError(f"Total samples in bucket files ({total_loaded}) does not match dataset size ({self.total_samples}).")
+        if not all_assignments:
+             raise ValueError("Failed to load any bucket assignments.")
 
-        return torch.cat(all_assignments, dim=0)
+        full_assignments = torch.cat(all_assignments, dim=0)
 
+        # Validate size
+        if full_assignments.shape[0] != self.total_samples:
+            self.logger.warning(f"Total loaded bucket assignments ({full_assignments.shape[0]}) does not match expected dataset size ({self.total_samples}).")
+            # This might indicate issues in discovery or loading.
 
-    # --- Methods below might be less critical for basic operation ---
-    def _compute_cluster_statistics(self):
-        """Compute and cache cluster statistics"""
-        if self._bucket_assignments is None:
-            self.logger.warning("No bucket assignments found - using uniform distribution")
-            self.cluster_counts = torch.ones(self.config.num_experts, dtype=torch.long, device=self.device)
-            return
+        self.logger.info(f"Successfully loaded bucket assignments for {full_assignments.shape[0]} samples.")
+        return full_assignments.short() # Use short tensor for memory efficiency
 
-        # Count samples per cluster - ensure long dtype
-        unique_clusters, counts = torch.unique(
-            self._bucket_assignments, 
-            return_counts=True
-        )
-        
-        # Initialize counts tensor with matching dtype
-        self.cluster_counts = torch.zeros(
-            self.config.num_experts, 
-            dtype=counts.dtype,  # Match the dtype of counts
-            device=self.device
-        )
-        
-        # Fill in actual counts
-        self.cluster_counts[unique_clusters] = counts
-        
-        # Log distribution
-        total = self.cluster_counts.sum().item()
-        for cluster, count in enumerate(self.cluster_counts.tolist()):
-            if self.rank == 0:
-                self.logger.info(f"Cluster {cluster}: {count} samples ({100 * count/total:.2f}%)")
-
-    def get_cluster_sizes(self):
-        """Return number of samples per cluster"""
-        if not hasattr(self, 'cluster_counts'):
-            self._compute_cluster_statistics()
-        return self.cluster_counts
-
-    def get_cluster_distribution(self):
-        """Return normalized cluster distribution"""
-        counts = self.get_cluster_sizes()
-        return counts / counts.sum()
 
     @staticmethod
     def collate_fn(batch):
         """
-        Collates a list of item dictionaries into a single batch dictionary.
-        Handles padding if sequences have variable lengths (e.g., T5 embeddings).
-        Uses default_collate for efficient stacking of uniform tensors.
+        Collates a list of samples (dictionaries) into a single batch dictionary.
+        Filters out None samples resulting from loading errors.
         """
-        # Use default collate which handles stacking tensors of the same shape
-        collated_batch = torch.utils.data.default_collate(batch)
+        # Filter out None samples if __getitem__ returns None on error
+        batch = [sample for sample in batch if sample is not None]
+        if not batch:
+            return None # Return None if the entire batch failed
 
-        # --- Padding for variable length sequences (if needed) ---
-        # Check if 'txt' or 'txt_ids' are present and need padding
-        # Example for 'txt' (T5 embeddings):
-        if 'txt' in collated_batch:
-             # Check if tensors in the batch had different lengths originally
-             # default_collate might raise error or pad incorrectly if lengths vary.
-             # We need the original list to pad correctly.
-             txt_sequences = [item['txt'] for item in batch if 'txt' in item]
-             if txt_sequences:
-                  # Pad to the max length in the batch
-                  padded_txt = torch.nn.utils.rnn.pad_sequence(txt_sequences, batch_first=True, padding_value=0.0) # Use 0.0 for padding
-                  collated_batch['txt'] = padded_txt
+        # Get keys from the first sample (assume all samples have the same structure)
+        elem_keys = batch[0].keys()
+        collated = {}
 
-                  # If 'txt_ids' exist, pad them similarly
-                  if 'txt_ids' in collated_batch:
-                       txt_ids_sequences = [item['txt_ids'] for item in batch if 'txt_ids' in item]
-                       # Pad the IDs tensor. Shape is [L, 3], padding should add [0, 0, 0] vectors.
-                       padded_txt_ids = torch.nn.utils.rnn.pad_sequence(txt_ids_sequences, batch_first=True, padding_value=0.0)
-                       collated_batch['txt_ids'] = padded_txt_ids
-                  # TODO: Generate attention mask for 'txt' if model requires it
-                  # attention_mask = (padded_txt != 0).any(dim=-1).long() # Example: mask based on padding token (0)
-                  # collated_batch['txt_attention_mask'] = attention_mask
+        for key in elem_keys:
+            # Get the list of tensors/values for this key
+            values = [sample[key] for sample in batch]
 
+            # Stack tensors, handle other types appropriately
+            if isinstance(values[0], torch.Tensor):
+                collated[key] = torch.stack(values, dim=0)
+            elif isinstance(values[0], (int, float, str)):
+                # Convert numerical types to tensors if desired, keep strings as list
+                try:
+                    # Attempt to convert to tensor, fallback to list
+                    collated[key] = torch.tensor(values)
+                except TypeError:
+                    collated[key] = values # Keep as list if not numerical
+            elif isinstance(values[0], list): # e.g. list of strings for captions before tokenization
+                 collated[key] = values # Keep as list of lists/strings
+            else:
+                 # Handle other potential types if necessary
+                 collated[key] = values
 
-        return collated_batch
+        return collated
 
 class CombinedBatchSampler(Sampler):
     """Combines multiple batch samplers into one epoch."""
@@ -516,6 +595,21 @@ class BucketBatchSampler(Sampler):
     def __len__(self):
         # Total number of batches yielded by this rank per epoch
         return self.num_batches
+
+    def _load_bucket_assignments(self) -> torch.Tensor:
+        # ... existing code ...
+        try:
+            assignments = self.dataset.bucket_assignments
+        except FileNotFoundError:
+            self.logger.error("Bucket assignments not found. Cannot use BucketBatchSampler.")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error loading bucket assignments: {e}")
+            raise # Correct indentation for raise
+
+        self.num_buckets = assignments.max().item() + 1
+        self.logger.info(f"Sampler Rank {self.rank}: Found {self.num_buckets} buckets.")
+        # ... rest of the method ...
 
 def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     """

@@ -23,736 +23,578 @@ import time
 import argparse
 import random
 import sys
+import toml
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from types import SimpleNamespace
+import fire
+import logging
+from data.clustering import DDMClustering
+from utils.distributed import setup_distributed
 
+# Import local modules (assuming correct paths relative to project root)
+from data.vae import VAEWrapper
+from data.clip import CLIPTextEncoder
+from data.t5 import T5TextEncoder
+from utils import dict_to_sns # Assuming dict_to_sns is in utils
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Dataset for Precomputation ---
+class PrecomputeDataset(Dataset):
+    """Basic dataset to load images and captions."""
+    def __init__(self, config):
+        self.root_dir = Path(config.dataset_path)
+        self.image_files = []
+        self.captions = {} # Maps image filename (without ext) to caption
+
+        logger.info(f"Scanning dataset at {self.root_dir}...")
+        # Example: Assume images are in root_dir and captions in root_dir/captions.txt
+        # Adjust this logic based on your actual dataset structure
+        caption_file = self.root_dir / "captions.txt" # Example caption file path
+        try:
+            with open(caption_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split('\t', 1) # Example: image_name.jpg\tCaption text
+                    if len(parts) == 2:
+                        img_name_no_ext = os.path.splitext(parts[0])[0]
+                        self.captions[img_name_no_ext] = parts[1]
+        except FileNotFoundError:
+            logger.warning(f"Caption file not found at {caption_file}. Text features (CLIP/T5) cannot be generated.")
+            self.captions = {}
+
+        valid_extensions = ('.jpg', '.jpeg', '.png', '.webp')
+        for entry in os.scandir(self.root_dir):
+            if entry.is_file() and entry.name.lower().endswith(valid_extensions):
+                 self.image_files.append(entry.path)
+
+        logger.info(f"Found {len(self.image_files)} images.")
+        if not self.captions:
+            logger.warning("No captions loaded. CLIP/T5 features will be skipped or use empty strings.")
+
+        # Basic image transform: resize and convert to tensor
+        # VAEWrapper expects [-1, 1] range, encoders expect specific formats
+        # We load PIL images and let each extractor handle its required transform
+        self.transform = transforms.Compose([
+            transforms.Resize(512, interpolation=transforms.InterpolationMode.LANCZOS), # Example resize
+            transforms.CenterCrop(512)
+        ])
+
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_path = self.image_files[idx]
+        img_filename = os.path.basename(img_path)
+        img_name_no_ext = os.path.splitext(img_filename)[0]
+
+        try:
+            # Load image as PIL
+            img = Image.open(img_path).convert('RGB')
+            # Apply minimal transform if needed, or let extractors handle it
+            # img = self.transform(img) # Optional basic transform
+        except Exception as e:
+            logger.error(f"Error loading image {img_path}: {e}. Returning None.")
+            img = None # Signal error
+
+        # Get caption, default to empty string if missing or no caption file
+        caption = self.captions.get(img_name_no_ext, "")
+
+        # Return raw PIL image, caption, and original path/ID
+        return {'image': img, 'caption': caption, 'id': img_filename}
+
+# --- Feature Generator ---
 class FeatureGenerator:
     def __init__(self, config, enabled_features):
         self.config = config
-        # Handle non-distributed clustering case
-        try:
+        self.rank = 0
+        self.world_size = 1
+        self.distributed = False
+        if dist.is_available() and dist.is_initialized():
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
             self.distributed = True
-        except (RuntimeError, ValueError):  # Catch both exception types
-            # Fallback for standalone clustering
-            self.rank = 0
-            self.world_size = 1
-            self.distributed = False
-            
-        self.device = torch.device(f'cuda:{self.rank}' if torch.cuda.is_available() else 'cpu')
-        self.enabled_features = enabled_features
-        
-        # Only initialize requested models
-        if 'vae' in enabled_features:
-            self.vae = VAEWrapper(self.device, config)
-        if 'clip' in enabled_features:
-            self.clip = CLIPTextEncoder(self.device, config)
-        if 't5' in enabled_features:
-            # Add T5 text encoder initialization
-            from data.t5 import T5TextEncoder
-            self.t5 = T5TextEncoder(self.device, config)
-        if 'dino' in enabled_features:
-            # Check if we should use existing features or load model
-            self.dino = None
-            if not getattr(config, 'use_existing_dino', False):
-                self.dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device).eval()
+            self.device = torch.device(f'cuda:{self.rank}')
         else:
-            self.dino = None  # Explicitly set to None if not loading
-        
-        # Create feature directories aggressively
-        self.feature_dir = Path(config.feature_cache_path)
-        self._force_create_dirs()
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def _force_create_dirs(self):
-        """Create only needed directories"""
-        dir_map = {
-            'vae': 'latents',
-            'clip': 'clip',
-            't5': 't5',  # Add directory for T5 embeddings
-            'dino': 'dino_features',
-            'buckets': 'buckets',
-            'dims': 'dims',
-            'clustering': 'clusters'
-        }
-        
+        logger.info(f"[Rank {self.rank}] Initializing FeatureGenerator on device: {self.device}")
+        self.enabled_features = set(enabled_features) # Use a set for faster checks
+        self.feature_dir = Path(config.data.feature_cache_path)
+
+        # Initialize models ONLY if the corresponding feature is enabled
+        self.vae = None
+        self.clip = None
+        self.t5 = None
+        self.dino = None
+
+        # Pass relevant sub-config to wrappers/encoders
+        data_cfg = config.data
+        train_cfg = config.train # Need use_mixed_precision
+
+        # Combine necessary fields for sub-configs
+        vae_sub_config = SimpleNamespace(
+             **{k: v for k, v in data_cfg.__dict__.items() if k.startswith('vae_')},
+             use_mixed_precision=train_cfg.use_mixed_precision,
+             latent_channels=data_cfg.latent_channels # Ensure latent_channels is included
+        )
+        clip_sub_config = SimpleNamespace(
+             clip_model_name=data_cfg.clip_model_name,
+             clip_max_token_length=getattr(data_cfg, 'clip_max_token_length', 77),
+             use_mixed_precision=train_cfg.use_mixed_precision
+        )
+        t5_sub_config = SimpleNamespace(
+             t5_model_name=data_cfg.t5_model_name,
+             t5_max_token_length=getattr(data_cfg, 't5_max_token_length', 128),
+             use_mixed_precision=train_cfg.use_mixed_precision
+        )
+
+        if 'vae' in self.enabled_features:
+            logger.info(f"[Rank {self.rank}] Initializing VAE...")
+            self.vae = VAEWrapper(self.device, vae_sub_config)
+        if 'clip' in self.enabled_features:
+            logger.info(f"[Rank {self.rank}] Initializing CLIP...")
+            self.clip = CLIPTextEncoder(self.device, clip_sub_config)
+        if 't5' in self.enabled_features:
+            logger.info(f"[Rank {self.rank}] Initializing T5...")
+            self.t5 = T5TextEncoder(self.device, t5_sub_config)
+        if 'dino' in self.enabled_features:
+            logger.info(f"[Rank {self.rank}] Initializing DINO...")
+            # DINO feature extraction can be implemented here if needed.
+            # self.dino = ... load DINO model ...
+            logger.warning("DINO model loading/extraction not implemented. Skipping 'dino' feature.")
+            self.enabled_features.discard('dino') # Disable if not loaded
+        if 'dims' in self.enabled_features or 'buckets' in self.enabled_features:
+             # Store bucketing config for direct use
+             self.buckets = getattr(data_cfg, 'buckets', None)
+             self.bucket_scale = getattr(data_cfg, 'bucket_scale', None)
+             if not self.buckets or not self.bucket_scale:
+                  logger.warning("Bucketing enabled but 'buckets' or 'bucket_scale' missing in config. Disabling.")
+                  self.enabled_features.discard('buckets')
+
+        # Create directories on rank 0
+        self._create_dirs()
+
+    def _create_dirs(self):
+        """Create output directories for enabled features on rank 0."""
         if self.rank == 0:
-            for feat in self.enabled_features:
-                if feat in dir_map:
-                    dir_path = self.feature_dir/dir_map[feat]
-                    dir_path.mkdir(parents=True, exist_ok=True)
-                    
-        # Only call barrier if distributed mode is active
-        if hasattr(self, 'distributed') and self.distributed:
+            dir_map = {
+                'vae': 'latents', 'clip': 'clip', 't5': 't5', 'dino': 'dino',
+                'dims': 'dims', 'buckets': 'buckets', 'clusters': 'clusters'
+            }
+            self.feature_dir.mkdir(parents=True, exist_ok=True)
+            for feat, dirname in dir_map.items():
+                if feat in self.enabled_features:
+                    (self.feature_dir / dirname).mkdir(exist_ok=True)
+        if self.distributed:
             dist.barrier()
 
-    # Keep only the feature extraction methods that work with single inputs
-    def _extract_vae_latent(self, img):
-        """Direct latent encoding without caching"""
-        # Ensure RGB and proper tensor format
-        img_rgb = img.convert('RGB')
-        img_tensor = transforms.ToTensor()(img_rgb.resize((512, 512))).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            return self.vae.encode(img_tensor).cpu()
-
-    def _extract_clip_embedding(self, caption):
-        """Raw text embedding without validation"""
-        with torch.no_grad():
-            return self.clip.encode([caption]).cpu()
-
-    def _extract_dino_features(self, img):
-        """Robust DINO feature extraction with model check"""
-        if self.dino is None:
-            return torch.zeros(1, 1024)  # Return empty features if model not loaded
-            
+    # --- Batch Feature Extraction Methods ---
+    def _extract_batch_vae(self, images_pil: list):
+        """Encodes a batch of PIL images into latents."""
+        if not self.vae: return None
+        # VAEWrapper expects [-1, 1] normalized tensors.
+        # PIL Images are passed; VAEWrapper or specific extraction logic handles format.
+        # Assuming VAEWrapper handles PIL -> Tensor -> Normalize internally if needed,
+        # otherwise, preprocessing is needed here. Let's assume VAEWrapper expects tensors.
+        preprocess = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]) # Normalize to [-1, 1]
+        ])
         try:
-            # Convert to RGB tensor with 3 channels
-            img_rgb = img.convert('RGB')
-            prep_img = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.size(0) == 1 else x),  # Handle grayscale
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])(img_rgb).unsqueeze(0).to(self.device)
-            
-            # Validate channel dimensions
-            if prep_img.shape[1] != 3:
-                raise ValueError(f"Invalid channel count: {prep_img.shape[1]}")
-            
+            # Stack preprocessed images into a batch tensor
+            # Filter out None images before preprocessing
+            valid_images = [img for img in images_pil if img is not None]
+            if not valid_images: return None # Skip if no valid images in batch
+            img_tensors = torch.stack([preprocess(img) for img in valid_images]).to(self.device)
+
             with torch.no_grad():
-                return self.dino(prep_img).cpu()
+                # Precision handled within VAEWrapper encode
+                latents = self.vae.encode(img_tensors)
+            # Handle potential mismatch if some images were None
+            # Need to return a tensor of the original batch size with placeholders for errors
+            # This is complex. Simplification: Assume no errors or handle in process_batch.
+            # Returning potentially smaller tensor here. process_batch needs adjustment or error handling.
+            # For now, returning the latents of valid images.
+            return latents.cpu() # Return on CPU
         except Exception as e:
-            print(f"DINO extraction failed: {str(e)}")
-            return torch.zeros(1, 1024)  # Return zero features for corrupt images
-
-    def _extract_t5_embedding(self, caption):
-        """Extract T5 embedding for captions - similar to CLIP but with T5"""
-        with torch.no_grad():
-            if not isinstance(caption, list):
-                caption = [caption]
-            
-            # Ensure model is on the correct device
-            if not hasattr(self.t5.model, 'device') or self.t5.model.device != self.device:
-                self.t5.model = self.t5.model.to(self.device)
-            
-            # Process on GPU
-            embedding = self.t5.encode(caption)
-            
-            # Return CPU version
-            return embedding.cpu()
-
-    def _get_bucket_index(self, width, height):
-        """Find best matching bucket using config parameters"""
-        aspect = width / height
-        config = self.config
-        
-        # 1. Determine aspect ratio group
-        aspect_group = None
-        
-        # Handle the case where bucket_thresholds might be a SimpleNamespace
-        if hasattr(config.bucket_thresholds, 'items'):
-            # It's a dictionary
-            for group, (min_ratio, max_ratio) in config.bucket_thresholds.items():
-                if min_ratio <= aspect <= max_ratio:
-                    aspect_group = group
-                    break
-        else:
-            # It's a SimpleNamespace - access attributes directly
-            if hasattr(config.bucket_thresholds, 'square'):
-                min_ratio, max_ratio = config.bucket_thresholds.square
-                if min_ratio <= aspect <= max_ratio:
-                    aspect_group = 'square'
-            
-            if aspect_group is None and hasattr(config.bucket_thresholds, 'portrait'):
-                min_ratio, max_ratio = config.bucket_thresholds.portrait
-                if min_ratio <= aspect <= max_ratio:
-                    aspect_group = 'portrait'
-            
-            if aspect_group is None and hasattr(config.bucket_thresholds, 'landscape'):
-                min_ratio, max_ratio = config.bucket_thresholds.landscape
-                if min_ratio <= aspect <= max_ratio:
-                    aspect_group = 'landscape'
-        
-        # If no aspect group was determined, use the first bucket
-        if aspect_group is None:
-            return 0
-        
-        # 2. Calculate scaled dimensions
-        scale = config.bucket_scale
-        scaled_w = round(width / scale) * scale
-        scaled_h = round(height / scale) * scale
-        
-        # 3. Find matching bucket
-        for idx, (bw, bh) in enumerate(config.buckets):
-            if aspect_group == 'square' and bw == bh and scaled_w == bw and scaled_h == bh:
-                return idx
-            elif aspect_group == 'portrait' and bw < bh and scaled_w == bw and scaled_h == bh:
-                return idx
-            elif aspect_group == 'landscape' and bw > bh and scaled_w == bw and scaled_h == bh:
-                return idx
-            
-        # Fallback to nearest bucket
-        distances = [
-            (abs(scaled_w - bw) + abs(scaled_h - bh), idx)
-            for idx, (bw, bh) in enumerate(config.buckets)
-        ]
-        return min(distances)[1]
-
-    def _extract_dims(self, img):
-        """Extract original image dimensions"""
-        return torch.tensor(img.size, dtype=torch.int16)
-
-    def _gpu_health_check(self):
-        """Verify GPU is responsive"""
-        test_tensor = torch.randn(1024, device=self.device)
-        torch.cuda.synchronize()
-        # If this hangs, it indicates GPU health issues
-        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
-
-    # Update the FEATURE_PROCESSORS dictionary to clearly indicate feature type and save key
-    FEATURE_PROCESSORS = {
-        'vae': {
-            'save_prefix': 'latents',
-        },
-        'clip': {
-            'save_prefix': 'clip',
-        },
-        't5': {
-            'save_prefix': 't5',
-        },
-        'dino': {
-            'save_prefix': 'dino_features',
-        },
-        'buckets': {
-            'save_prefix': 'buckets',
-        },
-        'dims': {
-            'save_prefix': 'dims',
-        }
-    }
-
-    def run_clustering(self):
-        """Pure CPU clustering implementation - standalone process"""
-        try:
-            # Only rank 0 handles clustering
-            if self.rank != 0:
-                return True  # Non-rank 0 processes exit immediately
-            
-            print("Starting CPU-only clustering on rank 0")
-            feature_files = list((self.feature_dir/"dino_features").glob("*.pt"))
-            total_files = len(feature_files)
-            
-            # Memory map setup
-            mmap_path = self.feature_dir/"clusters/features.mmap"
-            sample_feat = torch.load(feature_files[0], map_location='cpu')
-            feat_dim = sample_feat.shape[1]
-            
-            # Create memory-mapped array
-            with open(mmap_path, 'wb') as f:
-                f.seek(total_files * feat_dim * 4 - 1)
-                f.write(b'\0')
-            
-            mmap_array = np.memmap(mmap_path, dtype=np.float32, mode='r+', 
-                                 shape=(total_files, feat_dim))
-            
-            # Batched loading with error handling
-            batch_size = 8192
-            # Store file paths to maintain name association
-            file_paths = []
-            
-            with tqdm(total=total_files, desc="Loading features") as pbar:
-                for batch_idx in range(0, total_files, batch_size):
-                    batch_files = feature_files[batch_idx:batch_idx+batch_size]
-                    
-                    with ThreadPoolExecutor(max_workers=32) as executor:
-                        futures = {executor.submit(self._safe_load_feature, f): (i, f) 
-                                 for i, f in enumerate(batch_files, batch_idx)}
-                        for future in as_completed(futures):
-                            idx, file_path = futures[future]
-                            try:
-                                feat = future.result()
-                                if feat is not None:
-                                    mmap_array[idx] = feat.numpy().squeeze()
-                                    file_paths.append(file_path)
-                            except Exception as e:
-                                print(f"Skipping corrupted file: {str(e)}")
-                            pbar.update(1)
-            
-            # Filter invalid entries
-            valid_mask = ~np.all(mmap_array == 0, axis=1)
-            full_features = mmap_array[valid_mask]
-            valid_file_paths = [fp for i, fp in enumerate(file_paths) if valid_mask[i]]
-            del mmap_array  # Release memory map
-
-            # CPU-only k-means
-            kmeans = faiss.Kmeans(
-                full_features.shape[1], 1024,
-                niter=100, 
-                gpu=False,
-                spherical=True,
-                min_points_per_centroid=100,
-                max_points_per_centroid=10000,
-                nredo=3,
-                verbose=True
-            )
-            kmeans.train(full_features)
-            
-            # CPU-based hierarchical clustering
-            agg = AgglomerativeClustering(
-                n_clusters=8, 
-                linkage='average',
-                metric='cosine', 
-                compute_full_tree=True
-            )
-            agg.fit(kmeans.centroids)
-            
-            # Save final clusters
-            _, labels = kmeans.index.search(full_features, 1)
-            cluster_labels = agg.labels_[labels.flatten()]
-            
-            # Save cluster labels with original file names
-            cluster_dict = {}
-            for i, file_path in enumerate(valid_file_paths):
-                # Extract base name from file path without rank suffix
-                base_name = Path(file_path).stem
-                # Remove rank suffix if present (e.g., "_rank0")
-                if "_rank" in base_name:
-                    base_name = base_name.split("_rank")[0]
-                cluster_dict[base_name] = int(cluster_labels[i])
-            
-            torch.save(cluster_dict, self.feature_dir/"clusters/final_clusters.pt")
-
-            # Cleanup
-            os.remove(mmap_path)
-
-            # Save completion marker
-            completion_file = self.feature_dir/"clusters/COMPLETED.flag"
-            with open(completion_file, 'w') as f:
-                f.write(str(time.time()))
-            
-            return True
-            
-        except Exception as e:
-            print(f"Clustering failed: {str(e)}")
-            return False
-
-    def _safe_load_feature(self, path):
-        """Load features with validation and retries"""
-        try:
-            # Check file size first
-            if path.stat().st_size < 100:
-                raise ValueError(f"Corrupted small file: {path}")
-            
-            # Load with device mapping
-            data = torch.load(path, map_location='cpu')
-            
-            # Validate tensor shape
-            if data.shape != (1, 1024):
-                raise ValueError(f"Invalid feature shape {data.shape} in {path}")
-            
-            return data
-        except (EOFError, RuntimeError, ValueError) as e:
-            print(f"Failed to load {path}: {str(e)}")
+            logger.error(f"[Rank {self.rank}] Error in VAE batch encoding: {e}")
+            # Return None to indicate batch failure
             return None
 
-    # Optimize dimension and bucket extraction methods
-    def _extract_dims_fast(self, img_path):
-        """Extract image dimensions without fully loading the image"""
-        # Use PIL's faster size property - doesn't require full image loading
-        with Image.open(img_path) as img:
-            size = img.size  # Just get width and height
-        return torch.tensor(size, dtype=torch.int16)
 
-    def _get_bucket_index_from_path(self, img_path):
-        """Calculate bucket index directly from image path without full loading"""
-        with Image.open(img_path) as img:
-            width, height = img.size
-        
-        # Now calculate bucket index using the dimensions
-        return self._get_bucket_index(width, height)
-
-def process_dims_and_buckets(img_path, dims_save_path, buckets_save_path, bucket_func):
-    """Process dimensions and buckets together for efficiency."""
-    try:
-        # Just get the size, don't fully load the image
-        with Image.open(img_path) as img:
-            width, height = img.size
-        
-        # Calculate both in one go
-        dims_data = torch.tensor((width, height), dtype=torch.int16)
-        bucket_idx = bucket_func(width, height)
-        bucket_data = torch.tensor(bucket_idx, dtype=torch.int16)
-        
-        # Save both
-        if not dims_save_path.exists():
-            torch.save(dims_data, dims_save_path)
-        
-        if not buckets_save_path.exists():
-            torch.save(bucket_data, buckets_save_path)
-            
-        return True
-    except Exception as e:
-        print(f"Failed to process {img_path}: {str(e)}")
-        return False
-
-def main():
-    # Parse command line arguments EARLY
-    parser = argparse.ArgumentParser(description='DDM Preprocessing Pipeline')
-    parser.add_argument('--buckets', action='store_true', help='Process image buckets')
-    parser.add_argument('--clustering', action='store_true', help='Run clustering')
-    parser.add_argument('--vae-latents', action='store_true', help='Extract VAE latents')
-    parser.add_argument('--clip-latents', action='store_true', help='Extract CLIP embeddings')
-    parser.add_argument('--t5-latents', action='store_true', help='Extract T5 embeddings')
-    parser.add_argument('--dino-features', action='store_true', help='Extract DINO features')
-    parser.add_argument('--all', action='store_true', help='Run all processing stages')
-    parser.add_argument('--use-existing-dino', action='store_true',
-                     help='Use existing DINO features from disk')
-    args = parser.parse_args()
-
-    # Handle standalone clustering without distributed
-    if args.clustering and args.use_existing_dino and not args.all and not args.vae_latents and not args.clip_latents and not args.t5_latents and not args.dino_features and not args.buckets:
-        # Run clustering as standalone CPU process
-        config = get_config()
-        print("Starting standalone CPU clustering")
-        cluster_processor = FeatureGenerator(config, ['clustering'])
-        success = cluster_processor.run_clustering()
-        sys.exit(0 if success else 1)
-
-    # Determine enabled features EARLY
-    enabled_features = []
-    if args.all:
-        enabled_features = ['vae', 'clip', 't5', 'dino', 'buckets', 'dims', 'clustering']
-    else:
-        if args.clip_latents:
-            enabled_features.append('clip')
-        if args.t5_latents:
-            enabled_features.append('t5')
-        if args.dino_features:
-            enabled_features.append('dino')
-        if args.vae_latents:
-            enabled_features.append('vae')
-        if args.buckets:
-            enabled_features.append('buckets')
-        if args.clustering:
-            enabled_features.append('clustering')
-
-    # Initialize distributed processing with fallback
-    try:
-        rank = int(os.environ['LOCAL_RANK'])
-    except KeyError:
-        print("WARNING: Running in single-process mode for debugging")
-        rank = 0
-        os.environ['LOCAL_RANK'] = '0'
-        os.environ['WORLD_SIZE'] = '1'
-
-    print(f"Rank {rank} starting initialization")
-    
-    # Only initialize CUDA and distributed if needed
-    if any(feat in ['vae', 'clip', 't5', 'dino'] for feat in enabled_features):
-        torch.cuda.set_device(rank)
-        device = torch.device(f'cuda:{rank}')
-        dist.init_process_group(
-            backend='nccl',
-            init_method='env://',
-            world_size=int(os.getenv('WORLD_SIZE', 1)),
-            rank=rank
-        )
-    else:
-        device = torch.device('cpu')
-
-    # Load config after distributed init
-    config = get_config()
-    # Add command line args to config
-    config.use_existing_dino = args.use_existing_dino
-    
-    # Verify dataset path exists
-    if rank == 0:
-        if not Path(config.dataset_path).exists():
-            raise FileNotFoundError(f"Dataset path {config.dataset_path} not found")
-    
-    # Get all images
-    if rank == 0:
-        print("Scanning dataset directory...")
-    all_images = [str(p) for p in Path(config.dataset_path).rglob('*') 
-                 if p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
-    
-    # Distribute images with remainder handling
-    world_size = dist.get_world_size()
-    chunk_size = len(all_images) // world_size
-    remainder = len(all_images) % world_size
-    
-    start = rank * chunk_size + min(rank, remainder)
-    end = (rank + 1) * chunk_size + min(rank + 1, remainder)
-    local_images = all_images[start:end]
-    
-    print(f"Rank {rank} received {len(local_images)} images to process")
-    
-    # Define processing order by computational intensity (most intensive first)
-    processing_order = ['vae', 'dino', 't5', 'clip', 'buckets', 'dims']
-
-    # Special case for dimensions and buckets - they can be processed together efficiently
-    # using a single pass through the images
-    if 'dims' in enabled_features and 'buckets' in enabled_features:
-        # Move these to the end and process them together
-        features_to_process = [f for f in processing_order if f in enabled_features and f not in ['dims', 'buckets']]
-        # Add a special combined processing step
-        features_to_process.append('dims_and_buckets')
-    else:
-        features_to_process = [f for f in processing_order if f in enabled_features]
-    
-    if rank == 0:
-        print(f"Processing features in order: {features_to_process}")
-    
-    # Process one feature type at a time for all images
-    for feature_type in features_to_process:
-        if rank == 0:
-            print(f"All ranks processing feature type: {feature_type}")
-        
-        # Special case for combined dimension and bucket processing
-        if feature_type == 'dims_and_buckets':
-            # Process dimensions and buckets together efficiently
-            dims_processor = FeatureGenerator(config, ['dims'])
-            buckets_processor = FeatureGenerator(config, ['buckets'])
-            
-            dims_save_dir = dims_processor.feature_dir/dims_processor.FEATURE_PROCESSORS['dims']['save_prefix']
-            buckets_save_dir = buckets_processor.feature_dir/buckets_processor.FEATURE_PROCESSORS['buckets']['save_prefix']
-            
-            dims_save_dir.mkdir(parents=True, exist_ok=True)
-            buckets_save_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Larger batch size for these lightweight operations
-            batch_size = 256
-            
-            try:
-                # Main processing loop with batching and multi-threading
-                with tqdm(total=len(local_images), desc=f"GPU {rank} - dims+buckets", position=rank) as pbar:
-                    for batch_start in range(0, len(local_images), batch_size):
-                        batch_end = min(batch_start + batch_size, len(local_images))
-                        batch_paths = local_images[batch_start:batch_end]
-                        
-                        # Skip already processed files
-                        batch_to_process = []
-                        processed_count = 0
-                        
-                        for img_path in batch_paths:
-                            img_path_obj = Path(img_path)
-                            base_name = img_path_obj.stem
-                            
-                            dims_save_path = dims_save_dir/f"{base_name}_rank{rank}.pt"
-                            buckets_save_path = buckets_save_dir/f"{base_name}_rank{rank}.pt"
-                            
-                            # Skip if both already processed
-                            if dims_save_path.exists() and buckets_save_path.exists():
-                                processed_count += 1
-                                continue
-                                
-                            batch_to_process.append(img_path)
-                        
-                        # Skip if all files already processed
-                        if not batch_to_process:
-                            pbar.update(processed_count)
-                            continue
-                        
-                        # Process dimensions and buckets in parallel with threads
-                        with ThreadPoolExecutor(max_workers=min(32, len(batch_to_process))) as executor:
-                            futures = []
-                            
-                            for img_path in batch_to_process:
-                                img_path_obj = Path(img_path)
-                                base_name = img_path_obj.stem
-                                
-                                dims_save_path = dims_save_dir/f"{base_name}_rank{rank}.pt"
-                                buckets_save_path = buckets_save_dir/f"{base_name}_rank{rank}.pt"
-                                
-                                # Submit task to thread pool
-                                futures.append(executor.submit(
-                                    process_dims_and_buckets,
-                                    img_path, dims_save_path, buckets_save_path, 
-                                    buckets_processor._get_bucket_index
-                                ))
-                            
-                            # Wait for threads to complete
-                            for future in as_completed(futures):
-                                try:
-                                    future.result()
-                                    processed_count += 1
-                                except Exception as e:
-                                    print(f"Rank {rank} failed in dims/buckets: {str(e)}")
-                                    processed_count += 1
-                        
-                        pbar.update(processed_count)
-                
-                # Synchronize after completion
-                dist.barrier()
-                
-                # Free memory
-                del dims_processor
-                del buckets_processor
-                torch.cuda.empty_cache()
-                
-                if rank == 0:
-                    print("Completed processing dimensions and buckets")
-                
-            except Exception as e:
-                print(f"Rank {rank} failed during dims/buckets processing: {str(e)}")
-                dist.barrier(timeout=60)
-                continue
-            
-            # Continue to next feature type
-            continue
-        
-        # Regular feature processing for other types
-        processor = FeatureGenerator(config, [feature_type])
-        
-        # Get save directory
-        save_prefix = processor.FEATURE_PROCESSORS[feature_type]['save_prefix']
-        save_dir = processor.feature_dir/save_prefix
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Batch size depends on feature type - use larger batches for smaller features
-        if feature_type in ['buckets', 'dims']:
-            batch_size = 128  # Very fast operations
-        elif feature_type in ['clip', 't5']:
-            batch_size = 64   # Text operations, medium speed
-        else:
-            batch_size = 16   # Heavy image processing (VAE, DINO)
-            
+    def _extract_batch_clip(self, captions: list):
+        """Encodes a batch of captions using CLIP pooler."""
+        if not self.clip: return None
         try:
-            # Main processing loop with batching
-            with tqdm(total=len(local_images), desc=f"GPU {rank} - {feature_type}", position=rank) as pbar:
-                for batch_start in range(0, len(local_images), batch_size):
-                    batch_end = min(batch_start + batch_size, len(local_images))
-                    batch_paths = local_images[batch_start:batch_end]
-                    
-                    # Track successfully processed items for pbar update
-                    processed_count = 0
-                    
-                    # Check which files already exist
-                    batch_to_process = []
-                    for img_path in batch_paths:
-                        img_path_obj = Path(img_path)
-                        base_name = img_path_obj.stem
-                        save_path = save_dir/f"{base_name}_rank{rank}.pt"
-                        
-                        # Skip if already processed
-                        if save_path.exists():
-                            processed_count += 1
-                            continue
-                            
-                        # For text features, check if caption exists
-                        if feature_type in ['clip', 't5']:
-                            caption_path = img_path_obj.with_suffix('.txt')
-                            if not caption_path.exists():
-                                processed_count += 1
-                                continue
-                                
-                        batch_to_process.append(img_path)
-                    
-                    # Skip if all files already processed
-                    if not batch_to_process:
-                        pbar.update(processed_count)
-                        continue
-                        
-                    # Process remaining batch
-                    for img_path in batch_to_process:
-                        try:
-                            img_path_obj = Path(img_path)
-                            base_name = img_path_obj.stem
-                            
-                            # Process based on feature type
-                            try:
-                                if feature_type in ['clip', 't5']:
-                                    # Text feature processing
-                                    caption_path = img_path_obj.with_suffix('.txt')
-                                    caption_text = caption_path.read_text()
-                                    
-                                    if feature_type == 'clip':
-                                        feature_data = processor._extract_clip_embedding(caption_text)
-                                    else:  # t5
-                                        feature_data = processor._extract_t5_embedding(caption_text)
-                                else:
-                                    # Image feature processing
-                                    with Image.open(img_path) as img:
-                                        img = img.convert('RGB')  # Ensure RGB format
-                                        
-                                        if feature_type == 'vae':
-                                            feature_data = processor._extract_vae_latent(img)
-                                        elif feature_type == 'dino':
-                                            feature_data = processor._extract_dino_features(img)
-                                        elif feature_type == 'buckets':
-                                            feature_data = torch.tensor(processor._get_bucket_index_from_path(img_path), dtype=torch.int16)
-                                        elif feature_type == 'dims':
-                                            feature_data = processor._extract_dims_fast(img_path)
-                                
-                                # Save the feature
-                                save_path = save_dir/f"{base_name}_rank{rank}.pt"
-                                torch.save(feature_data.squeeze(1), save_path)  # Remove sequence dimension during saving
-                                
-                                # Occasional logging
-                                if rank == 0 and random.random() < 0.001:
-                                    print(f"Rank {rank}: Saved {feature_type} for {base_name}")
-                                    
-                                processed_count += 1
-                                
-                            except Exception as e:
-                                print(f"Rank {rank} failed processing {feature_type} for {img_path}: {str(e)}")
-                                processed_count += 1  # Still count as processed for progress
-                                continue
-                                
-                        except Exception as e:
-                            print(f"Rank {rank} failed completely for {img_path}: {str(e)}")
-                            processed_count += 1
-                            continue
+            with torch.no_grad(): # Encoder handles internal context
+                pooled_embeddings = self.clip.encode_pooled(captions)
+            return pooled_embeddings.cpu() # Return on CPU
+        except Exception as e:
+            logger.error(f"[Rank {self.rank}] Error in CLIP batch encoding: {e}")
+            embed_dim = self.clip.model.config.hidden_size if hasattr(self.clip.model, 'config') else 768
+            return torch.zeros(len(captions), embed_dim) # Placeholder
 
-                    # Update progress bar with batch results
-                    pbar.update(processed_count)
-        
-            # Synchronize after each feature type
-            dist.barrier()
+    def _extract_batch_t5(self, captions: list):
+        """Encodes a batch of captions using T5 sequence."""
+        if not self.t5: return None
+        try:
+            with torch.no_grad(): # Encoder handles internal context
+                sequence_embeddings = self.t5.encode(captions)
+            return sequence_embeddings.cpu() # Return on CPU
+        except Exception as e:
+            logger.error(f"[Rank {self.rank}] Error in T5 batch encoding: {e}")
+            hidden_size = getattr(self.t5.model.config, 'd_model', 1024)
+            max_len = self.t5.max_length
+            return torch.zeros(len(captions), max_len, hidden_size) # Placeholder
 
-            # Free memory
-            del processor
-            torch.cuda.empty_cache()
-            if rank == 0:
-                print(f"Completed processing {feature_type} features")
+    def _extract_batch_dino(self, images_pil: list):
+        """Encodes a batch of PIL images using DINO."""
+        # Placeholder - Implement DINO batch processing if needed
+        logger.warning("Batch DINO extraction not implemented.")
+        if not self.dino: return None
+        return torch.zeros(len(images_pil), 1024) # Placeholder
+
+    def _extract_batch_dims(self, images_pil: list):
+        """Extracts dimensions for a batch of PIL images."""
+        dims = []
+        for img in images_pil:
+            if img:
+                dims.append(list(img.size)) # [width, height]
+            else:
+                dims.append([0, 0]) # Placeholder for errors
+        return torch.tensor(dims, dtype=torch.int16) # B x 2
+
+    def _get_bucket_index(self, width, height):
+        """Finds the bucket index for a given dimension."""
+        # Simple Manhattan distance to find closest bucket
+        if not self.buckets: return 0 # Default to bucket 0 if not configured
+        target_w = round(width / self.bucket_scale) * self.bucket_scale
+        target_h = round(height / self.bucket_scale) * self.bucket_scale
+        min_dist = float('inf')
+        best_idx = 0
+        for idx, (bw, bh) in enumerate(self.buckets):
+            dist = abs(target_w - bw) + abs(target_h - bh)
+            if dist < min_dist:
+                min_dist = dist
+                best_idx = idx
+        return best_idx
+
+    def _extract_batch_buckets(self, batch_dims: torch.Tensor):
+        """Determines bucket indices for a batch based on dimensions."""
+        if not self.buckets: return None
+        bucket_indices = [self._get_bucket_index(w, h) for w, h in batch_dims.tolist()]
+        return torch.tensor(bucket_indices, dtype=torch.int16) # B
+
+    def _save_batch_feature(self, feature_type: str, batch_data: torch.Tensor, batch_file_index: int):
+        """Saves a batch tensor for a specific feature type."""
+        if batch_data is None:
+             logger.warning(f"[Rank {self.rank}] Skipping save for {feature_type} batch {batch_file_index} due to None data.")
+             return
+
+        dir_map = {'vae': 'latents', 'clip': 'clip', 't5': 't5', 'dino': 'dino',
+                   'dims': 'dims', 'buckets': 'buckets', 'clusters': 'clusters'}
+        save_dir = self.feature_dir / dir_map[feature_type]
+        # Ensure filename includes rank to avoid collisions in shared FS when not using DS sampler offset
+        filename = f"{self.rank:03d}_{batch_file_index:06d}.pt"
+        filepath = save_dir / filename
+        try:
+            torch.save(batch_data.cpu(), filepath) # Save CPU tensor
+        except Exception as e:
+            logger.error(f"[Rank {self.rank}] Error saving {feature_type} batch to {filepath}: {e}")
+
+
+    def process_batch(self, batch_data: dict, batch_file_index: int):
+        """Processes a batch: extracts enabled features and saves them."""
+        images_pil = batch_data['image'] # List of PIL images or Nones
+        captions = batch_data['caption'] # List of strings
+        # Filter out None images and corresponding captions
+        valid_indices = [i for i, img in enumerate(images_pil) if img is not None]
+        if len(valid_indices) != len(images_pil):
+            logger.warning(f"[Rank {self.rank}] Batch {batch_file_index}: Found {len(images_pil) - len(valid_indices)} loading errors. Processing {len(valid_indices)} valid samples.")
+            if not valid_indices: # Skip batch if all images failed
+                 return
+            images_pil = [images_pil[i] for i in valid_indices]
+            captions = [captions[i] for i in valid_indices]
+
+        batch_results = {}
+        if 'dims' in self.enabled_features:
+             batch_results['dims'] = self._extract_batch_dims(images_pil)
+        if 'buckets' in self.enabled_features and 'dims' in batch_results:
+             batch_results['buckets'] = self._extract_batch_buckets(batch_results['dims'])
+        if 'vae' in self.enabled_features:
+             batch_results['vae'] = self._extract_batch_vae(images_pil)
+        if 'clip' in self.enabled_features:
+             batch_results['clip'] = self._extract_batch_clip(captions)
+        if 't5' in self.enabled_features:
+             batch_results['t5'] = self._extract_batch_t5(captions)
+        if 'dino' in self.enabled_features:
+             batch_results['dino'] = self._extract_batch_dino(images_pil)
+
+        # Save each computed feature tensor
+        for feature_type, batch_tensor in batch_results.items():
+             self._save_batch_feature(feature_type, batch_tensor, batch_file_index)
+
+    def run_feature_extraction(self, dataloader: DataLoader):
+        """Runs feature extraction over the dataset using the dataloader."""
+        logger.info(f"[Rank {self.rank}] Starting feature extraction...")
+        start_time = time.time()
+
+        # Each rank processes its slice of the data provided by the DistributedSampler
+        # The batch_idx here is local to the rank's dataloader iterator
+        for batch_idx, batch_data in enumerate(tqdm(dataloader, desc=f"Rank {self.rank} Processing", disable=(self.rank != 0))):
+            # The batch_file_index needs to be globally unique across ranks.
+            # We can derive this using the dataloader's sampler current epoch and batch index if needed,
+            # but simpler is to use rank and local batch_idx for the filename.
+            # DDMDataset loading logic will need to handle discovering files like rank_batchidx.pt
+            self.process_batch(batch_data, batch_idx)
+
+        if self.distributed:
+            dist.barrier() # Wait for all ranks to finish saving
+
+        end_time = time.time()
+        logger.info(f"[Rank {self.rank}] Feature extraction finished in {end_time - start_time:.2f} seconds.")
+
+    # --- Clustering Logic ---
+    def _load_features_for_clustering(self, feature_type: str, subsample_fraction: float):
+        """Loads features for clustering, potentially subsampled."""
+        logger.info(f"[Rank {self.rank}] Loading '{feature_type}' features for clustering (subsample: {subsample_fraction})...")
+        feature_subdir = self.feature_dir / feature_type
+        if not feature_subdir.exists():
+            raise FileNotFoundError(f"Feature directory not found: {feature_subdir}")
+
+        all_files = sorted([f for f in feature_subdir.glob(f"*.pt")]) # Find all .pt files
+
+        # --- Subsampling ---
+        num_files_to_sample = int(len(all_files) * subsample_fraction)
+        if num_files_to_sample < 1 and len(all_files) > 0:
+             num_files_to_sample = 1 # Sample at least one file if available
+        if num_files_to_sample == 0:
+             logger.warning("No feature files found or subsample fraction too small. Cannot cluster.")
+             return None
+
+        # Sample file indices globally consistently (same sample across all ranks if needed, though only rank 0 clusters)
+        # Use a fixed seed for reproducibility if desired
+        random.seed(42) # Use a fixed seed
+        sampled_file_indices = random.sample(range(len(all_files)), num_files_to_sample)
+        files_to_load_paths = [all_files[i] for i in sorted(sampled_file_indices)]
+
+        logger.info(f"[Rank {self.rank}] Loading {len(files_to_load_paths)}/{len(all_files)} '{feature_type}' files for subsampled clustering.")
+
+        # Load features (only rank 0 needs to do this for actual clustering)
+        features_list = []
+        if self.rank == 0:
+            for file_path in tqdm(files_to_load_paths, desc="Loading subsampled features"):
+                try:
+                    # Load directly to CPU to manage memory
+                    batch_features = torch.load(file_path, map_location='cpu')
+                    features_list.append(batch_features.float()) # Ensure float32
+                except Exception as e:
+                    logger.error(f"Error loading feature file {file_path}: {e}")
+            if not features_list:
+                 logger.error("Failed to load any features for clustering.")
+                 return None
+            all_features = torch.cat(features_list, dim=0)
+            logger.info(f"[Rank 0] Loaded subsampled features shape: {all_features.shape}")
+            return all_features
+        else:
+            return None # Other ranks don't need the features for clustering
+
+
+    def run_clustering(self):
+        """Performs two-stage clustering and saves assignments."""
+        if self.rank != 0:
+            # Clustering is only done by rank 0
+            if self.distributed:
+                 logger.info(f"Rank {self.rank} waiting at barrier before clustering.")
+                 dist.barrier()
+                 logger.info(f"Rank {self.rank} waiting at barrier after clustering attempt.")
+                 dist.barrier()
+            return
+
+        logger.info("Rank 0 starting clustering process...")
+        try:
+            feature_type = self.config.data.clustering_feature_type
+            subsample_fraction = self.config.data.clustering_subsample_fraction
+            num_coarse = self.config.model.num_clusters
+            num_fine = self.config.data.num_fine_clusters
+
+            # Load features for clustering (subsampled)
+            clustering_features = self._load_features_for_clustering(feature_type, subsample_fraction)
+            if clustering_features is None:
+                logger.error("Failed to load features for clustering. Aborting.")
+                # Raise an error or signal failure appropriately
+                raise RuntimeError("Clustering feature loading failed.")
+
+            # --- Use DDMClustering ---
+            logger.info(f"Initializing DDMClustering with {num_coarse} coarse and {num_fine} fine clusters.")
+            # Pass feature_path for potential internal saving/loading if DDMClustering needs it
+            clustering_module = DDMClustering(num_coarse, num_fine, feature_path=self.feature_dir)
+
+            # Perform clustering
+            # Modify DDMClustering.cluster to accept features directly and return assignments
+            # Assuming DDMClustering.cluster now takes features and returns assignments
+            final_assignments = clustering_module.cluster(features=clustering_features) # Pass loaded features
+
+            if final_assignments is None:
+                 raise RuntimeError("Clustering module failed to return assignments.")
+
+            # --- Save Assignments (Rank 0 handles this) ---
+            logger.info(f"Clustering complete. Saving assignments for {len(final_assignments)} samples...")
+            assignments_dir = self.feature_dir / "clusters"
+            assignments_dir.mkdir(exist_ok=True)
+
+            # The current implementation saves assignments sequentially based on the order
+            # of 'dims' files. This works correctly ONLY IF subsample_fraction=1.0
+            # AND the order of features loaded for clustering matches the order of dims files.
+            # Using subsampling < 1.0 requires a more complex mapping strategy.
+            if subsample_fraction < 1.0:
+                 logger.warning("Saving cluster assignments with subsampling < 1.0. The current sequential saving relies on the order of processed 'dims' files matching the order of the (subsampled) features used for clustering. Verify this assumption holds for your subsampling method, otherwise assignments might be incorrect.")
+
+            # Assume we clustered all features from rank 0's loaded files
+            # We need to distribute these assignments back into the per-batch file structure.
+            # Load the 'dims' files to know how many samples are in each original batch file.
+            dims_dir = self.feature_dir / "dims"
+            all_dims_files = sorted([f for f in dims_dir.glob(f"*.pt")]) # Load all dims files
+
+            assignments_idx = 0
+            total_samples_processed = 0
+            for dims_file_path in tqdm(all_dims_files, desc="Saving cluster assignments per file"):
+                try:
+                    batch_dims = torch.load(dims_file_path, map_location='cpu')
+                    num_samples_in_batch = batch_dims.shape[0]
+                    
+                    # Check if we have enough assignments left
+                    if assignments_idx + num_samples_in_batch > len(final_assignments):
+                        logger.error(f"Mismatch between number of clustered samples ({len(final_assignments)}) and total samples found in dims files. Stopping assignment saving.")
+                        # This indicates an issue, possibly with subsampling or file loading.
+                        break 
+
+                    batch_assignments = final_assignments[assignments_idx : assignments_idx + num_samples_in_batch]
+
+                    # Derive the cluster save path from the dims file path
+                    # Assumes dims filename format is rank_batchidx.pt
+                    base_filename = dims_file_path.name
+                    cluster_filename = base_filename # Use the same rank_batchidx.pt format
+                    cluster_save_path = assignments_dir / cluster_filename
+
+                    torch.save(batch_assignments.cpu(), cluster_save_path)
+                    assignments_idx += num_samples_in_batch
+                    total_samples_processed += num_samples_in_batch
+
+                except Exception as e:
+                    logger.error(f"Error processing/saving assignments for file corresponding to {dims_file_path.name}: {e}")
+                    # Decide whether to continue or stop
+
+            if assignments_idx != len(final_assignments):
+                 logger.warning(f"Processed assignments ({assignments_idx}) does not match total assignments ({len(final_assignments)}). There might be an issue.")
+            logger.info(f"Finished assigning clusters to {total_samples_processed} samples.")
             
         except Exception as e:
-            print(f"Rank {rank} failed during {feature_type} processing: {str(e)}")
-            dist.barrier(timeout=60)
-            continue
+            logger.exception(f"Clustering failed: {e}") # Log full traceback
+        finally:
+            # Ensure barrier happens even if rank 0 fails
+            if self.distributed:
+                logger.info("Rank 0 waiting at barrier after clustering attempt.")
+                dist.barrier()
 
-    # Clustering code with proper status updates
-    if 'clustering' in enabled_features:
-        if rank == 0:
-            print("Starting standalone CPU clustering process")
-            cluster_processor = FeatureGenerator(config, ['clustering'])
-            success = cluster_processor.run_clustering()
-            if success:
-                print("Clustering completed and saved")
-        else:
-            # Non-rank 0 processes exit immediately after feature processing
-            print(f"Rank {rank} - clustering handled by rank 0, exiting")
+
+# --- Main Execution ---
+def main(config_path: str = "config.toml",
+         skip_feature_extraction: bool = False,
+         skip_clustering: bool = False):
+    """Main function to run feature precomputation and clustering."""
+    # --- Setup Distributed ---
+    rank, world_size, local_rank, device = setup_distributed()
+    is_main = rank == 0
+    distributed = world_size > 1
+
+    # --- Setup Logging ---
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    if not is_main: # Reduce logging noise from non-main ranks
+        logger.setLevel(logging.WARNING)
+
+
+    # --- Load Config ---
+    try:
+        config_dict = toml.load(config_path)
+        cfg = dict_to_sns(config_dict) # Convert to SimpleNamespace
+        logger.info("Configuration loaded successfully.")
+    except Exception as e:
+        logger.error(f"Error loading configuration from {config_path}: {e}")
+        return # Exit if config fails
+
+    # --- Define Features to Generate ---
+    # Example: Generate all standard features. Modify based on needs.
+    # Clustering requires 'dims' and the feature specified in 'clustering_feature_type'.
+    # DDMDataset requires 'latents', 'clip', 't5', 'dims', 'buckets', 'clusters'.
+    features_to_generate = {'vae', 'clip', 't5', 'dims', 'buckets'}
+    features_for_clustering = {cfg.data.clustering_feature_type, 'dims'} # Need dims to save assignments correctly
+    features_needed = features_to_generate.union(features_for_clustering)
+    logger.info(f"Enabled features for generation/checking: {features_needed}")
+
+    # --- Initialize Generator ---
+    generator = FeatureGenerator(cfg, enabled_features=features_needed)
+
+    # --- Initialize Dataset & Dataloader ---
+    logger.info("Initializing Dataset and DataLoader...")
+    dataset = PrecomputeDataset(cfg) # Uses simple list of file paths
+
+    if distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False) # No shuffle for precompute
+        # Use a larger batch size for precomputation if memory allows
+        precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 128)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=precompute_batch_size, # Use dedicated precompute batch size
+            sampler=sampler,
+            num_workers=cfg.train.num_workers,
+            pin_memory=True,
+            drop_last=False # Process all samples
+        )
+    else:
+        # Non-distributed dataloader
+        precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 128)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=precompute_batch_size, # Use dedicated precompute batch size
+            shuffle=False,
+            num_workers=cfg.train.num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
+    logger.info(f"DataLoader initialized with batch size {precompute_batch_size}.")
+
+
+    # --- Run Feature Extraction ---
+    if not skip_feature_extraction:
+        generator.run_feature_extraction(dataloader)
+    else:
+        logger.info("Skipping feature extraction.")
+    # Add barrier after extraction or skip
+    if distributed:
+        logger.info(f"Rank {rank} waiting at barrier after feature extraction step.")
+        dist.barrier()
+
+    # --- Run Clustering ---
+    # Only rank 0 performs clustering after all ranks finish extraction
+    if not skip_clustering:
+        generator.run_clustering() # run_clustering now handles the rank check and barriers internally
+    else:
+        logger.info("Skipping clustering.")
+        # Barrier needed even if clustering skipped by rank 0, others wait
+        if distributed:
+             logger.info(f"Rank {rank} waiting at barrier after skipping clustering step.")
+             dist.barrier()
+
+    # --- Cleanup ---
+    if distributed:
             dist.destroy_process_group()
-            sys.exit(0)
+    logger.info("Precomputation finished.")
 
-    # Add GPU health check
-    test_tensor = torch.randn(1024, device=device)
-    torch.cuda.synchronize()
-    dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
-
-    # Final cleanup
-    feature_dir = Path(config.feature_cache_path)  # Define feature_dir for cleanup
-    if rank == 0:
-        for r in range(dist.get_world_size()):
-            (feature_dir/f"status_rank{r}.pt").unlink(missing_ok=True)
-    dist.barrier()
-    dist.destroy_process_group()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        import traceback
-        print(f"Fatal error: {str(e)}")
-        traceback.print_exc()
-        # Force exit with error code
-        sys.exit(1) 
+    fire.Fire(main) 

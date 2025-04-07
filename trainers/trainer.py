@@ -10,6 +10,8 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.nn.utils import clip_grad_norm_
 import torch.distributed as dist
 import wandb # Import wandb
+from torch import nn
+from torch.nn.functional import rearrange
 
 # Assuming ExpertModel and RouterModel are correctly defined
 from models.expert import ExpertModel
@@ -162,34 +164,65 @@ class BaseTrainer:
 class ExpertTrainer(BaseTrainer):
     def __init__(self, expert_id: int, **kwargs):
         super().__init__(**kwargs)
+        if not isinstance(expert_id, int) or expert_id < 0:
+            raise ValueError("ExpertTrainer requires a valid non-negative expert_id.")
         self.expert_id = expert_id
+        self.loss_fn = nn.MSELoss() # Standard for diffusion noise prediction
 
     def _get_batch_data(self, batch):
-        """Extracts relevant data from the collated batch dictionary for the Expert."""
-        if not isinstance(batch, dict):
-             raise TypeError(f"Expected batch to be a dict, but got {type(batch)}")
+        """Extracts and prepares data needed for the Expert model from the batch dict."""
+        required_keys = {'latents', 'clip', 't5', 'img_ids', 'txt_ids', 'clusters'}
+        if not all(key in batch for key in required_keys):
+            missing = required_keys - batch.keys()
+            raise ValueError(f"Missing required keys in expert batch: {missing}")
 
-        # --- Extract mandatory data ---
-        x0 = batch.get('image')
-        if x0 is None:
-             raise ValueError("Batch dictionary missing mandatory 'image' key (latent features).")
-        x0 = x0.to(self.device)
+        # Extract mandatory data
+        x0 = batch['latents'].to(self.device) # The 'clean' latents [B, C, H, W]
+        y = batch['clip'].to(self.device)     # CLIP condition [B, CondDim]
+        txt = batch['t5'].to(self.device)     # T5 condition [B, SeqLen, T5Dim]
+        img_ids = batch['img_ids'].to(self.device) # Image positional IDs [B, NumImgPatches, 3]
+        txt_ids = batch['txt_ids'].to(self.device) # Text positional IDs [B, SeqLen, 3]
+        # cluster_ids = batch['clusters'].to(self.device) # Cluster IDs [B] - not directly used by expert model forward pass
 
-        # --- Extract conditioning data required by Flux/ExpertModel ---
-        # Flux expects 'y' (vector), 'txt' (sequence), 'img_ids', 'txt_ids'
-        condition = {}
-        required_keys = ['y', 'txt', 'img_ids', 'txt_ids'] # Adjust based on exact Flux forward signature
-        optional_keys = [] # Add any optional keys Flux might use
+        # --- Patchify Image Latents ---
+        # Assuming ExpertModel underlying Flux expects patches [B, NumPatches, PatchDim]
+        # where PatchDim = C * ph * pw (ph=pw=2 assumed)
+        try:
+            # Get C, H, W
+            C = x0.shape[1]
+            # ph, pw = 2, 2 # Assume 2x2 patches based on Flux sampling example
+            # x0_patched = rearrange(x0, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=ph, pw=pw)
+            # Simpler if Flux model itself can take [B, C, H, W]? Let's assume it *requires* patching here for now.
+            # NOTE: Revisit this if Flux's internal structure handles patching differently or if config changes patch size.
+            # Need the expected patch dimensions (e.g., from config or Flux model)
+            # Let's assume expert_in_channels = C * ph * pw
+            # Check if Flux model.img_in handles the C,H,W -> NumPatches, HiddenSize mapping internally.
+            # Flux.img_in is nn.Linear(self.in_channels, self.hidden_size, bias=True)
+            # FluxParams.in_channels is likely the *patched* dimension C*ph*pw based on expert_in_channels = 128 in config
+            # Therefore, patching is necessary *before* passing to Flux.forward
+            ph, pw = 2, 2 # Hardcoding based on common use and sampling_flux.py example
+            x0_patched = rearrange(x0, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=ph, pw=pw)
 
-        for key in required_keys + optional_keys:
-             val = batch.get(key)
-             if val is not None:
-                 condition[key] = val.to(self.device) if isinstance(val, torch.Tensor) else val
-             elif key in required_keys:
-                  # This indicates a potential problem in dataset preparation or config mismatch
-                  raise ValueError(f"Batch dictionary missing required condition key '{key}' for ExpertModel.")
-                  
-        return x0, condition # Return image and condition dict
+        except Exception as e:
+             raise RuntimeError(f"Error patchifying latents in ExpertTrainer._get_batch_data: {e}. Latent shape: {x0.shape}")
+
+
+        # Generate random timesteps
+        t = torch.randint(0, self.num_diffusion_timesteps, (x0.shape[0],), device=self.device).long()
+
+        # Return dictionary matching ExpertModel forward args + necessary extras (x0, t)
+        return {
+            'img': x0_patched, # Pass patched latents as 'img' to match Flux forward signature
+            'img_ids': img_ids,
+            'txt': txt,
+            'txt_ids': txt_ids,
+            'timesteps': t,    # Keep 'timesteps' name for clarity, Flux forward expects this
+            'y': y,
+            'guidance': None, # Pass None for standard training
+            # Keep original x0 for noise generation/loss calculation
+            'x0': x0, # Store original unpatched latents
+            # 't_int': t # Store integer timesteps if needed elsewhere
+        }
 
     def train(self):
         self.model.train()
@@ -211,18 +244,18 @@ class ExpertTrainer(BaseTrainer):
                     data_iter = iter(self.dataloader)
                     batch = next(data_iter)
 
-                x0, condition = self._get_batch_data(batch)
-                B = x0.shape[0]
-                t = torch.randint(0, self.num_diffusion_timesteps, (B,), device=self.device).long()
+                batch_data = self._get_batch_data(batch)
+                B = batch_data['img'].shape[0]
+                t = batch_data['timesteps']
                 xt, noise = forward_diffuse(
-                    x0, t, self.sqrt_alphas_cumprod, self.sqrt_one_minus_alphas_cumprod
+                    batch_data['img'], t, self.sqrt_alphas_cumprod, self.sqrt_one_minus_alphas_cumprod
                 )
 
                 with autocast(enabled=self.use_amp):
-                    model_kwargs = {'img': xt, 'timesteps': t.float()}
-                    model_kwargs.update(condition)
+                    model_kwargs = {key: batch_data[key] for key in ['img', 'img_ids', 'txt', 'txt_ids', 'timesteps']}
+                    model_kwargs.update({'guidance': batch_data['guidance']})
                     pred_noise = self.model(**model_kwargs)
-                    loss = F.mse_loss(pred_noise, noise)
+                    loss = self.loss_fn(pred_noise, noise)
                     loss = loss / self.gradient_accumulation_steps
 
                 self.scaler.scale(loss).backward()

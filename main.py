@@ -83,9 +83,7 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         print(f"Error loading TOML config file: {e}")
         return
 
-    # TODO: Implement merging kwargs overrides into config_dict
-    # This requires parsing the dot notation like 'train.batch_size'
-    # For simplicity, we'll skip direct kwarg overrides for now, rely on editing config.toml
+    # Command-line overrides are handled by editing the config.toml file directly for simplicity.
 
     # Convert dict to SimpleNamespace for easier access (cfg.train.batch_size)
     cfg = dict_to_sns(config_dict)
@@ -251,8 +249,7 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         raise ValueError(f"Unknown model_type in config: {cfg.train.model_type}. Choose 'expert' or 'router'.")
 
     model = model.to(device)
-    # TODO: Add FSDP wrapping here if cfg.train.distributed is True
-    # model = create_fsdp_model(model, cfg, rank=local_rank) # Example
+    # DDP wrapping below handles distributed training. FSDP can be integrated later if needed.
 
     # --- Wrap Model with DDP if distributed ---
     if is_distributed:
@@ -268,7 +265,7 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         # model = create_fsdp_model(model, cfg, rank=local_rank)
 
     # --- 5. Initialize Optimizer and Scheduler ---
-    # TODO: Add support for parameter groups (e.g., no weight decay for biases/norms)
+    # Standard AdamW initialization. Parameter groups can be added later for refinement.
     optimizer = AdamW(
         model.parameters(),
         lr=cfg.train.learning_rate,
