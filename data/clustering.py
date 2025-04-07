@@ -81,60 +81,74 @@ class DDMClustering:
 
             # Stage 2: Coarse clustering (Agglomerative on fine centroids)
             logger.info(f"Performing coarse-grained hierarchical clustering (k={self.num_coarse}) on fine centroids...")
-            # Calculate similarity (cosine similarity for spherical KMeans) or use Euclidean distance
-            # Using Euclidean distance for Agglomerative as similarity matrices can be tricky
-            # fine_centroids_tensor = torch.from_numpy(self.fine_centroids).float() # If needed as tensor
-            # similarity_matrix = torch.mm(fine_centroids_tensor, fine_centroids_tensor.t()) # Cosine sim if normalized
-
-            # AgglomerativeClustering works on distance matrix (implicitly calculated from features)
-            agg_clustering = AgglomerativeClustering(
+            coarse_clustering = AgglomerativeClustering(
                 n_clusters=self.num_coarse,
-                metric='cosine', # Use cosine distance since KMeans was spherical
-                linkage='average' # Average linkage often works well
+                metric='cosine', # Changed from 'euclidean'
+                linkage='average' # Changed from 'ward' which requires euclidean
             )
-            # Fit on the fine centroids
-            agg_clustering.fit(self.fine_centroids) # Pass fine centroids as features
-            coarse_labels_for_fine = torch.from_numpy(agg_clustering.labels_).long() # Labels for each fine centroid
+            # coarse_clustering = AgglomerativeClustering(n_clusters=self.num_coarse, linkage='ward') # Original
+            self.coarse_labels_for_fine = torch.tensor(coarse_clustering.fit_predict(self.fine_centroids), dtype=torch.long) # Shape (num_fine,)
 
-            # Calculate coarse centroids (average of fine centroids in each coarse cluster) - Optional, not needed for assignment
-            self.coarse_centroids = torch.stack([
-                torch.from_numpy(self.fine_centroids[torch.where(coarse_labels_for_fine == i)[0]]).mean(0)
-                for i in range(self.num_coarse)
-            ]).float()
-            logger.info("Coarse-grained hierarchical clustering complete.")
-            logger.info(f"Coarse centroids calculated. Shape: {self.coarse_centroids.shape}")
+            # Calculate coarse centroids as the mean of their assigned fine centroids
+            coarse_means = []
+            # fine_centroids_tensor = torch.from_numpy(self.fine_centroids) # Work with tensors - Moved conversion down
+            # Convert to tensor here, after it's used as numpy by AgglomerativeClustering
+            fine_centroids_tensor = torch.from_numpy(self.fine_centroids) 
+            for i in range(self.num_coarse):
+                fine_indices = torch.where(self.coarse_labels_for_fine == i)[0]
+                if len(fine_indices) > 0:
+                     # Use the tensor version of fine_centroids for mean calculation
+                     mean_vec = torch.mean(fine_centroids_tensor[fine_indices], dim=0)
+                     coarse_means.append(mean_vec)
+                else:
+                     logger.warning(f"Coarse cluster {i} is empty. Assigning zero vector as centroid.")
+                     # Create a zero vector with the same shape and type as other centroids
+                     zero_vec = torch.zeros_like(fine_centroids_tensor[0]) 
+                     coarse_means.append(zero_vec)
+            
+            if len(coarse_means) != self.num_coarse:
+                logger.error(f"Expected {self.num_coarse} coarse centroids, but generated {len(coarse_means)}. This indicates a logic error.")
+                return None 
 
+            self.coarse_centroids = torch.stack(coarse_means) # Shape (num_coarse, D)
+            logger.info(f"Coarse clustering complete. Coarse centroids shape: {self.coarse_centroids.shape}")
 
-            # Assign original features to the final coarse clusters
-            # We need to map each original feature to its nearest *fine* centroid,
-            # and then use the coarse label assigned to that fine centroid.
-            logger.info("Assigning original features to final coarse clusters...")
-            index_fine = faiss.IndexFlatIP(self.fine_centroids.shape[1]) # Use Inner Product (cosine sim) since spherical=True
-            res = None
+            # --- MODIFICATION START: Assign original features to NEAREST COARSE centroid ---
+            logger.info("Assigning original features to final coarse clusters (nearest coarse centroid)...")
+            
+            # Ensure coarse centroids are numpy float32 for Faiss
+            coarse_centroids_np = np.ascontiguousarray(self.coarse_centroids.numpy(), dtype=np.float32)
+            features_np_cont = np.ascontiguousarray(features_np, dtype=np.float32)
+            
+            # Create Faiss index for COARSE centroids (Use Inner Product for cosine similarity)
+            index_coarse = faiss.IndexFlatIP(coarse_centroids_np.shape[1]) 
+            res_coarse = None
             if self.use_gpu:
-                res = faiss.StandardGpuResources()
-                index_fine = faiss.index_cpu_to_gpu(res, 0, index_fine)
+                res_coarse = faiss.StandardGpuResources()
+                index_coarse = faiss.index_cpu_to_gpu(res_coarse, 0, index_coarse)
 
-            index_fine.add(np.ascontiguousarray(self.fine_centroids, dtype=np.float32))
-            # Search for the nearest fine centroid for each original feature
-            _, fine_centroid_indices = index_fine.search(np.ascontiguousarray(features_np, dtype=np.float32), 1)
-            fine_centroid_indices = fine_centroid_indices.squeeze() # Shape (N,)
+            index_coarse.add(coarse_centroids_np)
+            
+            # Search the COARSE index using the ORIGINAL features
+            _, final_assignments_indices = index_coarse.search(features_np_cont, 1)
+            final_assignments = torch.from_numpy(final_assignments_indices.squeeze()).long() # Shape (N,)
+            # --- MODIFICATION END ---
 
-            # Map fine centroid indices to coarse labels
-            final_assignments = coarse_labels_for_fine[fine_centroid_indices] # Shape (N,)
             logger.info("Final cluster assignments generated.")
 
             # Optional: Save centroids if needed elsewhere
             if self.feature_path:
                  centroids_path = os.path.join(self.feature_path, "centroids")
                  os.makedirs(centroids_path, exist_ok=True)
-                 torch.save(self.fine_centroids, os.path.join(centroids_path, "fine_centroids.pt"))
+                 # Save fine_centroids as numpy array directly from Faiss KMeans output
+                 np.save(os.path.join(centroids_path, "fine_centroids.npy"), self.fine_centroids)
+                 # Save coarse centroids and mapping as tensors
                  torch.save(self.coarse_centroids, os.path.join(centroids_path, "coarse_centroids.pt"))
-                 torch.save(coarse_labels_for_fine, os.path.join(centroids_path, "coarse_labels_for_fine.pt")) # Save mapping
+                 torch.save(self.coarse_labels_for_fine, os.path.join(centroids_path, "coarse_labels_for_fine.pt"))
                  logger.info(f"Saved centroids to {centroids_path}")
 
 
-            return final_assignments.long()
+            return final_assignments # Return the direct coarse assignments
 
         except Exception as e:
             logger.exception(f"An error occurred during clustering: {e}")

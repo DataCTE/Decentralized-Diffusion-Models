@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 # Ensure the import path correctly points to the MMDiT implementation within your flux structure
-from .flux.model import Flux as MMDiT # Assuming Flux is the correct class in model.py, renaming for clarity based on paper text
+from .flux.model import Flux as MMDiT, FluxParams # Import FluxParams as well
 
 class ExpertModel(nn.Module):
     """
@@ -9,33 +9,21 @@ class ExpertModel(nn.Module):
     This model is typically trained on a specific partition of the dataset.
     It wraps a pre-existing diffusion model architecture, like MMDiT (Flux).
     """
-    def __init__(self, mmdit_config: dict):
+    def __init__(self, mmdit_params: FluxParams, checkpoint_path: str = None):
         """
         Initializes the ExpertModel.
 
         Args:
-            mmdit_config (dict): Configuration dictionary for the underlying MMDiT (Flux) model.
-                                 This should contain parameters expected by the Flux class __init__
-                                 (e.g., FluxParams or individual args like hidden_size, depth, etc.).
-                                 It can also include a 'checkpoint_path' key for loading weights.
+            mmdit_params (FluxParams): Configuration dataclass for the underlying MMDiT (Flux) model.
+            checkpoint_path (str, optional): Path to load pre-trained weights. Defaults to None.
         """
         super().__init__()
 
-        # Separate checkpoint path from model config keys
-        checkpoint_path = mmdit_config.pop("checkpoint_path", None)
-
-        # Instantiate the underlying diffusion model (MMDiT/Flux)
-        # Ensure mmdit_config keys match the expected arguments of MMDiT.__init__
-        # If MMDiT expects a FluxParams object, you might need to create it here:
-        # from .flux.model import FluxParams
-        # flux_params = FluxParams(**mmdit_config) # Assuming config keys match FluxParams fields
-        # self.model = MMDiT(flux_params)
-        # Or if it takes kwargs directly:
+        # Instantiate the underlying diffusion model (MMDiT/Flux) using FluxParams
         try:
-             self.model = MMDiT(**mmdit_config) # Assumes MMDiT.__init__ accepts these kwargs
+             self.model = MMDiT(params=mmdit_params) # Pass the FluxParams object
         except TypeError as e:
-             print(f"Error initializing MMDiT. Check if mmdit_config keys match MMDiT/Flux constructor arguments: {e}")
-             print(f"Provided config keys: {list(mmdit_config.keys())}")
+             print(f"Error initializing MMDiT/Flux with FluxParams. Check if params structure is correct: {e}")
              # Potentially re-raise or handle differently
              raise e
 
@@ -53,7 +41,7 @@ class ExpertModel(nn.Module):
             
             # Determine the actual state dict (common patterns: 'state_dict', 'model', raw dict)
             if isinstance(checkpoint, dict):
-                state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
+                state_dict = checkpoint.get('state_dict', checkpoint.get('model_state_dict', checkpoint.get('model', checkpoint)))
                 # If after checking common keys, it's still a dict but not the state_dict itself,
                 # maybe the checkpoint *is* the state_dict
                 if not isinstance(state_dict, dict): 

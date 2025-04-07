@@ -8,9 +8,9 @@ from imwatermark import WatermarkEncoder
 from PIL import ExifTags, Image
 from safetensors.torch import load_file as load_sft
 
-from flux.model import Flux, FluxLoraWrapper, FluxParams
-from flux.modules.autoencoder import AutoEncoder, AutoEncoderParams
-from flux.modules.conditioner import HFEmbedder
+from .flux.model import Flux, FluxLoraWrapper, FluxParams
+from .flux.modules.autoencoder import AutoEncoder, AutoEncoderParams
+from .flux.modules.conditioner import HFEmbedder
 
 
 def save_image(

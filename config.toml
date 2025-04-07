@@ -15,6 +15,7 @@ router_mlp_ratio = 4.0
 
 # Expert Parameters (using Flux/MMDiT structure)
 # These should match FluxParams fields or MMDiT.__init__ kwargs
+expert_patch_size = 2
 expert_in_channels = 128 # Example: latent_channels * patch_size^2 = 32 * 2 * 2 = 128. Verify!
 expert_out_channels = 128 # Example: Verify!
 expert_vec_in_dim = 768 # Example: Dimension of vector 'y' (CLIP pooler)
@@ -30,9 +31,9 @@ expert_qkv_bias = true # Example Flux qkv_bias
 expert_guidance_embed = false # Example Flux guidance embed (usually False for base models)
 
 [data]
-dataset_path = "/home/alex/workspace/datasets/danbooru2025/" # Root directory of the dataset
-feature_cache_path = "/home/alex/workspace/datasets/danbooru2025/cache" # Where VAE latents, CLIP embeddings etc. are stored
-precompute_batch_size = 2 # <-- Further reduced batch size
+dataset_path = "/home/alex/workspace/datasets/photo-concept-bucket/train" # Root directory of the dataset
+feature_cache_path = "/home/alex/workspace/datasets/photo-concept-bucket/cache" # Where VAE latents, CLIP embeddings etc. are stored
+precompute_batch_size = 8 # <-- Further reduced batch size
 
 # --- Feature Extractor Models ---
 # VAE settings - UPDATED FOR DC-AE f32c32-mix
@@ -50,7 +51,7 @@ t5_max_token_length = 128                           # Max sequence length for T5
 
 # --- Clustering Settings ---
 clustering_feature_type = "clip"                    # Feature type to use for clustering ('clip', 'dino', 'vae')
-clustering_subsample_fraction = 0.1                 # Fraction of features to use for training cluster centroids (e.g., 0.1 for 10%)
+clustering_subsample_fraction = 1.0                 # Use all samples for clustering
 # num_coarse_clusters = 8  # Defined in [model] section as num_clusters
 num_fine_clusters = 512                             # Number of fine clusters for two-stage clustering
 
@@ -87,3 +88,5 @@ num_workers = 4 # Dataloader workers
 use_mixed_precision = true # Enable AMP (Note: VAEWrapper forces float32 for VAE ops)
 distributed = true # Enable distributed training
 num_diffusion_timesteps = 1000 # T
+beta_start = 0.0001 # <-- ADDED: Linear schedule start beta
+beta_end = 0.02    # <-- ADDED: Linear schedule end beta

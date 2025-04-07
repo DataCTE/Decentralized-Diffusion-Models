@@ -11,7 +11,7 @@ from torch.nn.utils import clip_grad_norm_
 import torch.distributed as dist
 import wandb # Import wandb
 from torch import nn
-from torch.nn.functional import rearrange
+from einops import rearrange # Import rearrange from einops
 
 # Assuming ExpertModel and RouterModel are correctly defined
 from models.expert import ExpertModel
@@ -64,12 +64,14 @@ class BaseTrainer:
         checkpoint_frequency: int,
         checkpoint_dir: str,
         num_diffusion_timesteps: int,
+        beta_start: float,
+        beta_end: float,
         use_amp: bool,
         is_distributed: bool,
         is_main_process: bool,
         world_size: int,
-        use_wandb: bool = False, # Add use_wandb flag
-        max_grad_norm: Optional[float] = None # Add max_grad_norm option
+        use_wandb: bool = False,
+        max_grad_norm: Optional[float] = None
     ):
         self.model = model
         self.optimizer = optimizer
@@ -86,14 +88,16 @@ class BaseTrainer:
         self.is_distributed = is_distributed
         self.is_main_process = is_main_process
         self.world_size = world_size
-        self.use_wandb = use_wandb # Store the flag
-        self.max_grad_norm = max_grad_norm # Store max_grad_norm
+        self.use_wandb = use_wandb
+        self.max_grad_norm = max_grad_norm
 
         self.scaler = GradScaler(enabled=self.use_amp)
 
-        # Noise schedule setup
+        # Noise schedule setup using configured values
         self.sqrt_alphas_cumprod, self.sqrt_one_minus_alphas_cumprod = get_linear_noise_schedule(
-            timesteps=self.num_diffusion_timesteps
+            timesteps=self.num_diffusion_timesteps,
+            beta_start=beta_start,
+            beta_end=beta_end
         )
         self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
         self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
@@ -162,11 +166,14 @@ class BaseTrainer:
 
 
 class ExpertTrainer(BaseTrainer):
-    def __init__(self, expert_id: int, **kwargs):
+    def __init__(self, expert_id: int, patch_size: int, **kwargs):
         super().__init__(**kwargs)
         if not isinstance(expert_id, int) or expert_id < 0:
             raise ValueError("ExpertTrainer requires a valid non-negative expert_id.")
+        if not isinstance(patch_size, int) or patch_size <= 0:
+             raise ValueError("ExpertTrainer requires a valid positive patch_size.")
         self.expert_id = expert_id
+        self.patch_size = patch_size
         self.loss_fn = nn.MSELoss() # Standard for diffusion noise prediction
 
     def _get_batch_data(self, batch):
@@ -186,24 +193,22 @@ class ExpertTrainer(BaseTrainer):
 
         # --- Patchify Image Latents ---
         # Assuming ExpertModel underlying Flux expects patches [B, NumPatches, PatchDim]
-        # where PatchDim = C * ph * pw (ph=pw=2 assumed)
         try:
-            # Get C, H, W
-            C = x0.shape[1]
-            # ph, pw = 2, 2 # Assume 2x2 patches based on Flux sampling example
-            # x0_patched = rearrange(x0, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=ph, pw=pw)
-            # Simpler if Flux model itself can take [B, C, H, W]? Let's assume it *requires* patching here for now.
-            # NOTE: Revisit this if Flux's internal structure handles patching differently or if config changes patch size.
-            # Need the expected patch dimensions (e.g., from config or Flux model)
-            # Let's assume expert_in_channels = C * ph * pw
-            # Check if Flux model.img_in handles the C,H,W -> NumPatches, HiddenSize mapping internally.
-            # Flux.img_in is nn.Linear(self.in_channels, self.hidden_size, bias=True)
-            # FluxParams.in_channels is likely the *patched* dimension C*ph*pw based on expert_in_channels = 128 in config
-            # Therefore, patching is necessary *before* passing to Flux.forward
-            ph, pw = 2, 2 # Hardcoding based on common use and sampling_flux.py example
+            # Use the patch size read from config
+            ph = pw = self.patch_size
+            # Check if latent dimensions are divisible by patch size
+            _, _, H, W = x0.shape
+            if H % ph != 0 or W % pw != 0:
+                 raise ValueError(f"Latent dimensions ({H}x{W}) not divisible by patch size ({ph}x{pw})")
+
+            # Use einops.rearrange for patchifying
             x0_patched = rearrange(x0, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=ph, pw=pw)
 
+        except ValueError as e:
+             # Catch specific divisibility error
+             raise RuntimeError(f"Error patchifying latents in ExpertTrainer: {e}. Latent shape: {x0.shape}, Patch size: {self.patch_size}")
         except Exception as e:
+             # Catch other rearrange errors
              raise RuntimeError(f"Error patchifying latents in ExpertTrainer._get_batch_data: {e}. Latent shape: {x0.shape}")
 
 
@@ -220,7 +225,7 @@ class ExpertTrainer(BaseTrainer):
             'y': y,
             'guidance': None, # Pass None for standard training
             # Keep original x0 for noise generation/loss calculation
-            'x0': x0, # Store original unpatched latents
+            'x0_unpatched': x0, # Store original unpatched latents (renamed for clarity)
             # 't_int': t # Store integer timesteps if needed elsewhere
         }
 
@@ -231,68 +236,188 @@ class ExpertTrainer(BaseTrainer):
         total_grad_norm_for_log = 0.0
 
         print(f"Rank {dist.get_rank() if self.is_distributed else 0}: Starting training for Expert {self.expert_id} from step {self.global_step}...")
-        data_iter = iter(self.dataloader)
+        # Ensure dataloader is iterable
+        try:
+            data_iter = iter(self.dataloader)
+        except TypeError:
+            print(f"Error: DataLoader for Expert {self.expert_id} is not iterable. Check initialization.")
+            return # Cannot train
 
         while self.global_step < self.num_train_steps:
             accumulated_loss_per_step = 0.0
+            # Ensure optimizer is valid before zero_grad
+            if self.optimizer is None:
+                print(f"Error: Optimizer not initialized for Expert {self.expert_id}.")
+                return
             self.optimizer.zero_grad()
 
             for i in range(self.gradient_accumulation_steps):
                 try:
                     batch = next(data_iter)
+                    if batch is None: # Handle potential None from collate_fn
+                         print(f"Warning: Skipped None batch from dataloader (Rank {dist.get_rank() if self.is_distributed else 0})")
+                         continue
                 except StopIteration:
+                    print(f"Rank {dist.get_rank() if self.is_distributed else 0}: Resetting dataloader iterator.")
                     data_iter = iter(self.dataloader)
-                    batch = next(data_iter)
+                    try:
+                        batch = next(data_iter)
+                        if batch is None:
+                            print(f"Warning: Skipped None batch after iterator reset (Rank {dist.get_rank() if self.is_distributed else 0})")
+                            continue
+                    except StopIteration:
+                        print(f"Error: DataLoader became empty unexpectedly after reset (Rank {dist.get_rank() if self.is_distributed else 0}).")
+                        return # Cannot continue if dataloader is persistently empty
+                except Exception as e:
+                    print(f"Error fetching batch: {e}. Skipping accumulation step.")
+                    continue # Skip this gradient accumulation step
 
-                batch_data = self._get_batch_data(batch)
-                B = batch_data['img'].shape[0]
-                t = batch_data['timesteps']
-                xt, noise = forward_diffuse(
-                    batch_data['img'], t, self.sqrt_alphas_cumprod, self.sqrt_one_minus_alphas_cumprod
+
+                try:
+                    batch_data = self._get_batch_data(batch)
+                except Exception as e:
+                     print(f"Error processing batch data: {e}. Skipping accumulation step.")
+                     continue # Skip this step if batch processing fails
+
+                # Extract required tensors, ensure they exist
+                x0_unpatched = batch_data.get('x0_unpatched')
+                t = batch_data.get('timesteps')
+                noise_target = batch_data.get('noise') # Get pre-generated noise if available
+
+                if x0_unpatched is None or t is None:
+                     print("Error: Missing 'x0_unpatched' or 'timesteps' in batch_data. Skipping step.")
+                     continue
+                     
+                # --- Forward Diffusion on UNPATCHED latents ---
+                # Noise is added to the original latent representation
+                xt_unpatched, noise = forward_diffuse(
+                    x0_unpatched, t, self.sqrt_alphas_cumprod, self.sqrt_one_minus_alphas_cumprod, noise=noise_target
                 )
+                
+                # --- Patch the NOISY latents BEFORE passing to the model ---
+                # Model expects patched input corresponding to noisy latent
+                try:
+                    ph = pw = self.patch_size
+                    xt_patched = rearrange(xt_unpatched, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=ph, pw=pw)
+                except Exception as e:
+                    print(f"Error patching noisy latents xt_unpatched: {e}. Skipping step.")
+                    continue
+                
+                # Prepare model inputs
+                # Model forward expects 'img' to be the *patched noisy* input
+                model_kwargs = {
+                    'img': xt_patched, # Pass patched noisy latents
+                    'img_ids': batch_data['img_ids'],
+                    'txt': batch_data['txt'],
+                    'txt_ids': batch_data['txt_ids'],
+                    'timesteps': t, # Pass original timesteps
+                    'y': batch_data['y'],
+                    'guidance': batch_data['guidance'] # Should be None during training
+                }
+
 
                 with autocast(enabled=self.use_amp):
-                    model_kwargs = {key: batch_data[key] for key in ['img', 'img_ids', 'txt', 'txt_ids', 'timesteps']}
-                    model_kwargs.update({'guidance': batch_data['guidance']})
-                    pred_noise = self.model(**model_kwargs)
-                    loss = self.loss_fn(pred_noise, noise)
+                    # Pass arguments directly, not nested dict
+                    pred_noise_patched = self.model(**model_kwargs) # Model predicts noise in patched format
+                    
+                    # --- Loss Calculation ---
+                    # Target noise should also be in the patched format to match prediction
+                    try:
+                         ph = pw = self.patch_size
+                         noise_patched = rearrange(noise, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=ph, pw=pw)
+                    except Exception as e:
+                         print(f"Error patching target noise: {e}. Skipping step.")
+                         continue
+
+                    loss = self.loss_fn(pred_noise_patched, noise_patched) # Compare patched prediction with patched noise
                     loss = loss / self.gradient_accumulation_steps
 
+                # Accumulate loss before scaling
+                # Detach loss before accumulating to avoid graph buildup if accumulating items
+                accumulated_loss_per_step += loss.item() * self.gradient_accumulation_steps # Use item() for accumulation
+
+
+                # Scaled backward pass
                 self.scaler.scale(loss).backward()
-                accumulated_loss_per_step += loss.item() * self.gradient_accumulation_steps
 
-            self.scaler.unscale_(self.optimizer)
-            
+
+            # Unscale, clip, step, update scaler (outside accumulation loop)
+            try:
+                self.scaler.unscale_(self.optimizer)
+            except Exception as e:
+                 print(f"Error unscaling optimizer: {e}")
+                 # Potentially skip step if unscale fails catastrophically?
+
             if self.max_grad_norm is not None:
-                 grad_norm = clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                 total_grad_norm_for_log += grad_norm.item()
-            else:
                  try:
-                     grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]), 2)
-                     total_grad_norm_for_log += grad_norm.item()
-                 except:
-                      pass
+                     # Filter parameters that have gradients before clipping
+                     params_to_clip = [p for p in self.model.parameters() if p.grad is not None]
+                     if params_to_clip:
+                          grad_norm = clip_grad_norm_(params_to_clip, self.max_grad_norm)
+                          total_grad_norm_for_log += grad_norm.item()
+                     else:
+                          grad_norm = 0.0 # Or some placeholder if needed
+                 except Exception as e:
+                      print(f"Error during gradient clipping: {e}")
+                      # Handle error, e.g., log it, maybe skip logging this norm
+            else:
+                 # Calculate grad norm manually (optional, can be expensive)
+                 try:
+                     # Filter parameters with gradients
+                     params_with_grads = [p for p in self.model.parameters() if p.grad is not None]
+                     if params_with_grads:
+                         # Use torch.stack for potentially better performance on GPU
+                         all_norms = torch.stack([torch.norm(p.grad.detach().float(), 2) for p in params_with_grads])
+                         grad_norm = torch.norm(all_norms, 2)
+                         total_grad_norm_for_log += grad_norm.item()
+                     else:
+                          grad_norm = 0.0
+                 except RuntimeError as e:
+                      # Catch potential errors like "stack expects a non-empty TensorList"
+                      print(f"Error calculating manual grad norm (likely no grads found): {e}")
+                 except Exception as e:
+                      # Catch other unexpected errors
+                      print(f"Unexpected error calculating manual grad norm: {e}")
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            if self.lr_scheduler is not None: self.lr_scheduler.step()
+
+            # Optimizer step and scaler update
+            # Check if any gradients were actually computed before stepping
+            # A simple check could be if total_grad_norm_for_log increased, or check param.grad directly
+            has_grads = any(p.grad is not None for p in self.model.parameters())
+            if has_grads:
+                 self.scaler.step(self.optimizer)
+                 self.scaler.update()
+                 # Only step scheduler if optimizer stepped
+                 if self.lr_scheduler is not None: 
+                      self.lr_scheduler.step()
+            else:
+                 # If no gradients (e.g., due to skipping all accumulation steps), skip optimizer step
+                 # Log this situation?
+                 if self.gradient_accumulation_steps > 0: # Avoid logging if accum steps is 0
+                      print(f"Warning: Skipping optimizer step {self.global_step + 1} as no gradients were found.")
+                 # Need to decide if scheduler should step even if optimizer doesn't.
+                 # Usually, scheduler step is tied to optimizer step.
+                 # if self.lr_scheduler is not None: self.lr_scheduler.step() # Optional: Step scheduler anyway?
+
 
             if self.is_distributed:
+                 # Use non-blocking calls and average loss across devices
                  loss_tensor = torch.tensor(accumulated_loss_per_step, device=self.device)
-                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG, async_op=False) # Sync here for logging
                  avg_step_loss = loss_tensor.item()
             else:
                  avg_step_loss = accumulated_loss_per_step
 
             total_loss_for_log += avg_step_loss
 
+            # Logging logic (remains the same)
             if self.is_main_process and (self.global_step + 1) % self.log_frequency == 0:
                 avg_loss_log_period = total_loss_for_log / self.log_frequency
                 avg_grad_norm_log_period = total_grad_norm_for_log / self.log_frequency
                 current_time = time.time()
                 elapsed_time_log = current_time - log_start_time
                 steps_per_sec = self.log_frequency / elapsed_time_log if elapsed_time_log > 0 else 0
-                lr = self.optimizer.param_groups[0]['lr']
+                lr = self.optimizer.param_groups[0]['lr'] if self.optimizer.param_groups else 0 # Handle empty groups
 
                 print(f"Expert {self.expert_id} | Step: {self.global_step+1}/{self.num_train_steps} | "
                       f"Avg Loss: {avg_loss_log_period:.4f} | Grad Norm: {avg_grad_norm_log_period:.4f} | LR: {lr:.6f} | "
@@ -313,6 +438,8 @@ class ExpertTrainer(BaseTrainer):
                 total_grad_norm_for_log = 0.0
                 log_start_time = current_time
 
+
+            # Checkpointing logic (remains the same)
             if (self.global_step + 1) % self.checkpoint_frequency == 0:
                 self.save_checkpoint()
 
@@ -320,6 +447,7 @@ class ExpertTrainer(BaseTrainer):
             if self.global_step >= self.num_train_steps:
                  break
 
+        # Final checkpoint save (remains the same)
         self.save_checkpoint(filename=f"expert_{self.expert_id}_final.pt")
         print(f"Rank {dist.get_rank() if self.is_distributed else 0}: Training finished for Expert {self.expert_id}.")
 

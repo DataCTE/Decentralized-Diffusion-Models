@@ -22,6 +22,7 @@ from trainers.trainer import ExpertTrainer, RouterTrainer
 # Need to ensure DDMDataset is adapted for router/expert data loading
 from data.dataset import DDMDataset, BucketBatchSampler
 from utils import dict_to_sns, find_latest_checkpoint # Import helpers from utils
+from models.flux.model import FluxParams # Import FluxParams
 
 def setup_distributed():
     """Initializes torch.distributed"""
@@ -79,39 +80,52 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
     cfg = dict_to_sns(config_dict)
 
     # Derive checkpoint_dir after loading
+    # Ensure train section exists before accessing checkpoint_dir
+    if not hasattr(cfg, 'train'): raise ValueError("Config missing [train] section.")
+    if not hasattr(cfg.train, 'output_dir'): raise ValueError("Config missing output_dir in [train] section.")
     cfg.train.checkpoint_dir = os.path.join(cfg.train.output_dir, "checkpoints")
 
 
     # --- 2. Setup Environment ---
     rank, world_size, local_rank, device = setup_distributed()
     is_main = (rank == 0)
-    is_distributed = world_size > 1 and cfg.train.distributed # Check if distributed is enabled and active
-    set_seed(cfg.train.seed + rank) # Add rank for different seeds per process
+    is_distributed = world_size > 1 and getattr(cfg.train, 'distributed', False) # Check distributed flag safely
+    set_seed(getattr(cfg.train, 'seed', 42) + rank) # Use getattr for seed
 
     if is_main:
         print("-------------------- Configuration --------------------")
-        # Basic config print - consider using pprint or a dedicated library for complex configs
-        # Convert back to dict for printing or use a recursive print function
+        # Print the original dictionary for clarity before conversion
         print(config_dict)
         print("-------------------------------------------------------")
+        # Ensure output_dir exists before creating subdirs
         os.makedirs(cfg.train.output_dir, exist_ok=True)
         os.makedirs(cfg.train.checkpoint_dir, exist_ok=True)
         # Make specific subdirs for router/experts later when trainer is initialized
 
         # Initialize wandb
         # Determine run name based on model type and expert ID
-        run_name = f"{cfg.train.model_type}"
-        if cfg.train.model_type == "expert":
-            run_name += f"_{getattr(cfg.train, 'expert_id', 'unknown')}"
+        model_type = getattr(cfg.train, 'model_type', 'unknown')
+        run_name = f"{model_type}"
+        if model_type == "expert":
+            # Use getattr for safe access to expert_id
+            expert_id_val = getattr(cfg.train, 'expert_id', 'unknown')
+            run_name += f"_{expert_id_val}"
         
         try:
-             wandb.init(
-                  project="decentralized-diffusion", # Or your preferred project name
-                  name=run_name,
-                  config=config_dict, # Log the raw config dictionary
-                  dir=cfg.train.output_dir # Optional: Set wandb local log directory
-             )
-             print("WandB initialized successfully.")
+             # Check if wandb is enabled in config (add this if desired)
+             use_wandb = getattr(cfg.train, 'use_wandb', True) 
+             if use_wandb:
+                 wandb.init(
+                      project=getattr(cfg.train, 'wandb_project', "decentralized-diffusion"), # Configurable project
+                      name=run_name,
+                      config=config_dict, # Log the raw config dictionary
+                      dir=cfg.train.output_dir # Optional: Set wandb local log directory
+                 )
+                 print("WandB initialized successfully.")
+             else:
+                  print("WandB disabled by config.")
+                  wandb.init(mode="disabled")
+
         except Exception as e:
              print(f"Error initializing WandB: {e}. Proceeding without WandB logging.")
              wandb.init(mode="disabled") # Disable wandb if init fails
@@ -119,20 +133,27 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
 
     # --- 3. Initialize Dataset and Dataloader ---
     # Convert relevant parts of the main config to a dict for DDMDataset
-    # Now directly use the cfg object loaded from TOML
+    # Pass a FLAT dictionary, not the nested cfg
     dataset_config_dict = {
-        'feature_cache_path': cfg.data.feature_cache_path,
-        'latent_channels': cfg.data.latent_channels,
-        'num_experts': cfg.model.num_clusters,
-        # Add bucketing parameters if defined in config.toml
+        # Extract values safely using getattr from cfg.data if it exists
+        'feature_cache_path': getattr(cfg.data, 'feature_cache_path', None),
+        'latent_channels': getattr(cfg.data, 'latent_channels', None),
+        # num_clusters is needed by the dataset to determine which expert a sample belongs to
+        'num_experts': getattr(cfg.model, 'num_clusters', None), 
+        # Bucket settings need to be directly accessible
         'bucket_thresholds': getattr(cfg.data, 'bucket_thresholds', {}),
         'bucket_scale': getattr(cfg.data, 'bucket_scale', 8),
         'buckets': getattr(cfg.data, 'buckets', []),
-        # Add any other parameters DDMDataset expects from its config_dict
     }
+    # Validate required dataset config keys
+    if not dataset_config_dict['feature_cache_path']: raise ValueError("Missing feature_cache_path in [data] config.")
+    if not dataset_config_dict['num_experts']: raise ValueError("Missing num_clusters in [model] config (needed by dataset).")
+
     print(f"Rank {rank}: Initializing DDMDataset...")
-    # Pass the dict, not the SimpleNamespace directly if DDMDataset expects dict
+    # Pass the flat dict
     dataset = DDMDataset(config_dict=dataset_config_dict)
+    print(f"Rank {rank}: DDMDataset initialized with {len(dataset)} samples.")
+
 
     # --- Modify Sampler for DDP ---
     # Use DistributedSampler to wrap the dataset indices OR adapt BucketBatchSampler
@@ -140,20 +161,22 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
     # If bucketing IS required per batch with DDP, BucketBatchSampler needs adaptation (shown below)
     print(f"Rank {rank}: Initializing Sampler (Distributed={is_distributed})...")
     if is_distributed:
-         # Option A: Standard Distributed Sampler (ignores buckets per batch)
-         # sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=cfg.train.seed)
-         # dataloader = DataLoader(dataset, batch_size=cfg.train.batch_size, sampler=sampler, ...)
-
          # Option B: Adapt BucketBatchSampler for DDP (keeps buckets per batch)
-         # Requires BucketBatchSampler to handle DDP logic internally (as implemented in previous step)
          batch_sampler = BucketBatchSampler(
-              dataset=dataset, batch_size=cfg.train.batch_size, shuffle=True, drop_last=True
-              # BucketBatchSampler should already handle rank/world_size internally
+              dataset=dataset, 
+              batch_size=cfg.train.batch_size, 
+              shuffle=True, 
+              drop_last=True,
+              logger=dataset.logger # Pass logger
          )
     else:
          # Non-distributed: use BucketBatchSampler directly
          batch_sampler = BucketBatchSampler(
-              dataset=dataset, batch_size=cfg.train.batch_size, shuffle=True, drop_last=True
+              dataset=dataset, 
+              batch_size=cfg.train.batch_size, 
+              shuffle=True, 
+              drop_last=True,
+              logger=dataset.logger # Pass logger
          )
 
 
@@ -162,50 +185,80 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
     dataloader = DataLoader(
         dataset,
         batch_sampler=batch_sampler, # Use the (potentially DDP-aware) BucketBatchSampler
-        num_workers=cfg.train.num_workers,
+        num_workers=getattr(cfg.train, 'num_workers', 4), # Get num_workers safely
         pin_memory=True, # Important for performance
         collate_fn=DDMDataset.collate_fn # Use the static collate function
     )
-    print(f"Rank {rank}: DataLoader initialized.")
+    print(f"Rank {rank}: DataLoader initialized with {len(dataloader)} batches for this rank.")
 
     # --- 4. Initialize Model ---
     model = None
     trainer_class = None
-    trainer_checkpoint_subdir = "" # To store the specific subdir for checkpoint loading
+    trainer_checkpoint_subdir = ""
+    expert_patch_size_val = None
 
     if cfg.train.model_type == "expert":
-        expert_id = getattr(cfg.train, 'expert_id', None) # Use getattr for safety
-        if expert_id is None or expert_id < 0:
-             raise ValueError("Expert training requires a valid non-negative 'expert_id' in config.")
+        expert_id = getattr(cfg.train, 'expert_id', None)
+        if expert_id is None or not isinstance(expert_id, int) or expert_id < 0:
+             raise ValueError("Expert training requires a valid non-negative integer 'expert_id' in [train] config.")
         print(f"Rank {rank}: Initializing ExpertModel {expert_id}...")
-        # Extract expert-specific config params into a dict from cfg.model
-        expert_mmdit_config = {k: getattr(cfg.model, k) for k in dir(cfg.model) if k.startswith('expert_')}
-        model = ExpertModel(mmdit_config=expert_mmdit_config)
+
+        # --- Validate Expert Config ---
+        if not hasattr(cfg, 'model'):
+            raise ValueError("Config missing [model] section for expert parameters.")
+        required_expert_keys = [
+            'expert_patch_size', 'expert_in_channels', 'expert_out_channels',
+            'expert_vec_in_dim', 'expert_context_in_dim', 'expert_hidden_size',
+            'expert_mlp_ratio', 'expert_num_heads', 'expert_depth',
+            'expert_depth_single_blocks', 'expert_axes_dim', 'expert_theta',
+            'expert_qkv_bias', 'expert_guidance_embed'
+            # Add num_clusters if needed by ExpertModel itself, though usually just for dataset/router
+        ]
+        missing_expert_keys = [key for key in required_expert_keys if not hasattr(cfg.model, key)]
+        if missing_expert_keys:
+             raise ValueError(f"Missing required keys in [model] section for expert: {missing_expert_keys}")
+
+        expert_raw_config = {}
+        prefix = "expert_"
+        expert_patch_size_val = cfg.model.expert_patch_size # Read directly after validation
+
+        for k in dir(cfg.model):
+            if k.startswith(prefix):
+                v = getattr(cfg.model, k)
+                if k != 'expert_patch_size':
+                    new_key = k[len(prefix):]
+                    expert_raw_config[new_key] = v
+
+        try:
+            flux_params_for_expert = FluxParams(**expert_raw_config)
+            model = ExpertModel(mmdit_params=flux_params_for_expert)
+        except Exception as e:
+             print(f"Error creating ExpertModel: {e}")
+             raise e
+
         trainer_class = ExpertTrainer
         trainer_checkpoint_subdir = f"expert_{expert_id}"
-        trainer_init_kwargs = {
-             'model': model, 'optimizer': optimizer, 'dataloader': dataloader,
-             'device': device, 'lr_scheduler': lr_scheduler,
-             'num_train_steps': cfg.train.num_train_steps,
-             'gradient_accumulation_steps': cfg.train.gradient_accumulation_steps,
-             'log_frequency': cfg.train.log_frequency,
-             'checkpoint_frequency': cfg.train.checkpoint_frequency,
-             'checkpoint_dir': os.path.join(cfg.train.checkpoint_dir, trainer_checkpoint_subdir),
-             'num_diffusion_timesteps': cfg.train.num_diffusion_timesteps,
-             'expert_id': expert_id,
-             'use_amp': cfg.train.use_mixed_precision,
-             'is_distributed': is_distributed,
-             'is_main_process': is_main,
-             'world_size': world_size,
-             'use_wandb': is_main and wandb.run is not None and wandb.run.mode != "disabled",
-             'max_grad_norm': getattr(cfg.train, 'max_grad_norm', None)
-        }
 
     elif cfg.train.model_type == "router":
         print(f"Rank {rank}: Initializing RouterModel...")
-        # Extract router-specific config params
-        router_cond_dim = getattr(cfg.model, 'router_cond_dim', None) # Handle optional attribute
+        # --- Validate Router Config ---
+        if not hasattr(cfg, 'model'):
+            raise ValueError("Config missing [model] section for router parameters.")
+        required_router_keys = [
+            'num_clusters', 'router_input_size', 'router_patch_size',
+            'router_in_channels', 'router_hidden_size', 'router_depth',
+            'router_num_heads', 'router_mlp_ratio'
+            # router_cond_dim is optional
+        ]
+        missing_router_keys = [key for key in required_router_keys if not hasattr(cfg.model, key)]
+        if missing_router_keys:
+             raise ValueError(f"Missing required keys in [model] section for router: {missing_router_keys}")
+
+        # Extract router-specific config params directly after validation
+        router_cond_dim = getattr(cfg.model, 'router_cond_dim', None) # Keep default for optional
+
         model = RouterModel(
+            # Access required attributes directly
             num_clusters=cfg.model.num_clusters,
             input_size=cfg.model.router_input_size,
             patch_size=cfg.model.router_patch_size,
@@ -216,106 +269,95 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
             mlp_ratio=cfg.model.router_mlp_ratio,
             cond_dim=router_cond_dim, # Pass the potentially None value
         )
+
         trainer_class = RouterTrainer
         trainer_checkpoint_subdir = "router"
-        trainer_init_kwargs = {
-             'model': model, 'optimizer': optimizer, 'dataloader': dataloader,
-             'device': device, 'lr_scheduler': lr_scheduler,
-             'num_train_steps': cfg.train.num_train_steps,
-             'gradient_accumulation_steps': cfg.train.gradient_accumulation_steps,
-             'log_frequency': cfg.train.log_frequency,
-             'checkpoint_frequency': cfg.train.checkpoint_frequency,
-             'checkpoint_dir': os.path.join(cfg.train.checkpoint_dir, trainer_checkpoint_subdir),
-             'num_diffusion_timesteps': cfg.train.num_diffusion_timesteps,
-             'use_amp': cfg.train.use_mixed_precision,
-             'is_distributed': is_distributed,
-             'is_main_process': is_main,
-             'world_size': world_size,
-             'use_wandb': is_main and wandb.run is not None and wandb.run.mode != "disabled",
-             'max_grad_norm': getattr(cfg.train, 'max_grad_norm', None)
-        }
 
     else:
         raise ValueError(f"Unknown model_type in config: {cfg.train.model_type}. Choose 'expert' or 'router'.")
 
+    if model is None:
+         raise RuntimeError("Model initialization failed.") # Should not happen if logic above is correct
+
     model = model.to(device)
-    # DDP wrapping below handles distributed training. FSDP can be integrated later if needed.
+    if is_main: print(f"Model {cfg.train.model_type} initialized on {device}.")
 
     # --- Wrap Model with DDP if distributed ---
     if is_distributed:
         print(f"Rank {rank}: Wrapping model with DDP...")
-        # find_unused_parameters can be True if some outputs aren't used in loss
-        # (might happen with complex models, start with False)
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None,
                     output_device=local_rank if device.type == 'cuda' else None,
                     find_unused_parameters=False) # Set to True if needed
         print(f"Rank {rank}: Model wrapped with DDP.")
-        # FSDP Note: If using FSDP, the wrapping happens here instead of DDP
-        # from utils.fsdp import create_fsdp_model # Example
-        # model = create_fsdp_model(model, cfg, rank=local_rank)
 
     # --- 5. Initialize Optimizer and Scheduler ---
-    # Standard AdamW initialization. Parameter groups can be added later for refinement.
     optimizer = AdamW(
         model.parameters(),
-        lr=cfg.train.learning_rate,
-        betas=(cfg.train.adam_beta1, cfg.train.adam_beta2),
-        weight_decay=cfg.train.adam_weight_decay,
-        eps=cfg.train.adam_epsilon,
+        lr=getattr(cfg.train, 'learning_rate', 1e-4),
+        betas=(getattr(cfg.train, 'adam_beta1', 0.9), getattr(cfg.train, 'adam_beta2', 0.999)),
+        weight_decay=getattr(cfg.train, 'adam_weight_decay', 1e-2),
+        eps=getattr(cfg.train, 'adam_epsilon', 1e-8),
     )
 
+    # Ensure gradient accumulation steps >= 1
+    grad_accum_steps = max(1, cfg.train.gradient_accumulation_steps) # Read directly after validation
+
     lr_scheduler = get_scheduler(
-        name=cfg.train.lr_scheduler_type,
+        name=cfg.train.lr_scheduler_type, # Read directly
         optimizer=optimizer,
-        num_warmup_steps=cfg.train.lr_warmup_steps * cfg.train.gradient_accumulation_steps,
-        num_training_steps=cfg.train.num_train_steps * cfg.train.gradient_accumulation_steps,
+        num_warmup_steps=getattr(cfg.train, 'lr_warmup_steps', 0) * grad_accum_steps, # Keep default for optional warmup
+        num_training_steps=cfg.train.num_train_steps * grad_accum_steps, # Read directly
     )
 
     # --- 6. Initialize Trainer ---
     print(f"Rank {rank}: Initializing {trainer_class.__name__}...")
-    # Construct the specific checkpoint directory for this trainer instance
     specific_checkpoint_dir = os.path.join(cfg.train.checkpoint_dir, trainer_checkpoint_subdir)
-    if is_main: # Only main process creates directories
+    if is_main:
          os.makedirs(specific_checkpoint_dir, exist_ok=True)
 
-    # Common kwargs first
+    # Common kwargs - Now directly accessing cfg.train attributes after validation
+    # Removed default fallbacks for required parameters
     common_trainer_kwargs = {
-        'model': model, 'optimizer': optimizer, 'dataloader': dataloader,
-        'device': device, 'lr_scheduler': lr_scheduler,
+        'model': model,
+        'optimizer': optimizer,
+        'dataloader': dataloader,
+        'device': device,
+        'lr_scheduler': lr_scheduler,
         'num_train_steps': cfg.train.num_train_steps,
-        'gradient_accumulation_steps': cfg.train.gradient_accumulation_steps,
+        'gradient_accumulation_steps': grad_accum_steps,
         'log_frequency': cfg.train.log_frequency,
         'checkpoint_frequency': cfg.train.checkpoint_frequency,
-        'checkpoint_dir': specific_checkpoint_dir, # Use the specific dir here
+        'checkpoint_dir': specific_checkpoint_dir,
         'num_diffusion_timesteps': cfg.train.num_diffusion_timesteps,
+        'beta_start': cfg.train.beta_start,
+        'beta_end': cfg.train.beta_end,
         'use_amp': cfg.train.use_mixed_precision,
         'is_distributed': is_distributed,
         'is_main_process': is_main,
         'world_size': world_size,
-        'use_wandb': is_main and wandb.run is not None and wandb.run.mode != "disabled",
-        'max_grad_norm': getattr(cfg.train, 'max_grad_norm', None) # Get from config or default to None
+        # Keep getattr with default for optional parameters:
+        'use_wandb': is_main and getattr(cfg.train, 'use_wandb', False) and wandb.run is not None and wandb.run.mode != "disabled",
+        'max_grad_norm': getattr(cfg.train, 'max_grad_norm', None)
     }
 
     # Add model-specific kwargs
     trainer_init_kwargs = common_trainer_kwargs.copy()
     if cfg.train.model_type == "expert":
-        trainer_init_kwargs['expert_id'] = expert_id
-    # No specific kwargs needed for router beyond common ones currently
+        trainer_init_kwargs['expert_id'] = cfg.train.expert_id # Read directly
+        trainer_init_kwargs['patch_size'] = expert_patch_size_val
+    # No specific kwargs needed for router
 
     trainer = trainer_class(**trainer_init_kwargs)
     print(f"Rank {rank}: Trainer initialized.")
 
     # --- Checkpoint Loading ---
-    # Find the latest checkpoint in the specific directory for this trainer
-    latest_checkpoint = find_latest_checkpoint(trainer.checkpoint_dir)
+    latest_checkpoint = find_latest_checkpoint(trainer.checkpoint_dir) # find_latest_checkpoint uses the specific dir
     if latest_checkpoint:
          print(f"Rank {rank}: Found latest checkpoint: {latest_checkpoint}. Attempting to load...")
          try:
-              # Pass is_distributed status to load_checkpoint
               trainer.load_checkpoint(latest_checkpoint)
          except Exception as e:
               print(f"Rank {rank}: Failed to load checkpoint {latest_checkpoint}. Starting training from scratch. Error: {e}")
-              # Optionally reset global_step if loading fails partway
               trainer.global_step = 0
     else:
          print(f"Rank {rank}: No checkpoint found in {trainer.checkpoint_dir}. Starting training from scratch.")
@@ -335,8 +377,15 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         wandb.finish() # Finish the wandb run on the main process
 
     if is_distributed:
-        dist.barrier() # Wait for all processes to finish training
-        dist.destroy_process_group()
+        # Ensure barrier happens even if training fails on some ranks
+        try:
+             dist.barrier() # Wait for all processes to finish training
+        except Exception as e:
+             print(f"Rank {rank}: Error during final barrier: {e}")
+        finally:
+             # Always attempt to destroy the process group
+             if dist.is_initialized():
+                  dist.destroy_process_group()
 
     print(f"Rank {rank}: Training finished.")
 

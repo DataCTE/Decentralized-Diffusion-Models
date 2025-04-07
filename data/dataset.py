@@ -1,7 +1,5 @@
 """Dataset classes for Decentralized Diffusion Models."""
 
-import os
-import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
 import random
@@ -9,16 +7,12 @@ from collections import defaultdict
 import logging
 import time  
 from tqdm.auto import tqdm
-import torch.distributed as dist # Assuming dist is initialized elsewhere or handle initialization
-from types import SimpleNamespace
-# Import centralized utilities
-from utils.distributed import is_main_process, get_rank, get_world_size
-from utils.logging import setup_distributed_logger
-import re  # Add regex module
-import glob
-import json
+# Import centralized utilities and logging setup
+from utils import is_main_process, get_rank, get_world_size, dict_to_sns # Keep dict_to_sns if needed here
+from utils.logging import setup_distributed_logger # Correct import
 import math
 from pathlib import Path # Add Path import
+import re
 
 
 def chunks(lst, n):
@@ -53,7 +47,7 @@ class DDMDataset(Dataset):
         'dino':    {'dir': 'dino', 'ext': '.pt'},
         'dims':    {'dir': 'dims', 'ext': '.pt'},
         'buckets': {'dir': 'buckets', 'ext': '.pt'},
-        'clusters':{'dir': 'clusters', 'ext': '.cluster.pt'} # Use distinct extension if needed
+        'clusters':{'dir': 'clusters', 'ext': '.pt'}
     }
     # Features that are mandatory for the dataset to function
     MANDATORY_FEATURES = {'latents', 'clip', 't5', 'dims', 'buckets', 'clusters'}
@@ -66,13 +60,25 @@ class DDMDataset(Dataset):
             config_dict (dict): Configuration dictionary containing data parameters like
                                 'feature_cache_path', 'latent_channels', 'num_experts',
                                 bucket settings, etc.
+                                This dictionary is expected to be FLAT, not nested like the main config.toml.
             split (str): Data split ('train', 'val', etc.). Currently unused, assumes train.
             logger (logging.Logger, optional): Logger instance. Defaults to None.
         """
-        self.config = dict_to_sns(config_dict) # Convert dict to SimpleNamespace
-        self.feature_cache_path = Path(self.config.feature_cache_path)
+        # Convert the FLAT config_dict to SimpleNamespace
+        self.config = dict_to_sns(config_dict) 
+        
+        # Setup logger using the provided function if not passed
+        # Pass the rank explicitly if available, otherwise setup_distributed_logger will try to get it
+        current_rank = get_rank() if torch.distributed.is_initialized() else 0
+        self.logger = logger if logger else setup_distributed_logger(__name__, rank=current_rank)
+
+        # Access feature_cache_path directly from the flat self.config
+        feature_cache_path_str = getattr(self.config, 'feature_cache_path', None)
+        if not feature_cache_path_str:
+             raise ValueError("Missing 'feature_cache_path' in the config_dict passed to DDMDataset.")
+        self.feature_cache_path = Path(feature_cache_path_str)
+
         self.split = split
-        self.logger = logger if logger else logging.getLogger(__name__)
 
         # Validate mandatory config keys
         if not self.feature_cache_path.exists():
@@ -81,22 +87,36 @@ class DDMDataset(Dataset):
         # Check for mandatory feature directories (only check, files discovered later)
         for feat in self.MANDATORY_FEATURES:
             info = self.FEATURE_INFO.get(feat)
-            if not info or not (self.feature_cache_path / info['dir']).exists():
-                 self.logger.warning(f"Mandatory feature directory '{info['dir'] if info else feat}' not found in {self.feature_cache_path}. Dataset loading might fail.")
-                 # Could raise an error here if strictly required
+            if info: # Check if feature info exists
+                 feature_dir_path = self.feature_cache_path / info['dir']
+                 if not feature_dir_path.exists():
+                      self.logger.warning(f"Mandatory feature directory '{info['dir']}' not found in {self.feature_cache_path}. Dataset loading might fail.")
+                      # Raise error if strict checking is needed:
+                      # raise FileNotFoundError(f"Mandatory feature directory '{info['dir']}' not found: {feature_dir_path}")
+            else:
+                 self.logger.warning(f"Configuration for mandatory feature '{feat}' missing in FEATURE_INFO.")
+
 
         # Discover feature files and determine dataset size
-        self.file_list, self.cumulative_sizes, self.total_samples = self._discover_files()
+        try:
+             self.file_list, self.cumulative_sizes, self.total_samples = self._discover_files()
+        except FileNotFoundError as e:
+             self.logger.error(f"Failed to initialize dataset due to missing directory: {e}")
+             raise # Re-raise after logging
+        except Exception as e:
+             self.logger.error(f"Unexpected error during file discovery: {e}")
+             raise # Re-raise other unexpected errors
+
         if self.total_samples == 0:
-            raise ValueError(f"No data samples found in feature cache: {self.feature_cache_path}")
-        self.logger.info(f"Discovered {len(self.file_list)} batch files, total samples: {self.total_samples}")
+            raise ValueError(f"No data samples found in feature cache or mandatory features missing: {self.feature_cache_path}")
+        self.logger.info(f"Discovered {len(self.file_list)} verified batch file indices, total samples: {self.total_samples}")
+
 
         # Load bucket assignments (essential for BucketBatchSampler)
         self._bucket_assignments = self._load_bucket_assignments()
-
-        # Precompute cluster statistics if needed (optional)
-        self._cluster_stats = None
-        # self._compute_cluster_statistics() # Uncomment if needed
+        
+        # Load cluster assignments (needed for expert filtering/loading later)
+        self._cluster_assignments = self._load_cluster_assignments()
 
         # Feature cache (in-memory) - Use with caution for large datasets
         self.feature_cache = {} # Cache loaded batch files {('feature_type', file_idx): tensor}
@@ -109,14 +129,19 @@ class DDMDataset(Dataset):
         Assumes all feature types have corresponding files for each batch index across ranks.
         Uses 'dims' feature as the reference for determining batch structure and size.
         """
-        dims_dir = self.feature_cache_path / self.FEATURE_INFO['dims']['dir']
+        dims_info = self.FEATURE_INFO.get('dims')
+        if not dims_info:
+            raise ValueError("Configuration for 'dims' feature missing in FEATURE_INFO.")
+        dims_dir = self.feature_cache_path / dims_info['dir']
+        dims_ext = dims_info['ext']
+
         if not dims_dir.exists():
             raise FileNotFoundError(f"Mandatory 'dims' feature directory not found at {dims_dir}")
 
-        # Find all dims files: rank_batchidx.pt
-        dims_files = sorted(list(dims_dir.glob("*_*.pt"))) # Glob for rank_batchidx structure
+        # Find all dims files: rank_batchidx.pt (or other extension)
+        dims_files = sorted(list(dims_dir.glob(f"*_*{dims_ext}"))) # Use configured extension
         if not dims_files:
-            self.logger.error(f"No dimension files ('*_*.pt') found in {dims_dir}")
+            self.logger.error(f"No dimension files ('*_*_*{dims_ext}') found in {dims_dir}")
             return [], {}, 0
 
         # Group files by batch index
@@ -131,22 +156,33 @@ class DDMDataset(Dataset):
         for file_path in dims_files:
             try:
                 filename = file_path.name
-                parts = filename.split('_')
-                if len(parts) != 2 or not parts[0].isdigit() or not parts[1].endswith('.pt'):
+                # Updated pattern matching for rank_batchidx.ext
+                match = re.match(r"(\d+)_(\d+)" + re.escape(dims_ext), filename)
+                if not match:
                      self.logger.warning(f"Skipping unexpected filename format: {filename} in {dims_dir}")
                      continue
 
-                # rank_str = parts[0] # Rank is part of the filename now
-                batch_idx_str = parts[1].replace('.pt', '')
+                # rank_str = match.group(1) # Rank is part of the filename
+                batch_idx_str = match.group(2)
                 batch_idx = int(batch_idx_str)
 
                 if batch_idx not in processed_batch_indices:
                     # This is the first time we see this batch_idx, load it to get size
                     try:
+                        # Use a small timeout or check file size first? Loading can be slow/fail.
+                        # Quick check if file looks valid (e.g., size > 0)
+                        if file_path.stat().st_size == 0:
+                             self.logger.warning(f"Dims file {file_path} is empty. Skipping batch {batch_idx}.")
+                             continue
+
                         dims_tensor = torch.load(file_path, map_location='cpu')
+                        if dims_tensor.ndim == 0 or dims_tensor.shape[0] == 0:
+                             self.logger.warning(f"Dims file {file_path} loaded an empty or scalar tensor. Skipping batch {batch_idx}.")
+                             continue
+
                         num_samples = dims_tensor.shape[0]
                         batch_sizes[batch_idx] = num_samples
-                        total_samples += num_samples
+                        # total_samples += num_samples # Calculate total at the end based on verified
                         processed_batch_indices.add(batch_idx)
                         file_groups[batch_idx] = [file_path] # Initialize group
                     except Exception as e:
@@ -157,7 +193,6 @@ class DDMDataset(Dataset):
                     if batch_idx in file_groups:
                          file_groups[batch_idx].append(file_path)
                     else:
-                         # This case shouldn't happen if logic is correct, but log if it does
                          self.logger.warning(f"Found file for already processed batch_idx {batch_idx} but group not initialized: {file_path}")
 
             except ValueError:
@@ -173,12 +208,23 @@ class DDMDataset(Dataset):
         final_total_samples = 0
 
         self.logger.info(f"Verifying presence of mandatory features for {len(verified_batch_indices)} discovered batch indices...")
-        for batch_idx in verified_batch_indices:
+
+        # Use tqdm for verification progress if many batches
+        batch_iterator = tqdm(verified_batch_indices, desc="Verifying batches", leave=False, disable=(len(verified_batch_indices) < 100))
+
+        for batch_idx in batch_iterator:
             batch_complete = True
             for feature_type in required_features:
-                info = self.FEATURE_INFO[feature_type]
-                expected_filename_pattern = f"*_{batch_idx:06d}{info['ext']}" # Assumes 6-digit padding
+                info = self.FEATURE_INFO.get(feature_type)
+                if not info:
+                    self.logger.error(f"Missing FEATURE_INFO configuration for mandatory feature '{feature_type}'. Cannot verify.")
+                    batch_complete = False
+                    break # Cannot proceed with this batch
+
                 feature_dir = self.feature_cache_path / info['dir']
+                # Construct the expected filename pattern using the correct extension
+                expected_filename_pattern = f"*_{batch_idx:06d}{info['ext']}" # Assumes 6-digit padding
+
                 # Check if at least one rank's file exists for this batch_idx and feature
                 matches = list(feature_dir.glob(expected_filename_pattern))
                 if not matches:
@@ -187,15 +233,14 @@ class DDMDataset(Dataset):
                     break # Stop checking features for this batch
 
             if batch_complete:
-                num_samples = batch_sizes[batch_idx]
+                # Ensure batch_idx exists in batch_sizes (it should if dims loaded)
+                num_samples = batch_sizes.get(batch_idx)
+                if num_samples is None:
+                     self.logger.error(f"Internal error: Batch index {batch_idx} verified but size not found. Skipping.")
+                     continue
                 final_file_list.append((batch_idx, num_samples))
-                final_total_samples += num_samples
-            else:
-                 # Decrement total samples if batch was skipped
-                 original_size = batch_sizes.get(batch_idx, 0)
-                 # This adjustment might be complex if total_samples wasn't built correctly above
-                 # Safer to recalculate total_samples based on final_file_list
-                 pass # Recalculate below
+                # final_total_samples += num_samples # Accumulate at the end
+            # else: # No need to adjust total_samples here, recalculate at the end
 
         # Recalculate total samples accurately based on verified batches
         final_total_samples = sum(num_samples for _, num_samples in final_file_list)
@@ -209,6 +254,7 @@ class DDMDataset(Dataset):
 
         if not final_file_list:
              self.logger.error("No complete batches found after verifying mandatory features.")
+             # Consider raising an error if no data is usable
 
         return final_file_list, cumulative_sizes, final_total_samples
 
@@ -218,19 +264,36 @@ class DDMDataset(Dataset):
          Gets the path(s) for a given feature type and batch index.
          It returns the first available file found across potential ranks.
          """
-         info = self.FEATURE_INFO[feature_type]
+         info = self.FEATURE_INFO.get(feature_type)
+         if not info:
+             self.logger.error(f"Feature info not found for type '{feature_type}'")
+             return None
+
          feature_dir = self.feature_cache_path / info['dir']
          # Use the precise extension defined in FEATURE_INFO
          filename_pattern = f"*_{batch_idx:06d}{info['ext']}" # Assumes 6 digits padding from precompute
          
+         # Use glob to find matching files
          potential_files = sorted(list(feature_dir.glob(filename_pattern)))
          
          if not potential_files:
-              # self.logger.warning(f"No file found for feature '{feature_type}', batch {batch_idx} with pattern {filename_pattern}")
+              # Reduce log spam: Maybe log only once per feature type or less frequently
+              # self.logger.debug(f"No file found for feature '{feature_type}', batch {batch_idx} with pattern {filename_pattern}")
               return None # Indicate file not found
               
-         # Return the first found file path (e.g., rank 0's if available)
-         return potential_files[0]
+         # Return the first found file path (e.g., rank 0's if available and exists)
+         # Add an existence check for robustness, though glob should only return existing files
+         if potential_files[0].exists():
+            return potential_files[0]
+         else:
+            # This case is unlikely if glob works correctly, but handle defensively
+            self.logger.warning(f"Glob found {potential_files[0]} but it does not exist. Trying next...")
+            for pfile in potential_files[1:]:
+                if pfile.exists():
+                    return pfile
+            # If none exist after globbing, return None
+            self.logger.error(f"Glob found files for {feature_type} batch {batch_idx} but none actually exist.")
+            return None
 
 
     def _load_feature_file(self, feature_type: str, file_idx: int):
@@ -480,6 +543,53 @@ class DDMDataset(Dataset):
 
         return collated
 
+    def _load_cluster_assignments(self) -> torch.Tensor:
+         """Loads cluster assignments for the entire dataset."""
+         assignments_dir = self.feature_cache_path / self.FEATURE_INFO['clusters']['dir']
+         cluster_ext = self.FEATURE_INFO['clusters']['ext'] # Use correct extension
+         if not assignments_dir.exists():
+             raise FileNotFoundError(f"Cluster assignments directory not found: {assignments_dir}")
+
+         all_assignments = []
+         self.logger.info(f"Loading cluster assignments for {len(self.file_list)} verified batches...")
+         for batch_idx, num_samples in tqdm(self.file_list, desc="Loading cluster assignments"):
+             # Use _get_file_path which handles finding the file across ranks and uses correct extension
+             file_path = self._get_file_path('clusters', batch_idx)
+             if file_path:
+                 try:
+                     batch_assignments = torch.load(file_path, map_location='cpu')
+                     if batch_assignments.shape[0] != num_samples:
+                         self.logger.warning(f"Cluster assignment count mismatch for batch {batch_idx}. Expected {num_samples}, got {batch_assignments.shape[0]}. File: {file_path}")
+                         # Decide how to handle mismatch, e.g., attempt to resize or skip batch if critical
+                     all_assignments.append(batch_assignments)
+                 except Exception as e:
+                     self.logger.error(f"Error loading cluster assignment file {file_path}: {e}")
+                     raise RuntimeError(f"Failed to load cluster assignments for batch {batch_idx}")
+             else:
+                 self.logger.error(f"Could not find cluster assignment file for batch {batch_idx} (expected ext: {cluster_ext}). Cannot proceed.")
+                 raise FileNotFoundError(f"Missing cluster assignment file for batch {batch_idx}")
+
+         if not all_assignments:
+              raise ValueError("Failed to load any cluster assignments.")
+
+         full_assignments = torch.cat(all_assignments, dim=0)
+
+         if full_assignments.shape[0] != self.total_samples:
+             self.logger.warning(f"Total loaded cluster assignments ({full_assignments.shape[0]}) does not match expected dataset size ({self.total_samples}). Check for mismatches during loading.")
+
+         self.logger.info(f"Successfully loaded cluster assignments for {full_assignments.shape[0]} samples.")
+         return full_assignments.long() # Use long tensor for cluster indices
+
+
+    @property
+    def cluster_assignments(self) -> torch.Tensor:
+        """Returns the loaded cluster assignments."""
+        if self._cluster_assignments is None:
+             self.logger.error("Cluster assignments accessed before loading.")
+             raise ValueError("Cluster assignments not loaded.")
+        return self._cluster_assignments
+
+
 class CombinedBatchSampler(Sampler):
     """Combines multiple batch samplers into one epoch."""
     def __init__(self, batch_samplers):
@@ -619,8 +729,8 @@ def create_expert_bucket_loaders(dataset, config, world_size=1, rank=0):
     - Optimized worker processes
     """
     # Use the correct local device for this process
-    device = torch.device('cpu')
-    logger = setup_distributed_logger(name="ExpertLoaders", rank=rank)
+    device = torch.device('cpu') # Loaders primarily work with CPU data before transfer
+    logger = setup_distributed_logger(name="ExpertLoaders", rank=rank) # Use the imported function
 
     # Get expert assignments directly from GPU tensor
     expert_assignments = dataset.expert_assignments.cpu().numpy()

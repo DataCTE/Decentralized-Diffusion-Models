@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from flux.modules.layers import (
+from .modules.layers import (
     DoubleStreamBlock,
     EmbedND,
     LastLayer,
@@ -11,7 +11,7 @@ from flux.modules.layers import (
     SingleStreamBlock,
     timestep_embedding,
 )
-from flux.modules.lora import LinearLora, replace_linear_with_lora
+from .modules.lora import LinearLora, replace_linear_with_lora
 
 
 @dataclass
