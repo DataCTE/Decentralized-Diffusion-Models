@@ -546,9 +546,7 @@ class FeatureGenerator:
 
         # Load features (only rank 0 needs to do this for actual clustering)
         features_list = []
-        original_indices_map = [] # To map subsampled feature index back to original file/index
         if self.rank == 0:
-            current_original_idx = 0
             for file_path in tqdm(files_to_load_paths, desc="Loading subsampled features"):
                 try:
                     # Load directly to CPU to manage memory
@@ -558,12 +556,6 @@ class FeatureGenerator:
                          logger.warning(f"NaN/Inf found in feature file {file_path}. Skipping this batch for clustering.")
                          continue
                     features_list.append(batch_features.float()) # Ensure float32
-
-                    # Keep track of original indices if needed for assignment later (complex)
-                    # For now, we assume assignments are saved sequentially based on *all* files
-                    # num_in_batch = batch_features.shape[0]
-                    # original_indices_map.extend(range(current_original_idx, current_original_idx + num_in_batch))
-                    # current_original_idx += num_in_batch
 
                 except Exception as e:
                     logger.error(f"Error loading feature file {file_path}: {e}")
@@ -686,10 +678,12 @@ def main(config_path: str = "config.toml",
     distributed = world_size > 1
 
     # --- Setup Logging ---
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    # Add rank to the format string and keep INFO level for all ranks initially
+    log_format = f'%(asctime)s - Rank {rank} - %(levelname)s - %(message)s'
+    logging.basicConfig(level=logging.INFO, format=log_format)
     logger = logging.getLogger(__name__)
-    if not is_main: # Reduce logging noise from non-main ranks
-        logger.setLevel(logging.WARNING)
+    # if not is_main: # Temporarily disable log level reduction for non-main ranks
+    #     logger.setLevel(logging.WARNING)
 
 
     # --- Load Config ---
@@ -742,6 +736,7 @@ def main(config_path: str = "config.toml",
             collate_fn=precompute_collate_fn # Use the custom collate function
         )
     logger.info(f"DataLoader initialized with batch size {precompute_batch_size}.")
+    logger.info(f"Rank {rank} DataLoader length: {len(dataloader)}")
 
 
     # --- Run Feature Extraction ---
