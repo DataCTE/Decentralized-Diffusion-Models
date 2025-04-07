@@ -19,13 +19,13 @@ expert_patch_size = 2
 expert_in_channels = 128 # Example: latent_channels * patch_size^2 = 32 * 2 * 2 = 128. Verify!
 expert_out_channels = 128 # Example: Verify!
 expert_vec_in_dim = 768 # Example: Dimension of vector 'y' (CLIP pooler)
-expert_context_in_dim = 4096 # Example: Dimension of text context (T5)
-expert_hidden_size = 1792 # Example Flux hidden size
+expert_context_in_dim = 2048 # << CHANGED from 4096 (to match flan-t5-xl output)
+expert_hidden_size = 1024 # << CHANGED from 1792
 expert_mlp_ratio = 4.0 # Example Flux MLP ratio
-expert_num_heads = 16 # Example Flux num heads
-expert_depth = 28 # Example Flux depth (double stream blocks)
-expert_depth_single_blocks = 4 # Example Flux depth (single stream blocks)
-expert_axes_dim = [38, 38, 36] # Example Flux axes_dim (check consistency)
+expert_num_heads = 16 # << KEPT (1024 is divisible by 16)
+expert_depth = 20 # << CHANGED from 28
+expert_depth_single_blocks = 2 # << CHANGED from 4
+expert_axes_dim = [22, 22, 20] # << CHANGED (sums to 64, all elements are EVEN)
 expert_theta = 10000 # Example Flux theta
 expert_qkv_bias = true # Example Flux qkv_bias
 expert_guidance_embed = false # Example Flux guidance embed (usually False for base models)
@@ -71,7 +71,7 @@ expert_id = 0 # Required if model_type is 'expert', ignored otherwise
 output_dir = "output"
 # checkpoint_dir is derived from output_dir in the script
 seed = 42
-batch_size = 64 # Adjust batch size based on memory usage with new VAE/latent size
+batch_size = 8 # << CHANGED from 64
 num_train_steps = 100000 # Total training steps
 gradient_accumulation_steps = 1
 max_grad_norm = 1.0 # Optional: Max gradient norm for clipping (e.g., 1.0)
@@ -90,3 +90,10 @@ distributed = true # Enable distributed training
 num_diffusion_timesteps = 1000 # T
 beta_start = 0.0001 # <-- ADDED: Linear schedule start beta
 beta_end = 0.02    # <-- ADDED: Linear schedule end beta
+
+# --- WandB Configuration --- ADDED SECTION ---
+[wandb]
+enabled = true                      # Master switch for WandB logging
+project = "decentralized-diffusion" # WandB project name
+run_name_prefix = "ddm"             # Prefix for the run name (e.g., "ddm_expert_0")
+entity = ""                         # Optional: WandB entity (username or team) - leave blank if default

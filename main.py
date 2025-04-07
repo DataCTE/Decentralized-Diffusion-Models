@@ -122,33 +122,45 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         os.makedirs(cfg.train.checkpoint_dir, exist_ok=True)
         # Make specific subdirs for router/experts later when trainer is initialized
 
-        # Initialize wandb
-        # Determine run name based on model type and expert ID
-        model_type = getattr(cfg.train, 'model_type', 'unknown')
-        run_name = f"{model_type}"
-        if model_type == "expert":
-            # Use getattr for safe access to expert_id
-            expert_id_val = getattr(cfg.train, 'expert_id', 'unknown')
-            run_name += f"_{expert_id_val}"
-        
-        try:
-             # Check if wandb is enabled in config (add this if desired)
-             use_wandb = getattr(cfg.train, 'use_wandb', True) 
-             if use_wandb:
-                 wandb.init(
-                      project=getattr(cfg.train, 'wandb_project', "decentralized-diffusion"), # Configurable project
-                      name=run_name,
-                      config=config_dict, # Log the raw config dictionary
-                      dir=cfg.train.output_dir # Optional: Set wandb local log directory
-                 )
-                 print("WandB initialized successfully.")
-             else:
-                  print("WandB disabled by config.")
-                  wandb.init(mode="disabled")
+        # --- WandB Initialization (conditional and configured) --- START EDIT ---
+        wandb_config = getattr(cfg, 'wandb', None) # Get the [wandb] section safely
+        use_wandb = False
+        if wandb_config and getattr(wandb_config, 'enabled', False):
+            try:
+                # Construct run name
+                model_type = getattr(cfg.train, 'model_type', 'unknown')
+                run_name_prefix = getattr(wandb_config, 'run_name_prefix', 'run')
+                run_name = f"{run_name_prefix}_{model_type}"
+                if model_type == "expert":
+                    expert_id_val = getattr(cfg.train, 'expert_id', 'unknown')
+                    run_name += f"_{expert_id_val}"
 
-        except Exception as e:
-             print(f"Error initializing WandB: {e}. Proceeding without WandB logging.")
-             wandb.init(mode="disabled") # Disable wandb if init fails
+                wandb_kwargs = {
+                    "project": getattr(wandb_config, 'project', "default_project"),
+                    "name": run_name,
+                    "config": config_dict, # Log the raw config dictionary
+                    "dir": cfg.train.output_dir, # Optional: Set wandb local log directory
+                    "mode": "online", # Explicitly set online mode if enabled
+                }
+                # Add entity only if it's provided and not empty
+                wandb_entity = getattr(wandb_config, 'entity', None)
+                if wandb_entity:
+                    wandb_kwargs["entity"] = wandb_entity
+
+                wandb.init(**wandb_kwargs)
+                # The link is printed automatically by wandb.init() when mode is online
+                print(f"Rank {rank}: WandB initialized successfully.")
+                use_wandb = True # Set flag for trainer
+
+            except Exception as e:
+                print(f"Rank {rank}: Error initializing WandB: {e}. Proceeding without WandB logging.")
+                wandb.init(mode="disabled")
+                use_wandb = False
+        else:
+            print(f"Rank {rank}: WandB disabled by config.")
+            wandb.init(mode="disabled") # Ensure wandb is in disabled mode if not enabled
+            use_wandb = False
+        # --- WandB Initialization (conditional and configured) --- END EDIT ---
 
 
     # --- 3. Initialize Dataset and Dataloader ---
@@ -357,8 +369,7 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         'is_distributed': is_distributed,
         'is_main_process': is_main,
         'world_size': world_size,
-        # Keep getattr with default for optional parameters:
-        'use_wandb': is_main and getattr(cfg.train, 'use_wandb', False) and wandb.run is not None and wandb.run.mode != "disabled",
+        'use_wandb': is_main and use_wandb, # Pass the flag determined during init
         'max_grad_norm': getattr(cfg.train, 'max_grad_norm', None)
     }
 
@@ -395,8 +406,9 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
     trainer.train() # train() method in trainer should use self.global_step
 
     # --- 8. Cleanup ---
-    if is_main and wandb.run is not None and wandb.run.mode != "disabled":
-        wandb.finish() # Finish the wandb run on the main process
+    if is_main and use_wandb:
+        print(f"Rank {rank}: Finishing WandB run.") # Optional log
+        wandb.finish()
 
     if is_distributed:
         # Ensure barrier happens even if training fails on some ranks
