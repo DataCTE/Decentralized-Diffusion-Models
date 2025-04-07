@@ -196,6 +196,20 @@ class PrecomputeDataset(Dataset):
 
         return {'image': img, 'caption': caption, 'id': img_filename}
 
+def precompute_collate_fn(batch):
+    """
+    Custom collate function for PrecomputeDataset.
+    Keeps images as a list of PIL Images (or Nones).
+    Collates captions and ids into lists.
+    """
+    # Batch is a list of dictionaries like {'image': PIL/None, 'caption': str, 'id': str}
+    images = [item['image'] for item in batch]    # List of PIL Images or Nones
+    captions = [item['caption'] for item in batch] # List of strings
+    ids = [item['id'] for item in batch]          # List of strings
+
+    # Return a dictionary where values are lists
+    return {'image': images, 'caption': captions, 'id': ids}
+
 # --- Feature Generator ---
 class FeatureGenerator:
     def __init__(self, config, enabled_features):
@@ -690,8 +704,9 @@ def main(config_path: str = "config.toml",
             batch_size=precompute_batch_size, # Use dedicated precompute batch size
             sampler=sampler,
             num_workers=getattr(cfg.train, 'num_workers', 4), # Get num_workers from train config
-            pin_memory=True,
-            drop_last=False # Process all samples
+            pin_memory=False, # Cannot pin list of PIL Images
+            drop_last=False, # Process all samples
+            collate_fn=precompute_collate_fn # Use the custom collate function
         )
     else:
         precompute_batch_size = getattr(cfg.data, 'precompute_batch_size', 128)
@@ -700,8 +715,9 @@ def main(config_path: str = "config.toml",
             batch_size=precompute_batch_size, # Use dedicated precompute batch size
             shuffle=False,
             num_workers=getattr(cfg.train, 'num_workers', 4), # Get num_workers from train config
-            pin_memory=True,
-            drop_last=False
+            pin_memory=False, # Cannot pin list of PIL Images
+            drop_last=False,
+            collate_fn=precompute_collate_fn # Use the custom collate function
         )
     logger.info(f"DataLoader initialized with batch size {precompute_batch_size}.")
 
