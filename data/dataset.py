@@ -153,12 +153,13 @@ class DDMDataset(Dataset):
         """
         self.logger.info("Starting optimized file discovery v2 (assuming reliable precomputation)...")
         batch_indices_per_feature = {}
+        valid_batch_indices = None # Initialize to None
+        sorted_indices = None      # Initialize to None
+        dims_tensor = None         # Initialize to None
         parse_errors = 0
-        dims_tensor = None # Define variable for finally block
 
-        try: # Added try block for potential cleanup
-             # 1. Collect batch indices for each mandatory feature type (same as before)
-             #    Uses os.scandir for efficiency.
+        try:
+             # 1. Collect batch indices for each mandatory feature type
              for feature_type in tqdm(self.MANDATORY_FEATURES, desc="Scanning features"):
                  info = self.FEATURE_INFO[feature_type]
                  feature_dir = self.feature_cache_path / info['dir']
@@ -180,6 +181,9 @@ class DDMDataset(Dataset):
                      raise
                  except Exception as e: # pragma: no cover
                      self.logger.error(f"Error scanning directory {feature_dir}: {e}")
+                     # If error happens here, batch_indices_per_feature might be partially filled
+                     # but we should still raise to indicate failure. The finally block will handle cleanup.
+                     raise
 
                  if not current_indices:
                      self.logger.error(f"No batch files found for mandatory feature '{feature_type}' in {feature_dir}. Dataset cannot be formed.")
@@ -192,26 +196,29 @@ class DDMDataset(Dataset):
              for ft, idx_set in batch_indices_per_feature.items():
                  self.logger.info(f"Found {len(idx_set)} batch indices for feature '{ft}'.")
 
-             # 2. Find the intersection of batch indices (same as before)
-             if not batch_indices_per_feature: # Should not happen if checks above are done
+             # 2. Find the intersection of batch indices
+             if not batch_indices_per_feature:
                   self.logger.error("No features scanned, cannot determine valid batches.")
-                  return [], {}, 0 # pragma: no cover
+                  return [], {}, 0
              valid_batch_indices = set.intersection(*batch_indices_per_feature.values())
              self.logger.info(f"Found {len(valid_batch_indices)} batch indices present across ALL mandatory features.")
-             del batch_indices_per_feature # Delete intermediate dictionary of sets
-             gc.collect() # Collect after deleting potentially large structures
+             # Don't delete batch_indices_per_feature here yet, might be needed in finally if error occurs later
 
              if not valid_batch_indices:
                  self.logger.error("No common batch indices found across all mandatory features. Check precomputation outputs.")
+                 # Log counts per feature for debugging before returning
+                 for feat, indices in batch_indices_per_feature.items():
+                     self.logger.error(f"  Feature '{feat}': {len(indices)} indices")
                  return [], {}, 0
 
              # 3. Determine Batch Sizes (Optimized: Load only last batch dims)
-             final_file_list = [] # List of tuples: (batch_idx, num_samples)
+             final_file_list = []
              dims_info = self.FEATURE_INFO.get('dims')
              if not dims_info: raise ValueError("Internal Error: 'dims' feature info missing.")
 
              sorted_indices = sorted(list(valid_batch_indices))
-             del valid_batch_indices # Delete set after sorting
+             # Don't delete valid_batch_indices yet
+
              max_batch_idx = sorted_indices[-1]
              last_batch_size = 0
 
@@ -219,52 +226,70 @@ class DDMDataset(Dataset):
              self.logger.info(f"Loading 'dims' file only for the last batch index: {max_batch_idx}...")
              dims_file_path = self._get_file_path('dims', max_batch_idx)
              if dims_file_path is None:
-                  # This is critical - if the last batch dims file is missing, we can't determine size accurately.
                  self.logger.error(f"Could not find 'dims' file for the MAX validated batch index {max_batch_idx}. Cannot determine dataset size.")
                  raise FileNotFoundError(f"Missing dims file for max batch index: {max_batch_idx}")
 
              try:
                  dims_tensor = torch.load(dims_file_path, map_location='cpu')
-                 if dims_tensor.ndim == 0 or dims_tensor.shape[0] == 0: # Still a minimal safety check
+                 if dims_tensor.ndim == 0 or dims_tensor.shape[0] == 0:
                      self.logger.error(f"Last dims file {dims_file_path} loaded empty/scalar tensor. Cannot determine dataset size.")
                      raise ValueError(f"Last dims file empty/scalar: {dims_file_path}")
                  last_batch_size = dims_tensor.shape[0]
                  self.logger.info(f"Last batch ({max_batch_idx}) has {last_batch_size} samples.")
-                 # --- Explicitly delete the loaded tensor --- START EDIT ---
-                 del dims_tensor
-                 dims_tensor = None # Ensure it's None if deletion happens before assignment
-                 # --- Explicitly delete the loaded tensor --- END EDIT ---
+                 # Keep dims_tensor reference until finally block
 
              except Exception as e:
                  self.logger.error(f"Failed to load/process the last dims file {dims_file_path}: {e}")
-                 raise # Failure to load the last batch size is fatal for this method
+                 raise
 
-             # Construct the file list assuming expected size for all but the last
+             # Construct the file list
              for batch_idx in sorted_indices:
                  size = self.expected_batch_size if batch_idx != max_batch_idx else last_batch_size
                  final_file_list.append((batch_idx, size))
-             del sorted_indices # Delete sorted list
 
-             # 4. Calculate cumulative sizes and total samples (same as before)
+             # 4. Calculate cumulative sizes and total samples
              cumulative_sizes = {}
              current_pos = 0
              final_total_samples = 0
-             for batch_idx, num_samples in final_file_list: # final_file_list is already sorted
+             for batch_idx, num_samples in final_file_list:
                  cumulative_sizes[batch_idx] = current_pos
                  current_pos += num_samples
              final_total_samples = current_pos
 
              self.logger.info(f"Successfully verified {len(final_file_list)} batches using optimized discovery v2.")
-             return final_file_list, cumulative_sizes, final_total_samples
 
-        finally:
-             # Ensure intermediate large objects are cleaned up even if an error occurs
+             # --- Delete intermediate structures AFTER successful execution ---
              del batch_indices_per_feature
              del valid_batch_indices
              del sorted_indices
-             if dims_tensor is not None:
-                 del dims_tensor
+             del dims_tensor # Delete the tensor only if successfully loaded and used
+             batch_indices_per_feature, valid_batch_indices, sorted_indices, dims_tensor = None, None, None, None # Reset
+
+             return final_file_list, cumulative_sizes, final_total_samples
+
+        finally:
+             # --- Safe cleanup in finally block --- START EDIT ---
+             # Ensure intermediate large objects are cleaned up even if an error occurs.
+             # Check if variables were assigned before attempting deletion.
+             try:
+                 if 'batch_indices_per_feature' in locals() and batch_indices_per_feature is not None:
+                     del batch_indices_per_feature
+             except NameError: pass # Variable might not exist if error happened early
+             try:
+                 if 'valid_batch_indices' in locals() and valid_batch_indices is not None:
+                     del valid_batch_indices
+             except NameError: pass
+             try:
+                 if 'sorted_indices' in locals() and sorted_indices is not None:
+                     del sorted_indices
+             except NameError: pass
+             try:
+                 if 'dims_tensor' in locals() and dims_tensor is not None:
+                     del dims_tensor
+             except NameError: pass
+             # Always run garbage collection
              gc.collect()
+             # --- Safe cleanup in finally block --- END EDIT ---
 
     def _get_file_path(self, feature_type: str, batch_idx: int):
          """
