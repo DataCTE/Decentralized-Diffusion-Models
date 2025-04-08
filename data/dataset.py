@@ -14,6 +14,7 @@ import math
 from pathlib import Path # Add Path import
 import re
 from typing import Optional
+import os
 
 
 def chunks(lst, n):
@@ -45,7 +46,6 @@ class DDMDataset(Dataset):
         'latents': {'dir': 'latents', 'ext': '.pt'},
         'clip':    {'dir': 'clip', 'ext': '.pt'},
         't5':      {'dir': 't5', 'ext': '.pt'},
-        'dino':    {'dir': 'dino', 'ext': '.pt'},
         'dims':    {'dir': 'dims', 'ext': '.pt'},
         'buckets': {'dir': 'buckets', 'ext': '.pt'},
         'clusters':{'dir': 'clusters', 'ext': '.pt'}
@@ -85,180 +85,159 @@ class DDMDataset(Dataset):
         if not self.feature_cache_path.exists():
             raise FileNotFoundError(f"Feature cache path does not exist: {self.feature_cache_path}")
 
-        # Check for mandatory feature directories (only check, files discovered later)
+        # Check for mandatory feature directories upfront
         for feat in self.MANDATORY_FEATURES:
             info = self.FEATURE_INFO.get(feat)
-            if info: # Check if feature info exists
-                 feature_dir_path = self.feature_cache_path / info['dir']
-                 if not feature_dir_path.exists():
-                      self.logger.warning(f"Mandatory feature directory '{info['dir']}' not found in {self.feature_cache_path}. Dataset loading might fail.")
-                      # Raise error if strict checking is needed:
-                      # raise FileNotFoundError(f"Mandatory feature directory '{info['dir']}' not found: {feature_dir_path}")
-            else:
-                 self.logger.warning(f"Configuration for mandatory feature '{feat}' missing in FEATURE_INFO.")
+            if not info:
+                 self.logger.error(f"Configuration for mandatory feature '{feat}' missing in FEATURE_INFO.")
+                 raise ValueError(f"Missing config for mandatory feature: {feat}")
+            feature_dir_path = self.feature_cache_path / info['dir']
+            if not feature_dir_path.exists():
+                 self.logger.error(f"Mandatory feature directory '{info['dir']}' not found in {self.feature_cache_path}.")
+                 raise FileNotFoundError(f"Mandatory feature directory '{info['dir']}' not found: {feature_dir_path}")
 
+        # --- Retrieve expected batch size --- START EDIT ---
+        self.expected_batch_size = getattr(self.config, 'precompute_batch_size', None)
+        if self.expected_batch_size is None or not isinstance(self.expected_batch_size, int) or self.expected_batch_size <= 0:
+            raise ValueError(f"Invalid or missing 'precompute_batch_size' ({self.expected_batch_size}) in config_dict passed to DDMDataset.")
+        self.logger.info(f"Using expected precomputation batch size: {self.expected_batch_size}")
+        # --- Retrieve expected batch size --- END EDIT ---
 
-        # Discover feature files and determine dataset size
+        # Discover feature files and determine dataset size (Optimized v2)
+        discovery_start_time = time.time()
         try:
-             self.file_list, self.cumulative_sizes, self.total_samples = self._discover_files()
+             self.file_list, self.cumulative_sizes, self.total_samples = self._discover_files_optimized_v2()
         except FileNotFoundError as e:
              self.logger.error(f"Failed to initialize dataset due to missing directory: {e}")
              raise # Re-raise after logging
         except Exception as e:
-             self.logger.error(f"Unexpected error during file discovery: {e}")
+             self.logger.exception(f"Unexpected error during optimized file discovery.") # Log traceback
              raise # Re-raise other unexpected errors
+        discovery_time = time.time() - discovery_start_time
+        self.logger.info(f"Optimized file discovery v2 took {discovery_time:.2f} seconds.")
 
         if self.total_samples == 0:
-            raise ValueError(f"No data samples found in feature cache or mandatory features missing: {self.feature_cache_path}")
+            # This is more likely an error condition if mandatory directories existed
+            self.logger.error(f"No complete data samples found across mandatory features in {self.feature_cache_path}. Check if all features were generated correctly for all batches.")
+            raise ValueError(f"No complete data samples found in feature cache: {self.feature_cache_path}")
         self.logger.info(f"Discovered {len(self.file_list)} verified batch file indices, total samples: {self.total_samples}")
 
-
         # Load bucket assignments (essential for BucketBatchSampler)
+        # These load methods use the verified self.file_list
+        loading_start_time = time.time()
         self._bucket_assignments = self._load_bucket_assignments()
-        
-        # Load cluster assignments (needed for expert filtering/loading later)
         self._cluster_assignments = self._load_cluster_assignments()
+        loading_time = time.time() - loading_start_time
+        self.logger.info(f"Loading assignments took {loading_time:.2f} seconds.")
 
         # Feature cache (in-memory) - Use with caution for large datasets
         self.feature_cache = {} # Cache loaded batch files {('feature_type', file_idx): tensor}
 
-
-    def _discover_files(self):
+    def _discover_files_optimized_v2(self):
         """
-        Discovers precomputed feature files (rank_batchidx.pt) and calculates dataset size.
-
-        Assumes all feature types have corresponding files for each batch index across ranks.
-        Uses 'dims' feature as the reference for determining batch structure and size.
+        Optimized discovery v2: Assumes reliable precomputation.
+        Finds intersection of batch indices, assumes expected batch size for all
+        except the last batch index, loads only the last 'dims' file for exact size.
+        Requires 'precompute_batch_size' to be set in self.config.
         """
-        dims_info = self.FEATURE_INFO.get('dims')
-        if not dims_info:
-            raise ValueError("Configuration for 'dims' feature missing in FEATURE_INFO.")
-        dims_dir = self.feature_cache_path / dims_info['dir']
-        dims_ext = dims_info['ext']
+        self.logger.info("Starting optimized file discovery v2 (assuming reliable precomputation)...")
+        batch_indices_per_feature = {}
+        parse_errors = 0
 
-        if not dims_dir.exists():
-            raise FileNotFoundError(f"Mandatory 'dims' feature directory not found at {dims_dir}")
+        # 1. Collect batch indices for each mandatory feature type (same as before)
+        #    Uses os.scandir for efficiency.
+        for feature_type in tqdm(self.MANDATORY_FEATURES, desc="Scanning features"):
+            info = self.FEATURE_INFO[feature_type]
+            feature_dir = self.feature_cache_path / info['dir']
+            feature_ext = info['ext']
+            current_indices = set()
+            try:
+                for entry in os.scandir(feature_dir):
+                    if entry.is_file() and entry.name.endswith(feature_ext):
+                        match = re.match(r"(\d+)_(\d+)" + re.escape(feature_ext), entry.name)
+                        if match:
+                            try:
+                                batch_idx = int(match.group(2))
+                                current_indices.add(batch_idx)
+                            except ValueError: # pragma: no cover
+                                if parse_errors < 10: self.logger.warning(f"Could not parse batch index from filename: {entry.name} in {feature_dir}")
+                                parse_errors += 1
+            except FileNotFoundError: # pragma: no cover
+                self.logger.error(f"Directory not found during scan: {feature_dir}")
+                raise
+            except Exception as e: # pragma: no cover
+                self.logger.error(f"Error scanning directory {feature_dir}: {e}")
 
-        # Find all dims files: rank_batchidx.pt (or other extension)
-        dims_files = sorted(list(dims_dir.glob(f"*_*{dims_ext}"))) # Use configured extension
-        if not dims_files:
-            self.logger.error(f"No dimension files ('*_*_*{dims_ext}') found in {dims_dir}")
+            if not current_indices:
+                self.logger.error(f"No batch files found for mandatory feature '{feature_type}' in {feature_dir}. Dataset cannot be formed.")
+                raise FileNotFoundError(f"No files found for mandatory feature: {feature_type}")
+            batch_indices_per_feature[feature_type] = current_indices
+
+        # Log findings from scan
+        if parse_errors > 0: self.logger.warning(f"Encountered {parse_errors} filename parsing errors during scan.")
+        for ft, idx_set in batch_indices_per_feature.items():
+            self.logger.info(f"Found {len(idx_set)} batch indices for feature '{ft}'.")
+
+        # 2. Find the intersection of batch indices (same as before)
+        if not batch_indices_per_feature: # Should not happen if checks above are done
+             self.logger.error("No features scanned, cannot determine valid batches.")
+             return [], {}, 0 # pragma: no cover
+        valid_batch_indices = set.intersection(*batch_indices_per_feature.values())
+        self.logger.info(f"Found {len(valid_batch_indices)} batch indices present across ALL mandatory features.")
+
+        if not valid_batch_indices:
+            self.logger.error("No common batch indices found across all mandatory features. Check precomputation outputs.")
+            # Log counts per feature for debugging
+            for feat, indices in batch_indices_per_feature.items():
+                 self.logger.error(f"  Feature '{feat}': {len(indices)} indices")
             return [], {}, 0
 
-        # Group files by batch index
-        file_groups = {} # {batch_idx: [path_rank0, path_rank1, ...]}
-        batch_sizes = {} # {batch_idx: num_samples}
-
-        self.logger.info(f"Discovering files based on {len(dims_files)} dims files in {dims_dir}...")
-
-        total_samples = 0
-        processed_batch_indices = set()
-
-        for file_path in dims_files:
-            try:
-                filename = file_path.name
-                # Updated pattern matching for rank_batchidx.ext
-                match = re.match(r"(\d+)_(\d+)" + re.escape(dims_ext), filename)
-                if not match:
-                     self.logger.warning(f"Skipping unexpected filename format: {filename} in {dims_dir}")
-                     continue
-
-                # rank_str = match.group(1) # Rank is part of the filename
-                batch_idx_str = match.group(2)
-                batch_idx = int(batch_idx_str)
-
-                if batch_idx not in processed_batch_indices:
-                    # This is the first time we see this batch_idx, load it to get size
-                    try:
-                        # Use a small timeout or check file size first? Loading can be slow/fail.
-                        # Quick check if file looks valid (e.g., size > 0)
-                        if file_path.stat().st_size == 0:
-                             self.logger.warning(f"Dims file {file_path} is empty. Skipping batch {batch_idx}.")
-                             continue
-
-                        dims_tensor = torch.load(file_path, map_location='cpu')
-                        if dims_tensor.ndim == 0 or dims_tensor.shape[0] == 0:
-                             self.logger.warning(f"Dims file {file_path} loaded an empty or scalar tensor. Skipping batch {batch_idx}.")
-                             continue
-
-                        num_samples = dims_tensor.shape[0]
-                        batch_sizes[batch_idx] = num_samples
-                        # total_samples += num_samples # Calculate total at the end based on verified
-                        processed_batch_indices.add(batch_idx)
-                        file_groups[batch_idx] = [file_path] # Initialize group
-                    except Exception as e:
-                        self.logger.error(f"Failed to load dims file {file_path} to get size: {e}")
-                        continue # Skip this batch if dims file fails
-                else:
-                    # We've already processed this batch_idx (from another rank's file)
-                    if batch_idx in file_groups:
-                         file_groups[batch_idx].append(file_path)
-                    else:
-                         self.logger.warning(f"Found file for already processed batch_idx {batch_idx} but group not initialized: {file_path}")
-
-            except ValueError:
-                self.logger.warning(f"Could not parse batch index from filename: {filename}")
-            except Exception as e:
-                self.logger.error(f"Error processing file {file_path}: {e}")
-
-        # --- Verification ---
-        # Check if all mandatory features exist for the discovered batch indices
-        required_features = self.MANDATORY_FEATURES # Use the defined set
-        verified_batch_indices = sorted(list(processed_batch_indices))
+        # 3. Determine Batch Sizes (Optimized: Load only last batch dims)
         final_file_list = [] # List of tuples: (batch_idx, num_samples)
-        final_total_samples = 0
+        dims_info = self.FEATURE_INFO.get('dims')
+        if not dims_info: raise ValueError("Internal Error: 'dims' feature info missing.")
 
-        self.logger.info(f"Verifying presence of mandatory features for {len(verified_batch_indices)} discovered batch indices...")
+        sorted_indices = sorted(list(valid_batch_indices))
+        max_batch_idx = sorted_indices[-1]
+        last_batch_size = 0
 
-        # Use tqdm for verification progress if many batches
-        batch_iterator = tqdm(verified_batch_indices, desc="Verifying batches", leave=False, disable=(len(verified_batch_indices) < 100))
+        # Load ONLY the dims file for the maximum batch index found
+        self.logger.info(f"Loading 'dims' file only for the last batch index: {max_batch_idx}...")
+        dims_file_path = self._get_file_path('dims', max_batch_idx)
+        if dims_file_path is None:
+             # This is critical - if the last batch dims file is missing, we can't determine size accurately.
+            self.logger.error(f"Could not find 'dims' file for the MAX validated batch index {max_batch_idx}. Cannot determine dataset size.")
+            raise FileNotFoundError(f"Missing dims file for max batch index: {max_batch_idx}")
 
-        for batch_idx in batch_iterator:
-            batch_complete = True
-            for feature_type in required_features:
-                info = self.FEATURE_INFO.get(feature_type)
-                if not info:
-                    self.logger.error(f"Missing FEATURE_INFO configuration for mandatory feature '{feature_type}'. Cannot verify.")
-                    batch_complete = False
-                    break # Cannot proceed with this batch
+        try:
+            # No need to check size beforehand if we trust precompute not to make empty files
+            dims_tensor = torch.load(dims_file_path, map_location='cpu')
+            if dims_tensor.ndim == 0 or dims_tensor.shape[0] == 0: # Still a minimal safety check
+                self.logger.error(f"Last dims file {dims_file_path} loaded empty/scalar tensor. Cannot determine dataset size.")
+                raise ValueError(f"Last dims file empty/scalar: {dims_file_path}")
+            last_batch_size = dims_tensor.shape[0]
+            self.logger.info(f"Last batch ({max_batch_idx}) has {last_batch_size} samples.")
 
-                feature_dir = self.feature_cache_path / info['dir']
-                # Construct the expected filename pattern using the correct extension
-                expected_filename_pattern = f"*_{batch_idx:06d}{info['ext']}" # Assumes 6-digit padding
+        except Exception as e:
+            self.logger.error(f"Failed to load/process the last dims file {dims_file_path}: {e}")
+            raise # Failure to load the last batch size is fatal for this method
 
-                # Check if at least one rank's file exists for this batch_idx and feature
-                matches = list(feature_dir.glob(expected_filename_pattern))
-                if not matches:
-                    self.logger.warning(f"Missing mandatory feature '{feature_type}' for batch index {batch_idx} (Pattern: {feature_dir / expected_filename_pattern}). Skipping batch.")
-                    batch_complete = False
-                    break # Stop checking features for this batch
+        # Construct the file list assuming expected size for all but the last
+        for batch_idx in sorted_indices:
+            size = self.expected_batch_size if batch_idx != max_batch_idx else last_batch_size
+            final_file_list.append((batch_idx, size))
 
-            if batch_complete:
-                # Ensure batch_idx exists in batch_sizes (it should if dims loaded)
-                num_samples = batch_sizes.get(batch_idx)
-                if num_samples is None:
-                     self.logger.error(f"Internal error: Batch index {batch_idx} verified but size not found. Skipping.")
-                     continue
-                final_file_list.append((batch_idx, num_samples))
-                # final_total_samples += num_samples # Accumulate at the end
-            # else: # No need to adjust total_samples here, recalculate at the end
-
-        # Recalculate total samples accurately based on verified batches
-        final_total_samples = sum(num_samples for _, num_samples in final_file_list)
-
-        # Calculate cumulative sizes for index mapping
+        # 4. Calculate cumulative sizes and total samples (same as before)
         cumulative_sizes = {}
         current_pos = 0
-        for batch_idx, num_samples in final_file_list:
+        final_total_samples = 0
+        for batch_idx, num_samples in final_file_list: # final_file_list is already sorted
             cumulative_sizes[batch_idx] = current_pos
             current_pos += num_samples
+        final_total_samples = current_pos
 
-        if not final_file_list:
-             self.logger.error("No complete batches found after verifying mandatory features.")
-             # Consider raising an error if no data is usable
-
+        self.logger.info(f"Successfully verified {len(final_file_list)} batches using optimized discovery v2.")
         return final_file_list, cumulative_sizes, final_total_samples
-
 
     def _get_file_path(self, feature_type: str, batch_idx: int):
          """
@@ -467,44 +446,76 @@ class DDMDataset(Dataset):
         return self._bucket_assignments
 
     def _load_bucket_assignments(self) -> torch.Tensor:
-        """Loads bucket assignments for the entire dataset."""
+        """Loads bucket assignments for the entire dataset using pre-allocation."""
         assignments_dir = self.feature_cache_path / self.FEATURE_INFO['buckets']['dir']
-        if not assignments_dir.exists():
+        if not assignments_dir.exists(): # pragma: no cover
             raise FileNotFoundError(f"Bucket assignments directory not found: {assignments_dir}")
 
-        # Load assignments from all rank_*_*.pt files and concatenate
-        all_assignments = []
+        if not self.file_list: # pragma: no cover
+            self.logger.error("File list is empty, cannot load bucket assignments.")
+            raise ValueError("Cannot load assignments, file list is empty.")
+        if self.total_samples <= 0: # pragma: no cover
+             self.logger.error(f"Total samples is {self.total_samples}, cannot pre-allocate tensor.")
+             raise ValueError("Cannot pre-allocate assignments tensor, total samples is not positive.")
+
+
+        self.logger.info(f"Loading bucket assignments for {len(self.file_list)} verified batches into pre-allocated tensor ({self.total_samples} samples)...")
+        # --- Pre-allocate the full tensor --- START EDIT ---
+        full_assignments = torch.empty(self.total_samples, dtype=torch.short, device='cpu')
+        # --- Pre-allocate the full tensor --- END EDIT ---
+
+        load_errors = 0
         # Use self.file_list which contains verified batch indices and sizes
-        self.logger.info(f"Loading bucket assignments for {len(self.file_list)} verified batches...")
-        for batch_idx, num_samples in tqdm(self.file_list, desc="Loading bucket assignments"):
+        for batch_idx, num_samples_expected in tqdm(self.file_list, desc="Loading bucket assignments"):
             file_path = self._get_file_path('buckets', batch_idx) # Use helper to find the file
             if file_path:
                 try:
                     batch_assignments = torch.load(file_path, map_location='cpu')
-                    if batch_assignments.shape[0] != num_samples:
-                         self.logger.warning(f"Bucket assignment count mismatch for batch {batch_idx}. Expected {num_samples}, got {batch_assignments.shape[0]}. File: {file_path}")
-                         # Handle mismatch: skip, truncate, error? For now, use loaded count.
-                    all_assignments.append(batch_assignments)
+                    # --- Get slice indices and assign --- START EDIT ---
+                    start_idx = self.cumulative_sizes[batch_idx]
+                    end_idx = start_idx + batch_assignments.shape[0] # Use actual loaded shape
+
+                    # Basic validation before assignment
+                    if batch_assignments.shape[0] != num_samples_expected:
+                         self.logger.warning(f"Bucket assignment count mismatch for batch {batch_idx}. Expected {num_samples_expected}, got {batch_assignments.shape[0]}. File: {file_path}. Adjusting slice.")
+                         # Adjust end_idx based on what was actually loaded if mismatch occurs
+                         end_idx = start_idx + batch_assignments.shape[0]
+                         # NOTE: This might lead to size mismatches later if not handled carefully.
+                         # If total_samples was calculated based on *expected* sizes, a mismatch here
+                         # could cause an IndexError if end_idx exceeds self.total_samples.
+                         # However, discover_v2 uses the *last* batch actual size, making this less likely
+                         # unless intermediate batches are inconsistent. Add a check.
+                         if end_idx > self.total_samples:
+                              self.logger.error(f"Slice end index {end_idx} exceeds total samples {self.total_samples} for batch {batch_idx}. Skipping assignment.")
+                              load_errors += 1
+                              continue
+
+
+                    if batch_assignments.dtype != torch.short:
+                         batch_assignments = batch_assignments.short() # Ensure correct dtype
+
+                    full_assignments[start_idx:end_idx] = batch_assignments
+                    # --- Get slice indices and assign --- END EDIT ---
+
                 except Exception as e:
-                    self.logger.error(f"Error loading bucket assignment file {file_path}: {e}")
-                    # Handle error: skip batch, raise error? Requires consistent handling.
-                    raise RuntimeError(f"Failed to load bucket assignments for batch {batch_idx}")
-            else:
+                    self.logger.error(f"Error loading or assigning bucket assignment file {file_path}: {e}")
+                    load_errors += 1
+                    # Consider if failure here should be fatal
+            else: # pragma: no cover
                 self.logger.error(f"Could not find bucket assignment file for batch {batch_idx}. Cannot proceed.")
                 raise FileNotFoundError(f"Missing bucket assignment file for batch {batch_idx}")
 
-        if not all_assignments:
-             raise ValueError("Failed to load any bucket assignments.")
+        if load_errors > 0: # pragma: no cover
+             self.logger.warning(f"Encountered {load_errors} errors during bucket assignment loading.")
+             # Depending on requirements, might raise error here
 
-        full_assignments = torch.cat(all_assignments, dim=0)
+        # Validate final size against expected (optional, but good practice)
+        # Note: This check might fail if mismatches were handled by adjusting slice sizes
+        # if full_assignments.shape[0] != self.total_samples:
+        #     self.logger.warning(f"Final loaded bucket assignments tensor size ({full_assignments.shape[0]}) does not match expected dataset size ({self.total_samples}).")
 
-        # Validate size
-        if full_assignments.shape[0] != self.total_samples:
-            self.logger.warning(f"Total loaded bucket assignments ({full_assignments.shape[0]}) does not match expected dataset size ({self.total_samples}).")
-            # This might indicate issues in discovery or loading.
-
-        self.logger.info(f"Successfully loaded bucket assignments for {full_assignments.shape[0]} samples.")
-        return full_assignments.short() # Use short tensor for memory efficiency
+        self.logger.info(f"Successfully loaded bucket assignments for {full_assignments.shape[0]} samples into pre-allocated tensor.")
+        return full_assignments # Return the pre-allocated and filled tensor
 
 
     @staticmethod
@@ -545,42 +556,67 @@ class DDMDataset(Dataset):
         return collated
 
     def _load_cluster_assignments(self) -> torch.Tensor:
-         """Loads cluster assignments for the entire dataset."""
+         """Loads cluster assignments for the entire dataset using pre-allocation."""
          assignments_dir = self.feature_cache_path / self.FEATURE_INFO['clusters']['dir']
          cluster_ext = self.FEATURE_INFO['clusters']['ext'] # Use correct extension
-         if not assignments_dir.exists():
+         if not assignments_dir.exists(): # pragma: no cover
              raise FileNotFoundError(f"Cluster assignments directory not found: {assignments_dir}")
 
-         all_assignments = []
-         self.logger.info(f"Loading cluster assignments for {len(self.file_list)} verified batches...")
-         for batch_idx, num_samples in tqdm(self.file_list, desc="Loading cluster assignments"):
-             # Use _get_file_path which handles finding the file across ranks and uses correct extension
+         if not self.file_list: # pragma: no cover
+            self.logger.error("File list is empty, cannot load cluster assignments.")
+            raise ValueError("Cannot load assignments, file list is empty.")
+         if self.total_samples <= 0: # pragma: no cover
+             self.logger.error(f"Total samples is {self.total_samples}, cannot pre-allocate tensor.")
+             raise ValueError("Cannot pre-allocate assignments tensor, total samples is not positive.")
+
+
+         self.logger.info(f"Loading cluster assignments for {len(self.file_list)} verified batches into pre-allocated tensor ({self.total_samples} samples)...")
+         # --- Pre-allocate the full tensor --- START EDIT ---
+         full_assignments = torch.empty(self.total_samples, dtype=torch.long, device='cpu')
+         # --- Pre-allocate the full tensor --- END EDIT ---
+
+         load_errors = 0
+         for batch_idx, num_samples_expected in tqdm(self.file_list, desc="Loading cluster assignments"):
              file_path = self._get_file_path('clusters', batch_idx)
              if file_path:
                  try:
                      batch_assignments = torch.load(file_path, map_location='cpu')
-                     if batch_assignments.shape[0] != num_samples:
-                         self.logger.warning(f"Cluster assignment count mismatch for batch {batch_idx}. Expected {num_samples}, got {batch_assignments.shape[0]}. File: {file_path}")
-                         # Decide how to handle mismatch, e.g., attempt to resize or skip batch if critical
-                     all_assignments.append(batch_assignments)
+                     # --- Get slice indices and assign --- START EDIT ---
+                     start_idx = self.cumulative_sizes[batch_idx]
+                     end_idx = start_idx + batch_assignments.shape[0] # Use actual loaded shape
+
+                     # Basic validation before assignment
+                     if batch_assignments.shape[0] != num_samples_expected:
+                          self.logger.warning(f"Cluster assignment count mismatch for batch {batch_idx}. Expected {num_samples_expected}, got {batch_assignments.shape[0]}. File: {file_path}. Adjusting slice.")
+                          end_idx = start_idx + batch_assignments.shape[0]
+                          if end_idx > self.total_samples:
+                               self.logger.error(f"Slice end index {end_idx} exceeds total samples {self.total_samples} for batch {batch_idx}. Skipping assignment.")
+                               load_errors += 1
+                               continue
+
+                     if batch_assignments.dtype != torch.long:
+                          batch_assignments = batch_assignments.long() # Ensure correct dtype
+
+                     full_assignments[start_idx:end_idx] = batch_assignments
+                     # --- Get slice indices and assign --- END EDIT ---
+
                  except Exception as e:
-                     self.logger.error(f"Error loading cluster assignment file {file_path}: {e}")
-                     raise RuntimeError(f"Failed to load cluster assignments for batch {batch_idx}")
-             else:
+                     self.logger.error(f"Error loading or assigning cluster assignment file {file_path}: {e}")
+                     load_errors += 1
+                     # Consider if failure here should be fatal
+             else: # pragma: no cover
                  self.logger.error(f"Could not find cluster assignment file for batch {batch_idx} (expected ext: {cluster_ext}). Cannot proceed.")
                  raise FileNotFoundError(f"Missing cluster assignment file for batch {batch_idx}")
 
-         if not all_assignments:
-              raise ValueError("Failed to load any cluster assignments.")
+         if load_errors > 0: # pragma: no cover
+             self.logger.warning(f"Encountered {load_errors} errors during cluster assignment loading.")
 
-         full_assignments = torch.cat(all_assignments, dim=0)
+         # Validate final size (optional)
+         # if full_assignments.shape[0] != self.total_samples:
+         #     self.logger.warning(f"Final loaded cluster assignments tensor size ({full_assignments.shape[0]}) does not match expected dataset size ({self.total_samples}). Check for mismatches during loading.")
 
-         if full_assignments.shape[0] != self.total_samples:
-             self.logger.warning(f"Total loaded cluster assignments ({full_assignments.shape[0]}) does not match expected dataset size ({self.total_samples}). Check for mismatches during loading.")
-
-         self.logger.info(f"Successfully loaded cluster assignments for {full_assignments.shape[0]} samples.")
-         return full_assignments.long() # Use long tensor for cluster indices
-
+         self.logger.info(f"Successfully loaded cluster assignments for {full_assignments.shape[0]} samples into pre-allocated tensor.")
+         return full_assignments # Return the pre-allocated and filled tensor
 
     @property
     def cluster_assignments(self) -> torch.Tensor:

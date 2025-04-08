@@ -801,12 +801,16 @@ def main(config_path: str = "config.toml",
     generator = FeatureGenerator(cfg, enabled_features=all_possible_features)
     feature_cache_path = Path(cfg.data.feature_cache_path)
 
+    # --- START EDIT: Define dir_map here so it's accessible to all ranks ---
+    dir_map = {'vae': 'latents', 'clip': 'clip', 't5': 't5', 'dino': 'dino',
+               'dims': 'dims', 'buckets': 'buckets', 'clusters': 'clusters'}
+    # --- END EDIT ---
+
+
     # --- Check if Feature Extraction can be skipped ---
     can_skip_extraction = False
     if not skip_feature_extraction and is_main: # Only rank 0 performs the check
         logger.info("Checking if feature extraction outputs already exist...")
-        dir_map = {'vae': 'latents', 'clip': 'clip', 't5': 't5', 'dino': 'dino',
-                   'dims': 'dims', 'buckets': 'buckets'}
         all_dirs_exist_and_nonempty = True
         missing_or_empty_dirs = []
         for feature in essential_features:
@@ -893,12 +897,14 @@ def main(config_path: str = "config.toml",
     can_skip_clustering = False
     if not skip_clustering and is_main: # Only rank 0 checks
         logger.info("Checking if clustering output already exists...")
-        cluster_dir = feature_cache_path / dir_map[cfg.data.clustering_feature_type]
-        if cluster_dir.exists() and any(cluster_dir.iterdir()):
-            logger.info("Cluster directory exists and is non-empty. Will attempt to skip clustering.")
+        # --- START EDIT: Check the correct 'clusters' output directory ---
+        cluster_output_dir = feature_cache_path / dir_map['clusters'] # Directly check the 'clusters' directory
+        # --- END EDIT ---
+        if cluster_output_dir.exists() and any(cluster_output_dir.iterdir()):
+            logger.info("Cluster assignments directory exists and is non-empty. Will attempt to skip clustering.")
             can_skip_clustering = True
         else:
-            logger.info("Cluster directory missing or empty. Running clustering.")
+            logger.info("Cluster assignments directory missing or empty. Running clustering.")
             can_skip_clustering = False
 
     # Broadcast decision
@@ -906,6 +912,7 @@ def main(config_path: str = "config.toml",
         skip_clustering_tensor = torch.tensor(int(can_skip_clustering), dtype=torch.int, device=device)
         dist.broadcast(skip_clustering_tensor, src=0)
         can_skip_clustering = bool(skip_clustering_tensor.item())
+
 
     # Force skip if user requested
     if skip_clustering:
@@ -916,6 +923,7 @@ def main(config_path: str = "config.toml",
     # --- Run Clustering ---
     if not can_skip_clustering:
          # Check if required feature files for clustering exist (double-check after extraction step)
+         # Now dir_map is guaranteed to be defined for all ranks
          clustering_feature_dir = feature_cache_path / dir_map[cfg.data.clustering_feature_type]
          if not clustering_feature_dir.exists() or not any(clustering_feature_dir.iterdir()):
              logger.error(f"Cannot run clustering because required feature directory '{clustering_feature_dir}' is missing or empty, even after extraction phase.")
@@ -952,4 +960,4 @@ def main(config_path: str = "config.toml",
 
 
 if __name__ == "__main__":
-    fire.Fire(main) 
+    fire.Fire(main)

@@ -171,15 +171,17 @@ def train(config_path: str = "config.toml", **kwargs): # Default to config.toml
         'feature_cache_path': getattr(cfg.data, 'feature_cache_path', None),
         'latent_channels': getattr(cfg.data, 'latent_channels', None),
         # num_clusters is needed by the dataset to determine which expert a sample belongs to
-        'num_experts': getattr(cfg.model, 'num_clusters', None), 
+        'num_experts': getattr(cfg.model, 'num_clusters', None),
         # Bucket settings need to be directly accessible
         'bucket_thresholds': getattr(cfg.data, 'bucket_thresholds', {}),
         'bucket_scale': getattr(cfg.data, 'bucket_scale', 8),
         'buckets': getattr(cfg.data, 'buckets', []),
+        'precompute_batch_size': getattr(cfg.data, 'precompute_batch_size', None),
     }
     # Validate required dataset config keys
     if not dataset_config_dict['feature_cache_path']: raise ValueError("Missing feature_cache_path in [data] config.")
     if not dataset_config_dict['num_experts']: raise ValueError("Missing num_clusters in [model] config (needed by dataset).")
+    if not dataset_config_dict['precompute_batch_size']: raise ValueError("Missing precompute_batch_size in [data] config (needed by dataset).")
 
     print(f"Rank {rank}: Initializing DDMDataset...")
     # Pass the flat dict
