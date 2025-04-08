@@ -12,6 +12,7 @@ import torch.distributed as dist
 import wandb # Import wandb
 from torch import nn
 from einops import rearrange # Import rearrange from einops
+import gc # Import garbage collector
 
 # Assuming ExpertModel and RouterModel are correctly defined
 from models.expert import ExpertModel
@@ -254,6 +255,19 @@ class ExpertTrainer(BaseTrainer):
                 return
             self.optimizer.zero_grad()
 
+            # Define variables to delete in finally block
+            batch = None
+            batch_data = None
+            x0_unpatched = None
+            t = None
+            xt_unpatched = None
+            noise = None
+            xt_patched = None
+            model_kwargs = None
+            pred_noise_patched = None
+            noise_patched = None
+            loss = None
+
             for i in range(self.gradient_accumulation_steps):
                 # --- Try to get and process a batch ---
                 try:
@@ -262,6 +276,8 @@ class ExpertTrainer(BaseTrainer):
                         batch = next(data_iter)
                         if batch is None: # Handle potential None from collate_fn
                             print(f"Rank {current_rank}: Warning - Skipped None batch from dataloader.")
+                            del batch # Clean up None batch reference
+                            batch = None
                             continue
                     except StopIteration:
                         print(f"Rank {current_rank}: Resetting dataloader iterator (global step: {self.global_step}).")
@@ -270,10 +286,11 @@ class ExpertTrainer(BaseTrainer):
                             batch = next(data_iter)
                             if batch is None:
                                 print(f"Rank {current_rank}: Warning - Skipped None batch after iterator reset.")
+                                del batch # Clean up None batch reference
+                                batch = None
                                 continue
                         except StopIteration:
                             print(f"Rank {current_rank}: ERROR - DataLoader empty after reset. Stopping training.")
-                            # If it's empty immediately after reset, something is wrong with the sampler/dataset size
                             return # Cannot continue if dataloader is persistently empty
 
                     # 2. Process Batch Data
@@ -323,15 +340,47 @@ class ExpertTrainer(BaseTrainer):
                     accumulated_loss_per_step += loss.item() * self.gradient_accumulation_steps
                     processed_batches_in_step += 1 # Mark successful processing
 
-                # --- Catch errors within the accumulation step --- START EDIT ---
+                # --- Catch errors within the accumulation step ---
                 except Exception as e:
                     # Log the error WITH traceback for detailed debugging
                     import traceback
                     print(f"Rank {current_rank}: ERROR during accumulation step {i+1}/{self.gradient_accumulation_steps} (Global Step: {self.global_step}): {e}\n{traceback.format_exc()}")
-                    # Continue to the next accumulation step, hoping it's a transient issue.
-                    # If *all* accumulation steps fail, the optimizer step will be skipped later.
-                    continue
-                # --- Catch errors within the accumulation step --- END EDIT ---
+                    # Ensure variables from this failed step are cleaned up
+                    # The finally block below will handle deletion
+                    continue # Continue to the next accumulation step
+                finally:
+                    # --- Explicitly delete batch-specific variables --- START EDIT ---
+                    # Delete variables that might hold references to tensors,
+                    # especially those involved in the computation graph.
+                    del batch
+                    del batch_data
+                    del x0_unpatched
+                    del t
+                    del xt_unpatched
+                    del noise
+                    del xt_patched
+                    del model_kwargs
+                    del pred_noise_patched
+                    del noise_patched
+                    del loss
+                    # Set back to None for the next iteration or step exit
+                    batch = None
+                    batch_data = None
+                    x0_unpatched = None
+                    t = None
+                    xt_unpatched = None
+                    noise = None
+                    xt_patched = None
+                    model_kwargs = None
+                    pred_noise_patched = None
+                    noise_patched = None
+                    loss = None
+                    # Optionally, force garbage collection more frequently if leaks persist
+                    # if (i + 1) % 10 == 0: # Example: Collect every 10 accumulation steps
+                    #    gc.collect()
+                    #    if torch.cuda.is_available():
+                    #        torch.cuda.empty_cache()
+                    # --- Explicitly delete batch-specific variables --- END EDIT ---
 
 
             # --- Outside Accumulation Loop ---
@@ -367,6 +416,7 @@ class ExpertTrainer(BaseTrainer):
                          loss_tensor = torch.tensor(accumulated_loss_per_step / processed_batches_in_step, device=self.device) # Avg loss for this step
                          dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG, async_op=False)
                          avg_step_loss = loss_tensor.item()
+                         del loss_tensor # Clean up tensor
                      else:
                          avg_step_loss = accumulated_loss_per_step / processed_batches_in_step
 
@@ -403,6 +453,13 @@ class ExpertTrainer(BaseTrainer):
                          total_grad_norm_for_log = 0.0
                          log_start_time = current_time
 
+                         # --- Add periodic garbage collection --- START EDIT ---
+                         gc.collect()
+                         if torch.cuda.is_available():
+                             torch.cuda.empty_cache() # Clear GPU cache as well
+                         # --- Add periodic garbage collection --- END EDIT ---
+
+
                      # Checkpointing logic (uses updated global_step)
                      if self.global_step % self.checkpoint_frequency == 0:
                          self.save_checkpoint()
@@ -411,18 +468,27 @@ class ExpertTrainer(BaseTrainer):
                       # Catch errors during optimizer step/logging
                       import traceback
                       print(f"Rank {current_rank}: ERROR during optimizer step/logging (Global Step: {self.global_step}): {e}\n{traceback.format_exc()}")
-                      # Decide whether to continue or break, maybe break if opt step fails?
-                      # For now, let the outer loop continue, but global_step won't increment this time
-                      # If opt step failed, global_step wasn't incremented above
+                      # Force garbage collection on error
+                      gc.collect()
+                      if torch.cuda.is_available():
+                          torch.cuda.empty_cache()
 
             else: # No batches were successfully processed in this accumulation cycle
                  print(f"Rank {current_rank}: Warning - Skipping optimizer step {self.global_step + 1} as no gradients were computed (all accumulation steps failed or were skipped).")
-                 # Do not increment global_step if no work was done
+                 # Force garbage collection if step is skipped
+                 gc.collect()
+                 if torch.cuda.is_available():
+                     torch.cuda.empty_cache()
 
             # --- Check if max steps reached ---
             if self.global_step >= self.num_train_steps:
                  print(f"Rank {current_rank}: Reached target number of steps ({self.num_train_steps}).")
                  break
+
+        # Final cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+             torch.cuda.empty_cache()
 
         # Final checkpoint save
         self.save_checkpoint(filename=f"expert_{self.expert_id}_final_step_{self.global_step}.pt") # Include final step
@@ -432,6 +498,9 @@ class ExpertTrainer(BaseTrainer):
 class RouterTrainer(BaseTrainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # --- Router Trainer Memory Leak Prevention --- START EDIT ---
+        self.loss_fn = nn.CrossEntropyLoss() # Define loss function for router
+        # --- Router Trainer Memory Leak Prevention --- END EDIT ---
 
     def _get_batch_data(self, batch):
         """Extracts x0, condition (y), and cluster_idx for the Router."""
@@ -439,27 +508,35 @@ class RouterTrainer(BaseTrainer):
              raise TypeError(f"Expected batch to be a dict, but got {type(batch)}")
 
         # --- Extract mandatory data ---
-        x0 = batch.get('image')
-        cluster_idx = batch.get('cluster_idx')
+        # Corrected key assuming 'latents' holds the input for router as well
+        x0 = batch.get('latents')
+        cluster_idx = batch.get('clusters') # Use 'clusters' key for target expert ID
 
         if x0 is None:
-            raise ValueError("Batch dictionary missing mandatory 'image' key (latent features).")
+            # Corrected error message to reflect the expected key
+            raise ValueError("Batch dictionary missing mandatory 'latents' key.")
         if cluster_idx is None:
-            raise ValueError("Batch dictionary missing mandatory 'cluster_idx' key.")
+            # Corrected error message and key name
+            raise ValueError("Batch dictionary missing mandatory 'clusters' key.")
 
         x0 = x0.to(self.device)
         # Ensure cluster_idx is LongTensor on the correct device
         if isinstance(cluster_idx, (int, float)): # Handle potential scalar from dataset
              cluster_idx = torch.tensor([cluster_idx] * x0.shape[0], device=self.device).long()
         else:
+             # Make sure it's long type for CrossEntropyLoss
              cluster_idx = cluster_idx.to(self.device).long()
 
-        # --- Extract optional condition 'y' ---
+        # --- Extract optional condition 'y' (e.g., CLIP embeddings) ---
         condition_y = None
-        if self._get_raw_model().has_cond: # Check if the router expects 'y'
-            condition_y = batch.get('y')
+        # Check if the router *actually* expects 'y' based on its config/definition
+        # Assuming RouterModel has an attribute like `cond_dim` or `has_cond` set during init
+        # We need to access the raw model if wrapped in DDP
+        raw_model = self._get_raw_model()
+        if hasattr(raw_model, 'cond_dim') and raw_model.cond_dim is not None:
+            condition_y = batch.get('clip') # Assuming 'clip' is the key for the condition
             if condition_y is None:
-                 raise ValueError("RouterModel expects condition 'y', but it was not found in the batch dictionary.")
+                 raise ValueError("RouterModel expects condition 'clip', but it was not found in the batch dictionary.")
             condition_y = condition_y.to(self.device)
 
         return x0, condition_y, cluster_idx # Return image, optional condition 'y', and cluster index
@@ -470,93 +547,207 @@ class RouterTrainer(BaseTrainer):
         total_loss_for_log = 0.0
         total_grad_norm_for_log = 0.0
 
-        print(f"Rank {dist.get_rank() if self.is_distributed else 0}: Starting training for Router from step {self.global_step}...")
-        data_iter = iter(self.dataloader)
+        current_rank = dist.get_rank() if self.is_distributed else 0
+        print(f"Rank {current_rank}: Starting training for Router from step {self.global_step}...")
+
+        try:
+            data_iter = iter(self.dataloader)
+        except TypeError:
+            print(f"Rank {current_rank}: ERROR - DataLoader for Router is not iterable. Check initialization.")
+            return # Cannot train
+
 
         while self.global_step < self.num_train_steps:
             accumulated_loss_per_step = 0.0
+            processed_batches_in_step = 0
+
+            if self.optimizer is None:
+                print(f"Rank {current_rank}: ERROR - Optimizer not initialized for Router.")
+                return
             self.optimizer.zero_grad()
+
+            # Define variables to delete in finally block
+            batch = None
+            x0 = None
+            condition_y = None
+            cluster_idx = None
+            t = None
+            xt = None
+            model_kwargs = None
+            logits = None
+            loss = None
 
             for i in range(self.gradient_accumulation_steps):
                 try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    data_iter = iter(self.dataloader)
-                    batch = next(data_iter)
+                    # 1. Get Batch
+                    try:
+                        batch = next(data_iter)
+                        if batch is None:
+                             print(f"Rank {current_rank}: Warning - Skipped None batch from dataloader (Router).")
+                             del batch
+                             batch = None
+                             continue
+                    except StopIteration:
+                        print(f"Rank {current_rank}: Resetting Router dataloader iterator (global step: {self.global_step}).")
+                        data_iter = iter(self.dataloader)
+                        try:
+                             batch = next(data_iter)
+                             if batch is None:
+                                 print(f"Rank {current_rank}: Warning - Skipped None batch after iterator reset (Router).")
+                                 del batch
+                                 batch = None
+                                 continue
+                        except StopIteration:
+                             print(f"Rank {current_rank}: ERROR - Router DataLoader empty after reset. Stopping training.")
+                             return
 
-                x0, condition_y, cluster_idx = self._get_batch_data(batch)
-                B = x0.shape[0]
-                t = torch.randint(0, self.num_diffusion_timesteps, (B,), device=self.device).long()
-                xt, _ = forward_diffuse(
-                    x0, t, self.sqrt_alphas_cumprod, self.sqrt_one_minus_alphas_cumprod
-                )
+                    # 2. Process Batch Data
+                    x0, condition_y, cluster_idx = self._get_batch_data(batch)
 
-                with autocast(enabled=self.use_amp):
-                    model_kwargs = {'x': xt, 't': t.float()}
-                    if condition_y is not None: model_kwargs['y'] = condition_y
-                    logits = self.model(**model_kwargs)
-                    loss = F.cross_entropy(logits, cluster_idx)
-                    loss = loss / self.gradient_accumulation_steps
+                    # 3. Forward Diffusion
+                    B = x0.shape[0]
+                    t = torch.randint(0, self.num_diffusion_timesteps, (B,), device=self.device).long()
+                    xt, _ = forward_diffuse(
+                        x0, t, self.sqrt_alphas_cumprod, self.sqrt_one_minus_alphas_cumprod
+                    ) # Noise isn't needed for router loss
 
-                self.scaler.scale(loss).backward()
-                accumulated_loss_per_step += loss.item() * self.gradient_accumulation_steps
+                    # 4. Model Forward & Loss
+                    with autocast(enabled=self.use_amp):
+                        # Prepare args for router model forward pass
+                        model_kwargs = {'x': xt, 't': t.float()} # Router expects float time usually
+                        if condition_y is not None:
+                            model_kwargs['y'] = condition_y
 
-            self.scaler.unscale_(self.optimizer)
-            if self.max_grad_norm is not None:
-                 grad_norm = clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                 total_grad_norm_for_log += grad_norm.item()
+                        logits = self.model(**model_kwargs) # Get cluster logits
+
+                        # Use the defined loss function
+                        loss = self.loss_fn(logits, cluster_idx)
+                        loss = loss / self.gradient_accumulation_steps
+
+                    # 5. Backward Pass
+                    self.scaler.scale(loss).backward()
+                    accumulated_loss_per_step += loss.item() * self.gradient_accumulation_steps
+                    processed_batches_in_step += 1
+
+                except Exception as e:
+                    import traceback
+                    print(f"Rank {current_rank}: ERROR during Router accumulation step {i+1}/{self.gradient_accumulation_steps} (Global Step: {self.global_step}): {e}\n{traceback.format_exc()}")
+                    continue # Continue to next accumulation step
+                finally:
+                    # --- Explicitly delete Router batch variables --- START EDIT ---
+                    del batch
+                    del x0
+                    del condition_y
+                    del cluster_idx
+                    del t
+                    del xt
+                    del model_kwargs
+                    del logits
+                    del loss
+                    batch = None
+                    x0 = None
+                    condition_y = None
+                    cluster_idx = None
+                    t = None
+                    xt = None
+                    model_kwargs = None
+                    logits = None
+                    loss = None
+                    # --- Explicitly delete Router batch variables --- END EDIT ---
+
+
+            # --- Outside Accumulation Loop ---
+            if processed_batches_in_step > 0:
+                try:
+                    self.scaler.unscale_(self.optimizer)
+
+                    current_grad_norm = 0.0
+                    if self.max_grad_norm is not None:
+                        params_to_clip = [p for p in self.model.parameters() if p.grad is not None]
+                        if params_to_clip:
+                             current_grad_norm = clip_grad_norm_(params_to_clip, self.max_grad_norm, error_if_nonfinite=False).item()
+                    else:
+                         params_with_grads = [p for p in self.model.parameters() if p.grad is not None]
+                         if params_with_grads:
+                             all_norms = torch.stack([torch.norm(p.grad.detach().float(), 2) for p in params_with_grads])
+                             current_grad_norm = torch.norm(all_norms, 2).item()
+
+                    total_grad_norm_for_log += current_grad_norm
+
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    if self.lr_scheduler is not None: self.lr_scheduler.step()
+
+                    if self.is_distributed:
+                         # Average the loss across ranks
+                         loss_tensor = torch.tensor(accumulated_loss_per_step / processed_batches_in_step, device=self.device)
+                         dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                         avg_step_loss = loss_tensor.item()
+                         del loss_tensor # Clean up tensor
+                    else:
+                         avg_step_loss = accumulated_loss_per_step / processed_batches_in_step
+
+                    total_loss_for_log += avg_step_loss
+                    self.global_step += 1 # Increment step only on success
+
+                    if self.is_main_process and self.global_step % self.log_frequency == 0:
+                        avg_loss_log_period = total_loss_for_log / self.log_frequency
+                        avg_grad_norm_log_period = total_grad_norm_for_log / self.log_frequency
+                        current_time = time.time()
+                        elapsed_time_log = current_time - log_start_time
+                        steps_per_sec = self.log_frequency / elapsed_time_log if elapsed_time_log > 0 else 0
+                        lr = self.optimizer.param_groups[0]['lr'] if self.optimizer.param_groups else 0
+
+                        print(f"Router | Step: {self.global_step}/{self.num_train_steps} | "
+                              f"Avg Loss: {avg_loss_log_period:.4f} | Grad Norm: {avg_grad_norm_log_period:.4f} | LR: {lr:.6f} | "
+                              f"Steps/sec: {steps_per_sec:.2f}")
+
+                        if self.use_wandb:
+                            log_data = {
+                                "router/loss": avg_loss_log_period,
+                                "router/grad_norm": avg_grad_norm_log_period,
+                                "train/learning_rate": lr,
+                                "train/steps_per_second": steps_per_sec,
+                                "train/step": self.global_step
+                            }
+                            wandb.log(log_data, step=self.global_step)
+
+                        total_loss_for_log = 0.0
+                        total_grad_norm_for_log = 0.0
+                        log_start_time = current_time
+
+                        # --- Add periodic garbage collection --- START EDIT ---
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        # --- Add periodic garbage collection --- END EDIT ---
+
+                    if self.global_step % self.checkpoint_frequency == 0:
+                        self.save_checkpoint()
+
+                except Exception as e:
+                    import traceback
+                    print(f"Rank {current_rank}: ERROR during Router optimizer step/logging (Global Step: {self.global_step}): {e}\n{traceback.format_exc()}")
+                    # Force garbage collection on error
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             else:
-                 try:
-                     grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]), 2)
-                     total_grad_norm_for_log += grad_norm.item()
-                 except:
-                      pass
+                print(f"Rank {current_rank}: Warning - Skipping Router optimizer step {self.global_step + 1} as no gradients were computed.")
+                # Force garbage collection if step is skipped
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            if self.lr_scheduler is not None: self.lr_scheduler.step()
 
-            if self.is_distributed:
-                 loss_tensor = torch.tensor(accumulated_loss_per_step, device=self.device)
-                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-                 avg_step_loss = loss_tensor.item()
-            else:
-                 avg_step_loss = accumulated_loss_per_step
-
-            total_loss_for_log += avg_step_loss
-
-            if self.is_main_process and (self.global_step + 1) % self.log_frequency == 0:
-                avg_loss_log_period = total_loss_for_log / self.log_frequency
-                avg_grad_norm_log_period = total_grad_norm_for_log / self.log_frequency
-                current_time = time.time()
-                elapsed_time_log = current_time - log_start_time
-                steps_per_sec = self.log_frequency / elapsed_time_log if elapsed_time_log > 0 else 0
-                lr = self.optimizer.param_groups[0]['lr']
-
-                print(f"Router | Step: {self.global_step+1}/{self.num_train_steps} | "
-                      f"Avg Loss: {avg_loss_log_period:.4f} | Grad Norm: {avg_grad_norm_log_period:.4f} | LR: {lr:.6f} | "
-                      f"Steps/sec: {steps_per_sec:.2f}")
-
-                if self.use_wandb:
-                    log_data = {
-                        "router/loss": avg_loss_log_period,
-                        "router/grad_norm": avg_grad_norm_log_period,
-                        "train/learning_rate": lr,
-                        "train/steps_per_second": steps_per_sec,
-                        "train/step": self.global_step + 1
-                    }
-                    wandb.log(log_data, step=self.global_step + 1)
-
-                total_loss_for_log = 0.0
-                total_grad_norm_for_log = 0.0
-                log_start_time = current_time
-
-            if (self.global_step + 1) % self.checkpoint_frequency == 0:
-                self.save_checkpoint()
-
-            self.global_step += 1
             if self.global_step >= self.num_train_steps:
+                 print(f"Rank {current_rank}: Router reached target number of steps ({self.num_train_steps}).")
                  break
 
+        # Final cleanup
+        gc.collect()
+        if torch.cuda.is_available():
+             torch.cuda.empty_cache()
+
         self.save_checkpoint(filename="router_final.pt")
-        print(f"Rank {dist.get_rank() if self.is_distributed else 0}: Training finished for Router.")
+        print(f"Rank {current_rank}: Training finished for Router at step {self.global_step}.")
