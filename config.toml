@@ -31,8 +31,8 @@ expert_qkv_bias = true # Example Flux qkv_bias
 expert_guidance_embed = false # Example Flux guidance embed (usually False for base models)
 
 [data]
-dataset_path = "/home/alex/workspace/datasets/photo-concept-bucket/train" # Root directory of the dataset
-feature_cache_path = "/home/alex/workspace/datasets/photo-concept-bucket/cache" # Where VAE latents, CLIP embeddings etc. are stored
+dataset_path = "/home/alex/workspace/datasets/danbooru2025" # Root directory of the dataset
+feature_cache_path = "/home/alex/workspace/datasets/danbooru2025/cache" # Where VAE latents, CLIP embeddings etc. are stored
 precompute_batch_size = 8 # <-- Further reduced batch size
 
 # --- Feature Extractor Models ---
@@ -61,8 +61,8 @@ bucket_scale = 8
 bucket_thresholds = { square = [0.9, 1.1], portrait = [0.5, 0.9], landscape = [1.1, 2.0] } # Example thresholds
 # Example buckets (width, height) - adjust based on dataset aspect ratios
 buckets = [
-  [640, 1536], [768, 1344], [832, 1216], [896, 1152], [1024, 1024],
-  [1152, 896], [1216, 832], [1344, 768], [1536, 640]
+  [512, 1024], [640, 960], [768, 896], [832, 832], [896, 768],
+  [960, 640], [1024, 512], [1024, 1024]
 ]
 
 [train]
